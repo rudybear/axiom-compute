@@ -839,8 +839,11 @@ mod tests {
     // ── m1_reserved_detail (spec §7.1 sub-assertion) ─────────────────────────
 
     #[test]
-    fn let_statement_detail_matches() {
-        assert_eq!(TokenKind::Let.m1_reserved_detail(),      Some("let statement"));
+    fn reserved_detail_after_m1_1_delists_let_mut() {
+        // M1.1 removes Let and Mut from the reserved deny-list (they are now valid syntax).
+        assert_eq!(TokenKind::Let.m1_reserved_detail(),      None);
+        assert_eq!(TokenKind::Mut.m1_reserved_detail(),      None);
+        // If and For remain reserved (deferred to M1.3).
         assert_eq!(TokenKind::If.m1_reserved_detail(),       Some("if statement"));
         assert_eq!(TokenKind::For.m1_reserved_detail(),      Some("for loop"));
         assert_eq!(TokenKind::Return.m1_reserved_detail(),   None);

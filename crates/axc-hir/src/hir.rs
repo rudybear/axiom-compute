@@ -112,9 +112,15 @@ impl WorkgroupDims {
 
 /// The body of a kernel.
 ///
-/// M0 only represents empty kernels (those that `return;` immediately).
-/// Richer bodies are an M1 deliverable.
+/// `Empty` is preserved for the M0 backward-compat fast path (guarantees
+/// AT-103 bit-exact fixture). `Typed` wraps the M1.1 typechecked body.
 #[derive(Debug, Clone)]
 pub enum KernelBody {
+    /// An empty kernel: `{ return; }` with no computation.
+    ///
+    /// Preserved to keep the empty-kernel SPIR-V bytes identical to M0
+    /// (AT-103 guard). The codegen KernelBody::Empty path is unchanged.
     Empty,
+    /// A non-empty kernel body with typed HIR statements.
+    Typed(crate::expr::KernelBodyTyped),
 }

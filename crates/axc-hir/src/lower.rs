@@ -5,12 +5,13 @@
 //! `@complexity` is mapped to `ComplexityForm` enum values (never a String).
 
 use axc_lexer::Span;
-use axc_parser::ast::{Module as AstModule, Item, AnnotationArg};
+use axc_parser::ast::{Module as AstModule, Item, AnnotationArg, Stmt};
 use crate::hir::{
     Module as HirModule, Kernel, KernelId, KernelAnnotations, WorkgroupDims,
     KernelBody, ComplexityForm, ComplexityVar, PreconditionTrivial,
 };
 use crate::validate::{HirError, HirWarning};
+use crate::typecheck::typecheck_kernel_body;
 
 /// Lower an AST module to HIR, producing structured errors and warnings.
 ///
@@ -154,11 +155,14 @@ pub fn lower_module(ast: &AstModule) -> (HirModule, Vec<HirError>, Vec<HirWarnin
                     subgroup_uniform,
                 };
 
+                // Determine body: Empty if trivial (only void return), Typed otherwise.
+                let body = lower_kernel_body(&kd.body.node, &mut errors);
+
                 kernels.push(Kernel {
                     id: KernelId(next_id),
                     name: kd.name.node.clone(),
                     annotations,
-                    body: KernelBody::Empty,
+                    body,
                     span: item.span,
                 });
                 next_id += 1;
@@ -167,6 +171,46 @@ pub fn lower_module(ast: &AstModule) -> (HirModule, Vec<HirError>, Vec<HirWarnin
     }
 
     (HirModule { kernels }, errors, warnings)
+}
+
+/// Determine whether a block is an empty kernel body (only `return;` or completely
+/// empty), and lower it to the appropriate `KernelBody` variant.
+///
+/// Uses `KernelBody::Empty` if:
+/// - The block has no statements, OR
+/// - The block has exactly one statement that is `Stmt::Return(None)`.
+///
+/// This preserves the M0 empty-kernel bit-exact SPIR-V output (AT-103).
+fn lower_kernel_body(
+    block: &axc_parser::ast::Block,
+    errors: &mut Vec<HirError>,
+) -> KernelBody {
+    let stmts = &block.stmts;
+
+    let is_empty_body = stmts.is_empty()
+        || (stmts.len() == 1 && matches!(stmts[0].node, Stmt::Return(None)));
+
+    if is_empty_body {
+        return KernelBody::Empty;
+    }
+
+    // Non-trivial body — run the typechecker.
+    let (typed_body, tc_errors) = typecheck_kernel_body(block);
+    for e in tc_errors {
+        errors.push(HirError::Typecheck(e));
+    }
+    KernelBody::Typed(typed_body)
+}
+
+/// Public accessor for tests: given an AST module, return the first kernel's body block.
+///
+/// Used only in `typecheck::tests`.
+#[doc(hidden)]
+pub fn get_kernel_body_block(ast: &AstModule) -> Option<&axc_lexer::Spanned<axc_parser::ast::Block>> {
+    ast.items.first().map(|item| {
+        let axc_parser::ast::Item::Kernel(ref kd) = item.node;
+        &kd.body
+    })
 }
 
 /// Extract a single workgroup dimension from an `AnnotationArg::Int`.

@@ -7,8 +7,9 @@
 pub mod ast;
 pub mod parser;
 
-pub use ast::{Module, Item, KernelDecl, Annotation, AnnotationArg, Block, Stmt, Expr, TypeRef, Param};
-pub use parser::{Parser, ParseError};
+pub use ast::{Module, Item, KernelDecl, Annotation, AnnotationArg, Block, Stmt, Expr, TypeRef, Param,
+              BinOp, UnaryOp, ShortCircuitOp};
+pub use parser::{Parser, ParseError, M1_1_RESERVED_KEYWORDS};
 
 use axc_lexer::LexError;
 

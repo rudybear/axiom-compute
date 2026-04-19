@@ -1,10 +1,10 @@
 //! Abstract Syntax Tree node types for AXIOM-Compute.
 //!
 //! Every node is wrapped in `Spanned<T>` so that diagnostic messages can
-//! point at the exact source location. In M0 only `@kernel` functions with
-//! annotations and a `return;` body are representable.
+//! point at the exact source location. M1.1 adds scalar types, let/let-mut
+//! bindings, assignments, and a full Pratt-parsed expression tree.
 
-use axc_lexer::Spanned;
+use axc_lexer::{Spanned, IntSuffix, FloatSuffix};
 
 /// Top-level module: a sequence of items.
 #[derive(Debug, Clone, PartialEq)]
@@ -32,7 +32,7 @@ pub struct KernelDecl {
 
 /// A single function parameter (`name: type`).
 ///
-/// M0 rejects any params with `ParseError::UnsupportedInM0 { detail: "kernel parameters" }`.
+/// M0 rejects any params with `ParseError::UnsupportedInM1_1 { detail: "kernel parameters" }`.
 /// The field is kept for forward-compatibility so the AST shape is stable into M1.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Param {
@@ -40,17 +40,19 @@ pub struct Param {
     pub ty: Spanned<TypeRef>,
 }
 
-/// A type reference in source (return type of a kernel declaration).
+/// A type reference in source (return type of a kernel declaration, or let binding type).
 ///
-/// M0 only permits `void`. Other types parse successfully but HIR rejects them
-/// with `HirError::BadKernelReturnType`.
+/// M0 only permitted `void`. M1.1 adds scalar types (§3.1 subset).
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeRef {
     Void,
     Bool,
     I32,
     U32,
+    I64,
+    U64,
     F32,
+    F64,
 }
 
 /// An annotation on a kernel: `@name` or `@name(arg, …)`.
@@ -81,16 +83,100 @@ pub struct Block {
 
 /// A statement inside a kernel body.
 ///
-/// M0 only allows `return;` or `return <lit>;`. All other statement forms are
-/// caught by the §3.3 M1-reserved keyword pre-check in `parse_stmt`.
+/// M1.1 adds Let and Assign. Return remains from M0.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
+    /// `return;` or `return expr;` (only void return is used in M1.1).
     Return(Option<Spanned<Expr>>),
+    /// `let [mut] name: type = expr;`
+    Let {
+        is_mut: bool,
+        name: Spanned<String>,
+        ty: Spanned<TypeRef>,
+        init: Spanned<Expr>,
+    },
+    /// `name = expr;` (assignment to existing binding).
+    Assign {
+        target: Spanned<String>,
+        value: Spanned<Expr>,
+    },
 }
 
-/// A simple expression (only literals in M0).
+/// Binary arithmetic / comparison operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Eq,
+    Neq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+}
+
+/// Unary operator (prefix).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryOp {
+    /// Arithmetic negation (`-x`).
+    Neg,
+    /// Logical NOT (`not x`); operand must be bool.
+    LogicalNot,
+}
+
+/// Short-circuit logical operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortCircuitOp {
+    /// `a and b` — false if LHS is false (RHS not evaluated).
+    And,
+    /// `a or b` — true if LHS is true (RHS not evaluated).
+    Or,
+}
+
+/// An expression.
+///
+/// M1.1 adds a full expression tree. The `IntLit` shape changes from M0's
+/// `IntLit(i128)` to `IntLit { value, suffix }` to carry suffix information.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     BoolLit(bool),
-    IntLit(i128),
+    /// Integer literal with optional type suffix.
+    IntLit {
+        value: i128,
+        suffix: Option<IntSuffix>,
+    },
+    /// Float literal with optional type suffix.
+    FloatLit {
+        value: f64,
+        suffix: Option<FloatSuffix>,
+    },
+    /// Identifier reference (variable read).
+    Ident(String),
+    /// Unary prefix operator.
+    Unary {
+        op: UnaryOp,
+        operand: Box<Spanned<Expr>>,
+    },
+    /// Binary infix operator (arithmetic, comparison).
+    Binary {
+        op: BinOp,
+        lhs: Box<Spanned<Expr>>,
+        rhs: Box<Spanned<Expr>>,
+    },
+    /// Short-circuit logical operator (and / or).
+    ShortCircuit {
+        op: ShortCircuitOp,
+        lhs: Box<Spanned<Expr>>,
+        rhs: Box<Spanned<Expr>>,
+    },
+    /// Built-in function call: `band(a, b)`, `shl(a, n)`, etc.
+    Call {
+        name: Spanned<String>,
+        args: Vec<Spanned<Expr>>,
+    },
+    /// Parenthesized expression: `(expr)`.
+    Paren(Box<Spanned<Expr>>),
 }

@@ -14,6 +14,7 @@ use crate::hir::{
     PORTABLE_MIN_WORKGROUP_INVOCATIONS,
     DESKTOP_MAX_WORKGROUP_INVOCATIONS,
 };
+use crate::typecheck::TypecheckError;
 
 /// Diagnostic error from HIR validation.
 #[derive(Debug, thiserror::Error, miette::Diagnostic)]
@@ -76,6 +77,11 @@ pub enum HirError {
         #[label("here")]
         span: Span,
     },
+
+    /// A typechecking error from the M1.1 kernel body.
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Typecheck(TypecheckError),
 }
 
 /// Non-fatal diagnostic warning from HIR validation.
