@@ -122,6 +122,13 @@ pub fn emit_buffer_globals(
         // 8. OpDecorate struct Block
         b.decorate(struct_type_id, Decoration::Block, []);
 
+        // 8b. OpMemberDecorate struct 0 Offset 0
+        //     Vulkan §15.6.4 requires every member of a Block-decorated struct to carry
+        //     an explicit Offset decoration. Member 0 is the runtime array; its offset
+        //     within the wrapper struct is always 0. Without this, spirv-val with
+        //     --target-env vulkan1.1 rejects the binary.
+        b.member_decorate(struct_type_id, 0, Decoration::Offset, [Operand::LiteralBit32(0)]);
+
         // 9. OpDecorate var DescriptorSet 0
         b.decorate(var_id, Decoration::DescriptorSet, [Operand::LiteralBit32(0)]);
 
@@ -225,8 +232,6 @@ pub struct GlobalInvocationIdVar {
     pub var_id: Word,
     /// The `uvec3` type id (OpTypeVector u32 3).
     pub vec3_u32_type_id: Word,
-    /// Pointer type for a single `u32` component (used in access_chain).
-    pub u32_ptr_type_id: Word,
 }
 
 /// Emit the `gl_GlobalInvocationID` Input variable.
@@ -252,16 +257,13 @@ pub fn emit_gid_variable(
     // 3. Pointer to vec3 u32 in Input storage class.
     let ptr_to_vec3: Word = b.type_pointer(None, StorageClass::Input, vec3_u32_type_id);
 
-    // 4. Pointer to a single u32 in Input class (for access_chain).
-    let u32_ptr_type_id: Word = b.type_pointer(None, StorageClass::Input, u32_type_id);
-
-    // 5. OpVariable Input
+    // 4. OpVariable Input
     let var_id: Word = b.variable(ptr_to_vec3, None, StorageClass::Input, None);
 
-    // 6. OpDecorate var BuiltIn GlobalInvocationId
+    // 5. OpDecorate var BuiltIn GlobalInvocationId
     b.decorate(var_id, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
 
-    GlobalInvocationIdVar { var_id, vec3_u32_type_id, u32_ptr_type_id }
+    GlobalInvocationIdVar { var_id, vec3_u32_type_id }
 }
 
 // ── Scan helpers ─────────────────────────────────────────────────────────────
@@ -908,6 +910,42 @@ mod tests {
         assert_eq!(plan.scalars[1].member_index, 1, "b → member_index 1 (NOT 2 = position)");
         assert_eq!(plan.scalars[1].offset, 4);
         assert_eq!(plan.push_constant_total_bytes, 8);
+    }
+
+    // AT-231: cg_ssbo_struct_member_has_offset_zero
+    // Vulkan §15.6.4: every member of a Block-decorated struct must carry an explicit
+    // Offset decoration. The SSBO wrapper struct { T[] data } has member 0 (the runtime
+    // array) at byte offset 0 — this must be decorated with OpMemberDecorate … 0 Offset 0.
+    #[test]
+    fn cg_ssbo_struct_member_has_offset_zero() {
+        let mut b = make_builder();
+        let mut tc = ScalarTypeCache::new();
+        let slot = BufferBindingSlot {
+            name: "xs".into(),
+            ty: BufferTy { elem: ScalarTy::F32, access: BufferAccess::ReadWrite },
+            position: 0,
+            buffer_position: 0,
+            span: Span::new(0, 1),
+        };
+        emit_buffer_globals(&mut b, &mut tc, &[slot]);
+
+        // Walk annotations for an OpMemberDecorate with Decoration::Offset and value 0.
+        // OpMemberDecorate layout: [IdRef(struct), LiteralBit32(member_idx), Decoration(Offset), LiteralBit32(offset)]
+        let has_member_offset_zero = iter_annotations(&b).any(|inst| {
+            // Must be OpMemberDecorate
+            let has_offset_deco = inst.operands.iter().any(|op| {
+                matches!(op, Operand::Decoration(Decoration::Offset))
+            });
+            // Member index 0
+            let has_member_0 = inst.operands.iter().any(|op| {
+                matches!(op, Operand::LiteralBit32(0))
+            });
+            has_offset_deco && has_member_0
+        });
+        assert!(
+            has_member_offset_zero,
+            "SSBO struct member 0 must have OpMemberDecorate Offset 0 (Vulkan §15.6.4)"
+        );
     }
 
     // cg_multi_buffer_elem_ty_shares_type_per_elem
