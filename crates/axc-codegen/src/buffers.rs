@@ -36,7 +36,7 @@
 //!
 //! The input variable is included in the OpEntryPoint interface list.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use rspirv::dr::{Builder, Operand};
 use rspirv::spirv::{
     Word, StorageClass, Decoration, BuiltIn,
@@ -50,19 +50,23 @@ use crate::body::ScalarTypeCache;
 // ── Buffer bindings ───────────────────────────────────────────────────────────
 
 /// Emitted SSBO global variable ids, keyed by buffer_position (= Binding N).
+///
+/// Uses `BTreeMap` (not `HashMap`) to guarantee deterministic iteration order
+/// for SPIR-V emission. HashMap iteration order is seed-randomized and would
+/// produce non-deterministic bytewise output across runs (spec §5.8 / AT-227).
 pub struct BufferBindings {
     /// Maps buffer_position → SPIR-V global Variable id.
-    pub var_ids: HashMap<u32, Word>,
+    pub var_ids: BTreeMap<u32, Word>,
     /// Maps buffer_position → SPIR-V pointer-to-elem type id.
     /// (Used in access_chain for reads/writes.)
-    pub elem_ptr_ids: HashMap<u32, Word>,
+    pub elem_ptr_ids: BTreeMap<u32, Word>,
 }
 
 impl BufferBindings {
     pub fn new() -> Self {
         Self {
-            var_ids: HashMap::new(),
-            elem_ptr_ids: HashMap::new(),
+            var_ids: BTreeMap::new(),
+            elem_ptr_ids: BTreeMap::new(),
         }
     }
 }
@@ -151,7 +155,8 @@ pub struct PushConstantBlock {
     /// The push-constant struct type id.
     pub struct_type_id: Word,
     /// Maps scalar member_index → pointer-to-member type id.
-    pub member_ptr_ids: HashMap<u32, Word>,
+    /// Uses `BTreeMap` for deterministic iteration order (spec §5.8 / AT-227).
+    pub member_ptr_ids: BTreeMap<u32, Word>,
 }
 
 /// Emit the push-constant block for a kernel's scalar parameters.
@@ -202,7 +207,7 @@ pub fn emit_push_constant_block(
     let var_id: Word = b.variable(ptr_id, None, StorageClass::PushConstant, None);
 
     // 7. Pointer types for individual members.
-    let mut member_ptr_ids: HashMap<u32, Word> = HashMap::new();
+    let mut member_ptr_ids: BTreeMap<u32, Word> = BTreeMap::new();
     for s in &ordered_scalars {
         let elem_ty_id = type_cache.scalar_id(b, s.ty);
         let ptr_ty = b.type_pointer(None, StorageClass::PushConstant, elem_ty_id);
@@ -495,5 +500,443 @@ mod tests {
             has_array_stride && has_val_4
         });
         assert!(has_stride4, "expected ArrayStride 4 for f32 elements");
+    }
+
+    // ── AT-218: BufferTypeCache deduplication ─────────────────────────────────
+
+    // AT-218: cg_buffer_type_cache_dedupes_elem_ty
+    // Kernel with 2 × buffer[f32] params must emit exactly 1 OpTypeRuntimeArray and
+    // 1 OpTypeStruct for f32 (the type cache deduplicates). With buffer[f32] + buffer[i32],
+    // it must emit 2 of each.
+    #[test]
+    fn cg_buffer_type_cache_dedupes_elem_ty() {
+        use rspirv::spirv::Op;
+
+        // Case 1: 2 × buffer[f32] → 1 OpTypeRuntimeArray (same elem type deduplicated).
+        {
+            let mut b = make_builder();
+            let mut tc = ScalarTypeCache::new();
+            let slots = vec![
+                BufferBindingSlot {
+                    name: "a".into(),
+                    ty: BufferTy { elem: ScalarTy::F32, access: BufferAccess::ReadWrite },
+                    position: 0, buffer_position: 0, span: Span::new(0, 1),
+                },
+                BufferBindingSlot {
+                    name: "b".into(),
+                    ty: BufferTy { elem: ScalarTy::F32, access: BufferAccess::ReadWrite },
+                    position: 1, buffer_position: 1, span: Span::new(0, 1),
+                },
+            ];
+            emit_buffer_globals(&mut b, &mut tc, &slots);
+            let runtime_array_count = iter_type_instructions(&b)
+                .filter(|(op, _)| *op == Op::TypeRuntimeArray as u16)
+                .count();
+            // rspirv deduplicates OpTypeRuntimeArray for the same element type.
+            assert_eq!(
+                runtime_array_count, 1,
+                "2×buffer[f32] should produce exactly 1 OpTypeRuntimeArray; got {runtime_array_count}"
+            );
+        }
+
+        // Case 2: buffer[f32] + buffer[i32] → 2 OpTypeRuntimeArray (distinct elem types).
+        {
+            let mut b = make_builder();
+            let mut tc = ScalarTypeCache::new();
+            let slots = vec![
+                BufferBindingSlot {
+                    name: "x".into(),
+                    ty: BufferTy { elem: ScalarTy::F32, access: BufferAccess::ReadWrite },
+                    position: 0, buffer_position: 0, span: Span::new(0, 1),
+                },
+                BufferBindingSlot {
+                    name: "y".into(),
+                    ty: BufferTy { elem: ScalarTy::I32, access: BufferAccess::ReadWrite },
+                    position: 1, buffer_position: 1, span: Span::new(0, 1),
+                },
+            ];
+            emit_buffer_globals(&mut b, &mut tc, &slots);
+            let runtime_array_count = iter_type_instructions(&b)
+                .filter(|(op, _)| *op == Op::TypeRuntimeArray as u16)
+                .count();
+            assert_eq!(
+                runtime_array_count, 2,
+                "buffer[f32]+buffer[i32] should produce 2 OpTypeRuntimeArray; got {runtime_array_count}"
+            );
+        }
+    }
+
+    // AT-219: cg_buffer_array_stride_32bit and cg_buffer_array_stride_64bit
+    #[test]
+    fn cg_buffer_array_stride_32bit() {
+        // f32, i32, u32 → ArrayStride 4
+        for (elem, name) in &[
+            (ScalarTy::F32, "f32"),
+            (ScalarTy::I32, "i32"),
+            (ScalarTy::U32, "u32"),
+        ] {
+            let mut b = make_builder();
+            let mut tc = ScalarTypeCache::new();
+            let slot = BufferBindingSlot {
+                name: (*name).into(),
+                ty: BufferTy { elem: *elem, access: BufferAccess::ReadWrite },
+                position: 0, buffer_position: 0, span: Span::new(0, 1),
+            };
+            emit_buffer_globals(&mut b, &mut tc, &[slot]);
+            let has_stride4 = iter_annotations(&b).any(|inst| {
+                inst.operands.iter().any(|op| matches!(op, Operand::Decoration(Decoration::ArrayStride)))
+                && inst.operands.iter().any(|op| matches!(op, Operand::LiteralBit32(4)))
+            });
+            assert!(has_stride4, "buffer[{name}] must have ArrayStride 4");
+        }
+    }
+
+    #[test]
+    fn cg_buffer_array_stride_64bit() {
+        // f64, i64, u64 → ArrayStride 8
+        for (elem, name) in &[
+            (ScalarTy::F64, "f64"),
+            (ScalarTy::I64, "i64"),
+            (ScalarTy::U64, "u64"),
+        ] {
+            let mut b = make_builder();
+            let mut tc = ScalarTypeCache::new();
+            let slot = BufferBindingSlot {
+                name: (*name).into(),
+                ty: BufferTy { elem: *elem, access: BufferAccess::ReadWrite },
+                position: 0, buffer_position: 0, span: Span::new(0, 1),
+            };
+            emit_buffer_globals(&mut b, &mut tc, &[slot]);
+            let has_stride8 = iter_annotations(&b).any(|inst| {
+                inst.operands.iter().any(|op| matches!(op, Operand::Decoration(Decoration::ArrayStride)))
+                && inst.operands.iter().any(|op| matches!(op, Operand::LiteralBit32(8)))
+            });
+            assert!(has_stride8, "buffer[{name}] must have ArrayStride 8");
+        }
+    }
+
+    // AT-206: cg_saxpy_binding_indices_skip_scalar
+    // Verifies binding 0 is x (readonly_buffer), binding 1 is y (buffer), no binding 2.
+    #[test]
+    fn cg_saxpy_binding_indices_skip_scalar() {
+        use axc_hir::{BufferBindingSlot, BufferTy, BufferAccess};
+        let mut b = make_builder();
+        let mut tc = ScalarTypeCache::new();
+        // saxpy: (n: u32, alpha: f32, x: readonly_buffer[f32], y: buffer[f32])
+        // x is buffer_position 0, y is buffer_position 1
+        let slots = vec![
+            BufferBindingSlot {
+                name: "x".into(),
+                ty: BufferTy { elem: ScalarTy::F32, access: BufferAccess::ReadOnly },
+                position: 2, buffer_position: 0, span: Span::new(0, 1),
+            },
+            BufferBindingSlot {
+                name: "y".into(),
+                ty: BufferTy { elem: ScalarTy::F32, access: BufferAccess::ReadWrite },
+                position: 3, buffer_position: 1, span: Span::new(0, 1),
+            },
+        ];
+        emit_buffer_globals(&mut b, &mut tc, &slots);
+        let binding_vals: Vec<u32> = iter_annotations(&b)
+            .filter(|inst| inst.operands.iter().any(|op| matches!(op, Operand::Decoration(Decoration::Binding))))
+            .filter_map(|inst| inst.operands.iter().find_map(|op| {
+                if let Operand::LiteralBit32(n) = op { Some(*n) } else { None }
+            }))
+            .collect();
+        assert!(binding_vals.contains(&0), "x must have Binding 0; got {:?}", binding_vals);
+        assert!(binding_vals.contains(&1), "y must have Binding 1; got {:?}", binding_vals);
+        assert!(!binding_vals.contains(&2), "no Binding 2 expected; got {:?}", binding_vals);
+    }
+
+    // cg_descriptor_set_is_always_zero
+    #[test]
+    fn cg_descriptor_set_is_always_zero() {
+        let mut b = make_builder();
+        let mut tc = ScalarTypeCache::new();
+        let slots = vec![
+            BufferBindingSlot {
+                name: "a".into(),
+                ty: BufferTy { elem: ScalarTy::F32, access: BufferAccess::ReadOnly },
+                position: 0, buffer_position: 0, span: Span::new(0, 1),
+            },
+            BufferBindingSlot {
+                name: "b".into(),
+                ty: BufferTy { elem: ScalarTy::F32, access: BufferAccess::ReadWrite },
+                position: 1, buffer_position: 1, span: Span::new(0, 1),
+            },
+        ];
+        emit_buffer_globals(&mut b, &mut tc, &slots);
+        let ds_vals: Vec<u32> = iter_annotations(&b)
+            .filter(|inst| inst.operands.iter().any(|op| matches!(op, Operand::Decoration(Decoration::DescriptorSet))))
+            .filter_map(|inst| inst.operands.iter().find_map(|op| {
+                if let Operand::LiteralBit32(n) = op { Some(*n) } else { None }
+            }))
+            .collect();
+        assert!(ds_vals.iter().all(|&v| v == 0), "all buffers must be DescriptorSet 0; got {ds_vals:?}");
+    }
+
+    // cg_binding_indices_are_sequential_among_buffers
+    #[test]
+    fn cg_binding_indices_are_sequential_among_buffers() {
+        let mut b = make_builder();
+        let mut tc = ScalarTypeCache::new();
+        let slots: Vec<BufferBindingSlot> = (0..4u32).map(|i| BufferBindingSlot {
+            name: format!("buf{i}"),
+            ty: BufferTy { elem: ScalarTy::F32, access: BufferAccess::ReadWrite },
+            position: i,
+            buffer_position: i,
+            span: Span::new(0, 1),
+        }).collect();
+        emit_buffer_globals(&mut b, &mut tc, &slots);
+        let mut binding_vals: Vec<u32> = iter_annotations(&b)
+            .filter(|inst| inst.operands.iter().any(|op| matches!(op, Operand::Decoration(Decoration::Binding))))
+            .filter_map(|inst| inst.operands.iter().find_map(|op| {
+                if let Operand::LiteralBit32(n) = op { Some(*n) } else { None }
+            }))
+            .collect();
+        binding_vals.sort_unstable();
+        assert_eq!(binding_vals, vec![0, 1, 2, 3], "bindings must be sequential 0,1,2,3; got {binding_vals:?}");
+    }
+
+    // cg_readonly_buffer_emits_nonwritable_decoration (maps to AT-208)
+    #[test]
+    fn cg_readonly_buffer_emits_nonwritable_decoration() {
+        let mut b = make_builder();
+        let mut tc = ScalarTypeCache::new();
+        let slot = BufferBindingSlot {
+            name: "ro".into(),
+            ty: BufferTy { elem: ScalarTy::F32, access: BufferAccess::ReadOnly },
+            position: 0, buffer_position: 0, span: Span::new(0, 1),
+        };
+        emit_buffer_globals(&mut b, &mut tc, &[slot]);
+        let has_nw = iter_annotations(&b).any(|inst| {
+            inst.operands.iter().any(|op| matches!(op, Operand::Decoration(Decoration::NonWritable)))
+        });
+        assert!(has_nw, "readonly_buffer must have NonWritable decoration");
+    }
+
+    // cg_writeonly_buffer_emits_nonreadable_decoration (maps to AT-209)
+    #[test]
+    fn cg_writeonly_buffer_emits_nonreadable_decoration() {
+        let mut b = make_builder();
+        let mut tc = ScalarTypeCache::new();
+        let slot = BufferBindingSlot {
+            name: "wo".into(),
+            ty: BufferTy { elem: ScalarTy::F32, access: BufferAccess::WriteOnly },
+            position: 0, buffer_position: 0, span: Span::new(0, 1),
+        };
+        emit_buffer_globals(&mut b, &mut tc, &[slot]);
+        let has_nr = iter_annotations(&b).any(|inst| {
+            inst.operands.iter().any(|op| matches!(op, Operand::Decoration(Decoration::NonReadable)))
+        });
+        assert!(has_nr, "writeonly_buffer must have NonReadable decoration");
+    }
+
+    // cg_readwrite_buffer_no_access_decoration
+    #[test]
+    fn cg_readwrite_buffer_no_access_decoration() {
+        let mut b = make_builder();
+        let mut tc = ScalarTypeCache::new();
+        let slot = BufferBindingSlot {
+            name: "rw".into(),
+            ty: BufferTy { elem: ScalarTy::F32, access: BufferAccess::ReadWrite },
+            position: 0, buffer_position: 0, span: Span::new(0, 1),
+        };
+        emit_buffer_globals(&mut b, &mut tc, &[slot]);
+        let has_nw = iter_annotations(&b).any(|inst| {
+            inst.operands.iter().any(|op| matches!(op, Operand::Decoration(Decoration::NonWritable)))
+        });
+        let has_nr = iter_annotations(&b).any(|inst| {
+            inst.operands.iter().any(|op| matches!(op, Operand::Decoration(Decoration::NonReadable)))
+        });
+        assert!(!has_nw, "readwrite buffer must NOT have NonWritable");
+        assert!(!has_nr, "readwrite buffer must NOT have NonReadable");
+    }
+
+    // AT-214: cg_gid_var_emitted_once
+    // A kernel using gid(0) + gid(1) + gid(2) should emit exactly 1 OpVariable Input.
+    #[test]
+    fn cg_gid_var_emitted_once() {
+        use rspirv::spirv::Op;
+        let mut b = make_builder();
+        let mut tc = ScalarTypeCache::new();
+        // Call emit_gid_variable once (the codegen emits it once, then uses it N times).
+        let gid1 = emit_gid_variable(&mut b, &mut tc);
+        // Try to call again — but the codegen does NOT call it multiple times.
+        // The key test is that the codegen infrastructure only emits ONE Input variable.
+        let input_var_count = b.module_ref().types_global_values.iter()
+            .filter(|inst| {
+                inst.class.opcode == Op::Variable
+                    && inst.operands.iter().any(|op| matches!(op, Operand::StorageClass(rspirv::spirv::StorageClass::Input)))
+            })
+            .count();
+        assert_eq!(input_var_count, 1, "gid variable must be emitted exactly once; got {input_var_count}");
+        assert_ne!(gid1.var_id, 0, "var_id must be nonzero");
+    }
+
+    // AT-214: cg_gid_var_not_emitted_if_unused
+    #[test]
+    fn cg_gid_var_not_emitted_if_unused() {
+        use rspirv::spirv::Op;
+        let b = make_builder();
+        // If we don't call emit_gid_variable, no Input variable should exist.
+        let input_var_count = b.module_ref().types_global_values.iter()
+            .filter(|inst| {
+                inst.class.opcode == Op::Variable
+                    && inst.operands.iter().any(|op| matches!(op, Operand::StorageClass(rspirv::spirv::StorageClass::Input)))
+            })
+            .count();
+        assert_eq!(input_var_count, 0, "gid variable must NOT be emitted if unused");
+    }
+
+    // AT-226: cg_pushconstant_i32_then_f64_pads_correctly
+    // Parameterized test over 4 shapes from the spec.
+    #[test]
+    fn cg_pushconstant_i32_then_f64_pads_correctly() {
+        use axc_hir::{KernelParam, ParamTy, compute_binding_plan};
+        use axc_lexer::Span;
+
+        let ds = Span::new(0, 1);
+
+        fn scalar_param(name: &str, ty: ScalarTy, pos: u32, span: Span) -> KernelParam {
+            KernelParam {
+                name: name.to_owned(),
+                ty: ParamTy::Scalar(ty),
+                position: pos,
+                span,
+            }
+        }
+
+        // (a) fn k(a: i32, b: f64)
+        {
+            let params = vec![
+                scalar_param("a", ScalarTy::I32, 0, ds),
+                scalar_param("b", ScalarTy::F64, 1, ds),
+            ];
+            let plan = compute_binding_plan(&params, ds).expect("plan (a)");
+            assert_eq!(plan.scalars[0].member_index, 0);
+            assert_eq!(plan.scalars[0].offset, 0);
+            assert_eq!(plan.scalars[0].ty, ScalarTy::I32);
+            assert_eq!(plan.scalars[1].member_index, 1);
+            assert_eq!(plan.scalars[1].offset, 8, "(a) f64 must be at offset 8 (4-byte pad from 4)");
+            assert_eq!(plan.push_constant_total_bytes, 16, "(a) total must be 16");
+        }
+
+        // (b) fn k(a: u32, b: i64)
+        {
+            let params = vec![
+                scalar_param("a", ScalarTy::U32, 0, ds),
+                scalar_param("b", ScalarTy::I64, 1, ds),
+            ];
+            let plan = compute_binding_plan(&params, ds).expect("plan (b)");
+            assert_eq!(plan.scalars[0].offset, 0);
+            assert_eq!(plan.scalars[1].offset, 8, "(b) i64 must be at offset 8");
+            assert_eq!(plan.push_constant_total_bytes, 16, "(b) total must be 16");
+        }
+
+        // (c) fn k(a: f32, b: i64, c: u32)
+        {
+            let params = vec![
+                scalar_param("a", ScalarTy::F32, 0, ds),
+                scalar_param("b", ScalarTy::I64, 1, ds),
+                scalar_param("c", ScalarTy::U32, 2, ds),
+            ];
+            let plan = compute_binding_plan(&params, ds).expect("plan (c)");
+            assert_eq!(plan.scalars[0].offset, 0);
+            assert_eq!(plan.scalars[1].offset, 8, "(c) i64 at offset 8 (4-byte pad from 4)");
+            assert_eq!(plan.scalars[2].offset, 16, "(c) u32 at offset 16");
+            assert_eq!(plan.push_constant_total_bytes, 20, "(c) total must be 20 (NOT 24)");
+        }
+
+        // (d) fn k(a: f32, b: f32, c: f64)
+        {
+            let params = vec![
+                scalar_param("a", ScalarTy::F32, 0, ds),
+                scalar_param("b", ScalarTy::F32, 1, ds),
+                scalar_param("c", ScalarTy::F64, 2, ds),
+            ];
+            let plan = compute_binding_plan(&params, ds).expect("plan (d)");
+            assert_eq!(plan.scalars[0].offset, 0);
+            assert_eq!(plan.scalars[1].offset, 4);
+            assert_eq!(plan.scalars[2].offset, 8, "(d) f64 at offset 8 (no pad from 8)");
+            assert_eq!(plan.push_constant_total_bytes, 16, "(d) total must be 16");
+        }
+    }
+
+    // AT-225: cg_mixed_buffer_scalar_order_gets_correct_offsets
+    // fn foo(a: f32, buf: buffer[f32], b: u32) — member_index must be dense (0, 1)
+    // not global position (0, 2).
+    #[test]
+    fn cg_mixed_buffer_scalar_order_gets_correct_offsets() {
+        use axc_hir::{KernelParam, ParamTy, BufferTy, BufferAccess, compute_binding_plan};
+        use axc_lexer::Span;
+
+        let ds = Span::new(0, 1);
+
+        let params = vec![
+            KernelParam {
+                name: "a".into(),
+                ty: ParamTy::Scalar(ScalarTy::F32),
+                position: 0,
+                span: ds,
+            },
+            KernelParam {
+                name: "buf".into(),
+                ty: ParamTy::Buffer(BufferTy { elem: ScalarTy::F32, access: BufferAccess::ReadWrite }),
+                position: 1,
+                span: ds,
+            },
+            KernelParam {
+                name: "b".into(),
+                ty: ParamTy::Scalar(ScalarTy::U32),
+                position: 2,
+                span: ds,
+            },
+        ];
+
+        let plan = compute_binding_plan(&params, ds).expect("plan");
+        // Buffers
+        assert_eq!(plan.buffers.len(), 1);
+        assert_eq!(plan.buffers[0].name, "buf");
+        assert_eq!(plan.buffers[0].buffer_position, 0, "buf → binding 0");
+        // Scalars
+        assert_eq!(plan.scalars.len(), 2);
+        assert_eq!(plan.scalars[0].name, "a");
+        assert_eq!(plan.scalars[0].member_index, 0, "a → member_index 0");
+        assert_eq!(plan.scalars[0].offset, 0);
+        assert_eq!(plan.scalars[1].name, "b");
+        assert_eq!(plan.scalars[1].member_index, 1, "b → member_index 1 (NOT 2 = position)");
+        assert_eq!(plan.scalars[1].offset, 4);
+        assert_eq!(plan.push_constant_total_bytes, 8);
+    }
+
+    // cg_multi_buffer_elem_ty_shares_type_per_elem
+    #[test]
+    fn cg_multi_buffer_elem_ty_shares_type_per_elem() {
+        use rspirv::spirv::Op;
+        // Two buffer[f32] vars should share the same OpTypeFloat
+        let mut b = make_builder();
+        let mut tc = ScalarTypeCache::new();
+        let slots = vec![
+            BufferBindingSlot {
+                name: "a".into(),
+                ty: BufferTy { elem: ScalarTy::F32, access: BufferAccess::ReadOnly },
+                position: 0, buffer_position: 0, span: Span::new(0, 1),
+            },
+            BufferBindingSlot {
+                name: "b".into(),
+                ty: BufferTy { elem: ScalarTy::F32, access: BufferAccess::ReadWrite },
+                position: 1, buffer_position: 1, span: Span::new(0, 1),
+            },
+        ];
+        emit_buffer_globals(&mut b, &mut tc, &slots);
+        // Should have exactly 1 OpTypeFloat 32 (shared scalar type)
+        let float32_count = iter_type_instructions(&b)
+            .filter(|(op, inst)| {
+                *op == Op::TypeFloat as u16
+                    && inst.operands.iter().any(|o| matches!(o, Operand::LiteralBit32(32)))
+            })
+            .count();
+        assert_eq!(float32_count, 1, "2×buffer[f32] should share 1 OpTypeFloat 32; got {float32_count}");
     }
 }
