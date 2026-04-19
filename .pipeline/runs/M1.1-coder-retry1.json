@@ -1,0 +1,79 @@
+{
+  "verdict": "IMPLEMENTED",
+  "agent": "coder_retry1",
+  "milestone_id": "M1.1-scalar-ops",
+  "branch": "coder/M1.1-scalar-ops",
+  "date": "2026-04-18",
+  "model": "claude-sonnet-4-6",
+  "issues_fixed": 5,
+  "issues": [
+    {
+      "id": "AT-103",
+      "status": "FIXED",
+      "description": "Added `empty_kernel_binary_unchanged_vs_m0` to `crates/axc-codegen/src/emit.rs::tests`. Verifies SPIR-V magic (0x07230203), version (1.3 / 0x00010300), generator (0), schema (0), exactly Shader capability (1) with no Int64/Float64, determinism, and minimum word-count guard.",
+      "commit": "3f7f608",
+      "commit_msg": "test(codegen): AT-103 empty kernel bit-exact regression guard"
+    },
+    {
+      "id": "AT-113",
+      "status": "FIXED",
+      "description": "Added three tests to `crates/axc-codegen/src/emit.rs::tests`: `capability_int64_only_when_needed` (i64 kernel → Int64 cap=11), `capability_float64_only_when_needed` (f64 kernel → Float64 cap=10), `capability_empty_kernel_only_shader` (empty kernel → only Shader cap=1, no Int64/Float64). Also added `collect_capability_words()` helper.",
+      "commit": "3f7f608",
+      "commit_msg": "test(codegen): AT-103 empty kernel bit-exact regression guard (AT-113 tests included in same commit)"
+    },
+    {
+      "id": "AT-116",
+      "status": "FIXED",
+      "description": "Added `driver_scalar_demo_aggregates_errors` to `crates/axc-driver/src/lib.rs::tests`. Feeds a source with emoji (LexError), `struct Foo {}` (ParseError), and `let x: i32 = 1.0f32` (HirError::TypeMismatch). Asserts all three of `DriverError::Compile { lex, parse, hir }` are non-empty.",
+      "commit": "1c07159",
+      "commit_msg": "test(driver): AT-116 tri-phase error aggregation for scalar code"
+    },
+    {
+      "id": "AT-124",
+      "status": "FIXED",
+      "description": "Updated DESIGN.md with `### Integer division undefined behavior` section documenting OpSDiv/OpSRem INT_MIN/-1 as UNDEFINED BEHAVIOR per SPIR-V §3.32.14, with manual guard pattern. Added `design_md_documents_int_division_ub` to `crates/axc-driver/src/lib.rs::tests` with triple-check for 'INT_MIN / -1', 'UNDEFINED BEHAVIOR', and 'OpSDiv'/'OpSRem'.",
+      "commit": "d299487",
+      "commit_msg": "docs(design): AT-124 document INT_MIN/-1 OpSDiv UB + add regression test"
+    },
+    {
+      "id": "AT-101",
+      "status": "FIXED",
+      "description": "Extended `test_compile_scalar_demo_produces_valid_spirv` in `crates/axc-driver/tests/compile_scalar_demo.rs` with opcode presence assertions: Op::IAdd (128), Op::IMul (130), Op::Phi (245), Op::BitwiseAnd (196). scalar_demo.axc already uses band() and short-circuit and/or and multiplication.",
+      "commit": "a47f3b1",
+      "commit_msg": "test(driver): AT-101 assert arithmetic opcodes in scalar_demo"
+    }
+  ],
+  "test_results": {
+    "total": 157,
+    "breakdown": {
+      "axc_codegen_unit": 31,
+      "axc_driver_unit": 7,
+      "axc_driver_integration_empty_kernel": 1,
+      "axc_driver_integration_scalar_demo": 1,
+      "axc_hir_unit": 57,
+      "axc_lexer_unit": 29,
+      "axc_optimize_unit": 1,
+      "axc_parser_unit": 28,
+      "axc_runtime_unit": 1,
+      "axc_lexer_doc_test": 1
+    },
+    "passed": 157,
+    "failed": 0
+  },
+  "build_check": "PASS (cargo check --workspace: Finished dev profile in 0.13s)",
+  "clippy_check": "PASS (cargo clippy --workspace --all-targets -- -D warnings: 0 warnings)",
+  "self_assessment": {
+    "at_103": "FIXED — empty_kernel_binary_unchanged_vs_m0 now exists in emit.rs::tests with full structural + capability + determinism guards",
+    "at_113": "FIXED — all 3 required tests now in emit.rs::tests: capability_int64_only_when_needed, capability_float64_only_when_needed, capability_empty_kernel_only_shader",
+    "at_116": "FIXED — driver_scalar_demo_aggregates_errors now exists in axc-driver::tests, exercises all 3 error phases simultaneously",
+    "at_124": "FIXED — DESIGN.md updated with INT_MIN/-1 UB section; design_md_documents_int_division_ub test added to axc-driver::tests",
+    "at_101": "FIXED — integration test now asserts Op::IAdd, Op::IMul, Op::Phi, Op::BitwiseAnd are present in scalar_demo SPIR-V output",
+    "bug5_stale_comment": "NOT FIXED — BUG-5 (stale comment body.rs line 902 'Float64 cap = 6') was WARN severity only and not listed in the 5 required issues; left untouched to minimize diff scope"
+  },
+  "commits": [
+    "3f7f608 — AT-103 + AT-113 (emit.rs tests)",
+    "1c07159 — AT-116 (driver unit test)",
+    "d299487 — AT-124 (DESIGN.md + driver test)",
+    "a47f3b1 — AT-101 (scalar_demo integration test opcode assertions)"
+  ]
+}

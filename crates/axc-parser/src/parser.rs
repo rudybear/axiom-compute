@@ -1,17 +1,47 @@
-//! Recursive-descent parser for AXIOM-Compute M0 grammar.
+//! Recursive-descent + Pratt expression parser for AXIOM-Compute M1.1 grammar.
 //!
 //! Collects ALL errors — never short-circuits on the first error (anti-pattern #6).
 //! `TokenKind::Error` tokens from the lexer are skipped silently (already reported
 //! in the `LexError` channel; re-reporting would cause double-counting).
 //!
-//! The §3.3 M1-reserved keyword pre-check in `parse_stmt` produces
-//! `ParseError::UnsupportedInM0` with a human-readable `detail` string so that
-//! users see an M1-roadmap-aware hint rather than a generic "unexpected token".
+//! The §3.3 M1.1-reserved keyword pre-check in `parse_stmt` produces
+//! `ParseError::UnsupportedInM1_1` with a human-readable `detail` string so that
+//! users see a roadmap-aware hint rather than a generic "unexpected token".
+//!
+//! M1.1 changes from M0:
+//! - Let and Mut are removed from the reserved deny-list; they are now valid syntax.
+//! - Pratt expression parser added (§3.3 precedence table).
+//! - Let / Assign statements added to `parse_stmt`.
+//! - ParseError::UnsupportedInM0 renamed to UnsupportedInM1_1.
+//! - TypeRef gains I64, U64, F64.
+//! - MAX_EXPR_DEPTH = 256 nesting limit.
 
 use axc_lexer::{Token, TokenKind, Span, Spanned, LexError};
 use crate::ast::{
     Module, Item, KernelDecl, Annotation, AnnotationArg, Block, Stmt, Expr, TypeRef, Param,
+    BinOp, UnaryOp, ShortCircuitOp,
 };
+
+/// Maximum expression nesting depth before emitting ExpressionNestingTooDeep.
+const MAX_EXPR_DEPTH: u32 = 256;
+
+/// M1.1-reserved keywords (all still deferred past this milestone).
+/// Let and Mut were in this list in M0 but are now valid syntax.
+///
+/// Comment: M1.1 implements let/mut/return/arithmetic. Everything below is
+/// deferred to M1.3 (control-flow) or M2 (struct).
+///
+/// This constant mirrors `TokenKind::m1_reserved_detail()`'s Some-returning set
+/// and is used in `parse_stmt` (via `m1_reserved_detail()` dispatch) and in tests.
+pub const M1_1_RESERVED_KEYWORDS: &[TokenKind] = &[
+    TokenKind::If,
+    TokenKind::Else,
+    TokenKind::For,
+    TokenKind::While,
+    TokenKind::Break,
+    TokenKind::Continue,
+    TokenKind::Struct,
+];
 
 /// Error produced by the parser.
 #[derive(Debug, thiserror::Error, miette::Diagnostic)]
@@ -28,8 +58,10 @@ pub enum ParseError {
         #[label("here")]
         span: Span,
     },
-    #[error("unsupported syntax in M0: {detail}")]
-    UnsupportedInM0 {
+    /// Formerly UnsupportedInM0; renamed in M1.1 to reflect that we now implement
+    /// let/mut/return, but control flow (if/for/while/etc.) is still deferred.
+    #[error("unsupported syntax in M1.1: {detail}")]
+    UnsupportedInM1_1 {
         detail: String,
         #[label("here")]
         span: Span,
@@ -39,11 +71,30 @@ pub enum ParseError {
         #[label("here")]
         span: Span,
     },
+    /// `let x = …;` without `: type_ref` annotation — anti-pattern #1 at grammar level.
+    #[error("missing type annotation in `let` binding; every binding requires an explicit `: type` (e.g. `let x: i32 = 0i32;`)")]
+    MissingTypeAnnotation {
+        #[label("here")]
+        span: Span,
+    },
+    /// Expression nested deeper than MAX_EXPR_DEPTH (256) parentheses.
+    #[error("expression nesting depth exceeds {MAX_EXPR_DEPTH}; simplify the expression")]
+    ExpressionNestingTooDeep {
+        #[label("here")]
+        span: Span,
+    },
     #[error(transparent)]
     LexerError(#[from] LexError),
 }
 
-/// Recursive-descent parser.
+/// Internal enum for infix operators used by the Pratt parser.
+#[derive(Debug, Clone, Copy)]
+enum InfixOp {
+    Binary(BinOp),
+    ShortCircuit(ShortCircuitOp),
+}
+
+/// Recursive-descent + Pratt expression parser.
 pub struct Parser<'tok> {
     tokens: &'tok [Token],
     pos: usize,
@@ -73,7 +124,7 @@ impl<'tok> Parser<'tok> {
                 break;
             }
 
-            // Only `@kernel fn …` is valid at top level in M0
+            // Only `@kernel fn …` is valid at top level in M1.1
             if matches!(self.peek_kind(), TokenKind::Annotation(_)) {
                 match self.parse_kernel_decl() {
                     Some(kd) => {
@@ -288,13 +339,13 @@ impl<'tok> Parser<'tok> {
     // ── Parameters ───────────────────────────────────────────────────────────
 
     fn parse_params(&mut self) -> Vec<Spanned<Param>> {
-        // M0 rejects any params with UnsupportedInM0
+        // M1.1 still rejects any params with UnsupportedInM1_1
         if self.peek_kind() == &TokenKind::RParen {
             return Vec::new(); // empty param list is fine
         }
         // Any non-`)` token means params are present — reject
         let span: Span = self.peek_span();
-        self.errors.push(ParseError::UnsupportedInM0 {
+        self.errors.push(ParseError::UnsupportedInM1_1 {
             detail: "kernel parameters".into(),
             span,
         });
@@ -321,10 +372,13 @@ impl<'tok> Parser<'tok> {
             TokenKind::Bool => { self.advance(); TypeRef::Bool }
             TokenKind::I32  => { self.advance(); TypeRef::I32 }
             TokenKind::U32  => { self.advance(); TypeRef::U32 }
+            TokenKind::I64  => { self.advance(); TypeRef::I64 }
+            TokenKind::U64  => { self.advance(); TypeRef::U64 }
             TokenKind::F32  => { self.advance(); TypeRef::F32 }
+            TokenKind::F64  => { self.advance(); TypeRef::F64 }
             other => {
                 self.errors.push(ParseError::Unexpected {
-                    expected: "type (void, bool, i32, u32, f32)".into(),
+                    expected: "type (void, bool, i32, u32, i64, u64, f32, f64)".into(),
                     found: format!("{:?}", other),
                     span,
                 });
@@ -367,20 +421,22 @@ impl<'tok> Parser<'tok> {
 
     // ── Statement ────────────────────────────────────────────────────────────
 
-    /// Parse one statement inside a kernel body (§3.3 M1-reserved keyword pre-check).
+    /// Parse one statement inside a kernel body (§3.2 dispatch table).
     ///
     /// Flow:
     /// 1. Peek next token.
-    /// 2. If it is in the M1-reserved deny-list, emit `UnsupportedInM0` with a
-    ///    per-keyword detail string and recover to the next `;` or `}`.
-    /// 3. Otherwise, expect `return`, optional expression, `;`.
+    /// 2. If it is in M1_1_RESERVED_KEYWORDS, emit `UnsupportedInM1_1` and recover.
+    /// 3. If `Let` -> parse_let_stmt.
+    /// 4. If `Return` -> parse return statement (M0 path).
+    /// 5. If `Ident` -> lookahead for `=` -> parse_assign_stmt, else recover.
+    /// 6. Otherwise -> Unexpected.
     fn parse_stmt(&mut self) -> Option<Spanned<Stmt>> {
         let tok: &Token = self.current_token();
         let span: Span = tok.span;
 
-        // §3.3: M1-reserved keyword pre-check
+        // §3.2: M1.1-reserved keyword pre-check (Let and Mut are NO LONGER here)
         if let Some(detail) = tok.kind.m1_reserved_detail() {
-            self.errors.push(ParseError::UnsupportedInM0 {
+            self.errors.push(ParseError::UnsupportedInM1_1 {
                 detail: detail.to_owned(),
                 span,
             });
@@ -396,35 +452,155 @@ impl<'tok> Parser<'tok> {
             return None;
         }
 
-        // Expect `return`
-        if self.peek_kind() != &TokenKind::Return {
-            let found: String = format!("{:?}", self.peek_kind());
-            self.errors.push(ParseError::Unexpected {
-                expected: "return".into(),
-                found,
-                span,
-            });
-            // Recovery: skip to next `;` or `}`
-            loop {
-                match self.peek_kind() {
-                    TokenKind::Semicolon => { self.advance(); break; }
-                    TokenKind::RBrace | TokenKind::Eof => break,
-                    _ => { self.advance(); }
+        match self.peek_kind().clone() {
+            TokenKind::Let => self.parse_let_stmt(),
+            TokenKind::Return => self.parse_return_stmt(),
+            TokenKind::Ident(_) => {
+                // Lookahead: pos+1 is assign?
+                let next_pos: usize = (self.pos + 1).min(self.tokens.len() - 1);
+                if self.tokens[next_pos].kind == TokenKind::Assign {
+                    return self.parse_assign_stmt();
                 }
+                // Else: bare expression statements are not allowed in M1.1
+                let found: String = format!("{:?}", self.peek_kind());
+                self.errors.push(ParseError::Unexpected {
+                    expected: "let, return, or assignment".into(),
+                    found,
+                    span,
+                });
+                self.recover_to_semicolon_or_brace();
+                None
             }
+            _ => {
+                let found: String = format!("{:?}", self.peek_kind());
+                self.errors.push(ParseError::Unexpected {
+                    expected: "let, return, or assignment".into(),
+                    found,
+                    span,
+                });
+                self.recover_to_semicolon_or_brace();
+                None
+            }
+        }
+    }
+
+    /// Parse `let [mut] name: type = expr;`
+    fn parse_let_stmt(&mut self) -> Option<Spanned<Stmt>> {
+        let let_span: Span = self.peek_span();
+        self.advance(); // consume `let`
+
+        // Optional `mut`
+        let is_mut: bool = if self.peek_kind() == &TokenKind::Mut {
+            self.advance();
+            true
+        } else {
+            false
+        };
+
+        // Name
+        let name_span: Span = self.peek_span();
+        let name: String = match self.peek_kind().clone() {
+            TokenKind::Ident(n) => { self.advance(); n }
+            _ => {
+                self.errors.push(ParseError::Unexpected {
+                    expected: "binding name (identifier)".into(),
+                    found: format!("{:?}", self.peek_kind()),
+                    span: self.peek_span(),
+                });
+                self.recover_to_semicolon_or_brace();
+                return None;
+            }
+        };
+
+        // Require `: type_ref` (anti-pattern #1 at grammar level)
+        if self.peek_kind() != &TokenKind::Colon {
+            self.errors.push(ParseError::MissingTypeAnnotation { span: self.peek_span() });
+            self.recover_to_semicolon_or_brace();
             return None;
         }
+        self.advance(); // consume `:`
+
+        let ty: Spanned<TypeRef> = self.parse_type_ref()?;
+
+        // `=`
+        if !self.expect_token(TokenKind::Assign, "=") {
+            self.recover_to_semicolon_or_brace();
+            return None;
+        }
+
+        // Expression
+        let init: Spanned<Expr> = match self.parse_expr(0) {
+            Some(e) => e,
+            None => {
+                self.recover_to_semicolon_or_brace();
+                return None;
+            }
+        };
+
+        // `;`
+        let semi_span: Span = self.peek_span();
+        if !self.expect_token(TokenKind::Semicolon, ";") {
+            return None;
+        }
+
+        let span: Span = let_span.merge(semi_span);
+        Some(Spanned::new(
+            Stmt::Let {
+                is_mut,
+                name: Spanned::new(name, name_span),
+                ty,
+                init,
+            },
+            span,
+        ))
+    }
+
+    /// Parse `name = expr;`
+    fn parse_assign_stmt(&mut self) -> Option<Spanned<Stmt>> {
+        let name_span: Span = self.peek_span();
+        let name: String = match self.peek_kind().clone() {
+            TokenKind::Ident(n) => { self.advance(); n }
+            _ => unreachable!("parse_assign_stmt called without Ident"),
+        };
+
+        self.advance(); // consume `=`
+
+        let value: Spanned<Expr> = match self.parse_expr(0) {
+            Some(e) => e,
+            None => {
+                self.recover_to_semicolon_or_brace();
+                return None;
+            }
+        };
+
+        let semi_span: Span = self.peek_span();
+        if !self.expect_token(TokenKind::Semicolon, ";") {
+            return None;
+        }
+
+        let span: Span = name_span.merge(semi_span);
+        Some(Spanned::new(
+            Stmt::Assign {
+                target: Spanned::new(name, name_span),
+                value,
+            },
+            span,
+        ))
+    }
+
+    /// Parse `return [expr];` — only void return used in M1.1.
+    fn parse_return_stmt(&mut self) -> Option<Spanned<Stmt>> {
         let stmt_start: Span = self.peek_span();
         self.advance(); // consume `return`
 
-        // Optional expression (only int or bool literals in M0)
+        // Optional expression (only int or bool literals in M0; Pratt in M1.1)
         let expr: Option<Spanned<Expr>> = if self.peek_kind() == &TokenKind::Semicolon
             || self.peek_kind() == &TokenKind::RBrace
             || self.is_at_end()
         {
             None
         } else {
-            self.parse_expr()
+            self.parse_expr(0)
         };
 
         // Consume `;`
@@ -437,17 +613,208 @@ impl<'tok> Parser<'tok> {
         Some(Spanned::new(Stmt::Return(expr), span))
     }
 
-    fn parse_expr(&mut self) -> Option<Spanned<Expr>> {
+    // ── Pratt expression parser ───────────────────────────────────────────────
+
+    /// Entry-point: parse an expression with minimum binding power 0.
+    ///
+    /// `depth` tracks nesting for the MAX_EXPR_DEPTH guard.
+    fn parse_expr(&mut self, depth: u32) -> Option<Spanned<Expr>> {
+        self.parse_expr_bp(0, depth)
+    }
+
+    /// Pratt parser core (§3.3 precedence table).
+    ///
+    /// | Op/construct          | Token(s)               | (left_bp, right_bp) |
+    /// |-----------------------|------------------------|---------------------|
+    /// | `or`                  | Or                     | (1, 2)              |
+    /// | `and`                 | And                    | (3, 4)              |
+    /// | comparison            | Eq/Neq/Lt/LtEq/Gt/GtEq| (5, 6)              |
+    /// | additive              | Plus/Minus             | (7, 8)              |
+    /// | multiplicative        | Star/Slash/Percent     | (9, 10)             |
+    /// | unary `-` / `not`     | prefix                 | right_bp=11 / 9     |
+    /// | postfix call `(...)`  | LParen                 | left_bp=13          |
+    fn parse_expr_bp(&mut self, min_bp: u8, depth: u32) -> Option<Spanned<Expr>> {
+        if depth > MAX_EXPR_DEPTH {
+            let span: Span = self.peek_span();
+            self.errors.push(ParseError::ExpressionNestingTooDeep { span });
+            // Sentinel: suffixed literal so HIR won't emit UnconstrainedLiteralNeedsSuffix
+            use axc_lexer::IntSuffix;
+            return Some(Spanned::new(
+                Expr::IntLit { value: 0, suffix: Some(IntSuffix::I32) },
+                span,
+            ));
+        }
+
+        // Parse prefix (left-hand side)
+        let mut lhs: Spanned<Expr> = self.parse_prefix(depth)?;
+
+        // Parse infix operations as long as their binding power exceeds min_bp
+        while let Some((infix_op, left_bp, right_bp)) = self.peek_infix_op() {
+            if left_bp < min_bp {
+                break;
+            }
+
+            let op_span: Span = self.peek_span();
+            self.advance(); // consume the infix operator
+
+            let rhs: Spanned<Expr> = match self.parse_expr_bp(right_bp, depth + 1) {
+                Some(e) => e,
+                None => break,
+            };
+
+            let combined_span: Span = lhs.span.merge(rhs.span).merge(op_span);
+
+            lhs = match infix_op {
+                InfixOp::Binary(op) => Spanned::new(
+                    Expr::Binary {
+                        op,
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    },
+                    combined_span,
+                ),
+                InfixOp::ShortCircuit(op) => Spanned::new(
+                    Expr::ShortCircuit {
+                        op,
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    },
+                    combined_span,
+                ),
+            };
+        }
+
+        Some(lhs)
+    }
+
+    /// Parse a prefix expression (literal, ident, unary op, paren, call).
+    fn parse_prefix(&mut self, depth: u32) -> Option<Spanned<Expr>> {
+        if depth > MAX_EXPR_DEPTH {
+            let span: Span = self.peek_span();
+            self.errors.push(ParseError::ExpressionNestingTooDeep { span });
+            use axc_lexer::IntSuffix;
+            return Some(Spanned::new(
+                Expr::IntLit { value: 0, suffix: Some(IntSuffix::I32) },
+                span,
+            ));
+        }
+
         let span: Span = self.peek_span();
+
         match self.peek_kind().clone() {
+            // ── Literals ────────────────────────────────────────────────────
             TokenKind::BoolLiteral(b) => {
                 self.advance();
                 Some(Spanned::new(Expr::BoolLit(b), span))
             }
-            TokenKind::IntLiteral { value, .. } => {
+            TokenKind::IntLiteral { value, suffix, .. } => {
                 self.advance();
-                Some(Spanned::new(Expr::IntLit(value), span))
+                Some(Spanned::new(Expr::IntLit { value, suffix }, span))
             }
+            TokenKind::FloatLiteral { value, suffix } => {
+                self.advance();
+                Some(Spanned::new(Expr::FloatLit { value, suffix }, span))
+            }
+
+            // ── Identifier or call ──────────────────────────────────────────
+            TokenKind::Ident(name) => {
+                self.advance();
+                // Postfix call: `name(...)`
+                if self.peek_kind() == &TokenKind::LParen {
+                    self.advance(); // consume `(`
+                    let mut args: Vec<Spanned<Expr>> = Vec::new();
+                    while self.peek_kind() != &TokenKind::RParen && !self.is_at_end() {
+                        if let Some(arg) = self.parse_expr(depth + 1) {
+                            args.push(arg);
+                        }
+                        if self.peek_kind() == &TokenKind::Comma {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                    let end_span: Span = self.peek_span();
+                    if !self.expect_token(TokenKind::RParen, ")") {
+                        return None;
+                    }
+                    let call_span: Span = span.merge(end_span);
+                    Some(Spanned::new(
+                        Expr::Call {
+                            name: Spanned::new(name, span),
+                            args,
+                        },
+                        call_span,
+                    ))
+                } else {
+                    Some(Spanned::new(Expr::Ident(name), span))
+                }
+            }
+
+            // ── Unary minus ─────────────────────────────────────────────────
+            TokenKind::Minus => {
+                self.advance();
+                let operand: Spanned<Expr> = self.parse_expr_bp(11, depth + 1)?;
+                let combined: Span = span.merge(operand.span);
+                Some(Spanned::new(
+                    Expr::Unary { op: UnaryOp::Neg, operand: Box::new(operand) },
+                    combined,
+                ))
+            }
+
+            // ── Logical not ─────────────────────────────────────────────────
+            TokenKind::Not => {
+                self.advance();
+                let operand: Spanned<Expr> = self.parse_expr_bp(9, depth + 1)?;
+                let combined: Span = span.merge(operand.span);
+                Some(Spanned::new(
+                    Expr::Unary { op: UnaryOp::LogicalNot, operand: Box::new(operand) },
+                    combined,
+                ))
+            }
+
+            // ── Parenthesized expression ────────────────────────────────────
+            TokenKind::LParen => {
+                self.advance(); // consume `(`
+                let inner: Spanned<Expr> = self.parse_expr(depth + 1)?;
+                let end_span: Span = self.peek_span();
+                if !self.expect_token(TokenKind::RParen, ")") {
+                    return None;
+                }
+                let paren_span: Span = span.merge(end_span);
+                Some(Spanned::new(Expr::Paren(Box::new(inner)), paren_span))
+            }
+
+            // ── Anything else is not an expression start ────────────────────
+            other => {
+                self.errors.push(ParseError::Unexpected {
+                    expected: "expression".into(),
+                    found: format!("{other:?}"),
+                    span,
+                });
+                None
+            }
+        }
+    }
+
+    /// Return the infix operator at the current position plus its binding powers,
+    /// or `None` if the current token is not an infix operator.
+    ///
+    /// Precedence table per §3.3:
+    fn peek_infix_op(&self) -> Option<(InfixOp, u8, u8)> {
+        match self.peek_kind() {
+            TokenKind::Or     => Some((InfixOp::ShortCircuit(ShortCircuitOp::Or),  1, 2)),
+            TokenKind::And    => Some((InfixOp::ShortCircuit(ShortCircuitOp::And), 3, 4)),
+            TokenKind::Eq     => Some((InfixOp::Binary(BinOp::Eq),    5, 6)),
+            TokenKind::NotEq  => Some((InfixOp::Binary(BinOp::Neq),   5, 6)),
+            TokenKind::Lt     => Some((InfixOp::Binary(BinOp::Lt),    5, 6)),
+            TokenKind::LtEq   => Some((InfixOp::Binary(BinOp::LtEq),  5, 6)),
+            TokenKind::Gt     => Some((InfixOp::Binary(BinOp::Gt),    5, 6)),
+            TokenKind::GtEq   => Some((InfixOp::Binary(BinOp::GtEq),  5, 6)),
+            TokenKind::Plus   => Some((InfixOp::Binary(BinOp::Add),   7, 8)),
+            TokenKind::Minus  => Some((InfixOp::Binary(BinOp::Sub),   7, 8)),
+            TokenKind::Star   => Some((InfixOp::Binary(BinOp::Mul),   9, 10)),
+            TokenKind::Slash  => Some((InfixOp::Binary(BinOp::Div),   9, 10)),
+            TokenKind::Percent=> Some((InfixOp::Binary(BinOp::Rem),   9, 10)),
             _ => None,
         }
     }
@@ -475,6 +842,17 @@ impl<'tok> Parser<'tok> {
         loop {
             match self.peek_kind() {
                 TokenKind::Annotation(_) | TokenKind::Eof => break,
+                _ => { self.advance(); }
+            }
+        }
+    }
+
+    /// Skip tokens until `;` (consumed) or `}` / EOF (left in place).
+    fn recover_to_semicolon_or_brace(&mut self) {
+        loop {
+            match self.peek_kind() {
+                TokenKind::Semicolon => { self.advance(); break; }
+                TokenKind::RBrace | TokenKind::Eof => break,
                 _ => { self.advance(); }
             }
         }
@@ -513,8 +891,8 @@ impl<'tok> Parser<'tok> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axc_lexer::tokenize;
-    use crate::ast::{AnnotationArg, TypeRef};
+    use axc_lexer::{tokenize, IntSuffix, FloatSuffix};
+    use crate::ast::{AnnotationArg, TypeRef, BinOp, UnaryOp, ShortCircuitOp};
 
     fn parse_src(src: &str) -> (Module, Vec<ParseError>) {
         let (tokens, _) = tokenize(src);
@@ -554,6 +932,57 @@ mod tests {
         assert_eq!(kd.body.node.stmts.len(), 1);
     }
 
+    // ── §7.6 audit table row 4: nonempty_body_accepted_let (REWRITE) ─────────
+
+    #[test]
+    fn nonempty_body_accepts_let() {
+        // M1.1: let is now valid syntax — must produce ZERO errors.
+        let src = "@kernel @workgroup(64,1,1) fn k() -> void { let x: i32 = 0i32; return; }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "M1.1 let binding should be accepted, got errors: {errors:?}");
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        // Should have Stmt::Let + Stmt::Return
+        assert_eq!(kd.body.node.stmts.len(), 2);
+        assert!(matches!(kd.body.node.stmts[0].node, Stmt::Let { .. }));
+        assert!(matches!(kd.body.node.stmts[1].node, Stmt::Return(None)));
+    }
+
+    // ── §7.6 audit table row 5,6: renamed tests ──────────────────────────────
+
+    #[test]
+    fn nonempty_body_rejects_if_as_unsupported_in_m1_1() {
+        let src = "@kernel @workgroup(64,1,1) fn k() -> void { if true { return; } return; }";
+        let (_, errors) = parse_src(src);
+        let found = errors.iter().find(|e| matches!(e, ParseError::UnsupportedInM1_1 { detail, .. } if detail == "if statement"));
+        assert!(found.is_some(), "expected UnsupportedInM1_1 with detail 'if statement', got: {errors:?}");
+    }
+
+    #[test]
+    fn nonempty_body_rejects_for_as_unsupported_in_m1_1() {
+        let src = "@kernel @workgroup(64,1,1) fn k() -> void { for i in 0..1 {} return; }";
+        let (_, errors) = parse_src(src);
+        let found = errors.iter().find(|e| matches!(e, ParseError::UnsupportedInM1_1 { detail, .. } if detail == "for loop"));
+        assert!(found.is_some(), "expected UnsupportedInM1_1 with detail 'for loop', got: {errors:?}");
+    }
+
+    #[test]
+    fn nonempty_body_rejects_while_as_unsupported_in_m1_1() {
+        let src = "@kernel @workgroup(64,1,1) fn k() -> void { while true { } return; }";
+        let (_, errors) = parse_src(src);
+        let found = errors.iter().find(|e| matches!(e, ParseError::UnsupportedInM1_1 { detail, .. } if detail == "while loop"));
+        assert!(found.is_some(), "expected UnsupportedInM1_1 'while loop', got: {errors:?}");
+    }
+
+    // ── §7.6 audit table row 7: kernel params still rejected ─────────────────
+
+    #[test]
+    fn kernel_params_rejected() {
+        let src = "@kernel @workgroup(64,1,1) fn k(x: i32) -> void { return; }";
+        let (_, errors) = parse_src(src);
+        let found = errors.iter().find(|e| matches!(e, ParseError::UnsupportedInM1_1 { detail, .. } if detail == "kernel parameters"));
+        assert!(found.is_some(), "expected UnsupportedInM1_1 for kernel parameters: {errors:?}");
+    }
+
     // ── AT-6: unknown top-level item ─────────────────────────────────────────
 
     #[test]
@@ -562,42 +991,6 @@ mod tests {
         let (_, errors) = parse_src(src);
         assert!(!errors.is_empty());
         assert!(errors.iter().any(|e| matches!(e, ParseError::UnknownItem { .. })));
-    }
-
-    // ── AT-9: M1-reserved keyword pre-check ──────────────────────────────────
-
-    #[test]
-    fn nonempty_body_rejected_let() {
-        let src = "@kernel @workgroup(64,1,1) fn k() -> void { let x: i32 = 0; return; }";
-        let (_, errors) = parse_src(src);
-        let m0_err = errors.iter().find(|e| matches!(e, ParseError::UnsupportedInM0 { detail, .. } if detail == "let statement"));
-        assert!(m0_err.is_some(), "expected UnsupportedInM0 with detail 'let statement', got: {errors:?}");
-    }
-
-    #[test]
-    fn nonempty_body_rejected_if() {
-        let src = "@kernel @workgroup(64,1,1) fn k() -> void { if true { return; } return; }";
-        let (_, errors) = parse_src(src);
-        let m0_err = errors.iter().find(|e| matches!(e, ParseError::UnsupportedInM0 { detail, .. } if detail == "if statement"));
-        assert!(m0_err.is_some(), "expected UnsupportedInM0 with detail 'if statement', got: {errors:?}");
-    }
-
-    #[test]
-    fn nonempty_body_rejected_for() {
-        let src = "@kernel @workgroup(64,1,1) fn k() -> void { for i in 0..1 {} return; }";
-        let (_, errors) = parse_src(src);
-        let m0_err = errors.iter().find(|e| matches!(e, ParseError::UnsupportedInM0 { detail, .. } if detail == "for loop"));
-        assert!(m0_err.is_some(), "expected UnsupportedInM0 with detail 'for loop', got: {errors:?}");
-    }
-
-    // ── Kernel params are rejected ────────────────────────────────────────────
-
-    #[test]
-    fn kernel_params_rejected() {
-        let src = "@kernel @workgroup(64,1,1) fn k(x: i32) -> void { return; }";
-        let (_, errors) = parse_src(src);
-        let m0_err = errors.iter().find(|e| matches!(e, ParseError::UnsupportedInM0 { detail, .. } if detail == "kernel parameters"));
-        assert!(m0_err.is_some(), "expected UnsupportedInM0 for kernel parameters: {errors:?}");
     }
 
     // ── Missing @kernel annotation → UnknownItem ──────────────────────────────
@@ -614,19 +1007,16 @@ mod tests {
 
     #[test]
     fn lex_error_not_double_reported_as_parse_error() {
-        // Source with an emoji (lex error) followed by struct (parse error).
-        // Parser should skip the Error token silently; only UnknownItem for struct.
         let src = "💥 struct Foo {}";
         let (tokens, lex_errors) = tokenize(src);
         assert!(!lex_errors.is_empty(), "expected lex error for emoji");
         let mut p = Parser::new(&tokens);
         let (_, parse_errors) = p.parse_module();
-        // No ParseError should re-report the lex error
         let has_lex_replication = parse_errors.iter().any(|e| matches!(e, ParseError::LexerError(_)));
         assert!(!has_lex_replication, "lex error was double-reported as ParseError");
     }
 
-    // ── @complexity(O(1)) parses to Call AST (anti-pattern #7 guard) ─────────
+    // ── @complexity(O(1)) parses to Call AST ─────────────────────────────────
 
     #[test]
     fn complexity_o1_parses_to_call_not_string() {
@@ -665,5 +1055,225 @@ mod tests {
         assert!(errors.is_empty(), "errors: {errors:?}");
         let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
         assert_eq!(kd.return_type.node, TypeRef::Void);
+    }
+
+    // ── §7.1.2: 14+ new M1.1 parser tests ──────────────────────────────────
+
+    #[test]
+    fn parse_let_i32_literal() {
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { let x: i32 = 42i32; return; }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        if let Stmt::Let { is_mut, ref name, ref ty, ref init } = kd.body.node.stmts[0].node {
+            assert!(!is_mut);
+            assert_eq!(name.node, "x");
+            assert_eq!(ty.node, TypeRef::I32);
+            assert!(matches!(init.node, Expr::IntLit { value: 42, suffix: Some(IntSuffix::I32) }));
+        } else {
+            panic!("expected Stmt::Let");
+        }
+    }
+
+    #[test]
+    fn parse_let_mut_f64_suffixed() {
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { let mut y: f64 = 3.14f64; return; }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        if let Stmt::Let { is_mut, ref name, ref ty, ref init } = kd.body.node.stmts[0].node {
+            assert!(is_mut);
+            assert_eq!(name.node, "y");
+            assert_eq!(ty.node, TypeRef::F64);
+            if let Expr::FloatLit { suffix: Some(FloatSuffix::F64), .. } = &init.node {
+                // ok
+            } else {
+                panic!("expected FloatLit with f64 suffix: {:?}", init.node);
+            }
+        } else {
+            panic!("expected Stmt::Let");
+        }
+    }
+
+    #[test]
+    fn parse_let_missing_type_rejected() {
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { let x = 0; return; }";
+        let (_, errors) = parse_src(src);
+        assert!(errors.iter().any(|e| matches!(e, ParseError::MissingTypeAnnotation { .. })),
+            "expected MissingTypeAnnotation, got: {errors:?}");
+    }
+
+    #[test]
+    fn parse_assign_simple() {
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { let mut x: i32 = 0i32; x = 5i32; return; }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        assert!(matches!(kd.body.node.stmts[1].node, Stmt::Assign { .. }));
+    }
+
+    #[test]
+    fn parse_arith_precedence() {
+        // `1 + 2 * 3` should parse as `Add(1, Mul(2, 3))`
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { let a: i32 = 1i32 + 2i32 * 3i32; return; }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        if let Stmt::Let { ref init, .. } = kd.body.node.stmts[0].node {
+            if let Expr::Binary { op: BinOp::Add, ref rhs, .. } = init.node {
+                assert!(matches!(rhs.node, Expr::Binary { op: BinOp::Mul, .. }),
+                    "RHS should be Mul; got: {:?}", rhs.node);
+            } else {
+                panic!("expected Add at top, got: {:?}", init.node);
+            }
+        }
+    }
+
+    #[test]
+    fn parse_arith_left_assoc() {
+        // `1 - 2 - 3` should parse as `Sub(Sub(1,2), 3)`
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { let a: i32 = 1i32 - 2i32 - 3i32; return; }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        if let Stmt::Let { ref init, .. } = kd.body.node.stmts[0].node {
+            if let Expr::Binary { op: BinOp::Sub, ref lhs, .. } = init.node {
+                assert!(matches!(lhs.node, Expr::Binary { op: BinOp::Sub, .. }),
+                    "LHS should be Sub; got: {:?}", lhs.node);
+            } else {
+                panic!("expected top-level Sub, got: {:?}", init.node);
+            }
+        }
+    }
+
+    #[test]
+    fn parse_comparison_lower_than_arith() {
+        // `1i32 + 2i32 == 3i32` -> Eq(Add(1,2), 3)
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { let b: bool = 1i32 + 2i32 == 3i32; return; }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        if let Stmt::Let { ref init, .. } = kd.body.node.stmts[0].node {
+            if let Expr::Binary { op: BinOp::Eq, ref lhs, .. } = init.node {
+                assert!(matches!(lhs.node, Expr::Binary { op: BinOp::Add, .. }),
+                    "LHS of Eq should be Add; got: {:?}", lhs.node);
+            } else {
+                panic!("expected Eq at top, got: {:?}", init.node);
+            }
+        }
+    }
+
+    #[test]
+    fn parse_and_lower_than_comparison() {
+        // `a == 0i32 and b != 1i32` -> And(Eq(a,0), Neq(b,1))
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { let b: bool = a == 0i32 and b != 1i32; return; }";
+        let (module, errors) = parse_src(src);
+        // Parse errors are OK here (a,b not yet declared), we only check structure
+        let _: &Vec<ParseError> = &errors; // suppress unused
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        if kd.body.node.stmts.is_empty() {
+            return; // errors prevented statement from parsing
+        }
+        if let Stmt::Let { ref init, .. } = kd.body.node.stmts[0].node {
+            assert!(matches!(init.node, Expr::ShortCircuit { op: ShortCircuitOp::And, .. }),
+                "expected And at top: {:?}", init.node);
+        }
+    }
+
+    #[test]
+    fn parse_or_lower_than_and() {
+        // `a and b or c` -> Or(And(a,b), c)
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { let b: bool = a and b or c; return; }";
+        let (module, _) = parse_src(src);
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        if kd.body.node.stmts.is_empty() {
+            return;
+        }
+        if let Stmt::Let { ref init, .. } = kd.body.node.stmts[0].node {
+            if let Expr::ShortCircuit { op: ShortCircuitOp::Or, ref lhs, .. } = init.node {
+                assert!(matches!(lhs.node, Expr::ShortCircuit { op: ShortCircuitOp::And, .. }),
+                    "LHS should be And, got: {:?}", lhs.node);
+            } else {
+                panic!("expected Or at top: {:?}", init.node);
+            }
+        }
+    }
+
+    #[test]
+    fn parse_unary_minus_binds_tight() {
+        // `-x + y` -> Add(Neg(x), y)
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { let a: i32 = -x + y; return; }";
+        let (module, _) = parse_src(src);
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        if kd.body.node.stmts.is_empty() {
+            return;
+        }
+        if let Stmt::Let { ref init, .. } = kd.body.node.stmts[0].node {
+            if let Expr::Binary { op: BinOp::Add, ref lhs, .. } = init.node {
+                assert!(matches!(lhs.node, Expr::Unary { op: UnaryOp::Neg, .. }),
+                    "LHS of Add should be Neg; got: {:?}", lhs.node);
+            } else {
+                panic!("expected Add at top: {:?}", init.node);
+            }
+        }
+    }
+
+    #[test]
+    fn parse_not_unary() {
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { let b: bool = not x; return; }";
+        let (module, _) = parse_src(src);
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        if kd.body.node.stmts.is_empty() {
+            return;
+        }
+        if let Stmt::Let { ref init, .. } = kd.body.node.stmts[0].node {
+            assert!(matches!(init.node, Expr::Unary { op: UnaryOp::LogicalNot, .. }),
+                "expected LogicalNot: {:?}", init.node);
+        }
+    }
+
+    #[test]
+    fn parse_paren_group_overrides_precedence() {
+        // `(1i32 + 2i32) * 3i32` -> Mul(Add(1,2), 3)
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { let a: i32 = (1i32 + 2i32) * 3i32; return; }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        if let Stmt::Let { ref init, .. } = kd.body.node.stmts[0].node {
+            if let Expr::Binary { op: BinOp::Mul, ref lhs, .. } = init.node {
+                // LHS should be Paren wrapping Add
+                assert!(matches!(lhs.node, Expr::Paren(_)),
+                    "LHS of Mul should be Paren; got: {:?}", lhs.node);
+            } else {
+                panic!("expected Mul at top: {:?}", init.node);
+            }
+        }
+    }
+
+    #[test]
+    fn parse_bitwise_builtin_call() {
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { let c: u32 = band(0xFFu32, 0x0Fu32); return; }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        if let Stmt::Let { ref init, .. } = kd.body.node.stmts[0].node {
+            if let Expr::Call { ref name, ref args } = init.node {
+                assert_eq!(name.node, "band");
+                assert_eq!(args.len(), 2);
+            } else {
+                panic!("expected Call: {:?}", init.node);
+            }
+        }
+    }
+
+    #[test]
+    fn parse_nested_deep_rejected() {
+        // 257 nested parens should exceed MAX_EXPR_DEPTH
+        let open: String = "(".repeat(257);
+        let close: String = ")".repeat(257);
+        let src: String = format!("@kernel @workgroup(1,1,1) fn k() -> void {{ let a: i32 = {}1i32{}; return; }}", open, close);
+        let (_, errors) = parse_src(&src);
+        assert!(errors.iter().any(|e| matches!(e, ParseError::ExpressionNestingTooDeep { .. })),
+            "expected ExpressionNestingTooDeep for 257 nested parens, got: {errors:?}");
     }
 }

@@ -1,0 +1,73 @@
+// scalar_demo.axc — M1.1 scalar operations demonstration.
+//
+// Exercises the full M1.1 scalar type set and operations:
+//   - Integer arithmetic (signed, unsigned)
+//   - Float arithmetic
+//   - Bitwise builtins (band, bor, bxor, bnot, shl, shr, lshr)
+//   - Comparison operators
+//   - Logical short-circuit (and, or)
+//   - Mutable bindings and assignment
+//   - 64-bit types (requires Int64 capability in SPIR-V)
+//
+// This kernel is intentionally compute-only (no I/O buffers) since buffer
+// bindings are deferred to M1.2+.
+
+@kernel
+@workgroup(64, 1, 1)
+@intent("demonstrate M1.1 scalar operations")
+fn scalar_demo() -> void {
+    // Integer arithmetic
+    let a: i32 = 10i32 + 3i32;
+    let b: i32 = 10i32 - 3i32;
+    let c: i32 = 10i32 * 3i32;
+    let d: i32 = 10i32 / 3i32;
+    let e: i32 = 10i32 % 3i32;
+
+    // Unsigned arithmetic
+    let ua: u32 = 10u32 + 3u32;
+    let ub: u32 = 10u32 / 3u32;
+    let uc: u32 = 10u32 % 3u32;
+
+    // Float arithmetic
+    let fa: f32 = 1.0f32 + 2.5f32;
+    let fb: f32 = 10.0f32 / 3.0f32;
+    let fc: f32 = 10.0f32 % 3.0f32;
+
+    // 64-bit (requires OpCapability Int64 in SPIR-V)
+    let la: i64 = 1000000000i64 * 1000i64;
+    let lua: u64 = 18446744073709551615u64;
+
+    // Comparisons
+    let cmp_eq: bool = 5i32 == 5i32;
+    let cmp_ne: bool = 5i32 != 6i32;
+    let cmp_lt: bool = 3i32 < 5i32;
+    let cmp_le: bool = 3i32 <= 3i32;
+    let cmp_gt: bool = 5i32 > 3i32;
+    let cmp_ge: bool = 5i32 >= 5i32;
+
+    // Logical short-circuit (and/or): lowers to OpSelectionMerge diamond
+    let sc_and: bool = true and false;
+    let sc_or:  bool = false or true;
+
+    // Bitwise builtins
+    let bw_and: i32 = band(0x0Fi32, 0x3Fi32);
+    let bw_or:  i32 = bor(0x0Fi32, 0x30i32);
+    let bw_xor: i32 = bxor(0x0Fi32, 0x03i32);
+    let bw_not: i32 = bnot(0x0Fi32);
+    let bw_shl: i32 = shl(1i32, 4i32);
+    let bw_shr: i32 = shr(256i32, 2i32);
+
+    // Unsigned bitwise: lshr (logical shift right, sign-stripping)
+    let bw_lshr: u32 = lshr(256u32, 2u32);
+
+    // Negation
+    let neg_i: i32 = -42i32;
+    let neg_f: f32 = -1.5f32;
+
+    // Mutable binding with assignment
+    let mut counter: i32 = 0i32;
+    counter = counter + 1i32;
+    counter = counter + 1i32;
+
+    return;
+}

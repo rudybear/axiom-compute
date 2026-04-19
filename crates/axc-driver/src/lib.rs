@@ -193,4 +193,115 @@ mod tests {
         let e = DriverError::Compile { lex: Vec::new(), parse: Vec::new(), hir: Vec::new() };
         assert!(e.has_phase_errors());
     }
+
+    // ── AT-124: DESIGN.md documents integer division UB ──────────────────────
+    //
+    // Spec (CRITICAL-2 fix): DESIGN.md must contain a paragraph documenting that
+    // OpSDiv / OpSRem with INT_MIN / -1 is UNDEFINED BEHAVIOR per SPIR-V §3.32.14,
+    // and that AXIOM-Compute does NOT emit runtime checks for this case.
+    //
+    // This test triple-checks the presence of the required text to guard against
+    // accidental deletion during future DESIGN.md edits.
+    #[test]
+    fn design_md_documents_int_division_ub() {
+        // Locate DESIGN.md relative to the workspace root.
+        // CARGO_MANIFEST_DIR for axc-driver is <repo>/crates/axc-driver.
+        // Go up two levels to reach the repo root.
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR not set");
+        let design_md_path = std::path::PathBuf::from(&manifest_dir)
+            .join("..")
+            .join("..")
+            .join("DESIGN.md");
+        let content = std::fs::read_to_string(&design_md_path)
+            .unwrap_or_else(|e| panic!("failed to read DESIGN.md at {:?}: {e}", design_md_path));
+
+        // Triple-check: all three substrings must be present.
+        assert!(
+            content.contains("INT_MIN / -1"),
+            "DESIGN.md must document INT_MIN / -1 as UB; substring 'INT_MIN / -1' not found"
+        );
+        assert!(
+            content.to_uppercase().contains("UNDEFINED BEHAVIOR"),
+            "DESIGN.md must use the phrase 'UNDEFINED BEHAVIOR' (case-insensitive); not found"
+        );
+        assert!(
+            content.contains("OpSDiv") || content.contains("OpSRem"),
+            "DESIGN.md must mention OpSDiv or OpSRem in the UB section; neither found"
+        );
+    }
+
+    // ── AT-116: tri-phase error aggregation for scalar code ───────────────────
+    //
+    // Spec requires: feed a source with lex errors AND parse errors AND HIR errors;
+    // assert DriverError::Compile { lex, parse, hir } has ALL THREE non-empty.
+    //
+    // Construction:
+    //   - Lex error:   emoji 💥 in the token stream (axc-lexer rejects non-ASCII
+    //                  codepoints that are not inside string literals).
+    //   - Parse error: `struct Foo {}` at top level (axc-parser does not parse
+    //                  struct declarations; produces a parse error on `struct`).
+    //   - HIR error:   a valid-looking kernel that has a type mismatch.
+    //                  Because lex/parse errors propagate partial ASTs, we need the
+    //                  HIR error to survive even when there are upstream errors.
+    //                  Strategy: include a second kernel-like fragment that parses
+    //                  successfully but contains a type mismatch (e.g. assigning a
+    //                  float literal to an i32 binding without a suffix).
+    //
+    // Note: because the collect-all design runs all three phases unconditionally,
+    // the lex and parse phases will produce errors from the emoji / struct tokens,
+    // while the HIR phase sees the partially-parsed AST.  To guarantee a HIR error
+    // independent of lex/parse, we construct a source where the bad fragment that
+    // causes a lex error is isolated from a separately valid (but type-mismatched)
+    // kernel that will be parsed and HIR-checked.
+    //
+    // After careful analysis: the three phases run on the SAME source string.
+    // - Phase 1 tokenizes everything and records lex errors for bad tokens.
+    // - Phase 2 parses the full (possibly error-containing) token stream.
+    // - Phase 3 runs HIR on whatever partial AST Phase 2 produced.
+    //
+    // Therefore the simplest approach that reliably hits all three:
+    //   src = "<emoji> <struct-decl> @kernel fn k() -> void { let x: i32 = 1.0f32; return; }"
+    //
+    // - emoji → LexError (lex phase rejects non-ASCII outside string literals)
+    // - struct → ParseError (top-level struct is not in the grammar)
+    // - let x: i32 = 1.0f32 → HirError::TypeMismatch (f32 literal to i32 binding)
+    //
+    // The kernel `fn k() -> void` has no `@kernel` / `@workgroup` annotation
+    // so the HIR will also produce a validation error.  Any HirError makes
+    // hir.len() > 0, which is the assertion we need.
+    #[test]
+    fn driver_scalar_demo_aggregates_errors() {
+        // 💥 triggers a LexError (non-ASCII codepoint outside a string literal).
+        // `struct Foo {}` triggers a ParseError (not a valid top-level item in axc grammar).
+        // `let x: i32 = 1.0f32;` inside a kernel triggers a HirError (f32 ≠ i32).
+        let src = concat!(
+            "💥 struct Foo {}\n",
+            "@kernel @workgroup(1,1,1) fn k() -> void {\n",
+            "    let x: i32 = 1.0f32;\n",
+            "    return;\n",
+            "}\n",
+        );
+
+        let result = compile_source_to_spirv(src);
+        match result {
+            Err(DriverError::Compile { lex, parse, hir }) => {
+                assert!(
+                    !lex.is_empty(),
+                    "expected lex errors (emoji in source); got none. lex={lex:?}"
+                );
+                assert!(
+                    !parse.is_empty(),
+                    "expected parse errors (struct at top level); got none. parse={parse:?}"
+                );
+                assert!(
+                    !hir.is_empty(),
+                    "expected HIR errors (f32 assigned to i32); got none. hir={hir:?}"
+                );
+            }
+            other => panic!(
+                "expected DriverError::Compile with all three phases non-empty; got: {other:?}"
+            ),
+        }
+    }
 }
