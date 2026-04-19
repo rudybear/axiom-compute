@@ -1,0 +1,52 @@
+{
+  "id": "M1.1-scalar-ops",
+  "title": "Scalar types, let bindings, and arithmetic expressions",
+  "phase": "M1",
+  "goal": "Extend the M0 empty-kernel pipeline to lex+parse+HIR-typecheck+SPIR-V-emit scalar arithmetic inside a kernel body. Output is still a void kernel (no I/O yet — buffers are M1.2), but the function body now contains real SSA-form computation over scalar types. Validates every op we emit against the SPIR-V spec.",
+  "scope_in": [
+    "Scalar types accepted in source: i32, u32, i64, u64, f32, f64, bool",
+    "Integer and float literals with optional suffix (42i32, 3.14f32)",
+    "let immutable bindings: `let x: i32 = <expr>;`",
+    "let mut mutable bindings: `let mut x: i32 = <expr>;` with subsequent `x = <expr>;`",
+    "Arithmetic expressions: +, -, *, /, % (integer: OpIAdd/OpISub/OpIMul/OpSDiv|OpUDiv/OpSRem|OpUMod; float: OpFAdd/OpFSub/OpFMul/OpFDiv/OpFRem). Rationale: OpFRem (C99 fmod, sign-of-dividend) matches Rust's `%` operator and keeps int/float remainder semantically parallel with the signed integer OpSRem choice. See architect spec §5.4.",
+    "Comparison expressions: ==, !=, <, <=, >, >= producing bool (OpIEqual/OpINotEqual/OpSLessThan|OpULessThan/...; OpFOrdLessThan/... for float)",
+    "Logical expressions: and, or, not (short-circuit; OpLogicalAnd/OpLogicalOr/OpLogicalNot at HIR level, but short-circuit is lowered to structured SPIR-V OpSelectionMerge + OpBranchConditional)",
+    "Bitwise builtins: band(a,b), bor(a,b), bxor(a,b), bnot(a), shl(a,n), shr(a,n) [arithmetic right shift], lshr(a,n) [logical right shift] -- matches AXIOM convention (no `>>` operator)",
+    "Unary minus on int/float (OpSNegate/OpFNegate)",
+    "Parenthesized expressions for grouping",
+    "Parser: Pratt expression parser with correct precedence (from tightest: unary > * / % > + - > shifts > bitwise & > ^ > | > comparisons > and > or)",
+    "HIR: full typechecking -- every expression has a resolved type, mismatches are errors, no implicit coercions (anti-pattern #1: every type is explicit)",
+    "HIR: assignment requires matching type; mutable binding required for assignment",
+    "SPIR-V codegen: OpTypeInt(32,1)/OpTypeInt(32,0)/OpTypeInt(64,1)/OpTypeInt(64,0)/OpTypeFloat(32)/OpTypeFloat(64)/OpTypeBool types, OpConstant/OpConstantTrue/OpConstantFalse, variables as OpVariable in Function storage class with OpLoad/OpStore, arithmetic via the correct signed/unsigned/float op variants",
+    "SPIR-V: correct Function-storage variables (not private) for let/let-mut per spec §3.7 StorageClass Function",
+    "Example: examples/scalar_demo.axc with @kernel @workgroup(1,1,1) computing a nontrivial scalar expression chain"
+  ],
+  "scope_out": [
+    "Buffers / storage buffer types (M1.2)",
+    "Shared memory (M1.2+)",
+    "Array indexing / pointer reads (M1.2)",
+    "For/while loops (M1.3)",
+    "If/else (M1.3)",
+    "Function calls beyond builtins (M1.3)",
+    "Subgroup ops (M1.4)",
+    "Vulkan dispatch / GPU execution (M1.5)",
+    "Cooperative matrix (M2)",
+    "Autotuner / @strategy holes (M2)",
+    "String literals in source (no need until M1.3+ for @intent structured content)"
+  ],
+  "acceptance_criteria": [
+    "cargo test --workspace passes (expected: ~130+ tests after M1.1 additions)",
+    "cargo clippy --workspace --all-targets -- -D warnings clean (no regression from M0)",
+    "spirv-val passes on emitted SPIR-V for examples/scalar_demo.axc",
+    "A scalar expression chain `let x: i32 = 1 + 2 * 3; let mut y: i32 = x - 4; y = y + 10;` produces exactly the right sequence of OpConstant/OpIAdd/OpIMul/OpISub/OpStore/OpLoad (verified by unit test that walks dr::Module)",
+    "Every arithmetic/comparison operator has at least one positive and one negative test",
+    "Type-error test: `let x: i32 = 3.14;` rejected with a helpful HirError::TypeMismatch",
+    "Signed vs unsigned division test: `let a: i32 = -10; let b: i32 = 3; let c: i32 = a / b;` emits OpSDiv (not OpUDiv); swap to u32 emits OpUDiv",
+    "Mutable binding required for assignment: `let x: i32 = 1; x = 2;` rejected with HirError::AssignImmutable"
+  ],
+  "memory_limit_gb": 50,
+  "dependencies": ["M0-bootstrap"],
+  "blocks": ["M1.2-buffers", "M1.3-control-flow", "M1.4-subgroup-ops", "M1.5-vulkan-dispatch"],
+  "estimated_loc": "2500-4000",
+  "estimated_tests_added": "40-60"
+}
