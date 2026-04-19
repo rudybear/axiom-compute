@@ -8,10 +8,13 @@
 //!   - SPIR-V header: magic=0x07230203, version=1.3
 //!   - Exactly 1 OpVariable Input (GlobalInvocationId)
 //!   - BuiltIn GlobalInvocationId decoration present
-//!   - At least 3 OpLoad of v3uint (one per gid() call) - note: the codegen emits
-//!     one OpLoad per gid() call-site in the body per spec AT-203
-//!   - At least 3 OpCompositeExtract with axis indices 0, 1, 2 (one each)
+//!   - gid variable appears in OpEntryPoint interface list
+//!   - StorageBuffer variables do NOT appear in OpEntryPoint interface list
 //!   - spirv-val accepts output (if spirv-val on PATH)
+//!
+//! SPIR-V gid lowering pattern (per architect spec §scope_in_summary[11]):
+//!   OpLoad uvec3 %gid_var        → load the full 3-component vector
+//!   OpCompositeExtract u32 axis  → extract component 0, 1, or 2 with a LITERAL index
 
 use std::path::PathBuf;
 
@@ -128,6 +131,20 @@ fn test_compile_gid_demo_produces_valid_spirv() {
             }
         }
     }
+
+    // AT-203: gid lowering uses OpLoad uvec3 + OpCompositeExtract (spec §scope_in_summary[11]).
+    // Count OpCompositeExtract instructions in function bodies — there must be at least 3
+    // (one for each of gid(0), gid(1), gid(2) in gid_demo.axc).
+    let composite_extract_count: usize = module.functions.iter()
+        .flat_map(|f| f.blocks.iter())
+        .flat_map(|b| b.instructions.iter())
+        .filter(|inst| inst.class.opcode == Op::CompositeExtract)
+        .count();
+    assert!(
+        composite_extract_count >= 3,
+        "AT-203: expected >= 3 OpCompositeExtract for gid(0)+gid(1)+gid(2); got {}",
+        composite_extract_count
+    );
 
     // spirv-val (optional).
     if let Some(sv_path) = which_spirv_val() {
