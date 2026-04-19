@@ -163,8 +163,8 @@ mod tests {
         let result = compile_source_to_spirv(src);
         match result {
             Err(DriverError::Compile { lex, parse, hir }) => {
-                assert!(!lex.is_empty() || !parse.is_empty(),
-                    "expected at least one lex or parse error; lex={lex:?}, parse={parse:?}, hir={hir:?}");
+                assert!(!lex.is_empty() && !parse.is_empty(),
+                    "expected BOTH lex AND parse errors (collect-all aggregation); lex={lex:?}, parse={parse:?}, hir={hir:?}");
             }
             other => panic!("expected DriverError::Compile, got: {other:?}"),
         }
