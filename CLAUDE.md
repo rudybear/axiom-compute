@@ -150,4 +150,4 @@ Templates live under `.pipeline/templates/`. Config under `.pipeline/config.json
 
 ## Current feature set
 
-Empty (M0 in progress). Design document (`DESIGN.md`) pending dual design review.
+M0 complete: 7 crate skeletons, empty-kernel SPIR-V 1.3 codegen, spirv-val integration test. GPU execution (Lavapipe fallback) begins M1 — anti-pattern #9 is formally relaxed for M0 codegen-only milestone (syntactic validation via spirv-val substitutes).

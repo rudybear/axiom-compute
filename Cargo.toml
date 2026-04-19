@@ -1,7 +1,15 @@
 [workspace]
 resolver = "2"
 # Members populated by M0 Coder agent per Architect's spec.
-members = []
+members = [
+    "crates/axc-lexer",
+    "crates/axc-parser",
+    "crates/axc-hir",
+    "crates/axc-codegen",
+    "crates/axc-optimize",
+    "crates/axc-driver",
+    "crates/axc-runtime",
+]
 
 [workspace.package]
 version = "0.0.1"

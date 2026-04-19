@@ -1,0 +1,487 @@
+//! Token types for AXIOM-Compute (.axc) source files.
+//!
+//! Ported from axiom-lexer/token.rs with GPU-specific additions and removal
+//! of CPU-only variants (noalias, nsw, fast-math, arena, lifetime, etc.).
+//! M1-reserved keywords are included as dedicated variants so the parser's
+//! §3.3 deny-list check can match them with a typed `match` rather than
+//! string comparison.
+
+/// Byte offset span in source text (half-open: `start..end`).
+///
+/// Spans are raw-file-aligned: no BOM stripping, no whitespace trimming.
+/// The driver rejects BOM-prefixed files before any tokenization, so
+/// offset 0 always refers to the first non-BOM byte of the source.
+///
+/// `From<Span> for miette::SourceSpan` is implemented so that `#[label]`
+/// attributes in `thiserror` + `miette::Diagnostic` derive macros work correctly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub start: u32,
+    pub end: u32,
+}
+
+impl From<Span> for miette::SourceSpan {
+    fn from(s: Span) -> Self {
+        miette::SourceSpan::new(
+            miette::SourceOffset::from(s.start as usize),
+            s.end as usize - s.start as usize,
+        )
+    }
+}
+
+impl Span {
+    /// Create a new span from inclusive `start` to exclusive `end` byte offsets.
+    pub fn new(start: u32, end: u32) -> Self {
+        Self { start, end }
+    }
+
+    /// Extend this span to also cover `other` (smallest covering span).
+    pub fn merge(self, other: Span) -> Span {
+        Span {
+            start: self.start.min(other.start),
+            end: self.end.max(other.end),
+        }
+    }
+
+    /// Number of bytes covered by this span.
+    pub fn len(&self) -> u32 {
+        self.end - self.start
+    }
+
+    /// True when the span covers zero bytes.
+    pub fn is_empty(&self) -> bool {
+        self.start == self.end
+    }
+}
+
+/// Generic AST/IR node with attached source location.
+///
+/// Using a newtype wrapper rather than an (T, Span) tuple to keep
+/// the field names explicit and searchable in IDE tooling.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Spanned<T> {
+    pub node: T,
+    pub span: Span,
+}
+
+impl<T> Spanned<T> {
+    /// Wrap `node` with a source `span`.
+    pub fn new(node: T, span: Span) -> Self {
+        Self { node, span }
+    }
+
+    /// Transform the inner node, preserving the span.
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Spanned<U> {
+        Spanned { node: f(self.node), span: self.span }
+    }
+}
+
+/// A single lexed token with its kind and position.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Token {
+    pub kind: TokenKind,
+    pub span: Span,
+}
+
+impl Token {
+    /// Create a new token with the given kind and span.
+    pub fn new(kind: TokenKind, span: Span) -> Self {
+        Self { kind, span }
+    }
+}
+
+/// The base (radix) of an integer literal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntBase {
+    /// Decimal (base 10), e.g. `42`
+    Decimal,
+    /// Hexadecimal (base 16), e.g. `0xFF`
+    Hex,
+    /// Binary (base 2), e.g. `0b1010`
+    Binary,
+    /// Octal (base 8), e.g. `0o77`
+    Octal,
+}
+
+/// Width suffix for integer literals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntSuffix {
+    I8, I16, I32, I64,
+    U8, U16, U32, U64,
+}
+
+/// Width suffix for float literals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatSuffix {
+    F16,
+    Bf16,
+    F32,
+    F64,
+}
+
+/// All token kinds emitted by the AXIOM-Compute lexer.
+///
+/// Note on M1-reserved keywords: `Let`, `Mut`, `If`, `Else`, `For`, `While`,
+/// `Break`, `Continue`, `Struct` are included as dedicated variants even though
+/// M0 does not generate them in valid programs. This lets the parser's `parse_stmt`
+/// pre-check (§3.3) match on the token kind directly instead of comparing strings.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TokenKind {
+    // ── Literals ────────────────────────────────────────
+    IntLiteral { value: i128, suffix: Option<IntSuffix>, base: IntBase },
+    FloatLiteral { value: f64, suffix: Option<FloatSuffix> },
+    StringLiteral(String),
+    BoolLiteral(bool),
+
+    // ── Identifiers & Special Prefixes ──────────────────
+    Ident(String),
+    /// `@annotation_name` — the `@` is consumed; token carries the bare name.
+    Annotation(String),
+    /// `?opt_hole_name` — optimization hole for M2+ autotuner.
+    OptHole(String),
+
+    // ── Keywords ────────────────────────────────────────
+    Fn,
+    // M1-reserved keywords — present now so parse_stmt deny-list can match them.
+    Let,
+    Mut,
+    Return,
+    If,
+    Else,
+    For,
+    While,
+    In,
+    Struct,
+    Break,
+    Continue,
+    // Logical operators (keyword form, not operator tokens)
+    And,
+    Or,
+    Not,
+    // GPU-specific entry-point keyword (surface-level; also recognized as @kernel annotation)
+    Void,
+    // GPU built-in type keywords — needed for `-> void` return-type parsing
+    Kernel,
+    Buffer,
+    ReadonlyBuffer,
+    WriteonlyBuffer,
+    Shared,
+    Barrier,
+    SubgroupUniform,
+
+    // ── Primitive type keywords ──────────────────────────
+    I8, I16, I32, I64,
+    U8, U16, U32, U64,
+    F16, Bf16, F32, F64,
+    Bool,
+
+    // ── Operators ───────────────────────────────────────
+    Plus,       // +
+    Minus,      // -
+    Star,       // *
+    Slash,      // /
+    Percent,    // %
+    Eq,         // ==
+    NotEq,      // !=
+    Lt,         // <
+    Gt,         // >
+    LtEq,       // <=
+    GtEq,       // >=
+    Assign,     // =
+    Arrow,      // ->
+    FatArrow,   // =>
+    Dot,        // .
+    Colon,      // :
+    ColonColon, // ::
+    Comma,      // ,
+    Semicolon,  // ;
+    Pipe,       // |
+
+    // ── Delimiters ──────────────────────────────────────
+    LParen,   // (
+    RParen,   // )
+    LBracket, // [
+    RBracket, // ]
+    LBrace,   // {
+    RBrace,   // }
+
+    // ── Special ─────────────────────────────────────────
+    Eof,
+    /// Error token — lexer recovered and continued. The string is the error message.
+    Error(String),
+}
+
+impl TokenKind {
+    /// Map an identifier string to the corresponding keyword `TokenKind`, if any.
+    ///
+    /// Returns `None` for non-keywords so the caller falls back to `Ident`.
+    pub fn keyword_from_str(s: &str) -> Option<TokenKind> {
+        match s {
+            "fn"       => Some(TokenKind::Fn),
+            "let"      => Some(TokenKind::Let),
+            "mut"      => Some(TokenKind::Mut),
+            "return"   => Some(TokenKind::Return),
+            "if"       => Some(TokenKind::If),
+            "else"     => Some(TokenKind::Else),
+            "for"      => Some(TokenKind::For),
+            "while"    => Some(TokenKind::While),
+            "in"       => Some(TokenKind::In),
+            "struct"   => Some(TokenKind::Struct),
+            "break"    => Some(TokenKind::Break),
+            "continue" => Some(TokenKind::Continue),
+            "and"      => Some(TokenKind::And),
+            "or"       => Some(TokenKind::Or),
+            "not"      => Some(TokenKind::Not),
+            "void"     => Some(TokenKind::Void),
+            "true"     => Some(TokenKind::BoolLiteral(true)),
+            "false"    => Some(TokenKind::BoolLiteral(false)),
+            // Primitive types
+            "i8"   => Some(TokenKind::I8),
+            "i16"  => Some(TokenKind::I16),
+            "i32"  => Some(TokenKind::I32),
+            "i64"  => Some(TokenKind::I64),
+            "u8"   => Some(TokenKind::U8),
+            "u16"  => Some(TokenKind::U16),
+            "u32"  => Some(TokenKind::U32),
+            "u64"  => Some(TokenKind::U64),
+            "f16"  => Some(TokenKind::F16),
+            "bf16" => Some(TokenKind::Bf16),
+            "f32"  => Some(TokenKind::F32),
+            "f64"  => Some(TokenKind::F64),
+            "bool" => Some(TokenKind::Bool),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` for `TokenKind::Error(_)`.
+    pub fn is_error(&self) -> bool {
+        matches!(self, TokenKind::Error(_))
+    }
+
+    /// Returns the human-readable M1-reserved statement description for this token,
+    /// or `None` if the token is not in the M1-reserved deny-list.
+    ///
+    /// Used by `parse_stmt` (§3.3) to produce `ParseError::UnsupportedInM0 { detail }`.
+    /// Keeping the mapping here lets the parser stay free of literal strings.
+    pub fn m1_reserved_detail(&self) -> Option<&'static str> {
+        match self {
+            TokenKind::Let      => Some("let statement"),
+            TokenKind::Mut      => Some("mut statement"),
+            TokenKind::If       => Some("if statement"),
+            TokenKind::Else     => Some("else branch"),
+            TokenKind::For      => Some("for loop"),
+            TokenKind::While    => Some("while loop"),
+            TokenKind::Break    => Some("break statement"),
+            TokenKind::Continue => Some("continue statement"),
+            TokenKind::Struct   => Some("struct declaration"),
+            // All other tokens are not M1-reserved
+            TokenKind::IntLiteral { .. }
+            | TokenKind::FloatLiteral { .. }
+            | TokenKind::StringLiteral(_)
+            | TokenKind::BoolLiteral(_)
+            | TokenKind::Ident(_)
+            | TokenKind::Annotation(_)
+            | TokenKind::OptHole(_)
+            | TokenKind::Fn
+            | TokenKind::Return
+            | TokenKind::In
+            | TokenKind::And
+            | TokenKind::Or
+            | TokenKind::Not
+            | TokenKind::Void
+            | TokenKind::Kernel
+            | TokenKind::Buffer
+            | TokenKind::ReadonlyBuffer
+            | TokenKind::WriteonlyBuffer
+            | TokenKind::Shared
+            | TokenKind::Barrier
+            | TokenKind::SubgroupUniform
+            | TokenKind::I8
+            | TokenKind::I16
+            | TokenKind::I32
+            | TokenKind::I64
+            | TokenKind::U8
+            | TokenKind::U16
+            | TokenKind::U32
+            | TokenKind::U64
+            | TokenKind::F16
+            | TokenKind::Bf16
+            | TokenKind::F32
+            | TokenKind::F64
+            | TokenKind::Bool
+            | TokenKind::Plus
+            | TokenKind::Minus
+            | TokenKind::Star
+            | TokenKind::Slash
+            | TokenKind::Percent
+            | TokenKind::Eq
+            | TokenKind::NotEq
+            | TokenKind::Lt
+            | TokenKind::Gt
+            | TokenKind::LtEq
+            | TokenKind::GtEq
+            | TokenKind::Assign
+            | TokenKind::Arrow
+            | TokenKind::FatArrow
+            | TokenKind::Dot
+            | TokenKind::Colon
+            | TokenKind::ColonColon
+            | TokenKind::Comma
+            | TokenKind::Semicolon
+            | TokenKind::Pipe
+            | TokenKind::LParen
+            | TokenKind::RParen
+            | TokenKind::LBracket
+            | TokenKind::RBracket
+            | TokenKind::LBrace
+            | TokenKind::RBrace
+            | TokenKind::Eof
+            | TokenKind::Error(_) => None,
+        }
+    }
+}
+
+/// Lookup table mapping byte offsets to (line, column) positions.
+///
+/// Built on demand for diagnostic rendering; not part of the hot tokenize path.
+pub struct LineIndex {
+    /// Byte offset of the first character of each line (0-indexed).
+    line_starts: Vec<u32>,
+}
+
+impl LineIndex {
+    /// Build a `LineIndex` from the source text.
+    ///
+    /// # Examples
+    /// ```
+    /// use axc_lexer::LineIndex;
+    /// let idx = LineIndex::new("hello\nworld\n");
+    /// assert_eq!(idx.line_col(0), (0, 0));
+    /// assert_eq!(idx.line_col(6), (1, 0));
+    /// ```
+    pub fn new(source: &str) -> Self {
+        let mut line_starts: Vec<u32> = vec![0u32];
+        for (i, b) in source.bytes().enumerate() {
+            if b == b'\n' {
+                line_starts.push((i + 1) as u32);
+            }
+        }
+        Self { line_starts }
+    }
+
+    /// Convert a byte offset to a 0-based `(line, column)` pair.
+    pub fn line_col(&self, offset: u32) -> (u32, u32) {
+        let line: usize = match self.line_starts.binary_search(&offset) {
+            Ok(exact) => exact,
+            Err(insertion) => insertion.saturating_sub(1),
+        };
+        let col: u32 = offset.saturating_sub(self.line_starts[line]);
+        (line as u32, col)
+    }
+
+    /// Total number of lines in the source (always >= 1).
+    pub fn line_count(&self) -> u32 {
+        self.line_starts.len() as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn span_new_and_len() {
+        let s: Span = Span::new(3, 7);
+        assert_eq!(s.start, 3);
+        assert_eq!(s.end, 7);
+        assert_eq!(s.len(), 4);
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn span_empty() {
+        let s: Span = Span::new(5, 5);
+        assert!(s.is_empty());
+        assert_eq!(s.len(), 0);
+    }
+
+    #[test]
+    fn span_merge() {
+        let a: Span = Span::new(2, 5);
+        let b: Span = Span::new(4, 9);
+        let m: Span = a.merge(b);
+        assert_eq!(m.start, 2);
+        assert_eq!(m.end, 9);
+    }
+
+    #[test]
+    fn keyword_from_str_recognizes_m1_reserved() {
+        assert_eq!(TokenKind::keyword_from_str("let"), Some(TokenKind::Let));
+        assert_eq!(TokenKind::keyword_from_str("if"), Some(TokenKind::If));
+        assert_eq!(TokenKind::keyword_from_str("for"), Some(TokenKind::For));
+        assert_eq!(TokenKind::keyword_from_str("struct"), Some(TokenKind::Struct));
+        assert_eq!(TokenKind::keyword_from_str("break"), Some(TokenKind::Break));
+        assert_eq!(TokenKind::keyword_from_str("continue"), Some(TokenKind::Continue));
+    }
+
+    #[test]
+    fn keyword_from_str_non_keyword() {
+        assert_eq!(TokenKind::keyword_from_str("myident"), None);
+        assert_eq!(TokenKind::keyword_from_str(""), None);
+    }
+
+    #[test]
+    fn m1_reserved_detail_let_if_for() {
+        // Verifies the mapping table (AT-9 sub-assertion in spec §7.1)
+        assert_eq!(TokenKind::Let.m1_reserved_detail(), Some("let statement"));
+        assert_eq!(TokenKind::If.m1_reserved_detail(), Some("if statement"));
+        assert_eq!(TokenKind::For.m1_reserved_detail(), Some("for loop"));
+        assert_eq!(TokenKind::While.m1_reserved_detail(), Some("while loop"));
+        assert_eq!(TokenKind::Struct.m1_reserved_detail(), Some("struct declaration"));
+        assert_eq!(TokenKind::Break.m1_reserved_detail(), Some("break statement"));
+        assert_eq!(TokenKind::Continue.m1_reserved_detail(), Some("continue statement"));
+        assert_eq!(TokenKind::Mut.m1_reserved_detail(), Some("mut statement"));
+        assert_eq!(TokenKind::Else.m1_reserved_detail(), Some("else branch"));
+    }
+
+    #[test]
+    fn m1_reserved_detail_non_reserved() {
+        // Non-M1-reserved tokens must return None (not accidentally match)
+        assert_eq!(TokenKind::Return.m1_reserved_detail(), None);
+        assert_eq!(TokenKind::Fn.m1_reserved_detail(), None);
+        assert_eq!(TokenKind::Void.m1_reserved_detail(), None);
+        assert_eq!(TokenKind::Eof.m1_reserved_detail(), None);
+    }
+
+    #[test]
+    fn is_error_variants() {
+        assert!(TokenKind::Error("bad".into()).is_error());
+        assert!(!TokenKind::Fn.is_error());
+        assert!(!TokenKind::Return.is_error());
+    }
+
+    #[test]
+    fn line_index_basic() {
+        let idx: LineIndex = LineIndex::new("hello\nworld\nfoo");
+        assert_eq!(idx.line_col(0), (0, 0));
+        assert_eq!(idx.line_col(5), (0, 5)); // the '\n' character
+        assert_eq!(idx.line_col(6), (1, 0));
+        assert_eq!(idx.line_col(12), (2, 0));
+        assert_eq!(idx.line_count(), 3);
+    }
+
+    #[test]
+    fn line_index_empty_source() {
+        let idx: LineIndex = LineIndex::new("");
+        assert_eq!(idx.line_col(0), (0, 0));
+        assert_eq!(idx.line_count(), 1);
+    }
+
+    #[test]
+    fn spanned_map() {
+        let s: Spanned<i32> = Spanned::new(42_i32, Span::new(0, 2));
+        let s2: Spanned<String> = s.map(|n| n.to_string());
+        assert_eq!(s2.node, "42");
+        assert_eq!(s2.span, Span::new(0, 2));
+    }
+}

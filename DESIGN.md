@@ -166,6 +166,8 @@ Subgroup:       subgroup[T]            // subgroup-uniform values
 
 **Exit gate M0:** `axc compile empty_kernel.axc -o empty.spv && spirv-val empty.spv` succeeds on Linux CI.
 
+**M0 addendum:** Correctness for M0 is syntactic (spirv-val only). GPU dispatch + Lavapipe fallback + equivalence checks all begin at M1 per exit gate. Anti-pattern #9 (no feature without a GPU test) is formally relaxed for M0; re-armed from M1 onward.
+
 ### Phase M1 -- Minimum viable SPIR-V backend (month 1-3)
 
 - Parser + HIR + SPIR-V codegen path for: scalar ops, buffers, workgroup dispatch, barriers, subgroup ops

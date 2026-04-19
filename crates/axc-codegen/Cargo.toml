@@ -1,0 +1,17 @@
+[package]
+name = "axc-codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SPIR-V codegen for AXIOM-Compute via rspirv::dr::Builder"
+
+[dependencies]
+axc-hir = { path = "../axc-hir" }
+rspirv = { workspace = true }
+spirv = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+axc-lexer = { path = "../axc-lexer" }
+axc-parser = { path = "../axc-parser" }

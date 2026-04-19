@@ -1,0 +1,12 @@
+[package]
+name = "axc-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Parser for AXIOM-Compute (.axc) source files — produces AST"
+
+[dependencies]
+axc-lexer = { path = "../axc-lexer" }
+thiserror = { workspace = true }
+miette = { workspace = true }

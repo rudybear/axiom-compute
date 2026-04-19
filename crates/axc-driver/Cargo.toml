@@ -1,0 +1,20 @@
+[package]
+name = "axc-driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CLI driver for the AXIOM-Compute compiler"
+
+[[bin]]
+name = "axc"
+path = "src/main.rs"
+
+[dependencies]
+axc-lexer = { path = "../axc-lexer" }
+axc-parser = { path = "../axc-parser" }
+axc-hir = { path = "../axc-hir" }
+axc-codegen = { path = "../axc-codegen" }
+clap = { workspace = true }
+miette = { workspace = true }
+thiserror = { workspace = true }
