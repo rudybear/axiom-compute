@@ -1,0 +1,31 @@
+{
+  "id": "M0-bootstrap",
+  "title": "Bootstrap: Cargo workspace + lexer port + empty kernel SPIR-V",
+  "phase": "M0",
+  "goal": "Produce a minimal end-to-end slice that proves the plumbing works: parse a tiny .axc file, tokenize it, emit a minimal valid SPIR-V module for an empty kernel, and validate with spirv-val.",
+  "scope_in": [
+    "Cargo workspace with 7 empty crates (axc-lexer, axc-parser, axc-hir, axc-codegen, axc-optimize, axc-driver, axc-runtime)",
+    "Lexer: port from axiom-lexer with GPU keyword additions (@kernel, @workgroup, @subgroup_uniform, buffer, shared, barrier)",
+    "Minimal parser: @kernel function with @workgroup annotation and empty body",
+    "Minimal HIR: validates that @kernel has @workgroup annotation",
+    "Minimal codegen: rspirv direct emission of an empty kernel SPIR-V module (OpCapability Shader, OpEntryPoint GLCompute, OpExecutionMode LocalSize)",
+    "CLI: axc compile <file.axc> -o <file.spv>",
+    "CI on GitHub Actions: cargo test + spirv-val on compiled fixtures"
+  ],
+  "scope_out": [
+    "Any GPU execution at runtime (Vulkan/OpenCL dispatch)",
+    "Cooperative matrix codegen",
+    "Autotuner / @strategy",
+    "MCP server",
+    "Any optimization pass"
+  ],
+  "acceptance_criteria": [
+    "cargo test --workspace passes",
+    "cargo clippy --workspace -- -D warnings clean",
+    "spirv-val passes on examples/empty_kernel.spv",
+    "axc compile examples/empty_kernel.axc -o /tmp/empty.spv && spirv-val /tmp/empty.spv"
+  ],
+  "memory_limit_gb": 50,
+  "dependencies": [],
+  "blocks": ["M1-mvp-backend"]
+}

@@ -1,0 +1,101 @@
+{
+  "pipeline_version": "2.0",
+  "project": "axiom-compute",
+  "description": "7-agent development pipeline for AXIOM-Compute (SPIR-V GPGPU compiler)",
+
+  "agents": {
+    "architect": {
+      "description": "Designs specifications, execution plan, test requirements",
+      "template": "templates/architect.md",
+      "model": "opus",
+      "creates_branch": true,
+      "branch_prefix": "architect"
+    },
+    "optimistic_design_reviewer": {
+      "description": "Validates plan against existing solutions, project goals, feasibility",
+      "template": "templates/optimistic_design_reviewer.md",
+      "model": "sonnet",
+      "creates_branch": false
+    },
+    "pessimistic_design_reviewer": {
+      "description": "Finds correctness holes, principle violations, edge cases, SPIR-V validity risks",
+      "template": "templates/pessimistic_design_reviewer.md",
+      "model": "opus",
+      "creates_branch": false
+    },
+    "coder": {
+      "description": "Implements the agreed plan exactly",
+      "template": "templates/coder.md",
+      "model": "sonnet",
+      "creates_branch": true,
+      "branch_prefix": "coder"
+    },
+    "qa_agent": {
+      "description": "Verifies diff conformance and SPIR-V validity (never trust, always verify)",
+      "template": "templates/qa_agent.md",
+      "model": "sonnet",
+      "creates_branch": false
+    },
+    "optimistic_code_reviewer": {
+      "description": "Verifies implementation matches spec, patterns, quality",
+      "template": "templates/optimistic_code_reviewer.md",
+      "model": "sonnet",
+      "creates_branch": false
+    },
+    "pessimistic_code_reviewer": {
+      "description": "Finds bugs, UB, races, correctness holes; reads emitted SPIR-V",
+      "template": "templates/pessimistic_code_reviewer.md",
+      "model": "opus",
+      "creates_branch": false
+    }
+  },
+
+  "workflow": {
+    "phases": {
+      "design": {
+        "sequence": ["architect", ["optimistic_design_reviewer", "pessimistic_design_reviewer"]],
+        "parallel_reviewers": true,
+        "loop": "architect revises until both reviewers APPROVE",
+        "output": "agreed plan saved to docs/, DESIGN.md updated"
+      },
+      "implementation": {
+        "sequence": ["coder", "qa_agent"],
+        "loop": "coder revises until QA passes"
+      },
+      "code_review": {
+        "sequence": [["optimistic_code_reviewer", "pessimistic_code_reviewer"]],
+        "parallel_reviewers": true,
+        "on_issues": "back to architect for resolution, not coder",
+        "on_complete": "merge + final DESIGN.md update"
+      }
+    },
+    "retry_policy": {
+      "max_design_review_cycles": 3,
+      "max_coder_retries": 3,
+      "max_code_review_cycles": 2
+    }
+  },
+
+  "gpu_specific": {
+    "test_exec_size_limit_gb": 50,
+    "spirv_val_required": true,
+    "min_vendor_coverage_m2_plus": 2,
+    "lavapipe_fallback_allowed_in_ci": true
+  },
+
+  "git": {
+    "strategy": "branch_and_merge",
+    "merge_strategy": "--no-ff",
+    "protected_branch": "main",
+    "branch_naming": "{agent}/{run_id}/{milestone_id}",
+    "pr_mode": false
+  },
+
+  "timeouts": {
+    "agent_timeout_seconds": 900,
+    "gate_check_timeout_seconds": 180
+  },
+
+  "required_tools": ["cargo", "rustc", "jq", "git"],
+  "optional_tools": ["spirv-val", "spirv-opt", "spirv-dis", "glslangValidator", "clippy"]
+}

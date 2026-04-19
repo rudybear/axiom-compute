@@ -1,0 +1,11 @@
+// M0 smoke-test source: empty compute kernel.
+// Demonstrates minimum set of annotations required for SPIR-V codegen.
+
+@kernel
+@workgroup(64, 1, 1)
+@intent("smoke-test: smallest valid kernel for SPIR-V emission")
+@complexity(O(1))
+@precondition(true)
+fn empty() -> void {
+    return;
+}
