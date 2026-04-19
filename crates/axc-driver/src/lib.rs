@@ -194,6 +194,43 @@ mod tests {
         assert!(e.has_phase_errors());
     }
 
+    // ── AT-124: DESIGN.md documents integer division UB ──────────────────────
+    //
+    // Spec (CRITICAL-2 fix): DESIGN.md must contain a paragraph documenting that
+    // OpSDiv / OpSRem with INT_MIN / -1 is UNDEFINED BEHAVIOR per SPIR-V §3.32.14,
+    // and that AXIOM-Compute does NOT emit runtime checks for this case.
+    //
+    // This test triple-checks the presence of the required text to guard against
+    // accidental deletion during future DESIGN.md edits.
+    #[test]
+    fn design_md_documents_int_division_ub() {
+        // Locate DESIGN.md relative to the workspace root.
+        // CARGO_MANIFEST_DIR for axc-driver is <repo>/crates/axc-driver.
+        // Go up two levels to reach the repo root.
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR not set");
+        let design_md_path = std::path::PathBuf::from(&manifest_dir)
+            .join("..")
+            .join("..")
+            .join("DESIGN.md");
+        let content = std::fs::read_to_string(&design_md_path)
+            .unwrap_or_else(|e| panic!("failed to read DESIGN.md at {:?}: {e}", design_md_path));
+
+        // Triple-check: all three substrings must be present.
+        assert!(
+            content.contains("INT_MIN / -1"),
+            "DESIGN.md must document INT_MIN / -1 as UB; substring 'INT_MIN / -1' not found"
+        );
+        assert!(
+            content.to_uppercase().contains("UNDEFINED BEHAVIOR"),
+            "DESIGN.md must use the phrase 'UNDEFINED BEHAVIOR' (case-insensitive); not found"
+        );
+        assert!(
+            content.contains("OpSDiv") || content.contains("OpSRem"),
+            "DESIGN.md must mention OpSDiv or OpSRem in the UB section; neither found"
+        );
+    }
+
     // ── AT-116: tri-phase error aggregation for scalar code ───────────────────
     //
     // Spec requires: feed a source with lex errors AND parse errors AND HIR errors;

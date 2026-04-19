@@ -244,6 +244,22 @@ Stop the project if, at the stated gate:
 
 ---
 
+### Integer division undefined behavior
+
+SPIR-V `OpSDiv` and `OpSRem` with `INT_MIN / -1` (e.g., `i32::MIN / -1`) are UNDEFINED
+BEHAVIOR per SPIR-V unified spec §3.32.14. AXIOM-Compute does NOT emit runtime checks
+for this case. Programs that rely on well-defined behavior for this specific input
+must guard it manually at the source level, e.g.:
+
+    let x: i32 = if a == -2147483648 && b == -1 { -2147483648 } else { a / b };
+
+The same UB applies to unsigned integer division by zero and signed remainder by zero:
+both are undefined. Compile-time constant-folded cases (both operands literals that
+trigger UB) may be rejected at HIR typecheck in a future milestone.
+
+---
+
 ## Revision log
 
 - **2026-04-18:** Initial draft (v0.1), pre-architect review. To be revised through dual design review.
+- **2026-04-18:** M1.1 revision — added §3 integer division UB note (CRITICAL-2 fix from pessimistic review).
