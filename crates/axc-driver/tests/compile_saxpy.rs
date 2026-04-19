@@ -203,3 +203,61 @@ fn test_compile_saxpy_produces_valid_spirv() {
 
     let _ = std::fs::remove_file(&out_path);
 }
+
+// ── AT-224: design_md_m1_2_docs_present ──────────────────────────────────────
+// Verifies DESIGN.md contains the required M1.2 section headers.
+#[test]
+fn design_md_m1_2_docs_present() {
+    let manifest_dir = PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"),
+    );
+    let design_md_path = manifest_dir.join("..").join("..").join("DESIGN.md");
+    let content = std::fs::read_to_string(&design_md_path)
+        .unwrap_or_else(|e| panic!("failed to read DESIGN.md at {:?}: {e}", design_md_path));
+
+    assert!(
+        content.contains("### 3.1.1 Buffer types (M1.2)"),
+        "DESIGN.md must contain '### 3.1.1 Buffer types (M1.2)'"
+    );
+    assert!(
+        content.contains("### 3.1.2 Scalar kernel parameters (M1.2)"),
+        "DESIGN.md must contain '### 3.1.2 Scalar kernel parameters (M1.2)'"
+    );
+    assert!(
+        content.contains("### 3.1.3 Global invocation ID (M1.2)"),
+        "DESIGN.md must contain '### 3.1.3 Global invocation ID (M1.2)'"
+    );
+    assert!(
+        content.contains("M1.2 (this architect run): buffers, array indexing, gid."),
+        "DESIGN.md must contain 'M1.2 (this architect run): buffers, array indexing, gid.'"
+    );
+}
+
+// ── AT-229: design_md_m1_2_saxpy_binding_example_present ─────────────────────
+// Verifies DESIGN.md contains the saxpy binding example with correct labels.
+#[test]
+fn design_md_m1_2_saxpy_binding_example_present() {
+    let manifest_dir = PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"),
+    );
+    let design_md_path = manifest_dir.join("..").join("..").join("DESIGN.md");
+    let content = std::fs::read_to_string(&design_md_path)
+        .unwrap_or_else(|e| panic!("failed to read DESIGN.md at {:?}: {e}", design_md_path));
+
+    assert!(
+        content.contains("saxpy(a: f32, x: readonly_buffer[f32], y: buffer[f32])"),
+        "DESIGN.md must contain 'saxpy(a: f32, x: readonly_buffer[f32], y: buffer[f32])'"
+    );
+    assert!(
+        content.contains("x -> descriptor binding 0"),
+        "DESIGN.md must contain 'x -> descriptor binding 0'"
+    );
+    assert!(
+        content.contains("y -> descriptor binding 1"),
+        "DESIGN.md must contain 'y -> descriptor binding 1'"
+    );
+    assert!(
+        content.contains("a -> push-constant member 0"),
+        "DESIGN.md must contain 'a -> push-constant member 0'"
+    );
+}
