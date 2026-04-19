@@ -218,22 +218,9 @@ pub enum TypecheckError {
         span: Span,
     },
 
-    #[error("multi-dimensional buffer indexing is not supported in M1.2; use a single `u32` index")]
-    MultiDimIndexInM1_2 {
-        #[label("here")]
-        span: Span,
-    },
-
     #[error("unsupported buffer element type `{ty_name}` in M1.2 (only i32, u32, i64, u64, f32, f64 are supported)")]
     UnsupportedBufferElem {
         ty_name: &'static str,
-        #[label("here")]
-        span: Span,
-    },
-
-    #[error("unknown parameter `{name}` (not declared in kernel param list)")]
-    UnknownParam {
-        name: String,
         #[label("here")]
         span: Span,
     },
@@ -380,30 +367,40 @@ pub fn typecheck_kernel_body(
                 let _ = ty; // used in pass 1
             }
             past::Stmt::Assign { target, value } => {
-                match tc.find_binding(&target.node) {
-                    None => {
-                        tc.errors.push(TypecheckError::UnknownBinding {
-                            name: target.node.clone(),
-                            span: target.span,
-                        });
-                        // Still check the value in an unconstrained context
-                        let _ = check_expr(&mut tc, &value.node, value.span, None);
-                    }
-                    Some((bid, binding_ty, is_mutable, orig_span)) => {
-                        if !is_mutable {
-                            tc.errors.push(TypecheckError::AssignImmutable {
+                // Check if the target is a kernel parameter — params are always immutable.
+                if tc.find_param(&target.node).is_some() {
+                    tc.errors.push(TypecheckError::AssignToParam {
+                        name: target.node.clone(),
+                        span: target.span,
+                    });
+                    // Still check the value in an unconstrained context for further diagnostics.
+                    let _ = check_expr(&mut tc, &value.node, value.span, None);
+                } else {
+                    match tc.find_binding(&target.node) {
+                        None => {
+                            tc.errors.push(TypecheckError::UnknownBinding {
                                 name: target.node.clone(),
                                 span: target.span,
-                                original_span: orig_span,
                             });
+                            // Still check the value in an unconstrained context
+                            let _ = check_expr(&mut tc, &value.node, value.span, None);
                         }
-                        let hir_value = check_expr(&mut tc, &value.node, value.span, Some(binding_ty));
-                        if let Some(val_expr) = hir_value {
-                            hir_stmts.push(HirStmt::Assign {
-                                binding: bid,
-                                value: val_expr,
-                                span: spanned_stmt.span,
-                            });
+                        Some((bid, binding_ty, is_mutable, orig_span)) => {
+                            if !is_mutable {
+                                tc.errors.push(TypecheckError::AssignImmutable {
+                                    name: target.node.clone(),
+                                    span: target.span,
+                                    original_span: orig_span,
+                                });
+                            }
+                            let hir_value = check_expr(&mut tc, &value.node, value.span, Some(binding_ty));
+                            if let Some(val_expr) = hir_value {
+                                hir_stmts.push(HirStmt::Assign {
+                                    binding: bid,
+                                    value: val_expr,
+                                    span: spanned_stmt.span,
+                                });
+                            }
                         }
                     }
                 }
@@ -642,13 +639,20 @@ fn check_expr(
 
         // ── Buffer index read: name[index] ────────────────────────────────────
         past::Expr::Index { base, index } => {
-            // In M1.2, only direct identifier bases are supported.
+            // The M1.2 parser only produces Index with an Ident base (postfix `name[expr]`).
+            // Multi-dimensional chained indexing (e.g. buf[i][j]) is not parseable in M1.2.
             match &base.node {
                 past::Expr::Ident(name) => {
                     check_buffer_read(tc, name, base.span, index, span, expected)
                 }
                 _ => {
-                    tc.errors.push(TypecheckError::MultiDimIndexInM1_2 { span });
+                    // Unreachable with the current M1.2 grammar, which only allows
+                    // `identifier[expr]` as an index expression. Kept as a safety net
+                    // in case the parser is extended in a future milestone.
+                    tc.errors.push(TypecheckError::UnsupportedExprInM1_1 {
+                        detail: "multi-dimensional buffer indexing not supported in M1.2",
+                        span,
+                    });
                     None
                 }
             }
@@ -1736,10 +1740,12 @@ mod tests {
             "x: buffer[f32]",
             "let v: f32 = x[1.0f32]; return;",
         );
+        // check_buffer_read explicitly pushes BadIndexType when index_hir.ty != U32.
+        // A f32 literal with expected=U32 resolves as f32 (TypeMismatch in context), but
+        // when the resolved index type is f32, BadIndexType fires.
         assert!(
-            errors.iter().any(|e| matches!(e, TypecheckError::BadIndexType { got_ty: "f32", .. }
-                | TypecheckError::TypeMismatch { .. })),
-            "expected BadIndexType or TypeMismatch for float index: {errors:?}"
+            errors.iter().any(|e| matches!(e, TypecheckError::BadIndexType { got_ty: "f32", .. })),
+            "expected BadIndexType{{got_ty:'f32'}}: {errors:?}"
         );
     }
 
@@ -1750,9 +1756,10 @@ mod tests {
             "x: buffer[f32]",
             "let v: f32 = x[true]; return;",
         );
+        // `true` resolves as Bool; check_buffer_read fires BadIndexType for non-U32 index.
         assert!(
-            !errors.is_empty(),
-            "expected error for bool index on buffer: {errors:?}"
+            errors.iter().any(|e| matches!(e, TypecheckError::BadIndexType { got_ty: "bool", .. })),
+            "expected BadIndexType{{got_ty:'bool'}}: {errors:?}"
         );
     }
 
@@ -1789,14 +1796,25 @@ mod tests {
         );
     }
 
-    // AT-215: GidAxisOutOfRange (negative axis — stored as large u32)
+    // AT-216: GidAxisMustBeConstant for unary-negated literal (-1 is not an IntLit node)
+    // `-1` parses as Unary(Neg, IntLit(1)) — not a bare IntLit — so check_gid_call
+    // falls through to the `_` arm and fires GidAxisMustBeConstant, NOT GidAxisOutOfRange.
     #[test]
-    fn tc_gid_axis_negative_rejected() {
-        // -1 as i128 is out of 0..=2 range
+    fn tc_gid_axis_non_literal_rejected() {
         let (_, errors) = tc_body("let i: u32 = gid(-1); return;");
         assert!(
-            !errors.is_empty(),
-            "expected error for negative gid axis: {errors:?}"
+            errors.iter().any(|e| matches!(e, TypecheckError::GidAxisMustBeConstant { .. })),
+            "expected GidAxisMustBeConstant for unary-negated axis expression: {errors:?}"
+        );
+    }
+
+    // AT-215: GidAxisOutOfRange for axis value 3 (constant literal, in-range check fails)
+    #[test]
+    fn tc_gid_axis_three_out_of_range() {
+        let (_, errors) = tc_body("let i: u32 = gid(3u32); return;");
+        assert!(
+            errors.iter().any(|e| matches!(e, TypecheckError::GidAxisOutOfRange { got: 3, .. })),
+            "expected GidAxisOutOfRange{{got:3}}: {errors:?}"
         );
     }
 
@@ -1891,23 +1909,19 @@ mod tests {
         );
     }
 
-    // AssignToParam — params are immutable
+    // AssignToParam — kernel parameters are immutable; assignment fires AssignToParam
     #[test]
     fn tc_assign_to_param_rejected() {
-        // Scalar params exposed as read-only; assigning to them should fail.
-        // The typechecker exposes scalar params as LocalRead with a sentinel id.
-        // Assigning to a param name should hit UnknownBinding (since params
-        // are not in the binding table as mutable bindings).
-        // Per the typecheck implementation, a param name is not in the binding_lookup,
-        // so Assign{target="a"} hits UnknownBinding path.
+        // The typechecker checks param names BEFORE the binding table in the Assign path.
+        // Any assignment whose target matches a param name fires AssignToParam, not
+        // UnknownBinding or AssignImmutable.
         let (_, errors) = tc_with_params(
             "a: f32",
             "a = 2.0f32; return;",
         );
-        // Assigning to a param name triggers UnknownBinding (params are not let-bindings).
         assert!(
-            !errors.is_empty(),
-            "expected error when assigning to param 'a': {errors:?}"
+            errors.iter().any(|e| matches!(e, TypecheckError::AssignToParam { name, .. } if name == "a")),
+            "expected AssignToParam{{name:'a'}}: {errors:?}"
         );
     }
 
@@ -1943,31 +1957,31 @@ mod tests {
         assert!(errors.is_empty(), "writing writeonly_buffer should succeed: {errors:?}");
     }
 
-    // Buffer index with signed integer (i32) - check if accepted or rejected
+    // Buffer index with signed integer (i32) must be rejected with BadIndexType
     #[test]
-    fn tc_index_signed_integer_ok() {
-        // The spec says u32 is required; i32 should fail with BadIndexType
+    fn tc_index_signed_integer_rejected() {
+        // The spec requires u32 for buffer index; i32 must fire BadIndexType.
+        // `0i32` has an explicit suffix so it resolves as I32 regardless of expected=U32.
+        // check_buffer_read then sees index_hir.ty == I32 != U32 and fires BadIndexType.
         let (_, errors) = tc_with_params(
             "x: buffer[f32]",
             "let v: f32 = x[0i32]; return;",
         );
-        // 0i32 has type I32 which is not U32; BadIndexType should fire
         assert!(
-            errors.iter().any(|e| matches!(e, TypecheckError::BadIndexType { .. }
-                | TypecheckError::TypeMismatch { .. })),
-            "expected BadIndexType or TypeMismatch for i32 index: {errors:?}"
+            errors.iter().any(|e| matches!(e, TypecheckError::BadIndexType { got_ty: "i32", .. })),
+            "expected BadIndexType{{got_ty:'i32'}}: {errors:?}"
         );
     }
 
-    // MultiDimIndex
+    // AT-CRIT1: Verify that band() call is accepted (it was being misused as a multi-dim test).
+    // Multi-dimensional buffer indexing (e.g. buf[i][j]) is not parseable in M1.2 —
+    // the grammar only supports `identifier[expr]` postfix indexing. The
+    // TypecheckError::MultiDimIndexInM1_2 variant has been removed as dead code.
+    // This test confirms that band() is a valid bitwise builtin unrelated to indexing.
     #[test]
-    fn tc_multi_dim_index_rejected() {
-        // x[a][b] — multi-dimensional indexing is not supported in M1.2
-        // This is tricky to express syntactically — the parser may not produce Index(Index(...))
-        // but let's test what happens with a call expression in the index position
+    fn tc_band_builtin_ok() {
         let (_, errors) = tc_body("let a: i32 = 0i32; let b: i32 = 1i32; let c: i32 = band(a, b); return;");
-        // This should be fine — just a normal expression
-        assert!(errors.is_empty(), "band expr should succeed: {errors:?}");
+        assert!(errors.is_empty(), "band(a, b) should succeed: {errors:?}");
     }
 
     // Buffer index read works (integration)
