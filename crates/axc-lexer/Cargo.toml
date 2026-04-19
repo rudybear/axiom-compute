@@ -1,0 +1,14 @@
+[package]
+name = "axc-lexer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Tokenizer for AXIOM-Compute (.axc) source files"
+
+[dependencies]
+thiserror = { workspace = true }
+miette = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }

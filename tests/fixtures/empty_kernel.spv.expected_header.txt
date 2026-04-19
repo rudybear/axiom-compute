@@ -1,0 +1,13 @@
+// Golden header for examples/empty_kernel.axc compiled with default CodegenOptions.
+// Integration test asserts that the first 3 header words match these values.
+// The bound (word 3) and schema (word 4) are tested inline in the test itself.
+//
+// Per SPIR-V §2.3 Physical Layout of a SPIR-V Module:
+//   word[0] = magic
+//   word[1] = version (major.minor in high bytes; patch is 0)
+//   word[2] = generator magic
+//   word[3] = bound (ID count; runtime-determined, not in this fixture)
+//   word[4] = schema (always 0 per spec)
+0x07230203   // magic
+0x00010300   // version major=1 minor=3 (LE bytes: 00 03 01 00)
+0x00000000   // generator (forced to 0 via CodegenOptions override of rspirv default 0x000f_0000)
