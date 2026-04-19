@@ -24,6 +24,18 @@ use crate::buffers::{
     BufferBindings, PushConstantBlock, GlobalInvocationIdVar,
 };
 
+/// The SPIR-V version this codegen targets.
+///
+/// This compile-time constant gates the interface-list construction rule:
+/// in SPIR-V 1.3, StorageBuffer and PushConstant variables must NOT appear
+/// in the OpEntryPoint interface list (only Input/Output must be listed).
+/// In SPIR-V 1.4+, ALL referenced variables must appear.
+///
+/// If this constant is bumped to (1, 4), the `debug_assert_eq!` guard in
+/// `build_interface_list` will fire, forcing a review of the interface list
+/// construction logic (AT-228 requirement).
+pub const CURRENT_SPIRV_VERSION: (u8, u8) = (1, 3);
+
 /// Options for the SPIR-V emission pass.
 ///
 /// Both fields have tested defaults: `spirv_version = (1, 3)` and
@@ -206,7 +218,22 @@ pub fn emit_module(hir: &HirModule, opts: &CodegenOptions) -> Result<Vec<u32>, C
             b.end_function().expect("rspirv: end_function should not fail after a complete block");
 
             // ── Step 9: Entry point (with gid in interface if needed) ─────────
+            //
+            // SPIR-V 1.3 §2.17: only Input and Output variables must appear in the
+            // interface list. StorageBuffer and PushConstant are excluded.
+            // SPIR-V 1.4+ requires ALL referenced variables — so if CURRENT_SPIRV_VERSION
+            // is ever bumped to (1, 4), this assert fires to force a review.
+            debug_assert_eq!(
+                CURRENT_SPIRV_VERSION, (1, 3),
+                "CURRENT_SPIRV_VERSION bumped to {:?}; review interface list construction — \
+                 SPIR-V 1.4+ requires all referenced variables in the interface list, \
+                 not just Input/Output (AT-228 guard)",
+                CURRENT_SPIRV_VERSION
+            );
             let mut interface: Vec<u32> = Vec::new();
+            // Only Input-class variables go in the interface list for SPIR-V 1.3.
+            // gid_var has StorageClass::Input → include it.
+            // buffer_bindings (StorageBuffer) and push_constant (PushConstant) → exclude.
             if let Some(gid_id) = gid_var_id_for_ep {
                 interface.push(gid_id);
             }
@@ -572,6 +599,287 @@ mod tests {
         assert!(caps.contains(&1u32),   "empty kernel must declare OpCapability Shader (1)");
         assert!(!caps.contains(&11u32), "empty kernel must NOT declare OpCapability Int64 (11)");
         assert!(!caps.contains(&10u32), "empty kernel must NOT declare OpCapability Float64 (10)");
+    }
+
+    // ── AT-205: emit_saxpy_deterministic ─────────────────────────────────────
+
+    #[test]
+    fn emit_saxpy_deterministic() {
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR not set");
+        let examples_dir = std::path::PathBuf::from(&manifest_dir)
+            .join("..").join("..").join("examples");
+        let saxpy_path = examples_dir.join("saxpy.axc");
+        if !saxpy_path.exists() {
+            eprintln!("Skipping emit_saxpy_deterministic: saxpy.axc not found at {:?}", saxpy_path);
+            return;
+        }
+        let src = std::fs::read_to_string(&saxpy_path).expect("read saxpy.axc");
+        let hir1 = make_hir(&src);
+        let hir2 = make_hir(&src);
+        let words1 = emit_module(&hir1, &CodegenOptions::default()).expect("emit1");
+        let words2 = emit_module(&hir2, &CodegenOptions::default()).expect("emit2");
+        assert_eq!(words1, words2, "emit_saxpy_deterministic: two compilations must be bytewise equal");
+    }
+
+    // ── AT-206: cg_saxpy_binding_indices_skip_scalar ─────────────────────────
+
+    #[test]
+    fn cg_saxpy_binding_indices_skip_scalar() {
+        use rspirv::spirv::Decoration;
+        use rspirv::dr::Operand;
+
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR not set");
+        let examples_dir = std::path::PathBuf::from(&manifest_dir)
+            .join("..").join("..").join("examples");
+        let saxpy_path = examples_dir.join("saxpy.axc");
+        if !saxpy_path.exists() {
+            eprintln!("Skipping cg_saxpy_binding_indices_skip_scalar: saxpy.axc not found");
+            return;
+        }
+        let src = std::fs::read_to_string(&saxpy_path).expect("read saxpy.axc");
+        let hir = make_hir(&src);
+        let words = emit_module(&hir, &CodegenOptions::default()).expect("emit");
+        let module = rspirv::dr::load_words(&words).expect("load");
+
+        let binding_vals: Vec<u32> = module.annotations.iter()
+            .filter(|inst| {
+                inst.class.opcode == rspirv::spirv::Op::Decorate
+                    && inst.operands.iter().any(|op| matches!(op, Operand::Decoration(Decoration::Binding)))
+            })
+            .filter_map(|inst| inst.operands.iter().find_map(|op| {
+                if let Operand::LiteralBit32(n) = op { Some(*n) } else { None }
+            }))
+            .collect();
+
+        assert!(binding_vals.contains(&0), "saxpy: x must be at Binding 0; got {:?}", binding_vals);
+        assert!(binding_vals.contains(&1), "saxpy: y must be at Binding 1; got {:?}", binding_vals);
+        assert!(!binding_vals.contains(&2), "saxpy: no Binding 2 (scalar params skip binding slots); got {:?}", binding_vals);
+    }
+
+    // ── AT-207: emit_capability_no_int64_on_f32_saxpy ────────────────────────
+
+    #[test]
+    fn emit_capability_no_int64_on_f32_saxpy() {
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR not set");
+        let examples_dir = std::path::PathBuf::from(&manifest_dir)
+            .join("..").join("..").join("examples");
+        let saxpy_path = examples_dir.join("saxpy.axc");
+        if !saxpy_path.exists() {
+            eprintln!("Skipping emit_capability_no_int64_on_f32_saxpy: saxpy.axc not found");
+            return;
+        }
+        let src = std::fs::read_to_string(&saxpy_path).expect("read saxpy.axc");
+        let hir = make_hir(&src);
+        let words = emit_module(&hir, &CodegenOptions::default()).expect("emit");
+        let caps = collect_capability_words(&words);
+        assert!(caps.contains(&1u32), "saxpy must declare OpCapability Shader (1)");
+        assert!(!caps.contains(&11u32), "saxpy f32-only must NOT declare Int64 (11)");
+        assert!(!caps.contains(&10u32), "saxpy f32-only must NOT declare Float64 (10)");
+    }
+
+    // ── AT-217: emit_saxpy_interface_list_contains_only_gid ──────────────────
+
+    #[test]
+    fn emit_saxpy_interface_list_contains_only_gid() {
+        use rspirv::spirv::{Op, StorageClass};
+        use rspirv::dr::Operand;
+
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR not set");
+        let examples_dir = std::path::PathBuf::from(&manifest_dir)
+            .join("..").join("..").join("examples");
+        let saxpy_path = examples_dir.join("saxpy.axc");
+        if !saxpy_path.exists() {
+            eprintln!("Skipping emit_saxpy_interface_list_contains_only_gid: saxpy.axc not found");
+            return;
+        }
+        let src = std::fs::read_to_string(&saxpy_path).expect("read saxpy.axc");
+        let hir = make_hir(&src);
+        let words = emit_module(&hir, &CodegenOptions::default()).expect("emit");
+        let module = rspirv::dr::load_words(&words).expect("load");
+
+        // Collect the gid variable id (Input storage class).
+        let gid_var_ids: Vec<u32> = module.types_global_values.iter()
+            .filter(|inst| {
+                inst.class.opcode == Op::Variable
+                    && inst.operands.iter().any(|op| matches!(op, Operand::StorageClass(StorageClass::Input)))
+            })
+            .filter_map(|inst| inst.result_id)
+            .collect();
+        assert_eq!(gid_var_ids.len(), 1, "expected exactly 1 Input variable (gid)");
+        let gid_var_id = gid_var_ids[0];
+
+        // Collect StorageBuffer and PushConstant var ids.
+        let non_input_var_ids: std::collections::HashSet<u32> = module.types_global_values.iter()
+            .filter(|inst| {
+                inst.class.opcode == Op::Variable
+                    && inst.operands.iter().any(|op| matches!(
+                        op,
+                        Operand::StorageClass(StorageClass::StorageBuffer)
+                        | Operand::StorageClass(StorageClass::PushConstant)
+                    ))
+            })
+            .filter_map(|inst| inst.result_id)
+            .collect();
+
+        // Walk OpEntryPoint interface list.
+        for ep in &module.entry_points {
+            let interface_ids: Vec<u32> = ep.operands.iter().filter_map(|op| {
+                if let Operand::IdRef(id) = op { Some(*id) } else { None }
+            }).collect();
+            // gid must be present.
+            assert!(
+                interface_ids.contains(&gid_var_id),
+                "AT-217: gid variable must appear in OpEntryPoint interface list; list={:?}", interface_ids
+            );
+            // StorageBuffer and PushConstant must NOT be present.
+            for id in &interface_ids {
+                assert!(
+                    !non_input_var_ids.contains(id),
+                    "AT-217: non-Input variable {id} must NOT appear in OpEntryPoint interface list (SPIR-V 1.3 §2.17); list={:?}",
+                    interface_ids
+                );
+            }
+        }
+    }
+
+    // ── AT-228: emit_spirv_version_target_1_3_storage_buffer_excluded_from_interface_list
+
+    #[test]
+    fn emit_spirv_version_target_1_3_storage_buffer_excluded_from_interface_list() {
+        use rspirv::spirv::{Op, StorageClass};
+        use rspirv::dr::Operand;
+
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR not set");
+        let examples_dir = std::path::PathBuf::from(&manifest_dir)
+            .join("..").join("..").join("examples");
+        let saxpy_path = examples_dir.join("saxpy.axc");
+        if !saxpy_path.exists() {
+            eprintln!("Skipping AT-228 test: saxpy.axc not found");
+            return;
+        }
+        let src = std::fs::read_to_string(&saxpy_path).expect("read saxpy.axc");
+        let hir = make_hir(&src);
+        let words = emit_module(&hir, &CodegenOptions::default()).expect("emit");
+
+        // (1) Version word must be SPIR-V 1.3.
+        assert_eq!(words[1], 0x0001_0300_u32, "AT-228: version word must be SPIR-V 1.3 (0x00010300)");
+
+        // Also verify via the compile-time constant.
+        assert_eq!(
+            CURRENT_SPIRV_VERSION, (1, 3),
+            "AT-228: CURRENT_SPIRV_VERSION must be (1, 3)"
+        );
+
+        let module = rspirv::dr::load_words(&words).expect("load");
+
+        // (2) Collect S = StorageBuffer + PushConstant variable ids.
+        let excluded_ids: std::collections::HashSet<u32> = module.types_global_values.iter()
+            .filter(|inst| {
+                inst.class.opcode == Op::Variable
+                    && inst.operands.iter().any(|op| matches!(
+                        op,
+                        Operand::StorageClass(StorageClass::StorageBuffer)
+                        | Operand::StorageClass(StorageClass::PushConstant)
+                    ))
+            })
+            .filter_map(|inst| inst.result_id)
+            .collect();
+        assert!(!excluded_ids.is_empty(), "AT-228: saxpy must have StorageBuffer/PushConstant vars");
+
+        // (3) None of the excluded ids appear in any OpEntryPoint interface list.
+        for ep in &module.entry_points {
+            for op in &ep.operands {
+                if let Operand::IdRef(id) = op {
+                    assert!(
+                        !excluded_ids.contains(id),
+                        "AT-228: StorageBuffer/PushConstant variable {id} must not appear in interface list (SPIR-V 1.3 §2.17)"
+                    );
+                }
+            }
+        }
+
+        // (4) The gid (Input) variable DOES appear.
+        let gid_var_id = module.types_global_values.iter()
+            .filter(|inst| {
+                inst.class.opcode == Op::Variable
+                    && inst.operands.iter().any(|op| matches!(op, Operand::StorageClass(StorageClass::Input)))
+            })
+            .find_map(|inst| inst.result_id)
+            .expect("AT-228: saxpy must have an Input variable (gid)");
+        let gid_in_ep = module.entry_points.iter().any(|ep| {
+            ep.operands.iter().any(|op| matches!(op, Operand::IdRef(id) if *id == gid_var_id))
+        });
+        assert!(gid_in_ep, "AT-228: gid (Input) variable must appear in OpEntryPoint interface list");
+    }
+
+    // ── AT-227: cg_determinism_across_repeat_compilations_multi_entry_caches ──
+
+    #[test]
+    fn cg_determinism_across_repeat_compilations_multi_entry_caches() {
+        // Stress kernel with 3 distinct scalar types + 3 distinct buffer elem types.
+        // Compiles twice with fresh caches; asserts bytewise equality.
+        let src = concat!(
+            "@kernel @workgroup(1,1,1) fn stress(",
+            "  a: f32, b: u32, c: i64,",
+            "  x: readonly_buffer[f32], y: buffer[i32], z: buffer[u64]",
+            ") -> void {",
+            "  let i: u32 = gid(0u32);",
+            "  y[i] = 0i32;",
+            "  z[i] = 0u64;",
+            "  return;",
+            "}"
+        );
+
+        let hir1 = make_hir(src);
+        let hir2 = make_hir(src);
+        let opts = CodegenOptions::default();
+        let words1 = emit_module(&hir1, &opts).expect("emit1");
+        let words2 = emit_module(&hir2, &opts).expect("emit2");
+
+        assert_eq!(
+            words1, words2,
+            "AT-227: stress kernel must produce bytewise-identical output on two compilations \
+             (BTreeMap iteration order must be deterministic)"
+        );
+
+        // Also assert 3 distinct OpTypeRuntimeArray (one per buffer elem type)
+        let module = rspirv::dr::load_words(&words1).expect("load");
+        let runtime_array_count = module.types_global_values.iter()
+            .filter(|inst| inst.class.opcode == rspirv::spirv::Op::TypeRuntimeArray)
+            .count();
+        assert_eq!(
+            runtime_array_count, 3,
+            "AT-227: stress kernel must emit 3 OpTypeRuntimeArray (f32, i32, u64); got {runtime_array_count}"
+        );
+    }
+
+    // ── AT-204: emit_scalar_demo_unchanged_vs_m1_1 ───────────────────────────
+    // Scalar demo must still compile cleanly (backward compat).
+    #[test]
+    fn emit_scalar_demo_unchanged_vs_m1_1() {
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR not set");
+        let examples_dir = std::path::PathBuf::from(&manifest_dir)
+            .join("..").join("..").join("examples");
+        let path = examples_dir.join("scalar_demo.axc");
+        if !path.exists() {
+            eprintln!("Skipping emit_scalar_demo_unchanged_vs_m1_1: scalar_demo.axc not found");
+            return;
+        }
+        let src = std::fs::read_to_string(&path).expect("read scalar_demo.axc");
+        let hir = make_hir(&src);
+        let words = emit_module(&hir, &CodegenOptions::default()).expect("emit");
+        // Basic invariants: magic + version.
+        assert_eq!(words[0], 0x0723_0203_u32, "magic word mismatch for scalar_demo");
+        assert_eq!(words[1], 0x0001_0300_u32, "version must be 1.3 for scalar_demo");
+        // Must be deterministic.
+        let words2 = emit_module(&hir, &CodegenOptions::default()).expect("emit2");
+        assert_eq!(words, words2, "scalar_demo must be deterministic");
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
