@@ -19,7 +19,7 @@
 use axc_lexer::{Token, TokenKind, Span, Spanned, LexError};
 use crate::ast::{
     Module, Item, KernelDecl, Annotation, AnnotationArg, Block, Stmt, Expr, TypeRef, Param,
-    BinOp, UnaryOp, ShortCircuitOp,
+    BinOp, UnaryOp, ShortCircuitOp, ScalarTypeRef,
 };
 
 /// Maximum expression nesting depth before emitting ExpressionNestingTooDeep.
@@ -339,28 +339,71 @@ impl<'tok> Parser<'tok> {
     // ── Parameters ───────────────────────────────────────────────────────────
 
     fn parse_params(&mut self) -> Vec<Spanned<Param>> {
-        // M1.1 still rejects any params with UnsupportedInM1_1
+        // M1.2: kernel parameters are now supported.
+        let mut params: Vec<Spanned<Param>> = Vec::new();
+
         if self.peek_kind() == &TokenKind::RParen {
-            return Vec::new(); // empty param list is fine
+            return params; // empty param list is fine
         }
-        // Any non-`)` token means params are present — reject
-        let span: Span = self.peek_span();
-        self.errors.push(ParseError::UnsupportedInM1_1 {
-            detail: "kernel parameters".into(),
-            span,
-        });
-        // Recovery: skip to the matching `)` (or EOF)
-        let mut depth: usize = 0;
+
         loop {
-            match self.peek_kind() {
-                TokenKind::RParen if depth == 0 => break,
-                TokenKind::LParen => { depth += 1; self.advance(); }
-                TokenKind::RParen => { depth -= 1; self.advance(); }
-                TokenKind::Eof => break,
-                _ => { self.advance(); }
+            // Skip lexer error tokens
+            while self.peek_kind().is_error() {
+                self.advance();
+            }
+            if self.peek_kind() == &TokenKind::RParen || self.is_at_end() {
+                break;
+            }
+
+            let param_start: Span = self.peek_span();
+
+            // name : type_ref
+            let name: String = match self.peek_kind().clone() {
+                TokenKind::Ident(n) => { self.advance(); n }
+                _ => {
+                    self.errors.push(ParseError::Unexpected {
+                        expected: "parameter name (identifier)".into(),
+                        found: format!("{:?}", self.peek_kind()),
+                        span: self.peek_span(),
+                    });
+                    // Recovery: skip to `)` or `,`
+                    self.recover_to_comma_or_rparen();
+                    break;
+                }
+            };
+            let name_span: Span = self.last_span();
+
+            if !self.expect_token(TokenKind::Colon, ":") {
+                self.recover_to_comma_or_rparen();
+                break;
+            }
+
+            let ty: Spanned<TypeRef> = match self.parse_type_ref() {
+                Some(t) => t,
+                None => {
+                    self.recover_to_comma_or_rparen();
+                    break;
+                }
+            };
+
+            let param_span: Span = param_start.merge(ty.span);
+            params.push(Spanned::new(
+                Param {
+                    name: Spanned::new(name, name_span),
+                    ty,
+                },
+                param_span,
+            ));
+
+            // Optional trailing comma
+            if self.peek_kind() == &TokenKind::Comma {
+                self.advance();
+            } else {
+                break;
             }
         }
-        Vec::new()
+
+        params
     }
 
     // ── Type reference ───────────────────────────────────────────────────────
@@ -376,9 +419,28 @@ impl<'tok> Parser<'tok> {
             TokenKind::U64  => { self.advance(); TypeRef::U64 }
             TokenKind::F32  => { self.advance(); TypeRef::F32 }
             TokenKind::F64  => { self.advance(); TypeRef::F64 }
+            // M1.2: buffer types — buffer[elem], readonly_buffer[elem], writeonly_buffer[elem]
+            TokenKind::Buffer => {
+                self.advance();
+                let elem: ScalarTypeRef = self.parse_buffer_elem()?;
+                let end_span: Span = self.last_span();
+                return Some(Spanned::new(TypeRef::Buffer(elem), span.merge(end_span)));
+            }
+            TokenKind::ReadonlyBuffer => {
+                self.advance();
+                let elem: ScalarTypeRef = self.parse_buffer_elem()?;
+                let end_span: Span = self.last_span();
+                return Some(Spanned::new(TypeRef::ReadonlyBuffer(elem), span.merge(end_span)));
+            }
+            TokenKind::WriteonlyBuffer => {
+                self.advance();
+                let elem: ScalarTypeRef = self.parse_buffer_elem()?;
+                let end_span: Span = self.last_span();
+                return Some(Spanned::new(TypeRef::WriteonlyBuffer(elem), span.merge(end_span)));
+            }
             other => {
                 self.errors.push(ParseError::Unexpected {
-                    expected: "type (void, bool, i32, u32, i64, u64, f32, f64)".into(),
+                    expected: "type (void, bool, i32, u32, i64, u64, f32, f64, buffer[T], readonly_buffer[T], writeonly_buffer[T])".into(),
                     found: format!("{:?}", other),
                     span,
                 });
@@ -386,6 +448,33 @@ impl<'tok> Parser<'tok> {
             }
         };
         Some(Spanned::new(ty, span))
+    }
+
+    /// Parse `[scalar_type]` after a buffer keyword.
+    fn parse_buffer_elem(&mut self) -> Option<ScalarTypeRef> {
+        if !self.expect_token(TokenKind::LBracket, "[") {
+            return None;
+        }
+        let elem: ScalarTypeRef = match self.peek_kind().clone() {
+            TokenKind::I32 => { self.advance(); ScalarTypeRef::I32 }
+            TokenKind::U32 => { self.advance(); ScalarTypeRef::U32 }
+            TokenKind::I64 => { self.advance(); ScalarTypeRef::I64 }
+            TokenKind::U64 => { self.advance(); ScalarTypeRef::U64 }
+            TokenKind::F32 => { self.advance(); ScalarTypeRef::F32 }
+            TokenKind::F64 => { self.advance(); ScalarTypeRef::F64 }
+            other => {
+                self.errors.push(ParseError::Unexpected {
+                    expected: "buffer element type (i32, u32, i64, u64, f32, f64)".into(),
+                    found: format!("{:?}", other),
+                    span: self.peek_span(),
+                });
+                return None;
+            }
+        };
+        if !self.expect_token(TokenKind::RBracket, "]") {
+            return None;
+        }
+        Some(elem)
     }
 
     // ── Block ────────────────────────────────────────────────────────────────
@@ -456,12 +545,18 @@ impl<'tok> Parser<'tok> {
             TokenKind::Let => self.parse_let_stmt(),
             TokenKind::Return => self.parse_return_stmt(),
             TokenKind::Ident(_) => {
-                // Lookahead: pos+1 is assign?
+                // Lookahead: pos+1 is `=` → scalar assign; pos+1 is `[` → buffer index assign.
                 let next_pos: usize = (self.pos + 1).min(self.tokens.len() - 1);
-                if self.tokens[next_pos].kind == TokenKind::Assign {
-                    return self.parse_assign_stmt();
+                match self.tokens[next_pos].kind {
+                    TokenKind::Assign => {
+                        return self.parse_assign_stmt();
+                    }
+                    TokenKind::LBracket => {
+                        return self.parse_index_assign_stmt();
+                    }
+                    _ => {}
                 }
-                // Else: bare expression statements are not allowed in M1.1
+                // Else: bare expression statements are not allowed in M1.2
                 let found: String = format!("{:?}", self.peek_kind());
                 self.errors.push(ParseError::Unexpected {
                     expected: "let, return, or assignment".into(),
@@ -582,6 +677,59 @@ impl<'tok> Parser<'tok> {
         Some(Spanned::new(
             Stmt::Assign {
                 target: Spanned::new(name, name_span),
+                value,
+            },
+            span,
+        ))
+    }
+
+    /// Parse `name[index] = expr;` — buffer write statement.
+    fn parse_index_assign_stmt(&mut self) -> Option<Spanned<Stmt>> {
+        let name_span: Span = self.peek_span();
+        let name: String = match self.peek_kind().clone() {
+            TokenKind::Ident(n) => { self.advance(); n }
+            _ => unreachable!("parse_index_assign_stmt called without Ident"),
+        };
+
+        // Consume `[`
+        self.advance();
+
+        let index: Spanned<Expr> = match self.parse_expr(0) {
+            Some(e) => e,
+            None => {
+                self.recover_to_semicolon_or_brace();
+                return None;
+            }
+        };
+
+        if !self.expect_token(TokenKind::RBracket, "]") {
+            self.recover_to_semicolon_or_brace();
+            return None;
+        }
+
+        if !self.expect_token(TokenKind::Assign, "=") {
+            self.recover_to_semicolon_or_brace();
+            return None;
+        }
+
+        let value: Spanned<Expr> = match self.parse_expr(0) {
+            Some(e) => e,
+            None => {
+                self.recover_to_semicolon_or_brace();
+                return None;
+            }
+        };
+
+        let semi_span: Span = self.peek_span();
+        if !self.expect_token(TokenKind::Semicolon, ";") {
+            return None;
+        }
+
+        let span: Span = name_span.merge(semi_span);
+        Some(Spanned::new(
+            Stmt::IndexAssign {
+                target: Spanned::new(name, name_span),
+                index,
                 value,
             },
             span,
@@ -716,7 +864,7 @@ impl<'tok> Parser<'tok> {
                 Some(Spanned::new(Expr::FloatLit { value, suffix }, span))
             }
 
-            // ── Identifier or call ──────────────────────────────────────────
+            // ── Identifier, call, or index ──────────────────────────────────
             TokenKind::Ident(name) => {
                 self.advance();
                 // Postfix call: `name(...)`
@@ -744,6 +892,22 @@ impl<'tok> Parser<'tok> {
                             args,
                         },
                         call_span,
+                    ))
+                } else if self.peek_kind() == &TokenKind::LBracket {
+                    // Postfix index: `name[expr]` — buffer read.
+                    self.advance(); // consume `[`
+                    let index_expr: Spanned<Expr> = self.parse_expr(depth + 1)?;
+                    let end_span: Span = self.peek_span();
+                    if !self.expect_token(TokenKind::RBracket, "]") {
+                        return None;
+                    }
+                    let index_span: Span = span.merge(end_span);
+                    Some(Spanned::new(
+                        Expr::Index {
+                            base: Box::new(Spanned::new(Expr::Ident(name), span)),
+                            index: Box::new(index_expr),
+                        },
+                        index_span,
                     ))
                 } else {
                     Some(Spanned::new(Expr::Ident(name), span))
@@ -842,6 +1006,16 @@ impl<'tok> Parser<'tok> {
         loop {
             match self.peek_kind() {
                 TokenKind::Annotation(_) | TokenKind::Eof => break,
+                _ => { self.advance(); }
+            }
+        }
+    }
+
+    /// Skip tokens until `,` or `)` (left in place) or EOF.
+    fn recover_to_comma_or_rparen(&mut self) {
+        loop {
+            match self.peek_kind() {
+                TokenKind::Comma | TokenKind::RParen | TokenKind::Eof => break,
                 _ => { self.advance(); }
             }
         }
@@ -973,14 +1147,18 @@ mod tests {
         assert!(found.is_some(), "expected UnsupportedInM1_1 'while loop', got: {errors:?}");
     }
 
-    // ── §7.6 audit table row 7: kernel params still rejected ─────────────────
+    // ── §7.6 audit table row 7: kernel params now SUPPORTED in M1.2 ──────────
 
     #[test]
-    fn kernel_params_rejected() {
+    fn kernel_scalar_params_accepted() {
+        // M1.2: scalar params are now valid.
         let src = "@kernel @workgroup(64,1,1) fn k(x: i32) -> void { return; }";
-        let (_, errors) = parse_src(src);
-        let found = errors.iter().find(|e| matches!(e, ParseError::UnsupportedInM1_1 { detail, .. } if detail == "kernel parameters"));
-        assert!(found.is_some(), "expected UnsupportedInM1_1 for kernel parameters: {errors:?}");
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "expected scalar param to be accepted in M1.2: {errors:?}");
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        assert_eq!(kd.params.len(), 1);
+        assert_eq!(kd.params[0].node.name.node, "x");
+        assert_eq!(kd.params[0].node.ty.node, TypeRef::I32);
     }
 
     // ── AT-6: unknown top-level item ─────────────────────────────────────────
@@ -1275,5 +1453,120 @@ mod tests {
         let (_, errors) = parse_src(&src);
         assert!(errors.iter().any(|e| matches!(e, ParseError::ExpressionNestingTooDeep { .. })),
             "expected ExpressionNestingTooDeep for 257 nested parens, got: {errors:?}");
+    }
+
+    // ── M1.2: buffer parameter parsing ───────────────────────────────────────
+
+    #[test]
+    fn parse_buffer_param() {
+        let src = "@kernel @workgroup(64,1,1) fn saxpy(x: readonly_buffer[f32]) -> void { return; }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        assert_eq!(kd.params.len(), 1);
+        assert_eq!(kd.params[0].node.name.node, "x");
+        assert_eq!(kd.params[0].node.ty.node, TypeRef::ReadonlyBuffer(crate::ast::ScalarTypeRef::F32));
+    }
+
+    #[test]
+    fn parse_writeonly_buffer_param() {
+        let src = "@kernel @workgroup(64,1,1) fn k(out: writeonly_buffer[u32]) -> void { return; }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        assert_eq!(kd.params[0].node.ty.node, TypeRef::WriteonlyBuffer(crate::ast::ScalarTypeRef::U32));
+    }
+
+    #[test]
+    fn parse_rw_buffer_param() {
+        let src = "@kernel @workgroup(64,1,1) fn k(y: buffer[f32]) -> void { return; }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        assert_eq!(kd.params[0].node.ty.node, TypeRef::Buffer(crate::ast::ScalarTypeRef::F32));
+    }
+
+    #[test]
+    fn parse_multiple_params() {
+        let src = "@kernel @workgroup(64,1,1) fn saxpy(a: f32, x: readonly_buffer[f32], y: buffer[f32]) -> void { return; }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        assert_eq!(kd.params.len(), 3);
+        assert_eq!(kd.params[0].node.name.node, "a");
+        assert_eq!(kd.params[0].node.ty.node, TypeRef::F32);
+        assert_eq!(kd.params[1].node.name.node, "x");
+        assert_eq!(kd.params[1].node.ty.node, TypeRef::ReadonlyBuffer(crate::ast::ScalarTypeRef::F32));
+        assert_eq!(kd.params[2].node.name.node, "y");
+        assert_eq!(kd.params[2].node.ty.node, TypeRef::Buffer(crate::ast::ScalarTypeRef::F32));
+    }
+
+    #[test]
+    fn parse_index_expr_buffer_read() {
+        // x[i] in an expression context parses to Expr::Index
+        let src = "@kernel @workgroup(64,1,1) fn k(x: readonly_buffer[f32]) -> void { let v: f32 = x[0u32]; return; }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        if let crate::ast::Stmt::Let { ref init, .. } = kd.body.node.stmts[0].node {
+            assert!(matches!(init.node, Expr::Index { .. }), "expected Index expr, got: {:?}", init.node);
+        } else {
+            panic!("expected Let stmt");
+        }
+    }
+
+    #[test]
+    fn parse_index_assign_buffer_write() {
+        // y[i] = expr parses to Stmt::IndexAssign
+        let src = "@kernel @workgroup(64,1,1) fn k(y: buffer[f32]) -> void { y[0u32] = 1.0f32; return; }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        assert!(matches!(kd.body.node.stmts[0].node, crate::ast::Stmt::IndexAssign { .. }),
+            "expected IndexAssign stmt, got: {:?}", kd.body.node.stmts[0].node);
+    }
+
+    #[test]
+    fn parse_saxpy_body() {
+        // Full saxpy kernel: a * x[i] + y[i] with buffer write
+        let src = "@kernel @workgroup(64,1,1) fn saxpy(a: f32, x: readonly_buffer[f32], y: buffer[f32]) -> void { let i: u32 = 0u32; y[i] = a * x[i] + y[i]; return; }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        assert_eq!(kd.params.len(), 3);
+        // First stmt is let, second is index-assign
+        assert!(matches!(kd.body.node.stmts[0].node, crate::ast::Stmt::Let { .. }));
+        assert!(matches!(kd.body.node.stmts[1].node, crate::ast::Stmt::IndexAssign { .. }));
+    }
+
+    #[test]
+    fn parse_gid_call() {
+        // gid(0u32) — a builtin call that parses as Expr::Call
+        let src = "@kernel @workgroup(64,1,1) fn k() -> void { let i: u32 = gid(0u32); return; }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        if let crate::ast::Stmt::Let { ref init, .. } = kd.body.node.stmts[0].node {
+            assert!(matches!(&init.node, Expr::Call { name, .. } if name.node == "gid"),
+                "expected Call gid, got: {:?}", init.node);
+        } else {
+            panic!("expected Let stmt");
+        }
+    }
+
+    #[test]
+    fn parse_buffer_i64_elem() {
+        let src = "@kernel @workgroup(64,1,1) fn k(b: buffer[i64]) -> void { return; }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        assert_eq!(kd.params[0].node.ty.node, TypeRef::Buffer(crate::ast::ScalarTypeRef::I64));
+    }
+
+    #[test]
+    fn parse_buffer_invalid_elem_rejected() {
+        let src = "@kernel @workgroup(64,1,1) fn k(b: buffer[bool]) -> void { return; }";
+        let (_, errors) = parse_src(src);
+        assert!(!errors.is_empty(), "expected parse error for invalid buffer elem type");
     }
 }

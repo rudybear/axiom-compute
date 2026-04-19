@@ -15,6 +15,7 @@ use crate::hir::{
     DESKTOP_MAX_WORKGROUP_INVOCATIONS,
 };
 use crate::typecheck::TypecheckError;
+use crate::param::BindingPlanError;
 
 /// Diagnostic error from HIR validation.
 #[derive(Debug, thiserror::Error, miette::Diagnostic)]
@@ -82,6 +83,20 @@ pub enum HirError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     Typecheck(TypecheckError),
+
+    /// A binding plan error (push constant overflow or unsupported param type).
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    BindingPlan(BindingPlanError),
+
+    /// Unsupported parameter type (void, bool not allowed as kernel params).
+    #[error("unsupported parameter type `{ty_name}` for kernel parameter `{param_name}`")]
+    UnsupportedParamType {
+        ty_name: String,
+        param_name: String,
+        #[label("here")]
+        span: Span,
+    },
 }
 
 /// Non-fatal diagnostic warning from HIR validation.
@@ -161,6 +176,7 @@ mod tests {
 
     /// Build a minimal HIR module with one kernel and the given workgroup dims.
     fn make_module(x: u32, y: u32, z: u32) -> HirModule {
+        use crate::param::ParamBindingPlan;
         HirModule {
             kernels: vec![Kernel {
                 id: KernelId(0),
@@ -171,6 +187,12 @@ mod tests {
                     complexity: None,
                     preconditions: Vec::new(),
                     subgroup_uniform: false,
+                },
+                params: Vec::new(),
+                binding_plan: ParamBindingPlan {
+                    buffers: Vec::new(),
+                    scalars: Vec::new(),
+                    push_constant_total_bytes: 0,
                 },
                 body: KernelBody::Empty,
                 span: Span::new(0, 10),

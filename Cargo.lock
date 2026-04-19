@@ -95,6 +95,8 @@ dependencies = [
  "axc-parser",
  "clap",
  "miette",
+ "rspirv",
+ "spirv",
  "thiserror",
 ]
 

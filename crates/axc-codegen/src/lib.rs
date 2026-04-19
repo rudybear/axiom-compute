@@ -5,6 +5,11 @@
 
 pub mod emit;
 pub mod body;
+pub mod buffers;
 
 pub use emit::{emit_module, emit_module_bytes, CodegenError, CodegenOptions};
-pub use body::{ScalarTypeCache, CapabilitiesRequired, BodyCodegenError, emit_kernel_body};
+pub use body::{ScalarTypeCache, CapabilitiesRequired, BodyCodegenError, KernelResources, emit_kernel_body};
+pub use buffers::{
+    emit_buffer_globals, emit_push_constant_block, emit_gid_variable,
+    BufferBindings, PushConstantBlock, GlobalInvocationIdVar,
+};

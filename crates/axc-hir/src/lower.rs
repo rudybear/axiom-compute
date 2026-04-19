@@ -5,13 +5,16 @@
 //! `@complexity` is mapped to `ComplexityForm` enum values (never a String).
 
 use axc_lexer::Span;
-use axc_parser::ast::{Module as AstModule, Item, AnnotationArg, Stmt};
+use axc_parser::ast::{Module as AstModule, Item, AnnotationArg, Stmt, TypeRef, ScalarTypeRef};
 use crate::hir::{
     Module as HirModule, Kernel, KernelId, KernelAnnotations, WorkgroupDims,
     KernelBody, ComplexityForm, ComplexityVar, PreconditionTrivial,
 };
 use crate::validate::{HirError, HirWarning};
 use crate::typecheck::typecheck_kernel_body;
+use crate::ty::ScalarTy;
+use crate::buffer::{BufferAccess, BufferTy};
+use crate::param::{KernelParam, Ty as ParamTy, ParamBindingPlan, compute_binding_plan};
 
 /// Lower an AST module to HIR, producing structured errors and warnings.
 ///
@@ -155,13 +158,22 @@ pub fn lower_module(ast: &AstModule) -> (HirModule, Vec<HirError>, Vec<HirWarnin
                     subgroup_uniform,
                 };
 
+                // Lower kernel parameters.
+                let (params, binding_plan) = lower_params(
+                    &kd.params,
+                    item.span,
+                    &mut errors,
+                );
+
                 // Determine body: Empty if trivial (only void return), Typed otherwise.
-                let body = lower_kernel_body(&kd.body.node, &mut errors);
+                let body = lower_kernel_body(&kd.body.node, &params, &mut errors);
 
                 kernels.push(Kernel {
                     id: KernelId(next_id),
                     name: kd.name.node.clone(),
                     annotations,
+                    params,
+                    binding_plan,
                     body,
                     span: item.span,
                 });
@@ -177,29 +189,129 @@ pub fn lower_module(ast: &AstModule) -> (HirModule, Vec<HirError>, Vec<HirWarnin
 /// empty), and lower it to the appropriate `KernelBody` variant.
 ///
 /// Uses `KernelBody::Empty` if:
-/// - The block has no statements, OR
-/// - The block has exactly one statement that is `Stmt::Return(None)`.
+/// - The block has no statements AND there are no parameters, OR
+/// - The block has exactly one statement that is `Stmt::Return(None)` AND no parameters.
 ///
 /// This preserves the M0 empty-kernel bit-exact SPIR-V output (AT-103).
 fn lower_kernel_body(
     block: &axc_parser::ast::Block,
+    params: &[KernelParam],
     errors: &mut Vec<HirError>,
 ) -> KernelBody {
     let stmts = &block.stmts;
 
-    let is_empty_body = stmts.is_empty()
+    let is_trivial_stmts = stmts.is_empty()
         || (stmts.len() == 1 && matches!(stmts[0].node, Stmt::Return(None)));
+
+    // Only use Empty path if there are no params AND the body is trivial.
+    // With params, even a body that is just `return;` must go through Typed
+    // so that the codegen knows about the param bindings.
+    let is_empty_body = is_trivial_stmts && params.is_empty();
 
     if is_empty_body {
         return KernelBody::Empty;
     }
 
-    // Non-trivial body — run the typechecker.
-    let (typed_body, tc_errors) = typecheck_kernel_body(block);
+    // Non-trivial body or body with params — run the typechecker.
+    let (typed_body, tc_errors) = typecheck_kernel_body(block, params);
     for e in tc_errors {
         errors.push(HirError::Typecheck(e));
     }
     KernelBody::Typed(typed_body)
+}
+
+/// Lower AST kernel parameters to HIR `KernelParam`s and compute the binding plan.
+///
+/// Returns `(params, binding_plan)`. On error, a placeholder empty plan is returned
+/// so codegen can continue and collect further diagnostics.
+fn lower_params(
+    ast_params: &[axc_lexer::Spanned<axc_parser::ast::Param>],
+    kernel_span: Span,
+    errors: &mut Vec<HirError>,
+) -> (Vec<KernelParam>, ParamBindingPlan) {
+    let mut params: Vec<KernelParam> = Vec::new();
+
+    for (pos, spanned) in ast_params.iter().enumerate() {
+        let ast_param = &spanned.node;
+        let name: &str = &ast_param.name.node;
+        let span: Span = spanned.span;
+
+        let ty: ParamTy = match lower_type_ref(&ast_param.ty.node, span, name, errors) {
+            Some(t) => t,
+            None => continue, // error already pushed
+        };
+
+        params.push(KernelParam {
+            name: name.to_owned(),
+            ty,
+            position: pos as u32,
+            span,
+        });
+    }
+
+    match compute_binding_plan(&params, kernel_span) {
+        Ok(plan) => (params, plan),
+        Err(e) => {
+            errors.push(HirError::BindingPlan(e));
+            // Return params but empty plan so codegen doesn't crash.
+            (params, ParamBindingPlan {
+                buffers: Vec::new(),
+                scalars: Vec::new(),
+                push_constant_total_bytes: 0,
+            })
+        }
+    }
+}
+
+/// Convert an AST `TypeRef` to a HIR `ParamTy`.
+///
+/// Returns `None` and pushes an error for unsupported types (void, bool, etc.).
+fn lower_type_ref(
+    tr: &TypeRef,
+    span: Span,
+    param_name: &str,
+    errors: &mut Vec<HirError>,
+) -> Option<ParamTy> {
+    match tr {
+        TypeRef::I32 => Some(ParamTy::Scalar(ScalarTy::I32)),
+        TypeRef::U32 => Some(ParamTy::Scalar(ScalarTy::U32)),
+        TypeRef::I64 => Some(ParamTy::Scalar(ScalarTy::I64)),
+        TypeRef::U64 => Some(ParamTy::Scalar(ScalarTy::U64)),
+        TypeRef::F32 => Some(ParamTy::Scalar(ScalarTy::F32)),
+        TypeRef::F64 => Some(ParamTy::Scalar(ScalarTy::F64)),
+        TypeRef::Buffer(elem)         => Some(ParamTy::Buffer(BufferTy {
+            elem: lower_scalar_type_ref(elem),
+            access: BufferAccess::ReadWrite,
+        })),
+        TypeRef::ReadonlyBuffer(elem) => Some(ParamTy::Buffer(BufferTy {
+            elem: lower_scalar_type_ref(elem),
+            access: BufferAccess::ReadOnly,
+        })),
+        TypeRef::WriteonlyBuffer(elem) => Some(ParamTy::Buffer(BufferTy {
+            elem: lower_scalar_type_ref(elem),
+            access: BufferAccess::WriteOnly,
+        })),
+        TypeRef::Void | TypeRef::Bool => {
+            errors.push(HirError::UnsupportedParamType {
+                ty_name: format!("{:?}", tr),
+                param_name: param_name.to_owned(),
+                span,
+            });
+            None
+        }
+    }
+}
+
+/// Convert an AST `ScalarTypeRef` to an HIR `ScalarTy`.
+fn lower_scalar_type_ref(str_ref: &ScalarTypeRef) -> ScalarTy {
+    match str_ref {
+        ScalarTypeRef::I32 => ScalarTy::I32,
+        ScalarTypeRef::U32 => ScalarTy::U32,
+        ScalarTypeRef::I64 => ScalarTy::I64,
+        ScalarTypeRef::U64 => ScalarTy::U64,
+        ScalarTypeRef::F32 => ScalarTy::F32,
+        ScalarTypeRef::F64 => ScalarTy::F64,
+    }
 }
 
 /// Public accessor for tests: given an AST module, return the first kernel's body block.

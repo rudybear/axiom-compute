@@ -17,7 +17,12 @@ use rspirv::spirv::{
     Capability, AddressingModel, MemoryModel, ExecutionModel, ExecutionMode, FunctionControl,
 };
 use axc_hir::{HirModule, KernelBody};
-use crate::body::{ScalarTypeCache, CapabilitiesRequired, emit_kernel_body};
+use axc_hir::expr::{HirExprKind, HirStmt, KernelBodyTyped};
+use crate::body::{ScalarTypeCache, CapabilitiesRequired, KernelResources, emit_kernel_body};
+use crate::buffers::{
+    emit_buffer_globals, emit_push_constant_block, emit_gid_variable,
+    BufferBindings, PushConstantBlock, GlobalInvocationIdVar,
+};
 
 /// Options for the SPIR-V emission pass.
 ///
@@ -103,18 +108,79 @@ pub fn emit_module(hir: &HirModule, opts: &CodegenOptions) -> Result<Vec<u32>, C
             b.ret().expect("rspirv: ret() should not fail inside an open block");
         }
         KernelBody::Typed(typed_body) => {
-            // M1.1 path: emit typed body with full scalar ops.
+            // M1.2 path: emit typed body with full scalar, buffer, and gid ops.
             //
-            // Pre-allocate the first block label so `emit_kernel_body` can read it back
-            // from the block list (b.selected_block() returns an index, not a SPIR-V Word).
+            // Step order is load-bearing:
+            //   (a) Emit global OpVariables (SSBO, push-constant, gid) BEFORE begin_function.
+            //   (b) begin_function + begin_block.
+            //   (c) emit_kernel_body with KernelResources referencing the global vars.
+
+            let mut type_cache = ScalarTypeCache::new();
+
+            // (a1) Buffer globals.
+            let buffer_bindings: Option<BufferBindings> =
+                if !kernel.binding_plan.buffers.is_empty() {
+                    Some(emit_buffer_globals(&mut b, &mut type_cache, &kernel.binding_plan.buffers))
+                } else {
+                    None
+                };
+
+            // (a2) Push-constant block.
+            let push_constant: Option<PushConstantBlock> =
+                emit_push_constant_block(&mut b, &mut type_cache, &kernel.binding_plan.scalars);
+
+            // (a3) gl_GlobalInvocationID (if any GidBuiltin or buffer write/read uses gid).
+            let uses_gid = body_uses_gid(typed_body);
+            let gid_var: Option<GlobalInvocationIdVar> =
+                if uses_gid || !kernel.binding_plan.buffers.is_empty() {
+                    // Emit gid whenever buffers exist (typical usage) or gid() is explicitly called.
+                    Some(emit_gid_variable(&mut b, &mut type_cache))
+                } else {
+                    None
+                };
+
+            // Build scalar_params table: (position, member_index, ty) for push-constant reads.
+            let scalar_params_table: Vec<(u32, u32, axc_hir::ty::ScalarTy)> = kernel
+                .binding_plan
+                .scalars
+                .iter()
+                .map(|s| (s.position, s.member_index, s.ty))
+                .collect();
+
+            // (b) Begin the function body.
+            // Note: begin_function + begin_block happen AFTER the global vars.
+            // We cannot call them before — `b.variable()` checks selected_function to decide
+            // whether to put the var in types_global_values or the function body.
+            // The function was begun earlier (step 3-8 in the comment header);
+            // we need to restore that. Actually emit.rs begins the function BEFORE the body
+            // match, so we must re-examine the structure.
+            //
+            // Actually: the current structure calls begin_function before the match.
+            // Global OpVariables must come BEFORE begin_function in the SPIR-V binary layout,
+            // but rspirv buffers them in module.types_global_values regardless of emit order.
+            // The rspirv Builder places them correctly during assembly. So calling
+            // emit_buffer_globals / emit_push_constant_block / emit_gid_variable while a
+            // function IS open is fine — rspirv puts these in the global section automatically.
+            // The key constraint is that the Builder must NOT have a block selected when we
+            // call b.variable() for globals (because variable() checks selected_block).
+            //
+            // Since begin_block has NOT been called yet here, selected_block() is None,
+            // so b.variable() will correctly go to types_global_values.
+
             let first_block_id = b.id();
             b.begin_block(Some(first_block_id))
                 .expect("rspirv: begin_block should not fail after begin_function");
 
-            let mut type_cache = ScalarTypeCache::new();
             let mut caps = CapabilitiesRequired::default();
 
-            emit_kernel_body(&mut b, typed_body, &mut type_cache, &mut caps)
+            let res = KernelResources {
+                buffer_bindings: buffer_bindings.as_ref(),
+                push_constant: push_constant.as_ref(),
+                gid_var: gid_var.as_ref(),
+                scalar_params: &scalar_params_table,
+            };
+
+            emit_kernel_body(&mut b, typed_body, &mut type_cache, &mut caps, &res)
                 .map_err(|e| CodegenError::Rspirv(e.to_string()))?;
 
             // `b.capability()` pushes directly to `module.capabilities` — safe to call
@@ -125,6 +191,39 @@ pub fn emit_module(hir: &HirModule, opts: &CodegenOptions) -> Result<Vec<u32>, C
             if caps.float64 {
                 b.capability(Capability::Float64);
             }
+
+            // gid interface: included in OpEntryPoint interface list (required for Input vars).
+            if let Some(ref gid) = gid_var {
+                // Store the gid var_id for use in the entry_point call below.
+                // We pass it via a local to avoid borrow issues with `gid_var`.
+                // We'll patch the entry_point call after end_function.
+                let _ = gid.var_id; // used below in entry_point call
+            }
+
+            // Save for entry_point call below.
+            let gid_var_id_for_ep: Option<u32> = gid_var.as_ref().map(|g| g.var_id);
+
+            b.end_function().expect("rspirv: end_function should not fail after a complete block");
+
+            // ── Step 9: Entry point (with gid in interface if needed) ─────────
+            let mut interface: Vec<u32> = Vec::new();
+            if let Some(gid_id) = gid_var_id_for_ep {
+                interface.push(gid_id);
+            }
+            b.entry_point(ExecutionModel::GLCompute, main_id, &kernel.name, interface);
+
+            // ── Step 10: Execution mode ────────────────────────────────────────
+            b.execution_mode(main_id, ExecutionMode::LocalSize, vec![wg.x, wg.y, wg.z]);
+
+            // ── Steps 11-13: assemble ─────────────────────────────────────────
+            let mut module = b.module();
+            module
+                .header
+                .as_mut()
+                .expect("rspirv: module.header must be Some after b.module()")
+                .generator = opts.generator_magic;
+            let words: Vec<u32> = module.assemble();
+            return Ok(words);
         }
     }
 
@@ -152,6 +251,37 @@ pub fn emit_module(hir: &HirModule, opts: &CodegenOptions) -> Result<Vec<u32>, C
     // ── Step 13: Serialize to word stream ────────────────────────────────────
     let words: Vec<u32> = module.assemble();
     Ok(words)
+}
+
+/// Scan a typed kernel body for any `GidBuiltin` expression.
+///
+/// Used to decide whether to emit the `gl_GlobalInvocationID` Input variable.
+fn body_uses_gid(body: &KernelBodyTyped) -> bool {
+    body.stmts.iter().any(stmt_uses_gid)
+}
+
+fn stmt_uses_gid(stmt: &HirStmt) -> bool {
+    match stmt {
+        HirStmt::Let { init, .. } => expr_uses_gid(init),
+        HirStmt::Assign { value, .. } => expr_uses_gid(value),
+        HirStmt::Return { .. } => false,
+        HirStmt::BufferWrite { index, value, .. } => expr_uses_gid(index) || expr_uses_gid(value),
+    }
+}
+
+fn expr_uses_gid(expr: &axc_hir::expr::HirExpr) -> bool {
+    match &expr.kind {
+        HirExprKind::GidBuiltin { .. } => true,
+        HirExprKind::BufferRead { index, .. } => expr_uses_gid(index),
+        HirExprKind::Unary { operand, .. } => expr_uses_gid(operand),
+        HirExprKind::Binary { lhs, rhs, .. } => expr_uses_gid(lhs) || expr_uses_gid(rhs),
+        HirExprKind::ShortCircuit { lhs, rhs, .. } => expr_uses_gid(lhs) || expr_uses_gid(rhs),
+        HirExprKind::BitwiseBuiltin { args, .. } => args.iter().any(expr_uses_gid),
+        HirExprKind::IntLit { .. }
+        | HirExprKind::FloatLit { .. }
+        | HirExprKind::BoolLit(_)
+        | HirExprKind::LocalRead(_) => false,
+    }
 }
 
 /// Emit SPIR-V as a `Vec<u8>` in little-endian byte order (the SPIR-V file format).
@@ -324,7 +454,7 @@ mod tests {
     #[test]
     fn too_many_kernels_error() {
         // Two kernels → TooManyKernelsInM0
-        use axc_hir::{Kernel, KernelId, KernelAnnotations, WorkgroupDims, KernelBody};
+        use axc_hir::{Kernel, KernelId, KernelAnnotations, WorkgroupDims, KernelBody, ParamBindingPlan};
         use axc_lexer::Span;
         let mk_k = |id: u32, name: &str| Kernel {
             id: KernelId(id),
@@ -335,6 +465,12 @@ mod tests {
                 complexity: None,
                 preconditions: Vec::new(),
                 subgroup_uniform: false,
+            },
+            params: Vec::new(),
+            binding_plan: ParamBindingPlan {
+                buffers: Vec::new(),
+                scalars: Vec::new(),
+                push_constant_total_bytes: 0,
             },
             body: KernelBody::Empty,
             span: Span::new(0, 1),

@@ -5,6 +5,7 @@
 //! structured data — anti-pattern #7).
 //!
 //! M1.1 adds scalar types, let/let-mut bindings, and a full two-pass typechecker.
+//! M1.2 adds buffer types, kernel parameters, and push-constant binding plans.
 
 pub mod hir;
 pub mod lower;
@@ -12,6 +13,8 @@ pub mod validate;
 pub mod ty;
 pub mod expr;
 pub mod typecheck;
+pub mod buffer;
+pub mod param;
 
 pub use hir::{
     Module as HirModule,
@@ -34,3 +37,8 @@ pub use expr::{
     BitwiseOp as HirBitwiseOp,
 };
 pub use typecheck::{typecheck_kernel_body, TypecheckError};
+pub use buffer::{BufferAccess, BufferTy};
+pub use param::{
+    Ty as ParamTy, KernelParam, BufferBindingSlot, ScalarPushConstantSlot,
+    ParamBindingPlan, BindingPlanError, compute_binding_plan, MAX_PUSH_CONSTANT_BYTES,
+};

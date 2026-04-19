@@ -24,6 +24,8 @@ use crate::expr::{
     BinOp, UnaryOp, ShortCircuitOp, BitwiseOp,
 };
 use crate::ty::{ScalarTy, fit_int_literal, fit_float_literal};
+use crate::param::{KernelParam, Ty as ParamTy};
+use crate::buffer::BufferAccess;
 
 /// Typecheck error — emitted from `typecheck_kernel_body`.
 ///
@@ -158,26 +160,125 @@ pub enum TypecheckError {
         #[label("here")]
         span: Span,
     },
+
+    // ── M1.2 buffer errors ─────────────────────────────────────────────────────
+
+    #[error("cannot write to read-only buffer `{name}`")]
+    WriteToReadonlyBuffer {
+        name: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("cannot read from write-only buffer `{name}`")]
+    ReadFromWriteonlyBuffer {
+        name: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("buffer index must be `u32`; got `{got_ty}`")]
+    BadIndexType {
+        got_ty: &'static str,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("`{name}` is not a buffer and cannot be indexed with `[]`")]
+    IndexOnNonBuffer {
+        name: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("buffer `{name}` cannot be used as a value; use `name[index]` to read an element")]
+    BufferAsValue {
+        name: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("`gid()` axis must be an integer literal (0, 1, or 2); got a non-literal expression")]
+    GidAxisMustBeConstant {
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("`gid()` axis {got} is out of range; must be 0, 1, or 2")]
+    GidAxisOutOfRange {
+        got: u32,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("`gid()` requires exactly 1 argument; got {got}")]
+    GidArity {
+        got: usize,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("multi-dimensional buffer indexing is not supported in M1.2; use a single `u32` index")]
+    MultiDimIndexInM1_2 {
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("unsupported buffer element type `{ty_name}` in M1.2 (only i32, u32, i64, u64, f32, f64 are supported)")]
+    UnsupportedBufferElem {
+        ty_name: &'static str,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("unknown parameter `{name}` (not declared in kernel param list)")]
+    UnknownParam {
+        name: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("cannot assign to kernel parameter `{name}`; parameters are immutable")]
+    AssignToParam {
+        name: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("unsupported kernel parameter type for `{name}` (M1.2 supports scalar types and buffer types)")]
+    UnsupportedParamType {
+        name: String,
+        #[label("here")]
+        span: Span,
+    },
 }
 
 // ── Internal binding table ────────────────────────────────────────────────────
 
-struct TypeChecker {
+struct TypeChecker<'p> {
     bindings: Vec<Binding>,
     // Maps binding name -> index in `bindings` (for duplicate detection + lookup).
     binding_lookup: std::collections::HashMap<String, usize>,
     errors: Vec<TypecheckError>,
     next_id: u32,
+    /// Kernel parameters (read-only; buffer params cannot be assigned to).
+    params: &'p [KernelParam],
 }
 
-impl TypeChecker {
-    fn new() -> Self {
+impl<'p> TypeChecker<'p> {
+    fn new(params: &'p [KernelParam]) -> Self {
         Self {
             bindings: Vec::new(),
             binding_lookup: std::collections::HashMap::new(),
             errors: Vec::new(),
             next_id: 0,
+            params,
         }
+    }
+
+    /// Look up a kernel parameter by name.
+    fn find_param(&self, name: &str) -> Option<&KernelParam> {
+        self.params.iter().find(|p| p.name == name)
     }
 
     fn alloc_id(&mut self) -> BindingId {
@@ -223,16 +324,22 @@ impl TypeChecker {
 
 /// Typecheck a kernel body block.
 ///
+/// `params` is the list of kernel parameters — buffer params cannot be used
+/// as scalar values and cannot be assigned to; scalar params appear as read-only
+/// bindings in expressions.
+///
 /// Always returns a `KernelBodyTyped` (possibly incomplete on errors) plus any
 /// `TypecheckError`s. This supports error-recovery: even with errors, downstream
 /// code sees a partial HIR to collect further diagnostics.
 pub fn typecheck_kernel_body(
     body: &past::Block,
+    params: &[KernelParam],
 ) -> (KernelBodyTyped, Vec<TypecheckError>) {
-    let mut tc = TypeChecker::new();
+    let mut tc = TypeChecker::new(params);
     let mut hir_stmts: Vec<HirStmt> = Vec::new();
 
     // ── Pass 1: Register all let bindings into the binding table ─────────────
+    // IndexAssign is not a binding and is skipped in pass 1.
     for spanned_stmt in &body.stmts {
         if let past::Stmt::Let { name, ty, is_mut, .. } = &spanned_stmt.node {
             let scalar_ty = match typeref_to_scalar(&ty.node) {
@@ -310,6 +417,11 @@ pub fn typecheck_kernel_body(
                 }
                 hir_stmts.push(HirStmt::Return { span: spanned_stmt.span });
             }
+            past::Stmt::IndexAssign { target, index, value } => {
+                if let Some(stmt) = check_index_assign_stmt(&mut tc, target, index, value, spanned_stmt.span) {
+                    hir_stmts.push(stmt);
+                }
+            }
         }
     }
 
@@ -333,6 +445,11 @@ fn typeref_to_scalar(tr: &past::TypeRef) -> Result<ScalarTy, &'static str> {
         past::TypeRef::F64  => Ok(ScalarTy::F64),
         past::TypeRef::Bool => Ok(ScalarTy::Bool),
         past::TypeRef::Void => Err("void is not a valid scalar type for let bindings"),
+        past::TypeRef::Buffer(_)
+        | past::TypeRef::ReadonlyBuffer(_)
+        | past::TypeRef::WriteonlyBuffer(_) => {
+            Err("buffer types are not valid for let bindings; use as kernel parameters only")
+        }
     }
 }
 
@@ -424,20 +541,8 @@ fn check_expr(
 
         // ── Identifier ────────────────────────────────────────────────────────
         past::Expr::Ident(name) => {
+            // Check local bindings first, then params.
             match tc.find_binding(name) {
-                None => {
-                    tc.errors.push(TypecheckError::UnknownBinding {
-                        name: name.clone(),
-                        span,
-                    });
-                    // Placeholder with the expected type (or I32 if unconstrained).
-                    let placeholder_ty = expected.unwrap_or(ScalarTy::I32);
-                    Some(HirExpr {
-                        kind: HirExprKind::BoolLit(false), // placeholder
-                        ty: placeholder_ty,
-                        span,
-                    })
-                }
                 Some((bid, ty, _, _)) => {
                     if let Some(exp) = expected {
                         if exp != ty {
@@ -453,6 +558,60 @@ fn check_expr(
                         ty,
                         span,
                     })
+                }
+                None => {
+                    // Check if it's a kernel parameter.
+                    if let Some(param) = tc.find_param(name).map(|p| (p.position, p.ty.clone(), p.span)) {
+                        let (pos, pty, _pspan) = param;
+                        match pty {
+                            ParamTy::Scalar(st) => {
+                                // Scalar params are exposed as push-constant reads.
+                                // For now emit a placeholder LocalRead with a synthesized binding.
+                                // In M1.2 the codegen will handle params separately.
+                                // We emit UnknownBinding if the param is not in bindings —
+                                // to be consistent with M1.1, push-constant reads are not yet
+                                // implemented in the typechecker body (they're codegen-side).
+                                // But we DO need to handle this case to not emit an error.
+                                // Expose scalar params as opaque reads.
+                                let _ = pos;
+                                if let Some(exp) = expected {
+                                    if exp != st {
+                                        tc.errors.push(TypecheckError::TypeMismatch {
+                                            expected: exp.display_name(),
+                                            got: st.display_name(),
+                                            span,
+                                        });
+                                    }
+                                }
+                                // Use a sentinel BindingId::MAX to signal push-constant read.
+                                // The codegen handles this via KernelParam lookup.
+                                Some(HirExpr {
+                                    kind: HirExprKind::LocalRead(BindingId(u32::MAX - pos)),
+                                    ty: st,
+                                    span,
+                                })
+                            }
+                            ParamTy::Buffer(_) => {
+                                // Buffer params used bare (not indexed) are an error.
+                                tc.errors.push(TypecheckError::BufferAsValue {
+                                    name: name.clone(),
+                                    span,
+                                });
+                                None
+                            }
+                        }
+                    } else {
+                        tc.errors.push(TypecheckError::UnknownBinding {
+                            name: name.clone(),
+                            span,
+                        });
+                        let placeholder_ty: ScalarTy = expected.unwrap_or(ScalarTy::I32);
+                        Some(HirExpr {
+                            kind: HirExprKind::BoolLit(false), // placeholder
+                            ty: placeholder_ty,
+                            span,
+                        })
+                    }
                 }
             }
         }
@@ -472,9 +631,27 @@ fn check_expr(
             check_short_circuit(tc, *op, lhs, rhs, span)
         }
 
-        // ── Call (bitwise builtins) ────────────────────────────────────────────
+        // ── Call (bitwise builtins + gid) ────────────────────────────────────
         past::Expr::Call { name, args } => {
-            check_call(tc, &name.node, name.span, args, span, expected)
+            if name.node == "gid" {
+                check_gid_call(tc, args, span)
+            } else {
+                check_call(tc, &name.node, name.span, args, span, expected)
+            }
+        }
+
+        // ── Buffer index read: name[index] ────────────────────────────────────
+        past::Expr::Index { base, index } => {
+            // In M1.2, only direct identifier bases are supported.
+            match &base.node {
+                past::Expr::Ident(name) => {
+                    check_buffer_read(tc, name, base.span, index, span, expected)
+                }
+                _ => {
+                    tc.errors.push(TypecheckError::MultiDimIndexInM1_2 { span });
+                    None
+                }
+            }
         }
     }
 }
@@ -1010,6 +1187,218 @@ fn check_call(
     })
 }
 
+// ── Buffer and gid operations (M1.2) ─────────────────────────────────────────
+
+/// Check a `name[index] = value;` statement (buffer write).
+fn check_index_assign_stmt(
+    tc: &mut TypeChecker<'_>,
+    target: &axc_lexer::Spanned<String>,
+    index: &axc_lexer::Spanned<past::Expr>,
+    value: &axc_lexer::Spanned<past::Expr>,
+    stmt_span: Span,
+) -> Option<HirStmt> {
+    let name: &str = &target.node;
+
+    // Look up the param — clone the needed data to release the borrow before
+    // calling check_expr (which borrows tc mutably).
+    let param_info: Option<(ParamTy, u32)> = tc.find_param(name)
+        .map(|p| (p.ty.clone(), p.position));
+
+    let (param_ty, param_position) = match param_info {
+        Some(info) => info,
+        None => {
+            if tc.find_binding(name).is_some() {
+                tc.errors.push(TypecheckError::IndexOnNonBuffer {
+                    name: name.to_owned(),
+                    span: target.span,
+                });
+            } else {
+                tc.errors.push(TypecheckError::UnknownBinding {
+                    name: name.to_owned(),
+                    span: target.span,
+                });
+            }
+            return None;
+        }
+    };
+
+    // Verify it's a buffer
+    let bt = match param_ty {
+        ParamTy::Buffer(bt) => bt,
+        ParamTy::Scalar(_) => {
+            tc.errors.push(TypecheckError::IndexOnNonBuffer {
+                name: name.to_owned(),
+                span: target.span,
+            });
+            return None;
+        }
+    };
+
+    // Verify write is allowed
+    if bt.access == BufferAccess::ReadOnly {
+        tc.errors.push(TypecheckError::WriteToReadonlyBuffer {
+            name: name.to_owned(),
+            span: target.span,
+        });
+        return None;
+    }
+
+    // Typecheck the index (must be u32)
+    let index_hir: HirExpr = check_expr(tc, &index.node, index.span, Some(ScalarTy::U32))?;
+    if index_hir.ty != ScalarTy::U32 {
+        tc.errors.push(TypecheckError::BadIndexType {
+            got_ty: index_hir.ty.display_name(),
+            span: index.span,
+        });
+        return None;
+    }
+
+    // Typecheck the value (must match elem type)
+    let value_hir: HirExpr = check_expr(tc, &value.node, value.span, Some(bt.elem))?;
+    if value_hir.ty != bt.elem {
+        tc.errors.push(TypecheckError::TypeMismatch {
+            expected: bt.elem.display_name(),
+            got: value_hir.ty.display_name(),
+            span: value.span,
+        });
+        return None;
+    }
+
+    let buffer_binding: u32 = count_buffer_position(tc.params, param_position);
+
+    Some(HirStmt::BufferWrite {
+        param_position,
+        buffer_binding,
+        index: index_hir,
+        value: value_hir,
+        span: stmt_span,
+    })
+}
+
+/// Count the buffer-only position of a param (how many buffer params appear before it).
+fn count_buffer_position(params: &[KernelParam], target_position: u32) -> u32 {
+    params.iter()
+        .filter(|p| p.position < target_position && matches!(p.ty, ParamTy::Buffer(_)))
+        .count() as u32
+}
+
+/// Check a buffer-read expression: `name[index]`.
+fn check_buffer_read(
+    tc: &mut TypeChecker<'_>,
+    name: &str,
+    name_span: Span,
+    index: &axc_lexer::Spanned<past::Expr>,
+    expr_span: Span,
+    _expected: Option<ScalarTy>,
+) -> Option<HirExpr> {
+    // Clone param data to release borrow before calling check_expr.
+    let param_info: Option<(ParamTy, u32)> = tc.find_param(name)
+        .map(|p| (p.ty.clone(), p.position));
+
+    let (param_ty, param_position) = match param_info {
+        Some(info) => info,
+        None => {
+            if tc.find_binding(name).is_some() {
+                tc.errors.push(TypecheckError::IndexOnNonBuffer {
+                    name: name.to_owned(),
+                    span: name_span,
+                });
+            } else {
+                tc.errors.push(TypecheckError::UnknownBinding {
+                    name: name.to_owned(),
+                    span: name_span,
+                });
+            }
+            return None;
+        }
+    };
+
+    let bt = match param_ty {
+        ParamTy::Buffer(bt) => bt,
+        ParamTy::Scalar(_) => {
+            tc.errors.push(TypecheckError::IndexOnNonBuffer {
+                name: name.to_owned(),
+                span: name_span,
+            });
+            return None;
+        }
+    };
+
+    if bt.access == BufferAccess::WriteOnly {
+        tc.errors.push(TypecheckError::ReadFromWriteonlyBuffer {
+            name: name.to_owned(),
+            span: name_span,
+        });
+        return None;
+    }
+
+    // Typecheck the index (must be u32)
+    let index_hir: HirExpr = check_expr(tc, &index.node, index.span, Some(ScalarTy::U32))?;
+    if index_hir.ty != ScalarTy::U32 {
+        tc.errors.push(TypecheckError::BadIndexType {
+            got_ty: index_hir.ty.display_name(),
+            span: index.span,
+        });
+        return None;
+    }
+
+    let buffer_binding: u32 = count_buffer_position(tc.params, param_position);
+
+    Some(HirExpr {
+        kind: HirExprKind::BufferRead {
+            param_position,
+            buffer_binding,
+            index: Box::new(index_hir),
+        },
+        ty: bt.elem,
+        span: expr_span,
+    })
+}
+
+/// Check a `gid(axis)` call.
+fn check_gid_call(
+    tc: &mut TypeChecker<'_>,
+    args: &[axc_lexer::Spanned<past::Expr>],
+    call_span: Span,
+) -> Option<HirExpr> {
+    if args.len() != 1 {
+        tc.errors.push(TypecheckError::GidArity {
+            got: args.len(),
+            span: call_span,
+        });
+        return None;
+    }
+
+    // The axis must be a compile-time integer literal (u32 range 0..=2).
+    let arg: &axc_lexer::Spanned<past::Expr> = &args[0];
+    let axis: u32 = match &arg.node {
+        past::Expr::IntLit { value, .. } => {
+            if *value < 0 || *value > 2 {
+                tc.errors.push(TypecheckError::GidAxisOutOfRange {
+                    got: *value as u32,
+                    span: arg.span,
+                });
+                return None;
+            }
+            *value as u32
+        }
+        // For a u32-suffixed literal the same check applies
+        _ => {
+            // Try to evaluate as a constant — in M1.2 only integer literals are accepted.
+            tc.errors.push(TypecheckError::GidAxisMustBeConstant {
+                span: arg.span,
+            });
+            return None;
+        }
+    };
+
+    Some(HirExpr {
+        kind: HirExprKind::GidBuiltin { axis },
+        ty: ScalarTy::U32,
+        span: call_span,
+    })
+}
+
 fn builtin_name(op: BitwiseOp) -> &'static str {
     match op {
         BitwiseOp::Band => "band",
@@ -1042,7 +1431,7 @@ mod tests {
         // _parse_errs: some tests intentionally have parse errors (unresolved idents)
         if let Some(item) = ast.items.first() {
             let axc_parser::Item::Kernel(ref kd) = item.node;
-            return typecheck_kernel_body(&kd.body.node);
+            return typecheck_kernel_body(&kd.body.node, &[]);
         }
         (KernelBodyTyped { bindings: Vec::new(), stmts: Vec::new() }, Vec::new())
     }

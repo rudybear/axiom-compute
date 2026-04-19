@@ -17,6 +17,9 @@
 //!   0.12 requirement that types be unique (rspirv does not dedup internally).
 //! - `CapabilitiesRequired` accumulates Int64 / Float64 flags; the caller
 //!   (`emit.rs`) inserts the corresponding `OpCapability` after the body.
+//! - M1.2: `BufferRead`, `BufferWrite`, and `GidBuiltin` nodes are handled via
+//!   references to pre-emitted global variables (BufferBindings, PushConstantBlock,
+//!   GlobalInvocationIdVar) that `emit.rs` creates before calling this function.
 
 use std::collections::HashMap;
 use rspirv::dr::Builder;
@@ -28,6 +31,24 @@ use axc_hir::expr::{
     ShortCircuitOp, BitwiseOp, BindingId,
 };
 use axc_hir::ty::ScalarTy;
+use crate::buffers::{BufferBindings, PushConstantBlock, GlobalInvocationIdVar};
+
+/// References to pre-emitted global IR structures for M1.2 buffer/scalar/gid support.
+///
+/// All three are optional: a kernel with no params uses `None` for all fields.
+/// The `emit_kernel_body` function will panic at runtime (not at compile time) if
+/// a `BufferRead`/`BufferWrite`/`GidBuiltin` HIR node is encountered but the
+/// corresponding resource is `None` — this is a compiler bug, not a user error.
+pub struct KernelResources<'r> {
+    /// SSBO buffer globals emitted before the function.
+    pub buffer_bindings: Option<&'r BufferBindings>,
+    /// Push-constant block for scalar params.
+    pub push_constant: Option<&'r PushConstantBlock>,
+    /// gl_GlobalInvocationID Input variable.
+    pub gid_var: Option<&'r GlobalInvocationIdVar>,
+    /// Scalar param info: maps position → (member_index, ScalarTy) for load-from-PC.
+    pub scalar_params: &'r [(u32, u32, ScalarTy)],  // (position, member_index, ty)
+}
 
 /// Errors from SPIR-V body emission.
 #[derive(Debug, thiserror::Error)]
@@ -122,6 +143,8 @@ struct BodyEmitter<'a> {
     var_ids: HashMap<BindingId, Word>,
     /// Cached constants: (ScalarTy, bits) → result id.
     const_cache: HashMap<ConstKey, Word>,
+    /// References to pre-emitted global M1.2 resources (buffers, push-constants, gid).
+    res: &'a KernelResources<'a>,
 }
 
 impl<'a> BodyEmitter<'a> {
@@ -233,6 +256,7 @@ pub fn emit_kernel_body(
     body: &KernelBodyTyped,
     type_cache: &mut ScalarTypeCache,
     caps: &mut CapabilitiesRequired,
+    res: &KernelResources<'_>,
 ) -> Result<Word, BodyCodegenError> {
     // The first block's label is the one that was opened before we were called.
     let first_block_label = match (b.selected_function(), b.selected_block()) {
@@ -252,6 +276,7 @@ pub fn emit_kernel_body(
         caps,
         var_ids: HashMap::new(),
         const_cache: HashMap::new(),
+        res,
     };
 
     // ── Prelude: emit ALL OpVariable declarations in the first block ──────────
@@ -299,6 +324,9 @@ fn emit_stmt(em: &mut BodyEmitter<'_>, stmt: &HirStmt) -> Result<(), BodyCodegen
             em.b.ret().map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
             Ok(())
         }
+        HirStmt::BufferWrite { buffer_binding, index, value, .. } => {
+            emit_buffer_write(em, *buffer_binding, index, value)
+        }
     }
 }
 
@@ -323,6 +351,12 @@ fn emit_expr(em: &mut BodyEmitter<'_>, expr: &HirExpr) -> Result<Word, BodyCodeg
             Ok(id)
         }
         HirExprKind::LocalRead(bid) => {
+            // Sentinel BindingId(u32::MAX - pos) signals a scalar push-constant read.
+            // Any id >= 0x8000_0000 is treated as a sentinel (params can't have >2B positions).
+            if bid.0 >= 0x8000_0000 {
+                let param_position: u32 = u32::MAX - bid.0;
+                return emit_scalar_param_read(em, param_position, expr.ty);
+            }
             let var_id = em.var_ids.get(bid).copied()
                 .ok_or(BodyCodegenError::UnexpectedHir("LocalRead: binding not in var_ids"))?;
             let ty_id = em.type_id(expr.ty);
@@ -341,6 +375,12 @@ fn emit_expr(em: &mut BodyEmitter<'_>, expr: &HirExpr) -> Result<Word, BodyCodeg
         }
         HirExprKind::BitwiseBuiltin { op, args } => {
             emit_bitwise(em, *op, args, expr.ty)
+        }
+        HirExprKind::BufferRead { buffer_binding, index, .. } => {
+            emit_buffer_read(em, *buffer_binding, index, expr.ty)
+        }
+        HirExprKind::GidBuiltin { axis } => {
+            emit_gid_component(em, *axis)
         }
     }
 }
@@ -660,6 +700,131 @@ fn emit_bitwise(
         }
     };
     Ok(id)
+}
+
+// ── Scalar push-constant read (M1.2) ─────────────────────────────────────────
+
+/// Emit a load from the push-constant block for a scalar kernel parameter.
+///
+/// Decodes `param_position` to find the `member_index`, then emits:
+///   %ptr = OpAccessChain member_ptr_ty %pc_var %member_index_const
+///   %val = OpLoad ty %ptr
+fn emit_scalar_param_read(
+    em: &mut BodyEmitter<'_>,
+    param_position: u32,
+    result_ty: ScalarTy,
+) -> Result<Word, BodyCodegenError> {
+    let pc = em.res.push_constant
+        .ok_or(BodyCodegenError::UnexpectedHir("scalar param read with no push-constant block"))?;
+
+    // Look up member_index from scalar_params table.
+    let member_index: u32 = em.res.scalar_params
+        .iter()
+        .find(|(pos, _, _)| *pos == param_position)
+        .map(|(_, mi, _)| *mi)
+        .ok_or(BodyCodegenError::UnexpectedHir("scalar param not found in scalar_params table"))?;
+
+    let member_ptr_ty = *pc.member_ptr_ids.get(&member_index)
+        .ok_or(BodyCodegenError::UnexpectedHir("member_index not in push_constant.member_ptr_ids"))?;
+
+    let mi_const = em.get_const_int(ScalarTy::U32, member_index as u64);
+    let chain_id = em.b.access_chain(member_ptr_ty, None, pc.var_id, [mi_const])
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+
+    let ty_id = em.type_id(result_ty);
+    let load_id = em.b.load(ty_id, None, chain_id, None, None)
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    Ok(load_id)
+}
+
+// ── Buffer read/write and gid (M1.2) ─────────────────────────────────────────
+
+/// Emit `OpAccessChain` + `OpLoad` to read one element from an SSBO.
+///
+/// Pattern:
+///   %ptr_to_elem = OpAccessChain ptr_to_elem_ty  %var  %0_const  %index
+///   %result      = OpLoad        elem_ty          %ptr_to_elem
+fn emit_buffer_read(
+    em: &mut BodyEmitter<'_>,
+    buffer_binding: u32,
+    index: &HirExpr,
+    result_ty: ScalarTy,
+) -> Result<Word, BodyCodegenError> {
+    let bindings = em.res.buffer_bindings
+        .ok_or(BodyCodegenError::UnexpectedHir("BufferRead with no BufferBindings in resources"))?;
+    let var_id = *bindings.var_ids.get(&buffer_binding)
+        .ok_or(BodyCodegenError::UnexpectedHir("BufferRead: buffer_binding not in var_ids"))?;
+    let elem_ptr_ty = *bindings.elem_ptr_ids.get(&buffer_binding)
+        .ok_or(BodyCodegenError::UnexpectedHir("BufferRead: buffer_binding not in elem_ptr_ids"))?;
+
+    // Member 0 of the SSBO struct is the runtime array; we need a constant 0.
+    let u32_ty_id = em.type_id(ScalarTy::U32);
+    let zero_id = em.get_const_int(ScalarTy::U32, 0);
+    let index_id = emit_expr(em, index)?;
+
+    // OpAccessChain %elem_ptr_ty %var %zero %index
+    let chain_id = em.b.access_chain(elem_ptr_ty, None, var_id, [zero_id, index_id])
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+
+    // OpLoad %result_ty %chain_id
+    let elem_ty_id = em.type_id(result_ty);
+    let load_id = em.b.load(elem_ty_id, None, chain_id, None, None)
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    let _ = u32_ty_id;
+    Ok(load_id)
+}
+
+/// Emit `OpAccessChain` + `OpStore` to write one element to an SSBO.
+///
+/// Pattern:
+///   %ptr_to_elem = OpAccessChain ptr_to_elem_ty  %var  %0_const  %index
+///   OpStore %ptr_to_elem  %value
+fn emit_buffer_write(
+    em: &mut BodyEmitter<'_>,
+    buffer_binding: u32,
+    index: &HirExpr,
+    value: &HirExpr,
+) -> Result<(), BodyCodegenError> {
+    let bindings = em.res.buffer_bindings
+        .ok_or(BodyCodegenError::UnexpectedHir("BufferWrite with no BufferBindings in resources"))?;
+    let var_id = *bindings.var_ids.get(&buffer_binding)
+        .ok_or(BodyCodegenError::UnexpectedHir("BufferWrite: buffer_binding not in var_ids"))?;
+    let elem_ptr_ty = *bindings.elem_ptr_ids.get(&buffer_binding)
+        .ok_or(BodyCodegenError::UnexpectedHir("BufferWrite: buffer_binding not in elem_ptr_ids"))?;
+
+    let zero_id = em.get_const_int(ScalarTy::U32, 0);
+    let index_id = emit_expr(em, index)?;
+    let value_id = emit_expr(em, value)?;
+
+    let chain_id = em.b.access_chain(elem_ptr_ty, None, var_id, [zero_id, index_id])
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    em.b.store(chain_id, value_id, None, None)
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    Ok(())
+}
+
+/// Emit extraction of one component from `gl_GlobalInvocationID`.
+///
+/// Pattern:
+///   %ptr = OpAccessChain u32_ptr_type_id %gid_var %axis_const
+///   %val = OpLoad u32 %ptr
+fn emit_gid_component(
+    em: &mut BodyEmitter<'_>,
+    axis: u32,
+) -> Result<Word, BodyCodegenError> {
+    let gid = em.res.gid_var
+        .ok_or(BodyCodegenError::UnexpectedHir("GidBuiltin with no gid_var in resources"))?;
+    let gid_var_id = gid.var_id;
+    let u32_ptr_ty = gid.u32_ptr_type_id;
+
+    let axis_id = em.get_const_int(ScalarTy::U32, axis as u64);
+    let chain_id = em.b.access_chain(u32_ptr_ty, None, gid_var_id, [axis_id])
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+
+    let u32_ty_id = em.type_id(ScalarTy::U32);
+    let load_id = em.b.load(u32_ty_id, None, chain_id, None, None)
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    Ok(load_id)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
