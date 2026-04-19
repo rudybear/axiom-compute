@@ -157,18 +157,23 @@ mod tests {
         let hir = make_hir(EMPTY_SRC);
         let words = emit_module(&hir, &CodegenOptions::default()).expect("emit failed");
 
-        // Dual-check (spec AT-10): typed API AND raw word-stream
-        // First, rebuild the module to use the typed header API
-        let (ast, _, _) = parse(EMPTY_SRC);
-        let (hir2, _, _) = lower_module(&ast);
-
-        // Use raw word stream to verify the header byte layout
+        // Dual-check (spec AT-10):
+        // (a) Raw word-stream: version word at words[1] must be 0x00010300
         assert_eq!(words[0], 0x0723_0203_u32, "magic word mismatch");
         // Version word 0x00010300 = major 1, minor 3 (SPIR-V §2.3 layout)
         assert_eq!(words[1], 0x0001_0300_u32, "version word should be 1.3 (0x00010300)");
 
-        // Also verify via the module header typed API (Strategy X for non-word-stream checks)
-        let _ = hir2; // hir2 is only used to rebuild; the words above are our test
+        // (b) Typed API: rebuild the module via emit_module and read header.version()
+        // This validates that the rspirv typed header correctly reflects the version
+        // we set via b.set_version(1, 3) — not just the serialised word stream.
+        let (ast2, _, _) = parse(EMPTY_SRC);
+        let (hir2, _, _) = lower_module(&ast2);
+        let words2 = emit_module(&hir2, &CodegenOptions::default()).expect("emit (typed check) failed");
+        // Deserialise the word stream back into a dr::Module to access the typed header
+        let module2 = rspirv::dr::load_words(&words2).expect("rspirv: failed to load emitted words");
+        let (major, minor) = module2.header.as_ref().unwrap().version();
+        assert_eq!((major, minor), (1, 3),
+            "typed header API must report version (1, 3); got ({major}, {minor})");
     }
 
     // ── AT-11: generator word is overridden to 0 ─────────────────────────────
