@@ -541,11 +541,8 @@ mod tests {
         let (module, errors) = parse_src(src);
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
         let item = &module.items[0];
-        if let crate::ast::Item::Kernel(ref kd) = item.node {
-            assert_eq!(kd.annotations.len(), 4);
-        } else {
-            panic!("expected Kernel item");
-        }
+        let crate::ast::Item::Kernel(ref kd) = item.node;
+        assert_eq!(kd.annotations.len(), 4);
     }
 
     #[test]
@@ -553,11 +550,8 @@ mod tests {
         let src = "@kernel @workgroup(1,1,1) fn k() -> void { return 0; }";
         let (module, errors) = parse_src(src);
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
-        if let crate::ast::Item::Kernel(ref kd) = module.items[0].node {
-            assert_eq!(kd.body.node.stmts.len(), 1);
-        } else {
-            panic!("expected Kernel item");
-        }
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        assert_eq!(kd.body.node.stmts.len(), 1);
     }
 
     // ── AT-6: unknown top-level item ─────────────────────────────────────────
@@ -639,19 +633,16 @@ mod tests {
         let src = "@kernel @workgroup(64,1,1) @complexity(O(1)) fn k() -> void { return; }";
         let (module, errors) = parse_src(src);
         assert!(errors.is_empty(), "errors: {errors:?}");
-        if let crate::ast::Item::Kernel(ref kd) = module.items[0].node {
-            let complexity_ann = kd.annotations.iter().find(|a| a.node.name.node == "complexity")
-                .expect("@complexity annotation missing");
-            assert_eq!(complexity_ann.node.args.len(), 1);
-            if let AnnotationArg::Call { ref name, ref args } = complexity_ann.node.args[0].node {
-                assert_eq!(name, "O");
-                assert_eq!(args.len(), 1);
-                assert!(matches!(args[0].node, AnnotationArg::Int(1)));
-            } else {
-                panic!("expected Call arg, got: {:?}", complexity_ann.node.args[0].node);
-            }
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        let complexity_ann = kd.annotations.iter().find(|a| a.node.name.node == "complexity")
+            .expect("@complexity annotation missing");
+        assert_eq!(complexity_ann.node.args.len(), 1);
+        if let AnnotationArg::Call { ref name, ref args } = complexity_ann.node.args[0].node {
+            assert_eq!(name, "O");
+            assert_eq!(args.len(), 1);
+            assert!(matches!(args[0].node, AnnotationArg::Int(1)));
         } else {
-            panic!("expected Kernel item");
+            panic!("expected Call arg, got: {:?}", complexity_ann.node.args[0].node);
         }
     }
 
@@ -672,10 +663,7 @@ mod tests {
         let src = "@kernel @workgroup(1,1,1) fn k() -> void { return; }";
         let (module, errors) = parse_src(src);
         assert!(errors.is_empty(), "errors: {errors:?}");
-        if let crate::ast::Item::Kernel(ref kd) = module.items[0].node {
-            assert_eq!(kd.return_type.node, TypeRef::Void);
-        } else {
-            panic!("expected Kernel item");
-        }
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        assert_eq!(kd.return_type.node, TypeRef::Void);
     }
 }

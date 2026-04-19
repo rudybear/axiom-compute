@@ -7,6 +7,7 @@
 //! CI behaviour (AXC_REQUIRE_SPIRV_VAL=1 set at jobs.test.env level):
 //!   - spirv-val present: validate and assert exit 0.
 //!   - spirv-val absent: panic with an exact actionable message (pinned in spec §7.2).
+//!
 //! Local dev (AXC_REQUIRE_SPIRV_VAL unset or != "1"):
 //!   - spirv-val present: validate.
 //!   - spirv-val absent: print skip note to stderr, return.
@@ -141,7 +142,7 @@ fn test_compile_empty_kernel_produces_valid_spirv() {
             .lines()
             .filter(|l| !l.trim().is_empty() && !l.trim().starts_with("//"))
             .map(|l| {
-                let hex: &str = l.trim().split_whitespace().next().unwrap_or("");
+                let hex: &str = l.split_whitespace().next().unwrap_or("");
                 u32::from_str_radix(hex.trim_start_matches("0x"), 16)
                     .unwrap_or_else(|_| panic!("invalid hex in fixture: {:?}", hex))
             })

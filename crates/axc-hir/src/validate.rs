@@ -205,11 +205,8 @@ mod tests {
         let (errors, warnings) = validate(&m);
         assert!(errors.is_empty(), "(e) expected no errors at product=1024: {errors:?}");
         assert!(!warnings.is_empty(), "(e) expected warning at product=1024 (boundary)");
-        if let HirWarning::WorkgroupExceedsPortableFloor { product, .. } = &warnings[0] {
-            assert_eq!(*product, 1024);
-        } else {
-            panic!("(e) expected WorkgroupExceedsPortableFloor, got: {:?}", warnings[0]);
-        }
+        let HirWarning::WorkgroupExceedsPortableFloor { product, .. } = &warnings[0];
+        assert_eq!(*product, 1024);
 
         // (f) @workgroup(16,8,9) product==1152 → ERROR
         let m = make_module(16, 8, 9);
