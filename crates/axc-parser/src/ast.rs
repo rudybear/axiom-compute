@@ -40,9 +40,25 @@ pub struct Param {
     pub ty: Spanned<TypeRef>,
 }
 
-/// A type reference in source (return type of a kernel declaration, or let binding type).
+/// Scalar element type for buffer parameters.
+///
+/// Mirrors the subset of `ScalarTy` that is valid as a buffer element in M1.2.
+/// I8/I16/U8/U16/F16/Bf16 are excluded until the narrow-type milestone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScalarTypeRef {
+    I32,
+    U32,
+    I64,
+    U64,
+    F32,
+    F64,
+}
+
+/// A type reference in source (return type of a kernel declaration, let binding type,
+/// or kernel parameter type).
 ///
 /// M0 only permitted `void`. M1.1 adds scalar types (§3.1 subset).
+/// M1.2 adds buffer types with an element type.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeRef {
     Void,
@@ -53,6 +69,12 @@ pub enum TypeRef {
     U64,
     F32,
     F64,
+    /// `buffer[elem]` — readable and writable SSBO.
+    Buffer(ScalarTypeRef),
+    /// `readonly_buffer[elem]` — read-only SSBO.
+    ReadonlyBuffer(ScalarTypeRef),
+    /// `writeonly_buffer[elem]` — write-only SSBO.
+    WriteonlyBuffer(ScalarTypeRef),
 }
 
 /// An annotation on a kernel: `@name` or `@name(arg, …)`.
@@ -84,6 +106,7 @@ pub struct Block {
 /// A statement inside a kernel body.
 ///
 /// M1.1 adds Let and Assign. Return remains from M0.
+/// M1.2 adds IndexAssign for buffer writes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
     /// `return;` or `return expr;` (only void return is used in M1.1).
@@ -95,9 +118,15 @@ pub enum Stmt {
         ty: Spanned<TypeRef>,
         init: Spanned<Expr>,
     },
-    /// `name = expr;` (assignment to existing binding).
+    /// `name = expr;` (assignment to existing scalar binding).
     Assign {
         target: Spanned<String>,
+        value: Spanned<Expr>,
+    },
+    /// `name[index] = expr;` (write to a buffer parameter).
+    IndexAssign {
+        target: Spanned<String>,
+        index: Spanned<Expr>,
         value: Spanned<Expr>,
     },
 }
@@ -179,4 +208,11 @@ pub enum Expr {
     },
     /// Parenthesized expression: `(expr)`.
     Paren(Box<Spanned<Expr>>),
+    /// Array index expression: `expr[expr]`.
+    ///
+    /// Used for buffer reads: `buf[i]`.
+    Index {
+        base: Box<Spanned<Expr>>,
+        index: Box<Spanned<Expr>>,
+    },
 }

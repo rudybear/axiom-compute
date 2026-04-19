@@ -3,6 +3,9 @@
 //! Every `HirExpr` carries a resolved `ScalarTy` on every node — no type
 //! placeholders, no inference. This is the invariant produced by the two-pass
 //! typechecker in `typecheck.rs`.
+//!
+//! M1.2 adds `BufferRead`, `GidBuiltin`, and the `BufferWrite` / `BufferWriteStmt`
+//! statement kinds for buffer I/O.
 
 use axc_lexer::Span;
 use crate::ty::{ScalarTy, IntLiteralValue, FloatLiteralValue};
@@ -53,6 +56,23 @@ pub enum HirExprKind {
     BitwiseBuiltin {
         op: BitwiseOp,
         args: Vec<HirExpr>,
+    },
+    /// Read one element from a buffer parameter: `buf[index]`.
+    ///
+    /// `param_position` is the 0-based position in the kernel's param list.
+    /// `buffer_binding` is the 0-based buffer-only binding slot index.
+    /// `index` must have type `U32`.
+    BufferRead {
+        param_position: u32,
+        buffer_binding: u32,
+        index: Box<HirExpr>,
+    },
+    /// `gid(axis)` — extract one component of `gl_GlobalInvocationID`.
+    ///
+    /// `axis` must be 0, 1, or 2 and is a constant resolved at compile time.
+    /// Result type is always `U32`.
+    GidBuiltin {
+        axis: u32,
     },
 }
 
@@ -119,6 +139,18 @@ pub enum HirStmt {
     },
     /// `return;` — only void return is valid in M1.1.
     Return { span: Span },
+    /// Write one element to a buffer parameter: `buf[index] = value`.
+    ///
+    /// `param_position` is the 0-based position in the kernel's param list.
+    /// `buffer_binding` is the 0-based buffer-only binding slot index.
+    /// `index` must have type `U32`.
+    BufferWrite {
+        param_position: u32,
+        buffer_binding: u32,
+        index: HirExpr,
+        value: HirExpr,
+        span: Span,
+    },
 }
 
 /// The typed body of a kernel: a binding table plus ordered statements.

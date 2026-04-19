@@ -1,0 +1,54 @@
+{
+  "id": "M1.2-buffers",
+  "title": "Storage buffers, array indexing, global invocation ID",
+  "phase": "M1",
+  "goal": "Add storage buffer types (buffer[T], readonly_buffer[T], writeonly_buffer[T]) as kernel parameters, enable array indexing (buf[i] read/write), and expose a global invocation ID builtin. Output is still codegen + spirv-val (no GPU execution — M1.5). After this milestone, saxpy-shaped kernels can be expressed and validated.",
+  "scope_in": [
+    "New types in source: buffer[T], readonly_buffer[T], writeonly_buffer[T] for T in {i32, u32, i64, u64, f32, f64}",
+    "Kernel parameters: fn foo(a: readonly_buffer[f32], y: buffer[f32]) -> void",
+    "Parameter binding model: descriptor set 0, binding index assigned left-to-right (param[0] = binding 0, etc.); documented",
+    "Global invocation ID builtin: gid(axis: u32) -> u32 where axis in {0,1,2}; lowered to OpLoad of GlobalInvocationId + OpCompositeExtract(axis). Convenience: gid_x() = gid(0), gid_y() = gid(1), gid_z() = gid(2) — decide whether to expose these or require explicit gid(0)",
+    "Array indexing read: `let x: f32 = buf[i];` → OpAccessChain + OpLoad with StorageBuffer storage class",
+    "Array indexing write: `buf[i] = x;` → OpAccessChain + OpStore (requires buffer OR writeonly_buffer, rejects readonly)",
+    "Mutation rule: writes to readonly_buffer produce HirError::WriteToReadonlyBuffer; reads from writeonly_buffer produce HirError::ReadFromWriteonlyBuffer",
+    "Index type: must be u32 or u64 (i32/i64 with non-negative compile-time constant accepted); floats rejected",
+    "SPIR-V codegen: OpTypeStruct with runtime array member (SSBO pattern), OpTypePointer StorageBuffer, OpVariable StorageBuffer at global scope, OpDecorate Block on the struct (SPIR-V 1.3+ uses Block not BufferBlock), OpDecorate DescriptorSet 0 + Binding N, OpDecorate NonWritable on readonly, OpDecorate NonReadable on writeonly, OpMemberDecorate Offset 0 on the runtime array, OpDecorate ArrayStride on the runtime array",
+    "SPIR-V capability: StorageBuffer access via OpCapability Shader is sufficient for Vulkan 1.1+ SPIR-V 1.3; no extra capability required",
+    "Interface list on OpEntryPoint: all StorageBuffer variables referenced by the kernel are included per SPIR-V 1.4+ spec — but we target 1.3 where only Input/Output must be listed, so StorageBuffer is NOT in the interface list (confirm per 1.3 spec §2.17)",
+    "Example: examples/saxpy.axc — `fn saxpy(a: f32, x: readonly_buffer[f32], y: buffer[f32]) -> void { let i: u32 = gid(0); y[i] = a * x[i] + y[i]; }`",
+    "Example: examples/vector_add.axc — `fn vadd(a: readonly_buffer[f32], b: readonly_buffer[f32], c: writeonly_buffer[f32]) -> void { let i: u32 = gid(0); c[i] = a[i] + b[i]; }`"
+  ],
+  "scope_out": [
+    "Shared memory / workgroup-local arrays (M1.3 or later)",
+    "Dynamically-sized arrays other than runtime-array SSBOs (never — SPIR-V restricts)",
+    "Sized arrays as function-local variables (array[T, N] per DESIGN.md — M1.3)",
+    "Cooperative matrix (M2)",
+    "For/while/if control flow (M1.3)",
+    "Vulkan runtime dispatch (M1.5)",
+    "Subgroup ops (M1.4)",
+    "Multi-dimensional indexing buf[i][j] (M1.3)",
+    "Scalar kernel parameters (uniform buffers / push constants) — scalar param `a: f32` is in saxpy example, but pass-by-value scalar kernel params need a design choice: push constant vs uniform buffer vs specialization constant. Scope for M1.2: accept scalar parameters lowered to a single-member struct in PushConstant storage class, OR defer to M1.2b if it blows scope"
+  ],
+  "acceptance_criteria": [
+    "cargo test --workspace passes (~200+ tests)",
+    "cargo clippy --workspace --all-targets -- -D warnings clean",
+    "spirv-val passes on emitted SPIR-V for examples/saxpy.axc and examples/vector_add.axc",
+    "HIR rejects writes to readonly_buffer with WriteToReadonlyBuffer",
+    "HIR rejects reads from writeonly_buffer with ReadFromWriteonlyBuffer",
+    "HIR rejects float or negative-signed indices",
+    "Codegen produces exactly one OpTypeStruct per distinct T, reused across all buffer[T] params",
+    "Descriptor set = 0, binding = param-position (0, 1, 2, ...) consistent across emissions",
+    "Regression: all M0+M1.1 tests still pass (157 from prior milestone)"
+  ],
+  "memory_limit_gb": 50,
+  "dependencies": ["M1.1-scalar-ops"],
+  "blocks": ["M1.3-control-flow", "M1.4-subgroup-ops", "M1.5-vulkan-dispatch"],
+  "estimated_loc": "2000-3500",
+  "estimated_tests_added": "40-60",
+  "open_questions_for_architect": [
+    "Scalar kernel parameters: push-constant, uniform buffer, or specialization constant? Or defer entirely to M1.2b?",
+    "gid() convenience aliases gid_x/y/z or require gid(0)? Parent AXIOM uses bare identifiers; AXIOM-Compute should be explicit.",
+    "StorageBuffer on interface list: SPIR-V 1.3 vs 1.4 diverge. Confirm 1.3 behavior and test.",
+    "ArrayStride decoration value: element size in bytes (4 for f32/i32, 8 for f64/i64). Confirm alignment rules per Vulkan spec std430."
+  ]
+}

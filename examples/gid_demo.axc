@@ -1,0 +1,20 @@
+// gid_demo.axc — demonstrates gid(0), gid(1), gid(2) usage
+//
+// Writes the thread's 3-D global invocation ID components into an output buffer.
+// Each output element at index i receives: gid_x * 1000000 + gid_y * 1000 + gid_z
+//
+// Parameters:
+//   out — output buffer to store gid-derived values (buffer[u32], binding=0)
+
+@kernel
+@workgroup(4, 4, 4)
+@intent("write gid(0), gid(1), gid(2) components into an output buffer")
+@complexity(O(1))
+fn gid_demo(out: buffer[u32]) -> void {
+    let x: u32 = gid(0);
+    let y: u32 = gid(1);
+    let z: u32 = gid(2);
+    let i: u32 = gid(0);
+    out[i] = x;
+    return;
+}

@@ -232,9 +232,16 @@ impl TokenKind {
             "and"      => Some(TokenKind::And),
             "or"       => Some(TokenKind::Or),
             "not"      => Some(TokenKind::Not),
-            "void"     => Some(TokenKind::Void),
-            "true"     => Some(TokenKind::BoolLiteral(true)),
-            "false"    => Some(TokenKind::BoolLiteral(false)),
+            "void"             => Some(TokenKind::Void),
+            "kernel"           => Some(TokenKind::Kernel),
+            "buffer"           => Some(TokenKind::Buffer),
+            "readonly_buffer"  => Some(TokenKind::ReadonlyBuffer),
+            "writeonly_buffer" => Some(TokenKind::WriteonlyBuffer),
+            "shared"           => Some(TokenKind::Shared),
+            "barrier"          => Some(TokenKind::Barrier),
+            "subgroup_uniform" => Some(TokenKind::SubgroupUniform),
+            "true"             => Some(TokenKind::BoolLiteral(true)),
+            "false"            => Some(TokenKind::BoolLiteral(false)),
             // Primitive types
             "i8"   => Some(TokenKind::I8),
             "i16"  => Some(TokenKind::I16),
@@ -426,6 +433,54 @@ mod tests {
         assert_eq!(TokenKind::keyword_from_str("struct"), Some(TokenKind::Struct));
         assert_eq!(TokenKind::keyword_from_str("break"), Some(TokenKind::Break));
         assert_eq!(TokenKind::keyword_from_str("continue"), Some(TokenKind::Continue));
+    }
+
+    // ── M1.2: buffer keywords in keyword_from_str ────────────────────────────
+
+    #[test]
+    fn keyword_from_str_buffer_keywords() {
+        // All buffer-related keywords must map to distinct token kinds.
+        assert_eq!(TokenKind::keyword_from_str("buffer"), Some(TokenKind::Buffer));
+        assert_eq!(TokenKind::keyword_from_str("readonly_buffer"), Some(TokenKind::ReadonlyBuffer));
+        assert_eq!(TokenKind::keyword_from_str("writeonly_buffer"), Some(TokenKind::WriteonlyBuffer));
+        assert_eq!(TokenKind::keyword_from_str("shared"), Some(TokenKind::Shared));
+        assert_eq!(TokenKind::keyword_from_str("barrier"), Some(TokenKind::Barrier));
+        assert_eq!(TokenKind::keyword_from_str("kernel"), Some(TokenKind::Kernel));
+        assert_eq!(TokenKind::keyword_from_str("subgroup_uniform"), Some(TokenKind::SubgroupUniform));
+    }
+
+    #[test]
+    fn buffer_keywords_are_distinct_tokens() {
+        // All three buffer access modes produce distinct tokens.
+        use crate::Lexer;
+        let (tokens, errs) = Lexer::new("buffer readonly_buffer writeonly_buffer").tokenize();
+        assert!(errs.is_empty(), "unexpected lex errors: {errs:?}");
+        assert!(matches!(tokens[0].kind, TokenKind::Buffer));
+        assert!(matches!(tokens[1].kind, TokenKind::ReadonlyBuffer));
+        assert!(matches!(tokens[2].kind, TokenKind::WriteonlyBuffer));
+    }
+
+    #[test]
+    fn buffer_bracket_elem_lexes_correctly() {
+        // `buffer[f32]` should lex as Buffer, LBracket, F32, RBracket.
+        use crate::Lexer;
+        let (tokens, errs) = Lexer::new("buffer[f32]").tokenize();
+        assert!(errs.is_empty(), "unexpected lex errors: {errs:?}");
+        assert!(matches!(tokens[0].kind, TokenKind::Buffer));
+        assert!(matches!(tokens[1].kind, TokenKind::LBracket));
+        assert!(matches!(tokens[2].kind, TokenKind::F32));
+        assert!(matches!(tokens[3].kind, TokenKind::RBracket));
+    }
+
+    #[test]
+    fn readonly_buffer_bracket_elem_lexes_correctly() {
+        use crate::Lexer;
+        let (tokens, errs) = Lexer::new("readonly_buffer[u32]").tokenize();
+        assert!(errs.is_empty(), "unexpected lex errors: {errs:?}");
+        assert!(matches!(tokens[0].kind, TokenKind::ReadonlyBuffer));
+        assert!(matches!(tokens[1].kind, TokenKind::LBracket));
+        assert!(matches!(tokens[2].kind, TokenKind::U32));
+        assert!(matches!(tokens[3].kind, TokenKind::RBracket));
     }
 
     #[test]

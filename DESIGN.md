@@ -1,6 +1,6 @@
 # AXIOM-Compute -- Design Document (v0.1, Living)
 
-> Working document. Updated at every design-review approval. Last revision: bootstrap (M0, 2026-04-18).
+> Working document. Updated at every design-review approval. Last revision: M1.2 (this architect run): buffers, array indexing, gid.
 
 ---
 
@@ -98,6 +98,88 @@ axiom-compute/
 ---
 
 ## 3. Language
+
+### 3.1 M1.2 parameter binding model
+
+#### 3.1.1 Buffer types (M1.2)
+
+Buffer parameters are SSBO-backed arrays exposed as `buffer[T]`, `readonly_buffer[T]`,
+or `writeonly_buffer[T]` in kernel parameter lists. The allowed element types in M1.2
+are `i32`, `u32`, `i64`, `u64`, `f32`, and `f64`.
+
+**Binding assignment — worked saxpy example:**
+
+```
+fn saxpy(a: f32, x: readonly_buffer[f32], y: buffer[f32]) -> void { ... }
+```
+
+Buffer params are assigned consecutive descriptor bindings in left-to-right order among
+buffer parameters only (scalar params skip the binding counter):
+
+- `x` -> descriptor binding 0  (first buffer param)  ← x -> descriptor binding 0
+- `y` -> descriptor binding 1  (second buffer param)  ← y -> descriptor binding 1
+- `a` -> push-constant member 0  (scalar params go to push-constant block, not descriptors)  ← a -> push-constant member 0
+
+All buffer bindings are in **DescriptorSet 0**. The binding index equals the buffer's
+0-based position among buffer parameters, not its position among all parameters.
+
+**SPIR-V layout (one SSBO per buffer param):**
+
+```
+OpTypeRuntimeArray  %arr_T    %T
+OpTypeStruct        %block    %arr_T         ; { T[] data; }
+OpTypePointer       %ptr      StorageBuffer  %block
+OpVariable          %var      StorageBuffer
+OpDecorate          %arr_T    ArrayStride <elem_bytes>  ; 4 for f32, 8 for f64
+OpDecorate          %block    Block
+OpDecorate          %var      DescriptorSet 0
+OpDecorate          %var      Binding <slot>
+OpDecorate          %var      NonWritable    ; readonly_buffer only
+OpDecorate          %var      NonReadable    ; writeonly_buffer only
+```
+
+Note: `Block` decoration (SPIR-V 1.3+) is used — NOT `BufferBlock` (deprecated).
+
+**Interface list (SPIR-V 1.3 §2.17):** StorageBuffer and PushConstant variables
+are NOT included in the OpEntryPoint interface list. Only Input/Output variables
+(such as `gl_GlobalInvocationID`) must be listed. This is enforced via the
+`CURRENT_SPIRV_VERSION` compile-time constant guard (AT-228).
+
+#### 3.1.2 Scalar kernel parameters (M1.2)
+
+Scalar parameters (`i32`, `u32`, `i64`, `u64`, `f32`, `f64`) are passed via a
+single push-constant struct block. Member layout follows `std430`:
+
+- Members are ordered by their position in the push-constant member list (i.e., the order
+  of scalar params left-to-right, ignoring buffer params).
+- Alignment: each member is aligned to `max(4, sizeof(T))` bytes.
+  - `i32`, `u32`, `f32` → 4-byte aligned (no padding from prior 4-byte-aligned member)
+  - `i64`, `u64`, `f64` → 8-byte aligned (4-byte padding after any 4-byte member)
+- Member index is independent of global param position — it is only counted among scalar
+  params. A `buffer[f32]` param at position 0 does not consume a member index.
+- Total push-constant block size must not exceed 128 bytes (Vulkan `minPushConstantsSize`).
+  Exceeding this limit produces `BindingPlanError::PushConstantTooLarge`, with the
+  `overflowing_param_name` field pointing at the FIRST param that causes overflow
+  (not param[0]).
+
+#### 3.1.3 Global invocation ID (M1.2)
+
+The builtin `gid(axis)` returns the global invocation ID component for the given axis:
+
+```
+let i: u32 = gid(0);   // X axis (typical for 1-D dispatch)
+let j: u32 = gid(1);   // Y axis
+let k: u32 = gid(2);   // Z axis
+```
+
+Rules:
+- `axis` must be an integer literal (0, 1, or 2). A variable or out-of-range constant
+  produces a `GidAxisMustBeConstant` or `GidAxisOutOfRange` typecheck error.
+- Each call lowers to an `OpLoad` of the `gl_GlobalInvocationID` uvec3, followed by
+  an `OpCompositeExtract` with the axis index.
+- The `gl_GlobalInvocationID` `Input` variable is emitted ONCE per module regardless
+  of how many times `gid()` is called. The variable's ID appears in the OpEntryPoint
+  interface list (required for Input variables in SPIR-V 1.3).
 
 ### 3.1 Types
 
@@ -263,3 +345,4 @@ trigger UB) may be rejected at HIR typecheck in a future milestone.
 
 - **2026-04-18:** Initial draft (v0.1), pre-architect review. To be revised through dual design review.
 - **2026-04-18:** M1.1 revision — added §3 integer division UB note (CRITICAL-2 fix from pessimistic review).
+- **2026-04-18:** M1.2 revision — added §3.1 M1.2 parameter binding model (buffer types, scalar params, gid builtin), saxpy binding assignment walkthrough, and interface-list SPIR-V 1.3 rule.

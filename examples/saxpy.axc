@@ -1,0 +1,25 @@
+// saxpy.axc — SAXPY kernel: Y[i] = alpha * X[i] + Y[i]
+//
+// Demonstrates M1.2 buffer bindings and scalar push-constants.
+// Classic single-precision A*X + Y operation on two vectors.
+//
+// Parameters:
+//   n     — number of elements (u32, push-constant scalar)
+//   alpha — scalar multiplier (f32, push-constant scalar)
+//   x     — input vector (readonly_buffer, binding=0)
+//   y     — input/output vector (buffer, binding=1)
+
+@kernel
+@workgroup(64, 1, 1)
+@intent("compute Y[i] = alpha * X[i] + Y[i] in parallel")
+@complexity(O(n))
+fn saxpy(n: u32, alpha: f32, x: readonly_buffer[f32], y: buffer[f32]) -> void {
+    let i: u32 = gid(0);
+    let limit: u32 = n;
+    let in_range: bool = i < limit;
+    let xi: f32 = x[i];
+    let yi: f32 = y[i];
+    let result: f32 = alpha * xi + yi;
+    y[i] = result;
+    return;
+}

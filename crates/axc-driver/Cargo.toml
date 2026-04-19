@@ -18,3 +18,7 @@ axc-codegen = { path = "../axc-codegen" }
 clap = { workspace = true }
 miette = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+rspirv = { workspace = true }
+spirv = { workspace = true }

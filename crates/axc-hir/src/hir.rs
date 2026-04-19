@@ -8,6 +8,7 @@
 //! structured data).
 
 use axc_lexer::Span;
+use crate::param::{KernelParam, ParamBindingPlan};
 
 /// Vulkan 1.1 guaranteed minimum `maxComputeWorkGroupInvocations`.
 ///
@@ -39,6 +40,10 @@ pub struct Kernel {
     pub id: KernelId,
     pub name: String,
     pub annotations: KernelAnnotations,
+    /// Validated kernel parameters (scalars + buffers), in declaration order.
+    pub params: Vec<KernelParam>,
+    /// Binding plan derived from `params` (descriptor sets + push-constant layout).
+    pub binding_plan: ParamBindingPlan,
     pub body: KernelBody,
     pub span: Span,
 }

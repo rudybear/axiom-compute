@@ -5,13 +5,16 @@
 //! `@complexity` is mapped to `ComplexityForm` enum values (never a String).
 
 use axc_lexer::Span;
-use axc_parser::ast::{Module as AstModule, Item, AnnotationArg, Stmt};
+use axc_parser::ast::{Module as AstModule, Item, AnnotationArg, Stmt, TypeRef, ScalarTypeRef};
 use crate::hir::{
     Module as HirModule, Kernel, KernelId, KernelAnnotations, WorkgroupDims,
     KernelBody, ComplexityForm, ComplexityVar, PreconditionTrivial,
 };
 use crate::validate::{HirError, HirWarning};
 use crate::typecheck::typecheck_kernel_body;
+use crate::ty::ScalarTy;
+use crate::buffer::{BufferAccess, BufferTy};
+use crate::param::{KernelParam, Ty as ParamTy, ParamBindingPlan, compute_binding_plan};
 
 /// Lower an AST module to HIR, producing structured errors and warnings.
 ///
@@ -155,13 +158,22 @@ pub fn lower_module(ast: &AstModule) -> (HirModule, Vec<HirError>, Vec<HirWarnin
                     subgroup_uniform,
                 };
 
+                // Lower kernel parameters.
+                let (params, binding_plan) = lower_params(
+                    &kd.params,
+                    item.span,
+                    &mut errors,
+                );
+
                 // Determine body: Empty if trivial (only void return), Typed otherwise.
-                let body = lower_kernel_body(&kd.body.node, &mut errors);
+                let body = lower_kernel_body(&kd.body.node, &params, &mut errors);
 
                 kernels.push(Kernel {
                     id: KernelId(next_id),
                     name: kd.name.node.clone(),
                     annotations,
+                    params,
+                    binding_plan,
                     body,
                     span: item.span,
                 });
@@ -177,29 +189,129 @@ pub fn lower_module(ast: &AstModule) -> (HirModule, Vec<HirError>, Vec<HirWarnin
 /// empty), and lower it to the appropriate `KernelBody` variant.
 ///
 /// Uses `KernelBody::Empty` if:
-/// - The block has no statements, OR
-/// - The block has exactly one statement that is `Stmt::Return(None)`.
+/// - The block has no statements AND there are no parameters, OR
+/// - The block has exactly one statement that is `Stmt::Return(None)` AND no parameters.
 ///
 /// This preserves the M0 empty-kernel bit-exact SPIR-V output (AT-103).
 fn lower_kernel_body(
     block: &axc_parser::ast::Block,
+    params: &[KernelParam],
     errors: &mut Vec<HirError>,
 ) -> KernelBody {
     let stmts = &block.stmts;
 
-    let is_empty_body = stmts.is_empty()
+    let is_trivial_stmts = stmts.is_empty()
         || (stmts.len() == 1 && matches!(stmts[0].node, Stmt::Return(None)));
+
+    // Only use Empty path if there are no params AND the body is trivial.
+    // With params, even a body that is just `return;` must go through Typed
+    // so that the codegen knows about the param bindings.
+    let is_empty_body = is_trivial_stmts && params.is_empty();
 
     if is_empty_body {
         return KernelBody::Empty;
     }
 
-    // Non-trivial body — run the typechecker.
-    let (typed_body, tc_errors) = typecheck_kernel_body(block);
+    // Non-trivial body or body with params — run the typechecker.
+    let (typed_body, tc_errors) = typecheck_kernel_body(block, params);
     for e in tc_errors {
         errors.push(HirError::Typecheck(e));
     }
     KernelBody::Typed(typed_body)
+}
+
+/// Lower AST kernel parameters to HIR `KernelParam`s and compute the binding plan.
+///
+/// Returns `(params, binding_plan)`. On error, a placeholder empty plan is returned
+/// so codegen can continue and collect further diagnostics.
+fn lower_params(
+    ast_params: &[axc_lexer::Spanned<axc_parser::ast::Param>],
+    kernel_span: Span,
+    errors: &mut Vec<HirError>,
+) -> (Vec<KernelParam>, ParamBindingPlan) {
+    let mut params: Vec<KernelParam> = Vec::new();
+
+    for (pos, spanned) in ast_params.iter().enumerate() {
+        let ast_param = &spanned.node;
+        let name: &str = &ast_param.name.node;
+        let span: Span = spanned.span;
+
+        let ty: ParamTy = match lower_type_ref(&ast_param.ty.node, span, name, errors) {
+            Some(t) => t,
+            None => continue, // error already pushed
+        };
+
+        params.push(KernelParam {
+            name: name.to_owned(),
+            ty,
+            position: pos as u32,
+            span,
+        });
+    }
+
+    match compute_binding_plan(&params, kernel_span) {
+        Ok(plan) => (params, plan),
+        Err(e) => {
+            errors.push(HirError::BindingPlan(e));
+            // Return params but empty plan so codegen doesn't crash.
+            (params, ParamBindingPlan {
+                buffers: Vec::new(),
+                scalars: Vec::new(),
+                push_constant_total_bytes: 0,
+            })
+        }
+    }
+}
+
+/// Convert an AST `TypeRef` to a HIR `ParamTy`.
+///
+/// Returns `None` and pushes an error for unsupported types (void, bool, etc.).
+fn lower_type_ref(
+    tr: &TypeRef,
+    span: Span,
+    param_name: &str,
+    errors: &mut Vec<HirError>,
+) -> Option<ParamTy> {
+    match tr {
+        TypeRef::I32 => Some(ParamTy::Scalar(ScalarTy::I32)),
+        TypeRef::U32 => Some(ParamTy::Scalar(ScalarTy::U32)),
+        TypeRef::I64 => Some(ParamTy::Scalar(ScalarTy::I64)),
+        TypeRef::U64 => Some(ParamTy::Scalar(ScalarTy::U64)),
+        TypeRef::F32 => Some(ParamTy::Scalar(ScalarTy::F32)),
+        TypeRef::F64 => Some(ParamTy::Scalar(ScalarTy::F64)),
+        TypeRef::Buffer(elem)         => Some(ParamTy::Buffer(BufferTy {
+            elem: lower_scalar_type_ref(elem),
+            access: BufferAccess::ReadWrite,
+        })),
+        TypeRef::ReadonlyBuffer(elem) => Some(ParamTy::Buffer(BufferTy {
+            elem: lower_scalar_type_ref(elem),
+            access: BufferAccess::ReadOnly,
+        })),
+        TypeRef::WriteonlyBuffer(elem) => Some(ParamTy::Buffer(BufferTy {
+            elem: lower_scalar_type_ref(elem),
+            access: BufferAccess::WriteOnly,
+        })),
+        TypeRef::Void | TypeRef::Bool => {
+            errors.push(HirError::UnsupportedParamType {
+                ty_name: format!("{:?}", tr),
+                param_name: param_name.to_owned(),
+                span,
+            });
+            None
+        }
+    }
+}
+
+/// Convert an AST `ScalarTypeRef` to an HIR `ScalarTy`.
+fn lower_scalar_type_ref(str_ref: &ScalarTypeRef) -> ScalarTy {
+    match str_ref {
+        ScalarTypeRef::I32 => ScalarTy::I32,
+        ScalarTypeRef::U32 => ScalarTy::U32,
+        ScalarTypeRef::I64 => ScalarTy::I64,
+        ScalarTypeRef::U64 => ScalarTy::U64,
+        ScalarTypeRef::F32 => ScalarTy::F32,
+        ScalarTypeRef::F64 => ScalarTy::F64,
+    }
 }
 
 /// Public accessor for tests: given an AST module, return the first kernel's body block.
@@ -211,6 +323,33 @@ pub fn get_kernel_body_block(ast: &AstModule) -> Option<&axc_lexer::Spanned<axc_
         let axc_parser::ast::Item::Kernel(ref kd) = item.node;
         &kd.body
     })
+}
+
+/// Public test helper: lower AST params to `KernelParam`s without computing the
+/// full binding plan. Used by `typecheck::tests` to construct param lists for
+/// `typecheck_kernel_body` test helpers.
+///
+/// Errors are silently dropped (tests that exercise param errors use `lower_module`).
+#[doc(hidden)]
+pub fn lower_params_for_test(
+    ast_params: &[axc_lexer::Spanned<axc_parser::ast::Param>],
+) -> Vec<KernelParam> {
+    let mut params: Vec<KernelParam> = Vec::new();
+    let mut errors: Vec<crate::validate::HirError> = Vec::new();
+    for (pos, spanned) in ast_params.iter().enumerate() {
+        let ast_param = &spanned.node;
+        let span: axc_lexer::Span = spanned.span;
+        let name: &str = &ast_param.name.node;
+        if let Some(ty) = lower_type_ref(&ast_param.ty.node, span, name, &mut errors) {
+            params.push(KernelParam {
+                name: name.to_owned(),
+                ty,
+                position: pos as u32,
+                span,
+            });
+        }
+    }
+    params
 }
 
 /// Extract a single workgroup dimension from an `AnnotationArg::Int`.
@@ -490,5 +629,171 @@ mod tests {
         let (_, errors, _) = lower_module(&ast);
         assert!(errors.iter().any(|e| matches!(e, HirError::WorkgroupDimOverflow { .. })),
             "expected WorkgroupDimOverflow: {errors:?}");
+    }
+
+    // ── M1.2 lower tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn lower_buffer_param_assigns_binding_0() {
+        let (hir, errors, _) = lower_src(
+            "@kernel @workgroup(1,1,1) fn k(x: readonly_buffer[f32]) -> void { return; }",
+        );
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        let plan = &hir.kernels[0].binding_plan;
+        assert_eq!(plan.buffers.len(), 1, "expected 1 buffer binding");
+        assert_eq!(plan.buffers[0].buffer_position, 0, "first buffer must be at binding 0");
+        assert_eq!(plan.buffers[0].name, "x");
+    }
+
+    #[test]
+    fn lower_saxpy_params_binding_layout() {
+        // saxpy(n: u32, alpha: f32, x: readonly_buffer[f32], y: buffer[f32])
+        // x → binding 0, y → binding 1; n and alpha → push constant
+        let (hir, errors, _) = lower_src(concat!(
+            "@kernel @workgroup(64,1,1) fn saxpy(",
+            "n: u32, alpha: f32, x: readonly_buffer[f32], y: buffer[f32]",
+            ") -> void { return; }",
+        ));
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        let plan = &hir.kernels[0].binding_plan;
+        assert_eq!(plan.buffers.len(), 2);
+        assert_eq!(plan.buffers[0].name, "x");
+        assert_eq!(plan.buffers[0].buffer_position, 0);
+        assert_eq!(plan.buffers[1].name, "y");
+        assert_eq!(plan.buffers[1].buffer_position, 1);
+        assert_eq!(plan.scalars.len(), 2);
+        assert_eq!(plan.scalars[0].name, "n");
+        assert_eq!(plan.scalars[0].member_index, 0);
+        assert_eq!(plan.scalars[1].name, "alpha");
+        assert_eq!(plan.scalars[1].member_index, 1);
+    }
+
+    #[test]
+    fn lower_scalar_param_populates_kernel() {
+        let (hir, errors, _) = lower_src(
+            "@kernel @workgroup(1,1,1) fn k(a: f32) -> void { return; }",
+        );
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        let plan = &hir.kernels[0].binding_plan;
+        assert_eq!(plan.scalars.len(), 1);
+        assert_eq!(plan.scalars[0].name, "a");
+        assert_eq!(plan.scalars[0].ty, crate::ty::ScalarTy::F32);
+        assert_eq!(plan.scalars[0].offset, 0);
+        assert_eq!(plan.scalars[0].member_index, 0);
+        assert_eq!(plan.push_constant_total_bytes, 4);
+    }
+
+    #[test]
+    fn lower_pushconstant_over_128_rejected() {
+        // 17 × f64 = 136 bytes > 128 → PushConstantTooLarge
+        let params: String = (0..17).map(|i| format!("p{i}: f64")).collect::<Vec<_>>().join(", ");
+        let src = format!("@kernel @workgroup(1,1,1) fn k({params}) -> void {{ return; }}");
+        let (ast, lex_errs, parse_errs) = parse(&src);
+        assert!(lex_errs.is_empty(), "lex: {lex_errs:?}");
+        assert!(parse_errs.is_empty(), "parse: {parse_errs:?}");
+        let (_, errors, _) = lower_module(&ast);
+        assert!(
+            errors.iter().any(|e| matches!(e, HirError::BindingPlan(
+                crate::param::BindingPlanError::PushConstantTooLarge { got, .. }
+            ) if *got > 128)),
+            "expected BindingPlan::PushConstantTooLarge: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn lower_pushconstant_over_128_points_at_param32() {
+        // 33 × u32 = 132 bytes; param p32 (index 32) is the overflow trigger.
+        let params: String = (0..33).map(|i| format!("p{i}: u32")).collect::<Vec<_>>().join(", ");
+        let src = format!("@kernel @workgroup(1,1,1) fn k({params}) -> void {{ return; }}");
+        let (ast, lex_errs, parse_errs) = parse(&src);
+        assert!(lex_errs.is_empty(), "lex: {lex_errs:?}");
+        assert!(parse_errs.is_empty(), "parse: {parse_errs:?}");
+        let (_, errors, _) = lower_module(&ast);
+
+        let overflow_error = errors.iter().find_map(|e| {
+            if let HirError::BindingPlan(crate::param::BindingPlanError::PushConstantTooLarge {
+                got, limit, overflowing_param_name, span, ..
+            }) = e {
+                Some((*got, *limit, overflowing_param_name.clone(), *span))
+            } else {
+                None
+            }
+        });
+        let (got, limit, name, span) = overflow_error
+            .expect("expected PushConstantTooLarge error");
+
+        assert_eq!(got, 132, "132 bytes = 33 × 4");
+        assert_eq!(limit, 128, "Vulkan minimum is 128 bytes");
+        assert_eq!(name, "p32", "p32 (index 32) is the overflow param, NOT p0");
+
+        // The span of p32 must differ from p0's span.
+        // We re-parse to get the span of p0 from the params list.
+        let kd = ast.items.first().map(|item| {
+            let axc_parser::ast::Item::Kernel(ref kd) = item.node; kd
+        }).unwrap();
+        let p0_span = kd.params[0].span;
+        assert_ne!(span, p0_span, "error span must point at p32, not p0");
+    }
+
+    #[test]
+    fn lower_scalar_param_bool_rejected() {
+        // bool is not a valid scalar param type
+        let (ast, _, _) = parse("@kernel @workgroup(1,1,1) fn k(b: bool) -> void { return; }");
+        let (_, errors, _) = lower_module(&ast);
+        assert!(
+            errors.iter().any(|e| matches!(e, HirError::UnsupportedParamType { .. })),
+            "expected UnsupportedParamType for bool param: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn lower_buffer_elem_bool_rejected() {
+        // buffer[bool] is not supported in M1.2 — bool is not a ScalarTypeRef in the parser
+        // The parser grammar only allows i32/u32/i64/u64/f32/f64 as buffer element types.
+        // This test verifies that attempting to parse buffer[bool] fails at parse level.
+        // (Bool is not a valid buffer element type per the parser grammar.)
+        let (ast, lex_errs, parse_errs) = parse(
+            "@kernel @workgroup(1,1,1) fn k(x: buffer[bool]) -> void { return; }",
+        );
+        assert!(lex_errs.is_empty(), "lex: {lex_errs:?}");
+        // The parser rejects bool as a buffer element type (grammar doesn't allow it)
+        // OR the HIR rejects it via UnsupportedParamType.
+        if parse_errs.is_empty() {
+            let (_, errors, _) = lower_module(&ast);
+            assert!(
+                !errors.is_empty(),
+                "expected HIR error for buffer[bool]: {errors:?}"
+            );
+        } else {
+            // Parser rejected it — that's fine too
+            assert!(!parse_errs.is_empty(), "parse should reject buffer[bool]");
+        }
+    }
+
+    #[test]
+    fn lower_nested_buffer_rejected() {
+        // buffer[buffer[f32]] — nested buffers are not valid in M1.2
+        // The parser grammar uses ScalarTypeRef (not TypeRef) for buffer elements,
+        // so buffer[buffer[f32]] would be a parse error.
+        let (_, lex_errs, parse_errs) = parse(
+            "@kernel @workgroup(1,1,1) fn k(x: buffer[buffer[f32]]) -> void { return; }",
+        );
+        assert!(lex_errs.is_empty(), "lex: {lex_errs:?}");
+        // Either parser or HIR must reject nested buffers
+        assert!(!parse_errs.is_empty(), "parser should reject buffer[buffer[f32]]");
+    }
+
+    #[test]
+    fn lower_type_ref_scalar_types() {
+        // All 6 M1.2 scalar param types should lower cleanly
+        for ty_str in &["i32", "u32", "i64", "u64", "f32", "f64"] {
+            let src = format!(
+                "@kernel @workgroup(1,1,1) fn k(x: {ty_str}) -> void {{ return; }}"
+            );
+            let (hir, errors, _) = lower_src(&src);
+            assert!(errors.is_empty(), "errors for {ty_str}: {errors:?}");
+            assert_eq!(hir.kernels[0].binding_plan.scalars.len(), 1,
+                "expected 1 scalar for {ty_str}");
+        }
     }
 }

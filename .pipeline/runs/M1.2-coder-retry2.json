@@ -1,0 +1,77 @@
+{
+  "verdict": "IMPLEMENTED",
+  "agent": "coder_retry2",
+  "milestone_id": "M1.2-buffers",
+  "branch": "coder/M1.2-buffers",
+  "date": "2026-04-18",
+  "commits": [
+    "4eefe39 fix(codegen): SSBO struct member Offset 0 decoration (CRIT-7 Vulkan compliance)",
+    "d015b8e fix(hir): register params in symbol table; enable AssignToParam (CRIT-2)",
+    "ece6d1b fix(codegen): gid axis via OpCompositeExtract per spec (CRIT-5)"
+  ],
+  "test_results": {
+    "total_passing": 252,
+    "total_failing": 0,
+    "floor_required": 250,
+    "floor_met": true
+  },
+  "cargo_check": "PASS",
+  "cargo_clippy_D_warnings": "PASS",
+  "cargo_test": "PASS",
+  "git_clean_after": true,
+  "spirv_val_available": false,
+  "spirv_val_note": "spirv-tools not installed (no sudo access). CRIT-7 fix is correct per Vulkan §15.6.4 spec — OpMemberDecorate struct 0 Offset 0 now emitted for every SSBO struct. AT-231 test validates the decoration is present structurally.",
+
+  "crit_fixes": {
+    "CRIT-7": {
+      "status": "FIXED",
+      "description": "Added OpMemberDecorate struct_type_id 0 Offset 0 after the Block decoration in emit_buffer_globals. Added AT-231 test cg_ssbo_struct_member_has_offset_zero that walks annotations and asserts Decoration::Offset 0 is present for the SSBO struct member 0.",
+      "file": "crates/axc-codegen/src/buffers.rs"
+    },
+    "CRIT-2": {
+      "status": "FIXED",
+      "description": "The Assign path in typecheck_kernel_body now checks tc.find_param() BEFORE tc.find_binding(). If the target name matches a kernel parameter, TypecheckError::AssignToParam fires immediately. tc_assign_to_param_rejected now asserts AssignToParam{name:'a'} with a strong matches! check.",
+      "file": "crates/axc-hir/src/typecheck.rs"
+    },
+    "CRIT-1": {
+      "status": "FIXED",
+      "description": "tc_multi_dim_index_rejected was testing band() success (unrelated to multi-dim indexing). The M1.2 grammar cannot produce Index(non-Ident) nodes (postfix indexing is Ident-only). TypecheckError::MultiDimIndexInM1_2 removed as dead code (CRIT-6 co-fix). Test renamed tc_band_builtin_ok with correct intent.",
+      "file": "crates/axc-hir/src/typecheck.rs"
+    },
+    "CRIT-3": {
+      "status": "FIXED",
+      "description": "tc_gid_axis_negative_rejected renamed tc_gid_axis_non_literal_rejected and now asserts GidAxisMustBeConstant (the actual variant fired for -1 parsed as Unary(Neg,IntLit(1))). Added separate test tc_gid_axis_three_out_of_range using gid(3u32) which fires GidAxisOutOfRange{got:3}.",
+      "file": "crates/axc-hir/src/typecheck.rs"
+    },
+    "CRIT-4": {
+      "status": "FIXED",
+      "description": "Tightened 3 weak assertions: tc_bad_index_type_float now asserts BadIndexType{got_ty:'f32'} specifically (no OR with TypeMismatch). tc_bad_index_type_bool now asserts BadIndexType{got_ty:'bool'}. tc_index_signed_integer_ok renamed tc_index_signed_integer_rejected and asserts BadIndexType{got_ty:'i32'}.",
+      "file": "crates/axc-hir/src/typecheck.rs"
+    },
+    "CRIT-5": {
+      "status": "FIXED",
+      "description": "emit_gid_component now emits OpLoad uvec3 from gid_var followed by OpCompositeExtract u32 with a LITERAL axis operand (per architect spec §scope_in_summary[11] and SPIR-V §3.32.13). Removed u32_ptr_type_id field from GlobalInvocationIdVar (no longer needed). Updated compile_gid_demo.rs docstring and added OpCompositeExtract count assertion (>=3 for gid_demo.axc).",
+      "files": ["crates/axc-codegen/src/body.rs", "crates/axc-codegen/src/buffers.rs", "crates/axc-driver/tests/compile_gid_demo.rs"]
+    },
+    "CRIT-6": {
+      "status": "FIXED",
+      "description": "Removed TypecheckError::MultiDimIndexInM1_2 (dead — grammar cannot produce Index(non-Ident)) and TypecheckError::UnknownParam (never pushed anywhere). The Index fallthrough arm now emits UnsupportedExprInM1_1 as a forward-compatible safety net.",
+      "file": "crates/axc-hir/src/typecheck.rs"
+    }
+  },
+
+  "new_tests_added": [
+    "cg_ssbo_struct_member_has_offset_zero (AT-231, buffers.rs)",
+    "tc_assign_to_param_rejected (strengthened to assert AssignToParam{name:'a'})",
+    "tc_gid_axis_non_literal_rejected (was tc_gid_axis_negative_rejected, now asserts GidAxisMustBeConstant)",
+    "tc_gid_axis_three_out_of_range (new, asserts GidAxisOutOfRange{got:3})",
+    "tc_bad_index_type_float (strengthened to assert BadIndexType{got_ty:'f32'})",
+    "tc_bad_index_type_bool (strengthened to assert BadIndexType{got_ty:'bool'})",
+    "tc_index_signed_integer_rejected (renamed+strengthened, asserts BadIndexType{got_ty:'i32'})",
+    "tc_band_builtin_ok (renamed from tc_multi_dim_index_rejected)"
+  ],
+
+  "tests_removed": [
+    "tc_multi_dim_index_rejected (replaced by tc_band_builtin_ok with correct intent)"
+  ]
+}

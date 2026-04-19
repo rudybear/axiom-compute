@@ -1,0 +1,23 @@
+// vector_add.axc — element-wise vector addition: C[i] = A[i] + B[i]
+//
+// Demonstrates M1.2 buffer bindings with three buffer parameters.
+// All three buffers contain f32 elements.
+//
+// Parameters:
+//   n — number of elements (u32, push-constant scalar)
+//   a — first input vector (readonly_buffer, binding=0)
+//   b — second input vector (readonly_buffer, binding=1)
+//   c — output vector (writeonly_buffer, binding=2)
+
+@kernel
+@workgroup(64, 1, 1)
+@intent("compute C[i] = A[i] + B[i] in parallel")
+@complexity(O(n))
+fn vector_add(n: u32, a: readonly_buffer[f32], b: readonly_buffer[f32], c: writeonly_buffer[f32]) -> void {
+    let i: u32 = gid(0);
+    let ai: f32 = a[i];
+    let bi: f32 = b[i];
+    let sum: f32 = ai + bi;
+    c[i] = sum;
+    return;
+}
