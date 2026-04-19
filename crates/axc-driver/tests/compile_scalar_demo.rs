@@ -159,8 +159,8 @@ fn test_compile_scalar_demo_produces_valid_spirv() {
 
     // 7. Assert required arithmetic opcodes are present in the SPIR-V output.
     //    AT-101 expected_behavior: the scalar_demo output must contain at least
-    //    one of each: Op::IAdd (128), Op::IMul (130), Op::Phi (245),
-    //    Op::BitwiseAnd (196).
+    //    one of each: Op::IAdd (128), Op::IMul (132), Op::Phi (245),
+    //    Op::BitwiseAnd (199).
     //
     //    These opcode numbers come from the SPIR-V spec §3.32 / rspirv::spirv::Op.
     //    We use raw u16 values to avoid importing rspirv in the integration test
@@ -172,14 +172,14 @@ fn test_compile_scalar_demo_produces_valid_spirv() {
     //    - Phi:        `true and false` / `false or true` (short-circuit diamonds)
     //    - BitwiseAnd: `band(0x0Fi32, 0x3Fi32)`
 
-    // IAdd = 128 per SPIR-V §3.32.14
+    // IAdd = 128 per SPIR-V §3.32.14 / spirv::Op::IAdd
     const OP_IADD:       u16 = 128;
-    // IMul = 130
-    const OP_IMUL:       u16 = 130;
+    // IMul = 132 per SPIR-V §3.32.14 / spirv::Op::IMul (spirv-0.3.0+sdk-1.3.268.0)
+    const OP_IMUL:       u16 = 132;
     // Phi  = 245
     const OP_PHI:        u16 = 245;
-    // BitwiseAnd = 196
-    const OP_BITWISE_AND: u16 = 196;
+    // BitwiseAnd = 199 per SPIR-V §3.32.14 / spirv::Op::BitwiseAnd (spirv-0.3.0+sdk-1.3.268.0)
+    const OP_BITWISE_AND: u16 = 199;
 
     let has_iadd = iter_instructions(&all_words[5..]).any(|(op, _)| op == OP_IADD);
     let has_imul = iter_instructions(&all_words[5..]).any(|(op, _)| op == OP_IMUL);
@@ -187,9 +187,9 @@ fn test_compile_scalar_demo_produces_valid_spirv() {
     let has_band = iter_instructions(&all_words[5..]).any(|(op, _)| op == OP_BITWISE_AND);
 
     assert!(has_iadd, "scalar_demo must contain Op::IAdd (128); not found in SPIR-V output");
-    assert!(has_imul, "scalar_demo must contain Op::IMul (130); not found in SPIR-V output");
+    assert!(has_imul, "scalar_demo must contain Op::IMul (132); not found in SPIR-V output");
     assert!(has_phi,  "scalar_demo must contain Op::Phi (245) from short-circuit and/or; not found");
-    assert!(has_band, "scalar_demo must contain Op::BitwiseAnd (196) from band(); not found");
+    assert!(has_band, "scalar_demo must contain Op::BitwiseAnd (199) from band(); not found");
 
     // 8. Clean up temp file
     let _ = std::fs::remove_file(&out_path);
