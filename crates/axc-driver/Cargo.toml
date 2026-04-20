@@ -10,6 +10,36 @@ description = "CLI driver for the AXIOM-Compute compiler"
 name = "axc"
 path = "src/main.rs"
 
+# M2.2 bench harness: compile, cpu_reference, dispatch, postprocess.
+# Order matters (AT-708): compile FIRST, cpu_reference SECOND, dispatch THIRD,
+# postprocess FOURTH — ensures compile runs before GPU dispatch warms caches.
+[[bench]]
+name = "compile"
+path = "benches/compile.rs"
+harness = false
+
+[[bench]]
+name = "cpu_reference"
+path = "benches/cpu_reference.rs"
+harness = false
+
+[[bench]]
+name = "dispatch"
+path = "benches/dispatch.rs"
+harness = false
+
+[[bench]]
+name = "postprocess"
+path = "benches/postprocess.rs"
+harness = false
+
+[features]
+# M2.2 AT-714: fault-injection feature for regression-gate CI validation.
+# When enabled, cpu_saxpy_reference adds a 100M-iteration accumulator loop
+# that artificially slows execution by ~10000x, proving the regression gate
+# correctly detects slowdowns. NEVER enabled in default builds.
+bench_regression_fixture_slowdown = []
+
 [dependencies]
 axc-lexer = { path = "../axc-lexer" }
 axc-parser = { path = "../axc-parser" }
@@ -25,3 +55,9 @@ serde_json = { workspace = true }
 rspirv = { workspace = true }
 spirv = { workspace = true }
 spirv-tools = "0.13"
+# M2.2: Criterion bench framework (cargo_bench_support only — no HTML reports dep).
+criterion = { workspace = true }
+# M2.2: Deterministic PRNG for reproducible bench inputs (StdRng::seed_from_u64).
+rand = { workspace = true }
+# M2.2: Serde for baselines.json and candidate-baselines.json serialization.
+serde = { workspace = true }

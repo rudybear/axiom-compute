@@ -46,4 +46,4 @@ pub use error::{DispatchError, DispatchResult};
 pub use context::VulkanContext;
 pub use dispatch::DispatchRequest;
 pub use metadata::{KernelMetadata, load_kernel_metadata, CURRENT_SCHEMA_VERSION};
-pub use icd::{probe_vulkan_available, gpu_tests_enabled};
+pub use icd::{probe_vulkan_available, gpu_tests_enabled, captured_icd_path};

@@ -57,6 +57,29 @@ pub fn gpu_tests_enabled() -> bool {
     std::env::var("AXC_ENABLE_GPU_TESTS").as_deref() == Ok("1")
 }
 
+/// Return the Vulkan ICD path that the Loader will use for this process.
+///
+/// Reads `VK_DRIVER_FILES` first (Vulkan Loader 1.3.207+), then falls back to
+/// the legacy `VK_ICD_FILENAMES`.  Returns an empty string when neither is set.
+///
+/// This is used by the M2.2 bench harness to populate the `vulkan_icd` field
+/// in `baselines.json` (AT-709).
+///
+/// # Examples
+///
+/// ```
+/// // When VK_DRIVER_FILES is set, captured_icd_path returns its value verbatim.
+/// std::env::set_var("VK_DRIVER_FILES", "/usr/share/vulkan/icd.d/lvp_icd.x86_64.json");
+/// let path = axc_runtime::captured_icd_path();
+/// assert!(!path.is_empty());
+/// std::env::remove_var("VK_DRIVER_FILES");
+/// ```
+pub fn captured_icd_path() -> String {
+    std::env::var("VK_DRIVER_FILES")
+        .or_else(|_| std::env::var("VK_ICD_FILENAMES"))
+        .unwrap_or_default()
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -110,5 +133,43 @@ mod tests {
         // Just call it; whether it returns true or false depends on the environment.
         let _available: bool = probe_vulkan_available();
         // If we get here, it did not panic.
+    }
+
+    /// AT-709 unit test: captured_icd_path returns empty string when neither env var is set.
+    #[test]
+    fn at_709_captured_icd_path_empty_when_no_env() {
+        let saved_driver = std::env::var("VK_DRIVER_FILES").ok();
+        let saved_icd = std::env::var("VK_ICD_FILENAMES").ok();
+
+        std::env::remove_var("VK_DRIVER_FILES");
+        std::env::remove_var("VK_ICD_FILENAMES");
+
+        let path = captured_icd_path();
+        assert_eq!(path, "", "captured_icd_path must return empty string when neither env var is set");
+
+        // Restore
+        if let Some(v) = saved_driver { std::env::set_var("VK_DRIVER_FILES", v); }
+        if let Some(v) = saved_icd { std::env::set_var("VK_ICD_FILENAMES", v); }
+    }
+
+    /// AT-709 unit test: captured_icd_path returns VK_DRIVER_FILES verbatim when set.
+    #[test]
+    fn at_709_captured_icd_path_returns_vk_driver_files_verbatim() {
+        let saved_driver = std::env::var("VK_DRIVER_FILES").ok();
+        let saved_icd = std::env::var("VK_ICD_FILENAMES").ok();
+
+        let test_path = "/test/icd/path.json";
+        std::env::set_var("VK_DRIVER_FILES", test_path);
+        std::env::remove_var("VK_ICD_FILENAMES");
+
+        let path = captured_icd_path();
+        assert_eq!(path, test_path, "captured_icd_path must return VK_DRIVER_FILES verbatim");
+
+        // Restore
+        match saved_driver {
+            Some(v) => std::env::set_var("VK_DRIVER_FILES", v),
+            None => std::env::remove_var("VK_DRIVER_FILES"),
+        }
+        if let Some(v) = saved_icd { std::env::set_var("VK_ICD_FILENAMES", v); }
     }
 }

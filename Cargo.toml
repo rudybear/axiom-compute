@@ -32,3 +32,6 @@ spirv = "0.3"
 ash = "0.38"
 # M2.1: IEEE-754 binary16 type for f16 literal conversion.
 half = { version = "2.4", default-features = false }
+# M2.2: Benchmark harness and deterministic PRNG.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+rand = "0.8"
