@@ -166,7 +166,7 @@ pub fn lower_module(ast: &AstModule) -> (HirModule, Vec<HirError>, Vec<HirWarnin
                 );
 
                 // Determine body: Empty if trivial (only void return), Typed otherwise.
-                let body = lower_kernel_body(&kd.body.node, &params, &mut errors);
+                let body = lower_kernel_body(&kd.body.node, &params, &mut errors, &mut warnings);
 
                 kernels.push(Kernel {
                     id: KernelId(next_id),
@@ -197,6 +197,7 @@ fn lower_kernel_body(
     block: &axc_parser::ast::Block,
     params: &[KernelParam],
     errors: &mut Vec<HirError>,
+    warnings: &mut Vec<crate::validate::HirWarning>,
 ) -> KernelBody {
     let stmts = &block.stmts;
 
@@ -213,9 +214,12 @@ fn lower_kernel_body(
     }
 
     // Non-trivial body or body with params — run the typechecker.
-    let (typed_body, tc_errors) = typecheck_kernel_body(block, params);
+    let (typed_body, tc_errors, tc_warns) = typecheck_kernel_body(block, params);
     for e in tc_errors {
         errors.push(HirError::Typecheck(e));
+    }
+    for w in tc_warns {
+        warnings.push(w);
     }
     KernelBody::Typed(typed_body)
 }
@@ -952,5 +956,76 @@ mod tests {
             .expect("expected ForRange");
         let has_buffer_write = for_stmt.body.iter().any(|s| matches!(s, HirStmt::BufferWrite { .. }));
         assert!(has_buffer_write, "expected HirStmt::BufferWrite inside the for loop body of vector_axpy.axc");
+    }
+
+    // ── M1.4 Lower tests (AT-14.4) ───────────────────────────────────────────
+
+    // AT-421: subgroup_invocation_id() lowers to HirExprKind::SubgroupBuiltin { op: InvocationId }
+    #[test]
+    fn lower_sg_invocation_id_produces_subgroup_builtin_node() {
+        use crate::subgroup::SubgroupOp;
+        use crate::expr::HirExprKind;
+        let (hir, errors, _) = lower_src(
+            "@kernel @workgroup(64,1,1) fn k() -> void { let id: u32 = subgroup_invocation_id(); return; }"
+        );
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        let stmts = match &hir.kernels[0].body {
+            KernelBody::Typed(t) => &t.stmts,
+            KernelBody::Empty => panic!("expected Typed"),
+        };
+        let let_stmt = stmts.iter().find(|s| matches!(s, HirStmt::Let { .. }))
+            .expect("expected Let stmt");
+        if let HirStmt::Let { init, .. } = let_stmt {
+            assert!(
+                matches!(&init.kind, HirExprKind::SubgroupBuiltin { op: SubgroupOp::InvocationId, .. }),
+                "expected SubgroupBuiltin::InvocationId; got {:?}", &init.kind
+            );
+        } else {
+            panic!("expected HirStmt::Let");
+        }
+    }
+
+    // AT-422: workgroup_barrier() lowers to HirStmt::Barrier { kind: Workgroup }
+    #[test]
+    fn lower_workgroup_barrier_produces_barrier_stmt() {
+        use crate::subgroup::BarrierKind;
+        let (hir, errors, _) = lower_src(
+            "@kernel @workgroup(64,1,1) fn k() -> void { workgroup_barrier(); return; }"
+        );
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        let stmts = match &hir.kernels[0].body {
+            KernelBody::Typed(t) => &t.stmts,
+            KernelBody::Empty => panic!("expected Typed"),
+        };
+        assert!(
+            stmts.iter().any(|s| matches!(s, HirStmt::Barrier { kind: BarrierKind::Workgroup, .. })),
+            "expected HirStmt::Barrier{{Workgroup}} in stmts"
+        );
+    }
+
+    // AT-423: subgroup_reduce_add(f32) lowers to Reduce(Add) with correct binding type
+    #[test]
+    fn lower_sg_reduce_add_f32_produces_correct_binding_ty() {
+        use crate::subgroup::{SubgroupOp, SubgroupReduceKind};
+        use crate::expr::HirExprKind;
+        let (hir, errors, _) = lower_src(
+            "@kernel @workgroup(32,1,1) fn k() -> void { let v: f32 = 1.0f32; let r: f32 = subgroup_reduce_add(v); return; }"
+        );
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        let typed = match &hir.kernels[0].body {
+            KernelBody::Typed(t) => t,
+            KernelBody::Empty => panic!("expected Typed"),
+        };
+        // The second binding is the reduce result.
+        assert_eq!(typed.bindings[1].ty, crate::ty::ScalarTy::F32, "reduce result must be f32");
+        // Find the Let stmt for `r` and check the SubgroupBuiltin node.
+        let r_stmt = typed.stmts.iter()
+            .filter_map(|s| if let HirStmt::Let { init, .. } = s { Some(init) } else { None })
+            .nth(1)
+            .expect("expected second Let stmt");
+        assert!(
+            matches!(&r_stmt.kind, HirExprKind::SubgroupBuiltin { op: SubgroupOp::Reduce(SubgroupReduceKind::Add), .. }),
+            "expected SubgroupBuiltin::Reduce(Add); got {:?}", &r_stmt.kind
+        );
     }
 }

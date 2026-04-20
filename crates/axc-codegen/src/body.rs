@@ -26,7 +26,7 @@
 //!   AT-323: `return` inside a loop is deferred — codegen emits
 //!   `BodyCodegenError::ReturnInsideLoopDeferred`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use rspirv::dr::Builder;
 use rspirv::spirv::{
     Word, StorageClass, SelectionControl, LoopControl,
@@ -36,9 +36,15 @@ use axc_hir::expr::{
     ShortCircuitOp, BitwiseOp, BindingId,
 };
 use axc_hir::ty::ScalarTy;
+use axc_hir::subgroup::{SubgroupOp, SubgroupReduceKind, BarrierKind};
 use axc_hir::control_flow::{HirIf, HirElse, HirForRange, HirWhile};
 use axc_lexer::Span;
 use crate::buffers::{BufferBindings, PushConstantBlock, GlobalInvocationIdVar};
+use crate::subgroup::{
+    SubgroupBuiltinVars, SubgroupVote, SubgroupReduceOp,
+    emit_subgroup_elect, emit_subgroup_vote, emit_subgroup_reduce,
+    emit_subgroup_broadcast_first, emit_workgroup_barrier,
+};
 
 /// References to pre-emitted global IR structures for M1.2 buffer/scalar/gid support.
 ///
@@ -55,6 +61,9 @@ pub struct KernelResources<'r> {
     pub gid_var: Option<&'r GlobalInvocationIdVar>,
     /// Scalar param info: maps position → (member_index, ScalarTy) for load-from-PC.
     pub scalar_params: &'r [(u32, u32, ScalarTy)],  // (position, member_index, ty)
+    /// Subgroup builtin variables (SubgroupLocalInvocationId, SubgroupSize) emitted before fn.
+    /// M1.4: None if the kernel body uses no subgroup scalar builtins.
+    pub subgroup_vars: Option<&'r SubgroupBuiltinVars>,
 }
 
 /// Errors from SPIR-V body emission.
@@ -72,6 +81,9 @@ pub enum BodyCodegenError {
     /// M1.4 will add a pre-header-block escape scheme.
     #[error("return inside a loop is not yet supported in M1.3 (AT-323); restructure as `break;` + result variable, or move the return to after the loop")]
     ReturnInsideLoopDeferred { span: Span },
+    /// M1.4: subgroup operation codegen error.
+    #[error("subgroup codegen error: {0}")]
+    Subgroup(#[from] crate::subgroup::SubgroupCodegenError),
 }
 
 /// Cache of SPIR-V type IDs, keyed by `ScalarTy`.
@@ -81,6 +93,10 @@ pub enum BodyCodegenError {
 pub struct ScalarTypeCache {
     scalar_ids: HashMap<ScalarTy, Word>,
     pointer_ids: HashMap<ScalarTy, Word>,
+    /// Cache for `OpConstant u32` values used as scope/semantics constants (M1.4).
+    ///
+    /// Uses `BTreeMap` (not `HashMap`) for deterministic iteration order (AT-418).
+    u32_const_cache: BTreeMap<u32, Word>,
 }
 
 impl ScalarTypeCache {
@@ -120,15 +136,40 @@ impl ScalarTypeCache {
         self.pointer_ids.insert(pointee, id);
         id
     }
+
+    /// Get or create an `OpConstant u32` for the given literal value.
+    ///
+    /// Used by subgroup helpers for scope/semantics constants (M1.4).
+    /// BTreeMap ensures deterministic iteration order per AT-418.
+    pub fn get_or_emit_u32_const(&mut self, b: &mut Builder, value: u32) -> Word {
+        if let Some(&id) = self.u32_const_cache.get(&value) {
+            return id;
+        }
+        let u32_ty = self.scalar_id(b, ScalarTy::U32);
+        let id = b.constant_bit32(u32_ty, value);
+        self.u32_const_cache.insert(value, id);
+        id
+    }
 }
 
-/// Tracks which 64-bit capabilities are required by the emitted body.
+/// Tracks which capabilities are required by the emitted body.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CapabilitiesRequired {
     /// True if any i64 or u64 type was used — requires `OpCapability Int64`.
     pub int64: bool,
     /// True if any f64 type was used — requires `OpCapability Float64`.
     pub float64: bool,
+    /// True if any subgroup op was used — requires `OpCapability GroupNonUniform` (M1.4).
+    ///
+    /// Also implicitly required by all child subgroup caps. Set by every subgroup helper
+    /// (elect, vote, arith, ballot) per the CRITICAL-1 invariant.
+    pub subgroup_basic: bool,
+    /// True if subgroup_all or subgroup_any was used — requires `OpCapability GroupNonUniformVote` (M1.4).
+    pub subgroup_vote: bool,
+    /// True if any subgroup_reduce_* was used — requires `OpCapability GroupNonUniformArithmetic` (M1.4).
+    pub subgroup_arith: bool,
+    /// True if subgroup_broadcast_first was used — requires `OpCapability GroupNonUniformBallot` (M1.4).
+    pub subgroup_ballot: bool,
 }
 
 impl CapabilitiesRequired {
@@ -413,6 +454,17 @@ fn emit_stmt(em: &mut BodyEmitter<'_>, stmt: &HirStmt) -> Result<(), BodyCodegen
                 .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
             em.current_block_terminated = true;
             Ok(())
+        }
+        HirStmt::Barrier { kind, .. } => {
+            match kind {
+                BarrierKind::Workgroup => {
+                    // NOTE: workgroup_barrier is NOT a block terminator.
+                    // `current_block_terminated` MUST NOT be set after this call.
+                    emit_workgroup_barrier(em.b, em.type_cache)?;
+                    // Do NOT set em.current_block_terminated = true here.
+                    Ok(())
+                }
+            }
         }
     }
 }
@@ -727,6 +779,9 @@ fn emit_expr(em: &mut BodyEmitter<'_>, expr: &HirExpr) -> Result<Word, BodyCodeg
         }
         HirExprKind::GidBuiltin { axis } => {
             emit_gid_component(em, *axis)
+        }
+        HirExprKind::SubgroupBuiltin { op, args } => {
+            emit_subgroup_builtin(em, *op, args, expr.ty)
         }
     }
 }
@@ -1180,6 +1235,87 @@ fn emit_gid_component(
         .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
 
     Ok(axis_val)
+}
+
+// ── Subgroup builtin expression emission (M1.4) ───────────────────────────────
+
+/// Emit a subgroup builtin expression.
+///
+/// Dispatches to the appropriate helper in `crate::subgroup` based on the
+/// `SubgroupOp` kind. The subgroup Input variable loads (invocation_id, size)
+/// go through `KernelResources::subgroup_vars`; the collective ops call the
+/// typed helpers directly.
+fn emit_subgroup_builtin(
+    em: &mut BodyEmitter<'_>,
+    op: SubgroupOp,
+    args: &[HirExpr],
+    result_ty: ScalarTy,
+) -> Result<Word, BodyCodegenError> {
+    match op {
+        SubgroupOp::InvocationId => {
+            // Load SubgroupLocalInvocationId from the pre-emitted Input variable.
+            let sg_vars = em.res.subgroup_vars
+                .ok_or(BodyCodegenError::UnexpectedHir(
+                    "SubgroupBuiltin::InvocationId with no subgroup_vars in resources"
+                ))?;
+            let var_id = sg_vars.invocation_id_var
+                .ok_or(BodyCodegenError::UnexpectedHir(
+                    "SubgroupBuiltin::InvocationId: invocation_id_var is None"
+                ))?;
+            let u32_ty_id = em.type_id(ScalarTy::U32);
+            let loaded = em.b.load(u32_ty_id, None, var_id, None, None)
+                .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+            // subgroup_invocation_id requires GroupNonUniform (basic).
+            em.caps.subgroup_basic = true;
+            Ok(loaded)
+        }
+        SubgroupOp::Size => {
+            // Load SubgroupSize from the pre-emitted Input variable.
+            let sg_vars = em.res.subgroup_vars
+                .ok_or(BodyCodegenError::UnexpectedHir(
+                    "SubgroupBuiltin::Size with no subgroup_vars in resources"
+                ))?;
+            let var_id = sg_vars.size_var
+                .ok_or(BodyCodegenError::UnexpectedHir(
+                    "SubgroupBuiltin::Size: size_var is None"
+                ))?;
+            let u32_ty_id = em.type_id(ScalarTy::U32);
+            let loaded = em.b.load(u32_ty_id, None, var_id, None, None)
+                .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+            // subgroup_size requires GroupNonUniform (basic).
+            em.caps.subgroup_basic = true;
+            Ok(loaded)
+        }
+        SubgroupOp::Elect => {
+            let result = emit_subgroup_elect(em.b, em.type_cache, em.caps);
+            Ok(result)
+        }
+        SubgroupOp::All => {
+            let pred_id = emit_expr(em, &args[0])?;
+            let result = emit_subgroup_vote(em.b, em.type_cache, em.caps, SubgroupVote::All, pred_id);
+            Ok(result)
+        }
+        SubgroupOp::Any => {
+            let pred_id = emit_expr(em, &args[0])?;
+            let result = emit_subgroup_vote(em.b, em.type_cache, em.caps, SubgroupVote::Any, pred_id);
+            Ok(result)
+        }
+        SubgroupOp::Reduce(kind) => {
+            let v_id = emit_expr(em, &args[0])?;
+            let reduce_op = match kind {
+                SubgroupReduceKind::Add => SubgroupReduceOp::Add,
+                SubgroupReduceKind::Min => SubgroupReduceOp::Min,
+                SubgroupReduceKind::Max => SubgroupReduceOp::Max,
+            };
+            let result = emit_subgroup_reduce(em.b, em.type_cache, em.caps, reduce_op, result_ty, v_id)?;
+            Ok(result)
+        }
+        SubgroupOp::BroadcastFirst => {
+            let v_id = emit_expr(em, &args[0])?;
+            let result = emit_subgroup_broadcast_first(em.b, em.type_cache, em.caps, result_ty, v_id);
+            Ok(result)
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1655,6 +1791,34 @@ fn reduce_sum(n: u32, src: readonly_buffer[f32], dst: buffer[f32]) -> void {\n\
             self.cursor += wc;
             Some((op, slice))
         }
+    }
+
+    // ── M1.4 body codegen tests ───────────────────────────────────────────────
+
+    // AT-body-1: workgroup_barrier compiles and emits OpControlBarrier
+    #[test]
+    fn cg_workgroup_barrier_emits_op_control_barrier() {
+        let src = "@kernel @workgroup(64,1,1) fn k() -> void { workgroup_barrier(); return; }";
+        let words = compile_to_words(src);
+        assert!(has_op(&words, Op::ControlBarrier), "expected OpControlBarrier in SPIR-V");
+    }
+
+    // AT-body-2: subgroup_elect emits OpGroupNonUniformElect
+    #[test]
+    fn cg_sg_elect_emits_group_non_uniform_elect() {
+        let src = "@kernel @workgroup(32,1,1) fn k() -> void { let e: bool = subgroup_elect(); return; }";
+        let words = compile_to_words(src);
+        assert!(has_op(&words, Op::GroupNonUniformElect), "expected OpGroupNonUniformElect");
+    }
+
+    // AT-body-3: workgroup_barrier does NOT terminate block (subsequent return still emitted)
+    #[test]
+    fn cg_workgroup_barrier_not_block_terminator() {
+        let src = "@kernel @workgroup(64,1,1) fn k() -> void { workgroup_barrier(); return; }";
+        let words = compile_to_words(src);
+        // Both OpControlBarrier and OpReturn must be present.
+        assert!(has_op(&words, Op::ControlBarrier), "expected OpControlBarrier");
+        assert!(has_op(&words, Op::Return), "expected OpReturn after barrier");
     }
 }
 

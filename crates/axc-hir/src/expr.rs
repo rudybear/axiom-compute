@@ -7,6 +7,7 @@
 //! M1.2 adds `BufferRead`, `GidBuiltin`, and the `BufferWrite` / `BufferWriteStmt`
 //! statement kinds for buffer I/O.
 //! M1.3 adds `If`, `ForRange`, `While`, `Break`, `Continue` for structured control flow.
+//! M1.4 adds `SubgroupBuiltin` expression kind and `Barrier` statement kind.
 
 use axc_lexer::Span;
 use crate::ty::{ScalarTy, IntLiteralValue, FloatLiteralValue};
@@ -74,6 +75,14 @@ pub enum HirExprKind {
     /// Result type is always `U32`.
     GidBuiltin {
         axis: u32,
+    },
+    /// Subgroup builtin call (M1.4).
+    ///
+    /// Covers all subgroup operations except `workgroup_barrier`, which is a
+    /// statement (`HirStmt::Barrier`). See `crate::subgroup::SubgroupOp` for variants.
+    SubgroupBuiltin {
+        op: crate::subgroup::SubgroupOp,
+        args: Vec<HirExpr>,
     },
 }
 
@@ -164,6 +173,14 @@ pub enum HirStmt {
     Break { span: Span },
     /// `continue;` — targets the innermost enclosing loop's continue block.
     Continue { span: Span },
+    /// `workgroup_barrier();` — OpControlBarrier with Workgroup scope (M1.4).
+    ///
+    /// NOT a block terminator — subsequent statements continue in the same block.
+    /// Barrier-in-divergent-control-flow warning is deferred to M1.5.
+    Barrier {
+        kind: crate::subgroup::BarrierKind,
+        span: Span,
+    },
 }
 
 /// The typed body of a kernel: a binding table plus ordered statements.

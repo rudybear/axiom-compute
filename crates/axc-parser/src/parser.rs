@@ -16,7 +16,7 @@
 //! - TypeRef gains I64, U64, F64.
 //! - MAX_EXPR_DEPTH = 256 nesting limit.
 
-use axc_lexer::{Token, TokenKind, Span, Spanned, LexError};
+use axc_lexer::{Token, TokenKind, Span, Spanned, LexError, is_reserved_subgroup_builtin};
 use crate::ast::{
     Module, Item, KernelDecl, Annotation, AnnotationArg, Block, Stmt, Expr, TypeRef, Param,
     BinOp, UnaryOp, ShortCircuitOp, ScalarTypeRef, ElseArm,
@@ -577,9 +577,17 @@ impl<'tok> Parser<'tok> {
                 }
                 Some(Spanned::new(Stmt::Continue, cont_span.merge(semi_span)))
             }
-            TokenKind::Ident(_) => {
-                // Lookahead: pos+1 is `=` → scalar assign; pos+1 is `[` → buffer index assign.
+            TokenKind::Ident(ref ident_name) => {
+                // M1.4: if the ident is a reserved subgroup builtin followed by `(`,
+                // parse it as a BuiltinCallStmt (the HIR will validate return type).
+                let ident_name_clone: String = ident_name.clone();
                 let next_pos: usize = (self.pos + 1).min(self.tokens.len() - 1);
+                if is_reserved_subgroup_builtin(&ident_name_clone)
+                    && matches!(self.tokens[next_pos].kind, TokenKind::LParen)
+                {
+                    return self.parse_builtin_call_stmt();
+                }
+                // Lookahead: pos+1 is `=` → scalar assign; pos+1 is `[` → buffer index assign.
                 match self.tokens[next_pos].kind {
                     TokenKind::Assign => {
                         return self.parse_assign_stmt();
@@ -589,7 +597,7 @@ impl<'tok> Parser<'tok> {
                     }
                     _ => {}
                 }
-                // Else: bare expression statements are not allowed in M1.3
+                // Else: bare expression statements are not allowed in M1.3/M1.4
                 let found: String = format!("{:?}", self.peek_kind());
                 self.errors.push(ParseError::Unexpected {
                     expected: "let, return, assignment, or control flow".into(),
@@ -851,6 +859,36 @@ impl<'tok> Parser<'tok> {
                 init,
             },
             span,
+        ))
+    }
+
+    /// Parse a bare reserved-builtin call statement: `IDENT(args);`
+    ///
+    /// Called when the current Ident is a reserved subgroup builtin and the next
+    /// token is `(`. The inner `Expr` is always `Expr::Call { name, args }`.
+    /// HIR will validate return type and arity.
+    fn parse_builtin_call_stmt(&mut self) -> Option<Spanned<Stmt>> {
+        let stmt_start: Span = self.peek_span();
+
+        // Parse the call expression using the normal expression parser.
+        // The Ident + LParen will naturally produce an Expr::Call.
+        let call_expr: Spanned<Expr> = match self.parse_expr(0) {
+            Some(e) => e,
+            None => {
+                self.recover_to_semicolon_or_brace();
+                return None;
+            }
+        };
+
+        // Must be followed by `;`
+        let semi_span: Span = self.peek_span();
+        if !self.expect_token(TokenKind::Semicolon, ";") {
+            return None;
+        }
+
+        Some(Spanned::new(
+            Stmt::BuiltinCallStmt { call: call_expr },
+            stmt_start.merge(semi_span),
         ))
     }
 
@@ -1902,5 +1940,135 @@ mod tests {
         let src = "@kernel @workgroup(64,1,1) fn k(b: buffer[bool]) -> void { return; }";
         let (_, errors) = parse_src(src);
         assert!(!errors.is_empty(), "expected parse error for invalid buffer elem type");
+    }
+
+    // ── M1.4: subgroup builtin parsing tests ────────────────────────────────────
+
+    /// Helper: get the first stmt from the first kernel in a module.
+    fn first_stmt(src: &str) -> Stmt {
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "unexpected parse errors: {errors:?}");
+        let Item::Kernel(ref kd) = module.items[0].node;
+        kd.body.node.stmts[0].node.clone()
+    }
+
+    #[test]
+    fn parse_workgroup_barrier_as_stmt() {
+        let src = "@kernel @workgroup(64,1,1) fn k() -> void { workgroup_barrier(); return; }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        let Item::Kernel(ref kd) = module.items[0].node;
+        let stmt = &kd.body.node.stmts[0].node;
+        assert!(
+            matches!(stmt, Stmt::BuiltinCallStmt { call } if matches!(&call.node, Expr::Call { name, .. } if name.node == "workgroup_barrier")),
+            "expected BuiltinCallStmt for workgroup_barrier; got: {stmt:?}"
+        );
+    }
+
+    #[test]
+    fn parse_subgroup_reduce_add_as_expr() {
+        let src = "@kernel @workgroup(64,1,1) fn k() -> void { let v: f32 = 1.0f32; let s: f32 = subgroup_reduce_add(v); return; }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        let Item::Kernel(ref kd) = module.items[0].node;
+        // second stmt is the reduce_add
+        if let Stmt::Let { init, .. } = &kd.body.node.stmts[1].node {
+            assert!(
+                matches!(&init.node, Expr::Call { name, .. } if name.node == "subgroup_reduce_add"),
+                "expected Call to subgroup_reduce_add; got: {:?}", init.node
+            );
+        } else {
+            panic!("expected Let stmt for subgroup_reduce_add");
+        }
+    }
+
+    #[test]
+    fn parse_subgroup_elect_as_if_cond() {
+        let src = "@kernel @workgroup(64,1,1) fn k() -> void { if subgroup_elect() { return; } return; }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        let Item::Kernel(ref kd) = module.items[0].node;
+        if let Stmt::If { cond, .. } = &kd.body.node.stmts[0].node {
+            assert!(
+                matches!(&cond.node, Expr::Call { name, .. } if name.node == "subgroup_elect"),
+                "expected subgroup_elect as if cond; got: {:?}", cond.node
+            );
+        } else {
+            panic!("expected If stmt");
+        }
+    }
+
+    #[test]
+    fn parse_subgroup_invocation_id_as_expr() {
+        let src = "@kernel @workgroup(64,1,1) fn k() -> void { let id: u32 = subgroup_invocation_id(); return; }";
+        if let Stmt::Let { init, .. } = first_stmt(src) {
+            assert!(
+                matches!(&init.node, Expr::Call { name, .. } if name.node == "subgroup_invocation_id"),
+                "expected subgroup_invocation_id call; got: {:?}", init.node
+            );
+        } else {
+            panic!("expected Let stmt");
+        }
+    }
+
+    #[test]
+    fn parse_subgroup_size_as_expr() {
+        let src = "@kernel @workgroup(64,1,1) fn k() -> void { let sz: u32 = subgroup_size(); return; }";
+        if let Stmt::Let { init, .. } = first_stmt(src) {
+            assert!(
+                matches!(&init.node, Expr::Call { name, .. } if name.node == "subgroup_size"),
+                "expected subgroup_size call; got: {:?}", init.node
+            );
+        } else {
+            panic!("expected Let stmt");
+        }
+    }
+
+    #[test]
+    fn parse_subgroup_all_with_bool_arg() {
+        let src = "@kernel @workgroup(64,1,1) fn k() -> void { let e: bool = subgroup_elect(); let r: bool = subgroup_all(e); return; }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        let Item::Kernel(ref kd) = module.items[0].node;
+        if let Stmt::Let { init, .. } = &kd.body.node.stmts[1].node {
+            assert!(
+                matches!(&init.node, Expr::Call { name, .. } if name.node == "subgroup_all"),
+                "expected subgroup_all; got: {:?}", init.node
+            );
+        } else {
+            panic!("expected Let stmt for subgroup_all");
+        }
+    }
+
+    #[test]
+    fn parse_subgroup_any_with_bool_arg() {
+        let src = "@kernel @workgroup(64,1,1) fn k() -> void { let e: bool = subgroup_elect(); let r: bool = subgroup_any(e); return; }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        let Item::Kernel(ref kd) = module.items[0].node;
+        if let Stmt::Let { init, .. } = &kd.body.node.stmts[1].node {
+            assert!(
+                matches!(&init.node, Expr::Call { name, .. } if name.node == "subgroup_any"),
+                "expected subgroup_any; got: {:?}", init.node
+            );
+        } else {
+            panic!("expected Let stmt for subgroup_any");
+        }
+    }
+
+    #[test]
+    fn parse_subgroup_broadcast_first_as_expr() {
+        let src = "@kernel @workgroup(64,1,1) fn k() -> void { let v: f32 = 1.0f32; let b: f32 = subgroup_broadcast_first(v); return; }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        let Item::Kernel(ref kd) = module.items[0].node;
+        if let Stmt::Let { init, .. } = &kd.body.node.stmts[1].node {
+            assert!(
+                matches!(&init.node, Expr::Call { name, .. } if name.node == "subgroup_broadcast_first"),
+                "expected subgroup_broadcast_first; got: {:?}", init.node
+            );
+        } else {
+            panic!("expected Let stmt for subgroup_broadcast_first");
+        }
     }
 }

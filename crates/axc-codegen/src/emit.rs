@@ -15,14 +15,17 @@ use rspirv::binary::Assemble;
 use rspirv::dr::Builder;
 use rspirv::spirv::{
     Capability, AddressingModel, MemoryModel, ExecutionModel, ExecutionMode, FunctionControl,
+    BuiltIn,
 };
 use axc_hir::{HirModule, KernelBody};
 use axc_hir::expr::{HirExprKind, HirStmt, KernelBodyTyped};
+use axc_hir::subgroup::SubgroupOp;
 use crate::body::{ScalarTypeCache, CapabilitiesRequired, KernelResources, emit_kernel_body};
 use crate::buffers::{
     emit_buffer_globals, emit_push_constant_block, emit_gid_variable,
     BufferBindings, PushConstantBlock, GlobalInvocationIdVar,
 };
+use crate::subgroup::{SubgroupBuiltinVars, emit_subgroup_scalar_builtin_var};
 
 /// The SPIR-V version this codegen targets.
 ///
@@ -120,11 +123,11 @@ pub fn emit_module(hir: &HirModule, opts: &CodegenOptions) -> Result<Vec<u32>, C
             b.ret().expect("rspirv: ret() should not fail inside an open block");
         }
         KernelBody::Typed(typed_body) => {
-            // M1.2 path: emit typed body with full scalar, buffer, and gid ops.
+            // M1.2/M1.4 path: emit typed body with full scalar, buffer, gid, and subgroup ops.
             //
             // Step order is load-bearing:
-            //   (a) Emit global OpVariables (SSBO, push-constant, gid) BEFORE begin_function.
-            //   (b) begin_function + begin_block.
+            //   (a) Emit global OpVariables (SSBO, push-constant, gid, subgroup builtins) BEFORE begin_block.
+            //   (b) begin_block.
             //   (c) emit_kernel_body with KernelResources referencing the global vars.
 
             let mut type_cache = ScalarTypeCache::new();
@@ -150,6 +153,21 @@ pub fn emit_module(hir: &HirModule, opts: &CodegenOptions) -> Result<Vec<u32>, C
                 } else {
                     None
                 };
+
+            // (a4) M1.4: Subgroup scalar builtin variables (SubgroupLocalInvocationId, SubgroupSize).
+            // These are Input variables (like gid); emitted at most once per module.
+            let mut subgroup_vars = SubgroupBuiltinVars::new();
+            if body_uses_subgroup_invocation_id(typed_body) {
+                subgroup_vars.invocation_id_var = Some(
+                    emit_subgroup_scalar_builtin_var(&mut b, &mut type_cache, BuiltIn::SubgroupLocalInvocationId)
+                );
+            }
+            if body_uses_subgroup_size(typed_body) {
+                subgroup_vars.size_var = Some(
+                    emit_subgroup_scalar_builtin_var(&mut b, &mut type_cache, BuiltIn::SubgroupSize)
+                );
+            }
+            let subgroup_vars_emitted = subgroup_vars.any_emitted();
 
             // Build scalar_params table: (position, member_index, ty) for push-constant reads.
             let scalar_params_table: Vec<(u32, u32, axc_hir::ty::ScalarTy)> = kernel
@@ -185,11 +203,13 @@ pub fn emit_module(hir: &HirModule, opts: &CodegenOptions) -> Result<Vec<u32>, C
 
             let mut caps = CapabilitiesRequired::default();
 
+            let subgroup_vars_ref = if subgroup_vars_emitted { Some(&subgroup_vars) } else { None };
             let res = KernelResources {
                 buffer_bindings: buffer_bindings.as_ref(),
                 push_constant: push_constant.as_ref(),
                 gid_var: gid_var.as_ref(),
                 scalar_params: &scalar_params_table,
+                subgroup_vars: subgroup_vars_ref,
             };
 
             emit_kernel_body(&mut b, typed_body, &mut type_cache, &mut caps, &res)
@@ -203,13 +223,35 @@ pub fn emit_module(hir: &HirModule, opts: &CodegenOptions) -> Result<Vec<u32>, C
             if caps.float64 {
                 b.capability(Capability::Float64);
             }
-
-            // gid interface: included in OpEntryPoint interface list (required for Input vars).
-            if let Some(ref gid) = gid_var {
-                // Store the gid var_id for use in the entry_point call below.
-                // We pass it via a local to avoid borrow issues with `gid_var`.
-                // We'll patch the entry_point call after end_function.
-                let _ = gid.var_id; // used below in entry_point call
+            // M1.4: Subgroup capabilities. Emit in fixed order for determinism (AT-418).
+            // GroupNonUniform is the parent cap; always emitted if subgroup_basic is set.
+            // Child caps follow in fixed order: Vote, Arithmetic, Ballot.
+            if caps.subgroup_basic {
+                b.capability(Capability::GroupNonUniform);
+            }
+            if caps.subgroup_vote {
+                b.capability(Capability::GroupNonUniformVote);
+            }
+            if caps.subgroup_arith {
+                b.capability(Capability::GroupNonUniformArithmetic);
+            }
+            if caps.subgroup_ballot {
+                b.capability(Capability::GroupNonUniformBallot);
+            }
+            // M1.4: Emit OpExtension strings for SPV_KHR_shader_subgroup_* (AT-418, AT-426, AT-427).
+            // Each capability requires its corresponding KHR extension string.
+            // Emitted in the same fixed order as capabilities for determinism.
+            if caps.subgroup_basic {
+                b.extension("SPV_KHR_shader_subgroup_basic");
+            }
+            if caps.subgroup_vote {
+                b.extension("SPV_KHR_shader_subgroup_vote");
+            }
+            if caps.subgroup_arith {
+                b.extension("SPV_KHR_shader_subgroup_arithmetic");
+            }
+            if caps.subgroup_ballot {
+                b.extension("SPV_KHR_shader_subgroup_ballot");
             }
 
             // Save for entry_point call below.
@@ -217,7 +259,7 @@ pub fn emit_module(hir: &HirModule, opts: &CodegenOptions) -> Result<Vec<u32>, C
 
             b.end_function().expect("rspirv: end_function should not fail after a complete block");
 
-            // ── Step 9: Entry point (with gid in interface if needed) ─────────
+            // ── Step 9: Entry point (with Input vars in interface list if needed) ─────────
             //
             // SPIR-V 1.3 §2.17: only Input and Output variables must appear in the
             // interface list. StorageBuffer and PushConstant are excluded.
@@ -236,6 +278,13 @@ pub fn emit_module(hir: &HirModule, opts: &CodegenOptions) -> Result<Vec<u32>, C
             // buffer_bindings (StorageBuffer) and push_constant (PushConstant) → exclude.
             if let Some(gid_id) = gid_var_id_for_ep {
                 interface.push(gid_id);
+            }
+            // M1.4: subgroup Input variables also go in the interface list.
+            if let Some(invoc_id) = subgroup_vars.invocation_id_var {
+                interface.push(invoc_id);
+            }
+            if let Some(size_id) = subgroup_vars.size_var {
+                interface.push(size_id);
             }
             b.entry_point(ExecutionModel::GLCompute, main_id, &kernel.name, interface);
 
@@ -294,6 +343,7 @@ fn stmt_uses_gid(stmt: &HirStmt) -> bool {
         HirStmt::Return { .. } => false,
         HirStmt::BufferWrite { index, value, .. } => expr_uses_gid(index) || expr_uses_gid(value),
         HirStmt::Break { .. } | HirStmt::Continue { .. } => false,
+        HirStmt::Barrier { .. } => false,
         HirStmt::If(hir_if) => {
             expr_uses_gid(&hir_if.cond)
                 || hir_if.then_block.iter().any(stmt_uses_gid)
@@ -329,7 +379,89 @@ fn expr_uses_gid(expr: &axc_hir::expr::HirExpr) -> bool {
         HirExprKind::Binary { lhs, rhs, .. } => expr_uses_gid(lhs) || expr_uses_gid(rhs),
         HirExprKind::ShortCircuit { lhs, rhs, .. } => expr_uses_gid(lhs) || expr_uses_gid(rhs),
         HirExprKind::BitwiseBuiltin { args, .. } => args.iter().any(expr_uses_gid),
+        HirExprKind::SubgroupBuiltin { args, .. } => args.iter().any(expr_uses_gid),
         HirExprKind::IntLit { .. }
+        | HirExprKind::FloatLit { .. }
+        | HirExprKind::BoolLit(_)
+        | HirExprKind::LocalRead(_) => false,
+    }
+}
+
+// ── M1.4: Subgroup builtin usage walkers ─────────────────────────────────────
+
+/// Scan a typed kernel body for any `SubgroupBuiltin { InvocationId }` expression.
+///
+/// Used to decide whether to emit the `SubgroupLocalInvocationId` Input variable.
+fn body_uses_subgroup_invocation_id(body: &KernelBodyTyped) -> bool {
+    body.stmts.iter().any(|s| stmt_uses_subgroup_op(s, SubgroupOp::InvocationId))
+}
+
+/// Scan a typed kernel body for any `SubgroupBuiltin { Size }` expression.
+///
+/// Used to decide whether to emit the `SubgroupSize` Input variable.
+fn body_uses_subgroup_size(body: &KernelBodyTyped) -> bool {
+    body.stmts.iter().any(|s| stmt_uses_subgroup_op(s, SubgroupOp::Size))
+}
+
+fn stmt_uses_subgroup_op(stmt: &HirStmt, target: SubgroupOp) -> bool {
+    match stmt {
+        HirStmt::Let { init, .. } => expr_uses_subgroup_op(init, target),
+        HirStmt::Assign { value, .. } => expr_uses_subgroup_op(value, target),
+        HirStmt::Return { .. } => false,
+        HirStmt::BufferWrite { index, value, .. } => {
+            expr_uses_subgroup_op(index, target) || expr_uses_subgroup_op(value, target)
+        }
+        HirStmt::Break { .. } | HirStmt::Continue { .. } | HirStmt::Barrier { .. } => false,
+        HirStmt::If(hir_if) => {
+            expr_uses_subgroup_op(&hir_if.cond, target)
+                || hir_if.then_block.iter().any(|s| stmt_uses_subgroup_op(s, target))
+                || hir_if.else_arm.as_ref().is_some_and(|arm| else_uses_subgroup_op(arm, target))
+        }
+        HirStmt::ForRange(hir_for) => {
+            expr_uses_subgroup_op(&hir_for.start, target)
+                || expr_uses_subgroup_op(&hir_for.end, target)
+                || hir_for.body.iter().any(|s| stmt_uses_subgroup_op(s, target))
+        }
+        HirStmt::While(hir_while) => {
+            expr_uses_subgroup_op(&hir_while.cond, target)
+                || hir_while.body.iter().any(|s| stmt_uses_subgroup_op(s, target))
+        }
+    }
+}
+
+fn else_uses_subgroup_op(arm: &axc_hir::control_flow::HirElse, target: SubgroupOp) -> bool {
+    match arm {
+        axc_hir::control_flow::HirElse::Block(stmts) => {
+            stmts.iter().any(|s| stmt_uses_subgroup_op(s, target))
+        }
+        axc_hir::control_flow::HirElse::If(hir_if) => {
+            expr_uses_subgroup_op(&hir_if.cond, target)
+                || hir_if.then_block.iter().any(|s| stmt_uses_subgroup_op(s, target))
+                || hir_if.else_arm.as_ref().is_some_and(|arm| else_uses_subgroup_op(arm, target))
+        }
+    }
+}
+
+fn expr_uses_subgroup_op(expr: &axc_hir::expr::HirExpr, target: SubgroupOp) -> bool {
+    match &expr.kind {
+        HirExprKind::SubgroupBuiltin { op, args } => {
+            // Use PartialEq derived on SubgroupOp; for Reduce(_) we match any kind.
+            let matches_target = *op == target;
+            matches_target || args.iter().any(|a| expr_uses_subgroup_op(a, target))
+        }
+        HirExprKind::BufferRead { index, .. } => expr_uses_subgroup_op(index, target),
+        HirExprKind::Unary { operand, .. } => expr_uses_subgroup_op(operand, target),
+        HirExprKind::Binary { lhs, rhs, .. } => {
+            expr_uses_subgroup_op(lhs, target) || expr_uses_subgroup_op(rhs, target)
+        }
+        HirExprKind::ShortCircuit { lhs, rhs, .. } => {
+            expr_uses_subgroup_op(lhs, target) || expr_uses_subgroup_op(rhs, target)
+        }
+        HirExprKind::BitwiseBuiltin { args, .. } => {
+            args.iter().any(|a| expr_uses_subgroup_op(a, target))
+        }
+        HirExprKind::GidBuiltin { .. }
+        | HirExprKind::IntLit { .. }
         | HirExprKind::FloatLit { .. }
         | HirExprKind::BoolLit(_)
         | HirExprKind::LocalRead(_) => false,
@@ -349,7 +481,7 @@ mod tests {
     use super::*;
     use axc_parser::parse;
     use axc_hir::lower_module;
-    use rspirv::spirv::{Op, ExecutionModel as SpvExecModel, ExecutionMode as SpvExecMode};
+    use rspirv::spirv::{Op, Capability, ExecutionModel as SpvExecModel, ExecutionMode as SpvExecMode};
     use rspirv::dr::Operand;
 
     /// Build a minimal valid HIR for a kernel with the given workgroup dims.
@@ -1088,5 +1220,153 @@ mod tests {
             cursor += word_count;
         }
         caps
+    }
+
+    // ── M1.4 emit.rs tests ────────────────────────────────────────────────────
+
+    /// Helper: compile source, return SPIR-V word stream.
+    fn compile_src(src: &str) -> Vec<u32> {
+        let hir = make_hir(src);
+        emit_module(&hir, &CodegenOptions::default()).expect("emit_module failed")
+    }
+
+    /// Helper: get all capabilities from a compiled SPIR-V word stream as rspirv typed enums.
+    fn get_capabilities(words: &[u32]) -> Vec<Capability> {
+        let module = rspirv::dr::load_words(words).expect("load_words failed");
+        module.capabilities.iter()
+            .filter_map(|i| {
+                if let Some(Operand::Capability(cap)) = i.operands.first() {
+                    Some(*cap)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Helper: count OpExtension instructions with a specific string operand in the module.
+    fn count_extension_string(words: &[u32], ext_name: &str) -> usize {
+        let module = rspirv::dr::load_words(words).expect("load_words failed");
+        module.extensions.iter()
+            .filter(|i| {
+                i.operands.first()
+                    .and_then(|op| if let rspirv::dr::Operand::LiteralString(s) = op { Some(s.as_str()) } else { None })
+                    == Some(ext_name)
+            })
+            .count()
+    }
+
+    // AT-413 / AT-416: emit_subgroup_reduce_kernel_smoke
+    // AT-413: Minimal reduce kernel emits OpCapability GroupNonUniformArithmetic AND GroupNonUniform exactly once.
+    // AT-416: SubgroupSize Input variable is emitted (subgroup_reduce uses subgroup_reduce_add, not size directly,
+    //         but smoke test checks the pipeline compiles and has expected caps).
+    #[test]
+    fn emit_subgroup_reduce_kernel_smoke() {
+        let words = compile_src(
+            "@kernel @workgroup(64,1,1) fn k() -> void { let v: f32 = 1.0f32; let s: f32 = subgroup_reduce_add(v); return; }"
+        );
+        let module = rspirv::dr::load_words(&words).expect("load_words failed");
+
+        // AT-413: both caps present exactly once.
+        let cap_basic_count = module.capabilities.iter()
+            .filter(|i| i.operands.first() == Some(&Operand::Capability(Capability::GroupNonUniform)))
+            .count();
+        let cap_arith_count = module.capabilities.iter()
+            .filter(|i| i.operands.first() == Some(&Operand::Capability(Capability::GroupNonUniformArithmetic)))
+            .count();
+        assert_eq!(cap_basic_count, 1, "AT-413: GroupNonUniform must appear exactly once; got {cap_basic_count}");
+        assert_eq!(cap_arith_count, 1, "AT-413: GroupNonUniformArithmetic must appear exactly once; got {cap_arith_count}");
+
+        // AT-416: pipeline compiles to valid SPIR-V (magic word check).
+        assert_eq!(words[0], 0x0723_0203_u32, "AT-416: magic word");
+        assert_eq!(words[1], 0x0001_0300_u32, "AT-416: SPIR-V version 1.3");
+    }
+
+    // AT-426: (rev 1 CRITICAL-1) Minimal reduce-only kernel emits GroupNonUniform + GroupNonUniformArithmetic
+    // Also asserts OpExtension "SPV_KHR_shader_subgroup_basic" and "SPV_KHR_shader_subgroup_arithmetic" each exactly 1.
+    #[test]
+    fn cg_minimal_subgroup_only_reduce_emits_basic_capability() {
+        let words = compile_src(
+            "@kernel @workgroup(64,1,1) fn k() -> void { let v: i32 = 1i32; let r: i32 = subgroup_reduce_add(v); return; }"
+        );
+        let caps = get_capabilities(&words);
+        assert!(
+            caps.contains(&Capability::GroupNonUniform),
+            "GroupNonUniform must be present (rev 1 CRITICAL-1); caps: {caps:?}"
+        );
+        assert!(
+            caps.contains(&Capability::GroupNonUniformArithmetic),
+            "GroupNonUniformArithmetic must be present for reduce_add (rev 1 CRITICAL-1); caps: {caps:?}"
+        );
+        // AT-426: OpExtension strings must be emitted exactly once each.
+        let ext_basic = count_extension_string(&words, "SPV_KHR_shader_subgroup_basic");
+        let ext_arith = count_extension_string(&words, "SPV_KHR_shader_subgroup_arithmetic");
+        assert_eq!(ext_basic, 1, "OpExtension \"SPV_KHR_shader_subgroup_basic\" : exactly 1; got {ext_basic}");
+        assert_eq!(ext_arith, 1, "OpExtension \"SPV_KHR_shader_subgroup_arithmetic\" : exactly 1; got {ext_arith}");
+    }
+
+    // AT-427: (rev 1 CRITICAL-1) Minimal broadcast-only kernel emits GroupNonUniform + GroupNonUniformBallot
+    // Also asserts OpExtension "SPV_KHR_shader_subgroup_basic" and "SPV_KHR_shader_subgroup_ballot" each exactly 1.
+    #[test]
+    fn cg_minimal_subgroup_only_broadcast_emits_basic_capability() {
+        let words = compile_src(
+            "@kernel @workgroup(64,1,1) fn k() -> void { let v: f32 = 1.0f32; let r: f32 = subgroup_broadcast_first(v); return; }"
+        );
+        let caps = get_capabilities(&words);
+        assert!(
+            caps.contains(&Capability::GroupNonUniform),
+            "GroupNonUniform must be present (rev 1 CRITICAL-1); caps: {caps:?}"
+        );
+        assert!(
+            caps.contains(&Capability::GroupNonUniformBallot),
+            "GroupNonUniformBallot must be present for broadcast_first (rev 1 CRITICAL-1); caps: {caps:?}"
+        );
+        // AT-427: OpExtension strings must be emitted exactly once each.
+        let ext_basic = count_extension_string(&words, "SPV_KHR_shader_subgroup_basic");
+        let ext_ballot = count_extension_string(&words, "SPV_KHR_shader_subgroup_ballot");
+        assert_eq!(ext_basic, 1, "OpExtension \"SPV_KHR_shader_subgroup_basic\" : exactly 1; got {ext_basic}");
+        assert_eq!(ext_ballot, 1, "OpExtension \"SPV_KHR_shader_subgroup_ballot\" : exactly 1; got {ext_ballot}");
+    }
+
+    // AT-428: workgroup_barrier does NOT emit any GroupNonUniform capability
+    #[test]
+    fn emit_workgroup_barrier_no_subgroup_cap() {
+        let words = compile_src(
+            "@kernel @workgroup(64,1,1) fn k() -> void { workgroup_barrier(); return; }"
+        );
+        let caps = get_capabilities(&words);
+        assert!(
+            !caps.contains(&Capability::GroupNonUniform),
+            "GroupNonUniform must NOT be emitted for workgroup_barrier; caps: {caps:?}"
+        );
+        assert!(
+            !caps.contains(&Capability::GroupNonUniformArithmetic),
+            "GroupNonUniformArithmetic must NOT be emitted; caps: {caps:?}"
+        );
+    }
+
+    // AT-429: subgroup_all emits GroupNonUniform + GroupNonUniformVote (not arith/ballot)
+    #[test]
+    fn emit_sg_all_emits_vote_cap_and_basic_not_arith_ballot() {
+        let words = compile_src(
+            "@kernel @workgroup(64,1,1) fn k() -> void { let p: bool = true; let r: bool = subgroup_all(p); return; }"
+        );
+        let caps = get_capabilities(&words);
+        assert!(
+            caps.contains(&Capability::GroupNonUniform),
+            "GroupNonUniform must be present; caps: {caps:?}"
+        );
+        assert!(
+            caps.contains(&Capability::GroupNonUniformVote),
+            "GroupNonUniformVote must be present for subgroup_all; caps: {caps:?}"
+        );
+        assert!(
+            !caps.contains(&Capability::GroupNonUniformArithmetic),
+            "GroupNonUniformArithmetic must NOT be present for subgroup_all; caps: {caps:?}"
+        );
+        assert!(
+            !caps.contains(&Capability::GroupNonUniformBallot),
+            "GroupNonUniformBallot must NOT be present for subgroup_all; caps: {caps:?}"
+        );
     }
 }

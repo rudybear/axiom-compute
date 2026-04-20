@@ -355,6 +355,34 @@ impl TokenKind {
     }
 }
 
+/// Sorted list of reserved subgroup builtin names for binary_search lookup.
+///
+/// These are plain identifiers (not keywords) recognized by the HIR typechecker
+/// in `check_call` and `check_builtin_call_stmt`. The lexer does NOT create
+/// dedicated token kinds for these; they remain `TokenKind::Ident`.
+///
+/// Sorted lexicographically so `binary_search` works correctly.
+/// `subgroup_ballot` is DEFERRED to M1.5 and NOT included here.
+pub const RESERVED_SUBGROUP_BUILTIN_NAMES: &[&str] = &[
+    "subgroup_all",
+    "subgroup_any",
+    "subgroup_broadcast_first",
+    "subgroup_elect",
+    "subgroup_invocation_id",
+    "subgroup_reduce_add",
+    "subgroup_reduce_max",
+    "subgroup_reduce_min",
+    "subgroup_size",
+    "workgroup_barrier",
+];
+
+/// Returns `true` if `name` is a reserved subgroup builtin identifier.
+///
+/// Uses binary search on the sorted `RESERVED_SUBGROUP_BUILTIN_NAMES` slice.
+pub fn is_reserved_subgroup_builtin(name: &str) -> bool {
+    RESERVED_SUBGROUP_BUILTIN_NAMES.binary_search(&name).is_ok()
+}
+
 /// Lookup table mapping byte offsets to (line, column) positions.
 ///
 /// Built on demand for diagnostic rendering; not part of the hot tokenize path.
@@ -521,6 +549,73 @@ mod tests {
         assert_eq!(TokenKind::Fn.m1_reserved_detail(), None);
         assert_eq!(TokenKind::Void.m1_reserved_detail(), None);
         assert_eq!(TokenKind::Eof.m1_reserved_detail(), None);
+    }
+
+    // ── M1.4: reserved subgroup builtin names ────────────────────────────────
+
+    #[test]
+    fn reserved_subgroup_builtin_names_contains_subgroup_invocation_id() {
+        assert!(is_reserved_subgroup_builtin("subgroup_invocation_id"));
+    }
+
+    #[test]
+    fn reserved_subgroup_builtin_names_contains_subgroup_size() {
+        assert!(is_reserved_subgroup_builtin("subgroup_size"));
+    }
+
+    #[test]
+    fn reserved_subgroup_builtin_names_contains_subgroup_elect() {
+        assert!(is_reserved_subgroup_builtin("subgroup_elect"));
+    }
+
+    #[test]
+    fn reserved_subgroup_builtin_names_contains_subgroup_reduce_add() {
+        assert!(is_reserved_subgroup_builtin("subgroup_reduce_add"));
+    }
+
+    #[test]
+    fn reserved_subgroup_builtin_names_contains_subgroup_reduce_min() {
+        assert!(is_reserved_subgroup_builtin("subgroup_reduce_min"));
+    }
+
+    #[test]
+    fn reserved_subgroup_builtin_names_contains_subgroup_reduce_max() {
+        assert!(is_reserved_subgroup_builtin("subgroup_reduce_max"));
+    }
+
+    #[test]
+    fn reserved_subgroup_builtin_names_contains_subgroup_broadcast_first() {
+        assert!(is_reserved_subgroup_builtin("subgroup_broadcast_first"));
+    }
+
+    #[test]
+    fn reserved_subgroup_builtin_names_contains_subgroup_all() {
+        assert!(is_reserved_subgroup_builtin("subgroup_all"));
+    }
+
+    #[test]
+    fn reserved_subgroup_builtin_names_contains_subgroup_any() {
+        assert!(is_reserved_subgroup_builtin("subgroup_any"));
+    }
+
+    #[test]
+    fn reserved_subgroup_builtin_names_contains_workgroup_barrier() {
+        assert!(is_reserved_subgroup_builtin("workgroup_barrier"));
+    }
+
+    #[test]
+    fn reserved_subgroup_builtin_names_rejects_unknown_names_via_binary_search() {
+        // Deferred names must NOT be in the M1.4 list.
+        assert!(!is_reserved_subgroup_builtin("subgroup_ballot"), "subgroup_ballot is deferred to M1.5");
+        assert!(!is_reserved_subgroup_builtin("foo"), "foo is not a reserved name");
+        assert!(!is_reserved_subgroup_builtin("gid"), "gid is not a subgroup reserved name");
+        // Verify sort invariant: RESERVED_SUBGROUP_BUILTIN_NAMES must be sorted lexicographically.
+        let mut sorted = RESERVED_SUBGROUP_BUILTIN_NAMES.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(
+            RESERVED_SUBGROUP_BUILTIN_NAMES, sorted.as_slice(),
+            "RESERVED_SUBGROUP_BUILTIN_NAMES must be sorted lexicographically for binary_search to work"
+        );
     }
 
     #[test]

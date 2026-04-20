@@ -115,6 +115,16 @@ pub enum HirWarning {
         floor: u32,
         span: Span,
     },
+
+    /// A collective subgroup op (Elect, All, Any, Reduce, BroadcastFirst) appears
+    /// inside a divergent context (if/else/while body).
+    ///
+    /// Non-fatal in M1.4. M1.5 may promote to error with uniform analysis.
+    /// `workgroup_barrier` does NOT trigger this warning in M1.4 (CRITICAL-4 fix).
+    SubgroupOpInDivergentContext {
+        op_name: &'static str,
+        span: Span,
+    },
 }
 
 /// Run post-lowering validation rules on a `HirModule`.
@@ -233,8 +243,11 @@ mod tests {
         let (errors, warnings) = validate(&m);
         assert!(errors.is_empty(), "(e) expected no errors at product=1024: {errors:?}");
         assert!(!warnings.is_empty(), "(e) expected warning at product=1024 (boundary)");
-        let HirWarning::WorkgroupExceedsPortableFloor { product, .. } = &warnings[0];
-        assert_eq!(*product, 1024);
+        if let HirWarning::WorkgroupExceedsPortableFloor { product, .. } = &warnings[0] {
+            assert_eq!(*product, 1024);
+        } else {
+            panic!("expected WorkgroupExceedsPortableFloor warning, got: {:?}", &warnings[0]);
+        }
 
         // (f) @workgroup(16,8,9) product==1152 → ERROR
         let m = make_module(16, 8, 9);
@@ -309,5 +322,55 @@ mod tests {
             }
         });
         assert!(found, "expected HirError::Typecheck(ContinueOutsideLoop): {errors:?}");
+    }
+
+    // ── M1.4 validate tests (AT-14.5) ────────────────────────────────────────
+
+    // AT-424: subgroup_invocation_id() in non-divergent context — no HirError, no warning
+    #[test]
+    fn validate_sg_invocation_id_no_error_no_warning() {
+        use crate::lower_module;
+        let src = "@kernel @workgroup(64,1,1) fn k() -> void { let id: u32 = subgroup_invocation_id(); return; }";
+        let (ast, lex_errs, parse_errs) = axc_parser::parse(src);
+        assert!(lex_errs.is_empty());
+        assert!(parse_errs.is_empty());
+        let (hir, hir_errs, hir_warns) = lower_module(&ast);
+        assert!(hir_errs.is_empty(), "errors: {hir_errs:?}");
+        assert!(
+            !hir_warns.iter().any(|w| matches!(w, HirWarning::SubgroupOpInDivergentContext { .. })),
+            "must not produce divergent warning in non-divergent context; warns: {hir_warns:?}"
+        );
+        let _ = hir;
+    }
+
+    // AT-425: subgroup_any() inside if body — produces SubgroupOpInDivergentContext warning end-to-end
+    #[test]
+    fn validate_sg_any_in_if_body_produces_warning() {
+        use crate::lower_module;
+        let src = "@kernel @workgroup(64,1,1) fn k() -> void { let p: bool = true; if p { let r: bool = subgroup_any(p); } return; }";
+        let (ast, lex_errs, parse_errs) = axc_parser::parse(src);
+        assert!(lex_errs.is_empty());
+        assert!(parse_errs.is_empty());
+        let (_hir, hir_errs, hir_warns) = lower_module(&ast);
+        assert!(hir_errs.is_empty(), "errors: {hir_errs:?}");
+        assert!(
+            hir_warns.iter().any(|w| matches!(w, HirWarning::SubgroupOpInDivergentContext { op_name, .. } if *op_name == "subgroup_any")),
+            "expected SubgroupOpInDivergentContext{{op_name:\"subgroup_any\"}}; warns: {hir_warns:?}"
+        );
+    }
+
+    // AT-426: subgroup_reduce_add with wrong arg count is a hard error end-to-end
+    #[test]
+    fn validate_sg_reduce_add_arity_error_is_fatal() {
+        use crate::lower_module;
+        let src = "@kernel @workgroup(32,1,1) fn k() -> void { let a: i32 = 1i32; let b: i32 = 2i32; let r: i32 = subgroup_reduce_add(a, b); return; }";
+        let (ast, lex_errs, parse_errs) = axc_parser::parse(src);
+        assert!(lex_errs.is_empty());
+        assert!(parse_errs.is_empty());
+        let (_hir, hir_errs, _hir_warns) = lower_module(&ast);
+        assert!(
+            hir_errs.iter().any(|e| matches!(e, HirError::Typecheck(TypecheckError::SubgroupArity { .. }))),
+            "expected HirError::Typecheck(SubgroupArity): {hir_errs:?}"
+        );
     }
 }
