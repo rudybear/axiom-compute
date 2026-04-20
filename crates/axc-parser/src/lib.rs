@@ -1,15 +1,16 @@
 //! AXIOM-Compute parser — produces a typed AST from a token stream.
 //!
-//! M0 grammar is intentionally minimal: only `@kernel fn name() -> void { return; }`
-//! is accepted. All M1-reserved syntax (let, if, for, …) produces a helpful
-//! `ParseError::UnsupportedInM0` rather than a generic "unexpected token" message.
+//! M0 grammar was minimal: only `@kernel fn name() -> void { return; }`.
+//! M1.1 adds let/let-mut bindings, assignments, and Pratt expressions.
+//! M1.2 adds buffer parameters, index expressions, and buffer writes.
+//! M1.3 adds structured control flow: if/else, for-range, while, break, continue.
 
 pub mod ast;
 pub mod parser;
 
 pub use ast::{Module, Item, KernelDecl, Annotation, AnnotationArg, Block, Stmt, Expr, TypeRef, Param,
-              BinOp, UnaryOp, ShortCircuitOp};
-pub use parser::{Parser, ParseError, M1_1_RESERVED_KEYWORDS};
+              BinOp, UnaryOp, ShortCircuitOp, ElseArm};
+pub use parser::{Parser, ParseError, M1_1_RESERVED_KEYWORDS, M1_3_RESERVED_KEYWORDS};
 
 use axc_lexer::LexError;
 

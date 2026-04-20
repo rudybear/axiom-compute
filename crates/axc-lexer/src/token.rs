@@ -265,25 +265,28 @@ impl TokenKind {
         matches!(self, TokenKind::Error(_))
     }
 
-    /// Returns the human-readable M1.1+-reserved statement description for this token,
-    /// or `None` if the token is not in the reserved deny-list for post-M1.1 features.
+    /// Returns the human-readable M1.3+-reserved statement description for this token,
+    /// or `None` if the token is not in the reserved deny-list for post-M1.3 features.
     ///
     /// Used by `parse_stmt` (§3.3) to produce `ParseError::UnsupportedInM1_1 { detail }`.
     /// Keeping the mapping here lets the parser stay free of literal strings.
     ///
-    /// Note: `Let` and `Mut` returned `Some(...)` in M0 but now return `None` because
-    /// M1.1 implements let/let-mut bindings as first-class syntax.
+    /// M1.1: `Let` and `Mut` were delisted from reserved (now valid syntax).
+    /// M1.3: `If`, `Else`, `For`, `While`, `Break`, `Continue` are delisted (now valid
+    ///        control-flow syntax). Only `Struct` remains reserved.
     pub fn m1_reserved_detail(&self) -> Option<&'static str> {
         match self {
             // Let and Mut are NO LONGER reserved — M1.1 implements them.
             TokenKind::Let      => None,
             TokenKind::Mut      => None,
-            TokenKind::If       => Some("if statement"),
-            TokenKind::Else     => Some("else branch"),
-            TokenKind::For      => Some("for loop"),
-            TokenKind::While    => Some("while loop"),
-            TokenKind::Break    => Some("break statement"),
-            TokenKind::Continue => Some("continue statement"),
+            // If/Else/For/While/Break/Continue are NO LONGER reserved — M1.3 implements them.
+            TokenKind::If       => None,
+            TokenKind::Else     => None,
+            TokenKind::For      => None,
+            TokenKind::While    => None,
+            TokenKind::Break    => None,
+            TokenKind::Continue => None,
+            // Struct remains reserved until M2.
             TokenKind::Struct   => Some("struct declaration"),
             // All other tokens are not M1-reserved
             TokenKind::IntLiteral { .. }
@@ -490,18 +493,25 @@ mod tests {
     }
 
     #[test]
-    fn reserved_detail_after_m1_1_delists_let_mut_in_token() {
+    fn m1_reserved_detail_control_flow_unreserved_after_m1_3() {
         // M1.1 delists Let and Mut — they are now valid syntax, not reserved.
         assert_eq!(TokenKind::Let.m1_reserved_detail(), None);
         assert_eq!(TokenKind::Mut.m1_reserved_detail(), None);
-        // The following still remain reserved (deferred to M1.3 or later):
-        assert_eq!(TokenKind::If.m1_reserved_detail(), Some("if statement"));
-        assert_eq!(TokenKind::For.m1_reserved_detail(), Some("for loop"));
-        assert_eq!(TokenKind::While.m1_reserved_detail(), Some("while loop"));
+        // M1.3 delists If/Else/For/While/Break/Continue — now valid control-flow syntax.
+        assert_eq!(TokenKind::If.m1_reserved_detail(), None);
+        assert_eq!(TokenKind::For.m1_reserved_detail(), None);
+        assert_eq!(TokenKind::While.m1_reserved_detail(), None);
+        assert_eq!(TokenKind::Break.m1_reserved_detail(), None);
+        assert_eq!(TokenKind::Continue.m1_reserved_detail(), None);
+        assert_eq!(TokenKind::Else.m1_reserved_detail(), None);
+        // Struct still remains reserved (deferred to M2+):
         assert_eq!(TokenKind::Struct.m1_reserved_detail(), Some("struct declaration"));
-        assert_eq!(TokenKind::Break.m1_reserved_detail(), Some("break statement"));
-        assert_eq!(TokenKind::Continue.m1_reserved_detail(), Some("continue statement"));
-        assert_eq!(TokenKind::Else.m1_reserved_detail(), Some("else branch"));
+    }
+
+    #[test]
+    fn m1_3_in_token_is_not_reserved() {
+        // `in` was never reserved; remains non-reserved in M1.3.
+        assert_eq!(TokenKind::In.m1_reserved_detail(), None);
     }
 
     #[test]

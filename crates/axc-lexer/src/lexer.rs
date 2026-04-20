@@ -843,9 +843,9 @@ mod tests {
         // M1.1 removes Let and Mut from the reserved deny-list (they are now valid syntax).
         assert_eq!(TokenKind::Let.m1_reserved_detail(),      None);
         assert_eq!(TokenKind::Mut.m1_reserved_detail(),      None);
-        // If and For remain reserved (deferred to M1.3).
-        assert_eq!(TokenKind::If.m1_reserved_detail(),       Some("if statement"));
-        assert_eq!(TokenKind::For.m1_reserved_detail(),      Some("for loop"));
+        // M1.3 removes If, For, While, Break, Continue from the reserved deny-list (now valid syntax).
+        assert_eq!(TokenKind::If.m1_reserved_detail(),       None);
+        assert_eq!(TokenKind::For.m1_reserved_detail(),      None);
         assert_eq!(TokenKind::Return.m1_reserved_detail(),   None);
         assert_eq!(TokenKind::Fn.m1_reserved_detail(),       None);
     }

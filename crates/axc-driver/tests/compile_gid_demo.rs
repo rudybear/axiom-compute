@@ -28,19 +28,14 @@ fn load_words(bytes: &[u8]) -> Vec<u32> {
     words
 }
 
-fn which_spirv_val() -> Option<PathBuf> {
-    let path_var: std::ffi::OsString = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate: PathBuf = dir.join("spirv-val");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        let candidate_exe: PathBuf = dir.join("spirv-val.exe");
-        if candidate_exe.is_file() {
-            return Some(candidate_exe);
-        }
-    }
-    None
+/// Validate SPIR-V words using the in-process spirv-tools crate.
+/// This is always mandatory — no PATH dependency, no silent skip.
+fn validate_spirv(words: &[u32], label: &str) {
+    use spirv_tools::val::{Validator, create as create_validator};
+    use spirv_tools::TargetEnv;
+    let validator = create_validator(Some(TargetEnv::Vulkan_1_1));
+    validator.validate(words, None)
+        .unwrap_or_else(|e| panic!("AT-203: spirv-tools rejected {label} SPIR-V: {e}"));
 }
 
 #[test]
@@ -146,21 +141,8 @@ fn test_compile_gid_demo_produces_valid_spirv() {
         composite_extract_count
     );
 
-    // spirv-val (optional).
-    if let Some(sv_path) = which_spirv_val() {
-        let output = std::process::Command::new(&sv_path)
-            .arg("--target-env")
-            .arg("vulkan1.1")
-            .arg(&out_path)
-            .output()
-            .expect("failed to execute spirv-val");
-        assert!(
-            output.status.success(),
-            "AT-203: spirv-val rejected gid_demo output:\nstdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-    }
+    // AT-203: in-process SPIR-V validation via spirv-tools crate (always mandatory).
+    validate_spirv(&words, "gid_demo");
 
     let _ = std::fs::remove_file(&out_path);
 }

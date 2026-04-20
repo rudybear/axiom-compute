@@ -18,34 +18,18 @@
 //!   AT-201-h: No debug opcodes
 //!   AT-201-i: spirv-val accepts output (if spirv-val on PATH)
 
-use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::path::PathBuf;
 use rspirv::spirv::{Op, StorageClass, Decoration};
 use rspirv::dr::Operand;
 
-/// Locate `spirv-val` by walking `PATH` without shelling out.
-fn which_spirv_val() -> Option<PathBuf> {
-    let path_var: std::ffi::OsString = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate: PathBuf = dir.join("spirv-val");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        let candidate_exe: PathBuf = dir.join("spirv-val.exe");
-        if candidate_exe.is_file() {
-            return Some(candidate_exe);
-        }
-    }
-    None
-}
-
-/// Run `spirv-val --target-env vulkan1.1 <path>`.
-fn run_spirv_val(spirv_val: &Path, spv_path: &Path) -> std::io::Result<Output> {
-    std::process::Command::new(spirv_val)
-        .arg("--target-env")
-        .arg("vulkan1.1")
-        .arg(spv_path)
-        .output()
+/// Validate SPIR-V words using the in-process spirv-tools crate.
+/// This is always mandatory — no PATH dependency, no silent skip.
+fn validate_spirv(words: &[u32], label: &str) {
+    use spirv_tools::val::{Validator, create as create_validator};
+    use spirv_tools::TargetEnv;
+    let validator = create_validator(Some(TargetEnv::Vulkan_1_1));
+    validator.validate(words, None)
+        .unwrap_or_else(|e| panic!("AT-201-i: spirv-tools rejected {label} SPIR-V: {e}"));
 }
 
 fn iter_instructions(words: &[u32]) -> impl Iterator<Item = (u16, &[u32])> {
@@ -174,32 +158,8 @@ fn test_compile_saxpy_produces_valid_spirv() {
         );
     }
 
-    // AT-201-i: spirv-val (optional).
-    match which_spirv_val() {
-        Some(sv_path) => {
-            let output = run_spirv_val(&sv_path, &out_path)
-                .expect("failed to execute spirv-val");
-            assert!(
-                output.status.success(),
-                "AT-201-i: spirv-val rejected saxpy output:\nstdout: {}\nstderr: {}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            );
-        }
-        None => {
-            if std::env::var("AXC_REQUIRE_SPIRV_VAL").as_deref() == Ok("1") {
-                panic!(
-                    "spirv-val required by CI but not found on PATH; \
-                    install SPIRV-Tools or set AXC_REQUIRE_SPIRV_VAL=0"
-                );
-            } else {
-                eprintln!(
-                    "note: spirv-val not found on PATH; \
-                    skipping spirv-val validation for saxpy."
-                );
-            }
-        }
-    }
+    // AT-201-i: in-process SPIR-V validation via spirv-tools crate (always mandatory).
+    validate_spirv(&words, "saxpy");
 
     let _ = std::fs::remove_file(&out_path);
 }

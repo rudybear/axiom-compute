@@ -8,6 +8,7 @@ description = "SPIR-V codegen for AXIOM-Compute via rspirv::dr::Builder"
 
 [dependencies]
 axc-hir = { path = "../axc-hir" }
+axc-lexer = { path = "../axc-lexer" }
 rspirv = { workspace = true }
 spirv = { workspace = true }
 thiserror = { workspace = true }

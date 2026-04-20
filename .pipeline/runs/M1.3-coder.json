@@ -1,0 +1,89 @@
+{
+  "verdict": "IMPLEMENTED",
+  "milestone": "M1.3",
+  "agent": "coder",
+  "date": "2026-04-18",
+  "summary": "M1.3 structured control flow fully implemented and passing all acceptance criteria.",
+  "test_results": {
+    "total_passing": 323,
+    "total_failing": 0,
+    "target": 323,
+    "result": "PASS"
+  },
+  "clippy": "clean (0 warnings, -D warnings enforced)",
+  "cargo_check": "clean",
+  "changes": {
+    "axc-lexer": [
+      "token.rs: m1_reserved_detail() returns None for If, Else, For, While, Break, Continue — only Struct remains reserved",
+      "lexer.rs: updated test reserved_detail_after_m1_1_delists_let_mut to reflect M1.3 reality",
+      "Added tests: m1_3_in_token_is_not_reserved, reserved_detail_after_m1_3_delists_control_flow"
+    ],
+    "axc-parser": [
+      "ast.rs: added ElseArm enum, extended Stmt with If/For/While/Break/Continue",
+      "parser.rs: renamed M1_3_RESERVED_KEYWORDS (only Struct), added parse_if_stmt/parse_for_stmt/parse_while_stmt",
+      "Removed 3 old tests expecting UnsupportedInM1_1 for if/for/while",
+      "Added 10+ new M1.3 parser tests (AT-301..AT-306, AT-327, AT-328)"
+    ],
+    "axc-hir": [
+      "loop_ctx.rs: NEW — HirLoopStack, ScopeStack with get_in_current_frame for correct duplicate detection",
+      "control_flow.rs: NEW — HirIf, HirElse, HirForRange, HirWhile, ForStep",
+      "expr.rs: extended HirStmt with If/ForRange/While/Break/Continue",
+      "typecheck.rs: 8 new TypecheckError variants, ScopeStack replaces flat HashMap, 27 new M1.3 tests",
+      "lib.rs: re-exports for all new types"
+    ],
+    "axc-codegen": [
+      "Cargo.toml: added axc-lexer as regular dependency (for Span in BodyCodegenError)",
+      "body.rs: emit_if/emit_for_range/emit_while functions, LoopCodegenCtx, current_block_terminated flag, 11 new tests",
+      "emit.rs: stmt_uses_gid extended for If/ForRange/While/Break/Continue, 6 new M1.3 integration tests"
+    ]
+  },
+  "acceptance_tests": {
+    "AT-301_if_parses": "PASS",
+    "AT-302_if_else_parses": "PASS",
+    "AT-303_else_if_chain": "PASS",
+    "AT-304_for_range_default_step": "PASS",
+    "AT-305_for_range_explicit_step": "PASS",
+    "AT-306_missing_in_rejected": "PASS",
+    "AT-307_if_bool_cond": "PASS",
+    "AT-308_if_non_bool_rejected": "PASS",
+    "AT-309_if_else_typecheck": "PASS",
+    "AT-310_else_if_chain": "PASS",
+    "AT-311_short_circuit_in_header_rejected": "PASS",
+    "AT-312_for_range_basic": "PASS",
+    "AT-313_for_range_step": "PASS",
+    "AT-314_induction_scoped": "PASS",
+    "AT-315_assign_induction_rejected": "PASS",
+    "AT-316_while_basic": "PASS",
+    "AT-317_while_non_bool_rejected": "PASS",
+    "AT-318_short_circuit_while_rejected": "PASS",
+    "AT-319_break_in_loop": "PASS",
+    "AT-320_break_outside_loop_rejected": "PASS",
+    "AT-321_continue_in_loop": "PASS",
+    "AT-322_continue_outside_loop_rejected": "PASS",
+    "AT-323_return_in_loop_deferred": "PASS",
+    "AT-324_nested_for_same_name": "PASS",
+    "AT-325_for_range_non_u32_rejected": "PASS",
+    "AT-326_let_inside_for_scoped": "PASS",
+    "AT-327_break_continue_unreserved": "PASS",
+    "AT-328_struct_still_reserved": "PASS",
+    "AT-329_for_step_zero_rejected": "PASS",
+    "AT-330_if_reads_outer_binding": "PASS",
+    "AT-331_while_reads_outer_binding": "PASS",
+    "AT-332_for_body_reads_induction": "PASS",
+    "AT-333_dead_code_after_break_allowed": "PASS",
+    "codegen_if_selection_merge": "PASS",
+    "codegen_while_loop_merge": "PASS",
+    "codegen_for_loop_merge": "PASS",
+    "codegen_break_branch": "PASS",
+    "codegen_continue_branch": "PASS",
+    "codegen_return_in_loop_deferred": "PASS"
+  },
+  "critical_design_decisions": {
+    "CRITICAL-1_short_circuit_in_header": "Rejected at typecheck with UnsupportedShortCircuitInHeader — OpSelectionMerge + OpLoopMerge cannot collide in same block",
+    "AT-323_return_inside_loop": "Deferred to M1.4 — codegen emits ReturnInsideLoopDeferred error",
+    "scope_stack_anti_pattern": "ScopeStack uses Vec not HashMap for deterministic order (anti-pattern #4)",
+    "spirv_opvariable_prelude": "ALL OpVariable declarations in first block per SPIR-V §2.16.1",
+    "current_block_terminated": "Dead code after break/continue/return silently dropped",
+    "nested_scope_shadowing": "get_in_current_frame checks only innermost frame for RedeclaredBinding — enables nested for loops with same induction var name"
+  }
+}

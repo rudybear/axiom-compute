@@ -12,36 +12,16 @@
 //!   - spirv-val present: validate.
 //!   - spirv-val absent: print skip note to stderr, return.
 
-use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::path::PathBuf;
 
-/// Locate `spirv-val` by walking `PATH` without shelling out.
-///
-/// Uses `std::env::split_paths` which handles platform-specific separator
-/// (`:` on Unix, `;` on Windows). Returns the first found binary.
-fn which_spirv_val() -> Option<PathBuf> {
-    let path_var: std::ffi::OsString = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate: PathBuf = dir.join("spirv-val");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        // Windows: also try spirv-val.exe
-        let candidate_exe: PathBuf = dir.join("spirv-val.exe");
-        if candidate_exe.is_file() {
-            return Some(candidate_exe);
-        }
-    }
-    None
-}
-
-/// Run `spirv-val --target-env vulkan1.1 <path>` and return the process output.
-fn run_spirv_val(spirv_val: &Path, spv_path: &Path) -> std::io::Result<Output> {
-    std::process::Command::new(spirv_val)
-        .arg("--target-env")
-        .arg("vulkan1.1")
-        .arg(spv_path)
-        .output()
+/// Validate SPIR-V words using the in-process spirv-tools crate.
+/// This is always mandatory — no PATH dependency, no silent skip.
+fn validate_spirv(words: &[u32], label: &str) {
+    use spirv_tools::val::{Validator, create as create_validator};
+    use spirv_tools::TargetEnv;
+    let validator = create_validator(Some(TargetEnv::Vulkan_1_1));
+    validator.validate(words, None)
+        .unwrap_or_else(|e| panic!("AT-1: spirv-tools rejected {label} SPIR-V: {e}"));
 }
 
 /// Walk an assembled SPIR-V word stream as an instruction stream.
@@ -167,35 +147,8 @@ fn test_compile_empty_kernel_produces_valid_spirv() {
         );
     }
 
-    // 6. Run spirv-val if available
-    match which_spirv_val() {
-        Some(sv_path) => {
-            let output: Output = run_spirv_val(&sv_path, &out_path)
-                .expect("failed to execute spirv-val");
-            assert!(
-                output.status.success(),
-                "spirv-val rejected the output:\nstdout: {}\nstderr: {}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            );
-        }
-        None => {
-            // No spirv-val found
-            if std::env::var("AXC_REQUIRE_SPIRV_VAL").as_deref() == Ok("1") {
-                panic!(
-                    "spirv-val required by CI but not found on PATH; \
-                    install SPIRV-Tools (apt-get install spirv-tools) \
-                    or set AXC_REQUIRE_SPIRV_VAL=0 to skip"
-                );
-            } else {
-                eprintln!(
-                    "note: spirv-val not found on PATH; \
-                    skipping spirv-val validation. \
-                    Install SPIRV-Tools to run the full test."
-                );
-            }
-        }
-    }
+    // 6. In-process SPIR-V validation via spirv-tools crate (always mandatory).
+    validate_spirv(&all_words, "empty_kernel");
 
     // 7. Clean up temp file (best-effort; don't fail test on cleanup error)
     let _ = std::fs::remove_file(&out_path);

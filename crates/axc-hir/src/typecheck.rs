@@ -26,6 +26,8 @@ use crate::expr::{
 use crate::ty::{ScalarTy, fit_int_literal, fit_float_literal};
 use crate::param::{KernelParam, Ty as ParamTy};
 use crate::buffer::BufferAccess;
+use crate::control_flow::{HirIf, HirElse, HirForRange, HirWhile, ForStep};
+use crate::loop_ctx::{HirLoopStack, ScopeStack};
 
 /// Typecheck error — emitted from `typecheck_kernel_body`.
 ///
@@ -238,29 +240,91 @@ pub enum TypecheckError {
         #[label("here")]
         span: Span,
     },
+
+    // ── M1.3 control-flow errors ────────────────────────────────────────────────
+
+    #[error("`break` outside of any loop")]
+    BreakOutsideLoop {
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("`continue` outside of any loop")]
+    ContinueOutsideLoop {
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("for-loop step must be a compile-time positive integer constant; got a non-constant expression")]
+    ForStepNotConstant {
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("for-loop step must be a positive integer; got {value}")]
+    ForStepNotPositive {
+        value: u64,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("for-loop step must have type `u32` (got suffix `{got_suffix}`)")]
+    ForStepNotU32 {
+        got_suffix: &'static str,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("cannot assign to for-loop induction variable `{name}`")]
+    AssignToForInductionVar {
+        name: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("condition in `{position}` statement must be a bool expression; got `{got}`")]
+    NonBoolCondition {
+        position: &'static str,
+        got: &'static str,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("compound short-circuit (`and`/`or`) is not allowed directly in the `{position}` condition header in M1.3; lift it to `let _cond: bool = <expr>; {position} _cond {{ ... }}`")]
+    UnsupportedShortCircuitInHeader {
+        position: &'static str,
+        #[label("here")]
+        span: Span,
+    },
 }
 
 // ── Internal binding table ────────────────────────────────────────────────────
 
 struct TypeChecker<'p> {
     bindings: Vec<Binding>,
-    // Maps binding name -> index in `bindings` (for duplicate detection + lookup).
-    binding_lookup: std::collections::HashMap<String, usize>,
     errors: Vec<TypecheckError>,
     next_id: u32,
     /// Kernel parameters (read-only; buffer params cannot be assigned to).
     params: &'p [KernelParam],
+    /// Loop context stack for break/continue validation and induction-var detection.
+    loop_stack: HirLoopStack,
+    /// Scoped name-resolution: each block pushes a frame, pops on exit.
+    scope_stack: ScopeStack,
 }
 
 impl<'p> TypeChecker<'p> {
     fn new(params: &'p [KernelParam]) -> Self {
-        Self {
+        let mut tc = Self {
             bindings: Vec::new(),
-            binding_lookup: std::collections::HashMap::new(),
             errors: Vec::new(),
             next_id: 0,
             params,
-        }
+            loop_stack: HirLoopStack::new(),
+            scope_stack: ScopeStack::new(),
+        };
+        // Push the top-level scope frame (pops at end of typecheck_kernel_body).
+        tc.scope_stack.push_frame();
+        tc
     }
 
     /// Look up a kernel parameter by name.
@@ -274,8 +338,9 @@ impl<'p> TypeChecker<'p> {
         id
     }
 
+    /// Find a binding by name: traverse scope_stack from inner to outer.
     fn find_binding(&self, name: &str) -> Option<(BindingId, ScalarTy, bool, Span)> {
-        if let Some(&idx) = self.binding_lookup.get(name) {
+        if let Some(idx) = self.scope_stack.get(name) {
             let b = &self.bindings[idx];
             Some((b.id, b.ty, b.is_mutable, b.span))
         } else {
@@ -283,9 +348,16 @@ impl<'p> TypeChecker<'p> {
         }
     }
 
+    /// Register a new binding in the innermost scope frame.
+    ///
+    /// Duplicate detection is within the SAME scope frame only.
+    /// Shadowing across frames (e.g. nested for loops with same induction var name) is allowed.
     fn register_binding(&mut self, name: &str, ty: ScalarTy, is_mutable: bool, span: Span) -> Option<BindingId> {
-        if let Some(&existing_idx) = self.binding_lookup.get(name) {
-            let orig_span = self.bindings[existing_idx].span;
+        // Check for duplicate in the CURRENT frame only (not outer scopes — shadowing is OK).
+        // Using get_in_current_frame ensures that nested scopes (e.g. nested for loops with
+        // the same induction variable name) do not falsely trigger RedeclaredBinding.
+        if let Some(idx) = self.scope_stack.get_in_current_frame(name) {
+            let orig_span = self.bindings[idx].span;
             self.errors.push(TypecheckError::RedeclaredBinding {
                 name: name.to_owned(),
                 span,
@@ -302,7 +374,7 @@ impl<'p> TypeChecker<'p> {
             is_mutable,
             span,
         });
-        self.binding_lookup.insert(name.to_owned(), idx);
+        self.scope_stack.insert(name.to_owned(), idx);
         Some(id)
     }
 }
@@ -323,29 +395,15 @@ pub fn typecheck_kernel_body(
     params: &[KernelParam],
 ) -> (KernelBodyTyped, Vec<TypecheckError>) {
     let mut tc = TypeChecker::new(params);
-    let mut hir_stmts: Vec<HirStmt> = Vec::new();
 
-    // ── Pass 1: Register all let bindings into the binding table ─────────────
-    // IndexAssign is not a binding and is skipped in pass 1.
-    for spanned_stmt in &body.stmts {
-        if let past::Stmt::Let { name, ty, is_mut, .. } = &spanned_stmt.node {
-            let scalar_ty = match typeref_to_scalar(&ty.node) {
-                Ok(t) => t,
-                Err(detail) => {
-                    tc.errors.push(TypecheckError::UnsupportedExprInM1_1 {
-                        detail,
-                        span: ty.span,
-                    });
-                    // Use a placeholder so future references resolve to something.
-                    ScalarTy::I32
-                }
-            };
-            // register_binding handles duplicate detection.
-            tc.register_binding(&name.node, scalar_ty, *is_mut, name.span);
-        }
-    }
+    // ── Pass 1: Pre-register top-level let bindings ───────────────────────────
+    // This keeps the flat-body path consistent with M1.1/M1.2. Control-flow
+    // nested blocks use a single-pass scheme (no pre-registration needed because
+    // they introduce new scope frames).
+    pre_register_lets_in_block(body, &mut tc);
 
     // ── Pass 2: Typecheck expressions in each statement ───────────────────────
+    let mut hir_stmts: Vec<HirStmt> = Vec::new();
     for spanned_stmt in &body.stmts {
         match &spanned_stmt.node {
             past::Stmt::Let { name, ty, init, .. } => {
@@ -386,7 +444,13 @@ pub fn typecheck_kernel_body(
                             let _ = check_expr(&mut tc, &value.node, value.span, None);
                         }
                         Some((bid, binding_ty, is_mutable, orig_span)) => {
-                            if !is_mutable {
+                            // Check induction variable assignment first.
+                            if tc.loop_stack.contains_induction_binding(bid) {
+                                tc.errors.push(TypecheckError::AssignToForInductionVar {
+                                    name: target.node.clone(),
+                                    span: target.span,
+                                });
+                            } else if !is_mutable {
                                 tc.errors.push(TypecheckError::AssignImmutable {
                                     name: target.node.clone(),
                                     span: target.span,
@@ -419,8 +483,40 @@ pub fn typecheck_kernel_body(
                     hir_stmts.push(stmt);
                 }
             }
+            past::Stmt::If { cond, then_block, else_arm } => {
+                if let Some(stmt) = check_if_stmt(&mut tc, cond, then_block, else_arm.as_deref(), spanned_stmt.span) {
+                    hir_stmts.push(HirStmt::If(stmt));
+                }
+            }
+            past::Stmt::For { var, start, end, step, body } => {
+                if let Some(stmt) = check_for_stmt(&mut tc, var, start, end, step.as_ref(), body, spanned_stmt.span) {
+                    hir_stmts.push(HirStmt::ForRange(stmt));
+                }
+            }
+            past::Stmt::While { cond, body } => {
+                if let Some(stmt) = check_while_stmt(&mut tc, cond, body, spanned_stmt.span) {
+                    hir_stmts.push(HirStmt::While(stmt));
+                }
+            }
+            past::Stmt::Break => {
+                if !tc.loop_stack.is_in_loop() {
+                    tc.errors.push(TypecheckError::BreakOutsideLoop { span: spanned_stmt.span });
+                } else {
+                    hir_stmts.push(HirStmt::Break { span: spanned_stmt.span });
+                }
+            }
+            past::Stmt::Continue => {
+                if !tc.loop_stack.is_in_loop() {
+                    tc.errors.push(TypecheckError::ContinueOutsideLoop { span: spanned_stmt.span });
+                } else {
+                    hir_stmts.push(HirStmt::Continue { span: spanned_stmt.span });
+                }
+            }
         }
     }
+
+    // Pop the top-level scope frame opened in TypeChecker::new.
+    tc.scope_stack.pop_frame();
 
     let body_typed = KernelBodyTyped {
         bindings: tc.bindings,
@@ -428,6 +524,410 @@ pub fn typecheck_kernel_body(
     };
 
     (body_typed, tc.errors)
+}
+
+// ── Pre-registration of let bindings (top-level only) ────────────────────────
+
+/// Pre-register let bindings at the TOP level of a block (not nested blocks).
+///
+/// This is the M1.1/M1.2 two-pass approach for flat kernel bodies. Nested blocks
+/// (if/for/while bodies) use single-pass with scope frames and DON'T pre-register.
+fn pre_register_lets_in_block(block: &past::Block, tc: &mut TypeChecker<'_>) {
+    for spanned_stmt in &block.stmts {
+        if let past::Stmt::Let { name, ty, is_mut, .. } = &spanned_stmt.node {
+            let scalar_ty = match typeref_to_scalar(&ty.node) {
+                Ok(t) => t,
+                Err(detail) => {
+                    tc.errors.push(TypecheckError::UnsupportedExprInM1_1 {
+                        detail,
+                        span: ty.span,
+                    });
+                    ScalarTy::I32
+                }
+            };
+            tc.register_binding(&name.node, scalar_ty, *is_mut, name.span);
+        }
+    }
+}
+
+// ── Control flow statement typechecking (M1.3) ───────────────────────────────
+
+/// Typecheck `if cond { then } [else ...]`
+///
+/// Rev 1 CRITICAL-1: compound short-circuit in cond is rejected BEFORE bool check.
+fn check_if_stmt(
+    tc: &mut TypeChecker<'_>,
+    cond: &axc_lexer::Spanned<past::Expr>,
+    then_block: &axc_lexer::Spanned<past::Block>,
+    else_arm: Option<&axc_parser::ast::ElseArm>,
+    _stmt_span: Span,
+) -> Option<HirIf> {
+    // CRITICAL-1: reject compound short-circuit in if-header
+    if matches!(&cond.node, past::Expr::ShortCircuit { .. }) {
+        tc.errors.push(TypecheckError::UnsupportedShortCircuitInHeader {
+            position: "if",
+            span: cond.span,
+        });
+        return None;
+    }
+
+    let cond_hir = check_expr(tc, &cond.node, cond.span, Some(ScalarTy::Bool))?;
+    if cond_hir.ty != ScalarTy::Bool {
+        tc.errors.push(TypecheckError::NonBoolCondition {
+            position: "if",
+            got: cond_hir.ty.display_name(),
+            span: cond.span,
+        });
+        return None;
+    }
+
+    let then_stmts = typecheck_nested_block(tc, then_block);
+
+    let hir_else: Option<Box<HirElse>> = match else_arm {
+        None => None,
+        Some(past::ElseArm::Block(block)) => {
+            let else_stmts = typecheck_nested_block(tc, block);
+            Some(Box::new(HirElse::Block(else_stmts)))
+        }
+        Some(past::ElseArm::If(inner_spanned)) => {
+            // inner_spanned.node must be Stmt::If
+            if let past::Stmt::If { cond: ic, then_block: itb, else_arm: iea } = &inner_spanned.node {
+                check_if_stmt(tc, ic, itb, iea.as_deref(), inner_spanned.span)
+                    .map(|hir_if| Box::new(HirElse::If(hir_if)))
+            } else {
+                // Should not happen: parser guarantees ElseArm::If contains Stmt::If
+                tc.errors.push(TypecheckError::UnsupportedExprInM1_1 {
+                    detail: "internal: ElseArm::If does not contain Stmt::If",
+                    span: inner_spanned.span,
+                });
+                None
+            }
+        }
+    };
+
+    Some(HirIf {
+        cond: cond_hir,
+        then_block: then_stmts,
+        else_arm: hir_else,
+        span: _stmt_span,
+    })
+}
+
+/// Typecheck `for var in range(start, end [, step]) { body }`
+fn check_for_stmt(
+    tc: &mut TypeChecker<'_>,
+    var: &axc_lexer::Spanned<String>,
+    start: &axc_lexer::Spanned<past::Expr>,
+    end: &axc_lexer::Spanned<past::Expr>,
+    step: Option<&axc_lexer::Spanned<past::Expr>>,
+    body: &axc_lexer::Spanned<past::Block>,
+    stmt_span: Span,
+) -> Option<HirForRange> {
+    // Typecheck start and end with expected=U32
+    let start_hir = check_expr(tc, &start.node, start.span, Some(ScalarTy::U32))?;
+    let end_hir   = check_expr(tc, &end.node,   end.span,   Some(ScalarTy::U32))?;
+
+    if start_hir.ty != ScalarTy::U32 {
+        tc.errors.push(TypecheckError::TypeMismatch {
+            expected: "u32",
+            got: start_hir.ty.display_name(),
+            span: start.span,
+        });
+    }
+    if end_hir.ty != ScalarTy::U32 {
+        tc.errors.push(TypecheckError::TypeMismatch {
+            expected: "u32",
+            got: end_hir.ty.display_name(),
+            span: end.span,
+        });
+    }
+
+    // Step: must be a compile-time positive u32 constant
+    let for_step: ForStep = match step {
+        None => ForStep::ONE,
+        Some(step_expr) => {
+            // Unwrap one layer of Paren before inspecting
+            let inner_expr = match &step_expr.node {
+                past::Expr::Paren(inner) => &inner.node,
+                other => other,
+            };
+            match inner_expr {
+                past::Expr::IntLit { value, suffix } => {
+                    // Check suffix: must be u32 or absent
+                    match suffix {
+                        Some(axc_lexer::IntSuffix::U32) | None => {}
+                        Some(axc_lexer::IntSuffix::I32) => {
+                            tc.errors.push(TypecheckError::ForStepNotU32 {
+                                got_suffix: "i32",
+                                span: step_expr.span,
+                            });
+                            return None;
+                        }
+                        Some(axc_lexer::IntSuffix::I64) => {
+                            tc.errors.push(TypecheckError::ForStepNotU32 {
+                                got_suffix: "i64",
+                                span: step_expr.span,
+                            });
+                            return None;
+                        }
+                        Some(axc_lexer::IntSuffix::U64) => {
+                            tc.errors.push(TypecheckError::ForStepNotU32 {
+                                got_suffix: "u64",
+                                span: step_expr.span,
+                            });
+                            return None;
+                        }
+                        Some(axc_lexer::IntSuffix::I8)
+                        | Some(axc_lexer::IntSuffix::I16)
+                        | Some(axc_lexer::IntSuffix::U8)
+                        | Some(axc_lexer::IntSuffix::U16) => {
+                            tc.errors.push(TypecheckError::ForStepNotU32 {
+                                got_suffix: "narrow integer",
+                                span: step_expr.span,
+                            });
+                            return None;
+                        }
+                    }
+                    // Must be positive and fit u32
+                    if *value <= 0 {
+                        tc.errors.push(TypecheckError::ForStepNotPositive {
+                            value: *value as u64,
+                            span: step_expr.span,
+                        });
+                        return None;
+                    }
+                    if *value > u32::MAX as i128 {
+                        tc.errors.push(TypecheckError::ForStepNotPositive {
+                            value: *value as u64,
+                            span: step_expr.span,
+                        });
+                        return None;
+                    }
+                    ForStep { value: *value as u32 }
+                }
+                _ => {
+                    tc.errors.push(TypecheckError::ForStepNotConstant { span: step_expr.span });
+                    return None;
+                }
+            }
+        }
+    };
+
+    // AT-315: reject redeclaration of a kernel-scope `let` binding by a for-induction.
+    // `let i = ...; for i in range(...) { }` must produce RedeclaredBinding.
+    // `for i in ... { for i in ... { } }` is allowed (outer `i` lives in for-scope
+    // frame 1, NOT kernel-scope frame 0, so the check below returns None for
+    // the inner for's `i` lookup in the kernel-scope frame).
+    tc.scope_stack.push_frame();
+    // Check the outermost (kernel-scope) frame only.
+    if let Some(orig_idx) = tc.scope_stack.get_in_kernel_scope_frame(&var.node) {
+        let orig_span = tc.bindings[orig_idx].span;
+        tc.errors.push(TypecheckError::RedeclaredBinding {
+            name: var.node.clone(),
+            span: var.span,
+            original_span: orig_span,
+        });
+        tc.scope_stack.pop_frame();
+        return None;
+    }
+    let induction_id: BindingId = match tc.register_binding(&var.node, ScalarTy::U32, false, var.span) {
+        Some(id) => id,
+        None => {
+            // Duplicate binding in the nested scope — error already pushed
+            tc.scope_stack.pop_frame();
+            return None;
+        }
+    };
+
+    // Push a loop frame with the induction variable
+    tc.loop_stack.push(Some(induction_id));
+
+    // Typecheck the loop body
+    let body_stmts = typecheck_nested_block(tc, body);
+
+    // Pop loop frame and induction scope frame
+    tc.loop_stack.pop();
+    tc.scope_stack.pop_frame();
+
+    Some(HirForRange {
+        induction: induction_id,
+        start: start_hir,
+        end: end_hir,
+        step: for_step,
+        body: body_stmts,
+        span: stmt_span,
+    })
+}
+
+/// Typecheck `while cond { body }`
+///
+/// Rev 1 CRITICAL-1: compound short-circuit in cond is rejected BEFORE bool check.
+fn check_while_stmt(
+    tc: &mut TypeChecker<'_>,
+    cond: &axc_lexer::Spanned<past::Expr>,
+    body: &axc_lexer::Spanned<past::Block>,
+    stmt_span: Span,
+) -> Option<HirWhile> {
+    // CRITICAL-1: reject compound short-circuit in while-header
+    if matches!(&cond.node, past::Expr::ShortCircuit { .. }) {
+        tc.errors.push(TypecheckError::UnsupportedShortCircuitInHeader {
+            position: "while",
+            span: cond.span,
+        });
+        return None;
+    }
+
+    let cond_hir = check_expr(tc, &cond.node, cond.span, Some(ScalarTy::Bool))?;
+    if cond_hir.ty != ScalarTy::Bool {
+        tc.errors.push(TypecheckError::NonBoolCondition {
+            position: "while",
+            got: cond_hir.ty.display_name(),
+            span: cond.span,
+        });
+        return None;
+    }
+
+    // Push a loop frame (no induction variable for while loops)
+    tc.loop_stack.push(None);
+    let body_stmts = typecheck_nested_block(tc, body);
+    tc.loop_stack.pop();
+
+    Some(HirWhile {
+        cond: cond_hir,
+        body: body_stmts,
+        span: stmt_span,
+    })
+}
+
+/// Typecheck a nested block (if-then, loop body, etc.) in a fresh scope frame.
+///
+/// The scope frame is pushed before typechecking and popped after.
+/// Let bindings inside nested blocks are registered via single-pass as they are
+/// encountered (no pre-registration needed — the flat kernel body is the only
+/// place that uses two-pass pre-registration for forward references).
+fn typecheck_nested_block(tc: &mut TypeChecker<'_>, block: &axc_lexer::Spanned<past::Block>) -> Vec<HirStmt> {
+    tc.scope_stack.push_frame();
+    let stmts = typecheck_block_stmts(tc, &block.node.stmts);
+    tc.scope_stack.pop_frame();
+    stmts
+}
+
+/// Typecheck a sequence of statements (single-pass, no pre-registration).
+fn typecheck_block_stmts(tc: &mut TypeChecker<'_>, stmts: &[axc_lexer::Spanned<past::Stmt>]) -> Vec<HirStmt> {
+    let mut hir_stmts: Vec<HirStmt> = Vec::new();
+    for spanned_stmt in stmts {
+        match &spanned_stmt.node {
+            past::Stmt::Let { name, ty, is_mut, init } => {
+                // Single-pass: register binding immediately on encounter.
+                let scalar_ty = match typeref_to_scalar(&ty.node) {
+                    Ok(t) => t,
+                    Err(detail) => {
+                        tc.errors.push(TypecheckError::UnsupportedExprInM1_1 {
+                            detail,
+                            span: ty.span,
+                        });
+                        ScalarTy::I32
+                    }
+                };
+                let hir_init = check_expr(tc, &init.node, init.span, Some(scalar_ty));
+                if let Some(bid) = tc.register_binding(&name.node, scalar_ty, *is_mut, name.span) {
+                    if let Some(init_expr) = hir_init {
+                        hir_stmts.push(HirStmt::Let {
+                            binding: bid,
+                            init: init_expr,
+                            span: spanned_stmt.span,
+                        });
+                    }
+                }
+            }
+            past::Stmt::Assign { target, value } => {
+                if tc.find_param(&target.node).is_some() {
+                    tc.errors.push(TypecheckError::AssignToParam {
+                        name: target.node.clone(),
+                        span: target.span,
+                    });
+                    let _ = check_expr(tc, &value.node, value.span, None);
+                } else {
+                    match tc.find_binding(&target.node) {
+                        None => {
+                            tc.errors.push(TypecheckError::UnknownBinding {
+                                name: target.node.clone(),
+                                span: target.span,
+                            });
+                            let _ = check_expr(tc, &value.node, value.span, None);
+                        }
+                        Some((bid, binding_ty, is_mutable, _orig_span)) => {
+                            // Check induction variable assignment
+                            if tc.loop_stack.contains_induction_binding(bid) {
+                                tc.errors.push(TypecheckError::AssignToForInductionVar {
+                                    name: target.node.clone(),
+                                    span: target.span,
+                                });
+                            } else if !is_mutable {
+                                tc.errors.push(TypecheckError::AssignImmutable {
+                                    name: target.node.clone(),
+                                    span: target.span,
+                                    original_span: _orig_span,
+                                });
+                            }
+                            let hir_value = check_expr(tc, &value.node, value.span, Some(binding_ty));
+                            if let Some(val_expr) = hir_value {
+                                hir_stmts.push(HirStmt::Assign {
+                                    binding: bid,
+                                    value: val_expr,
+                                    span: spanned_stmt.span,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            past::Stmt::Return(maybe_expr) => {
+                if let Some(expr) = maybe_expr {
+                    tc.errors.push(TypecheckError::UnsupportedExprInM1_1 {
+                        detail: "return with value (kernels must return void)",
+                        span: expr.span,
+                    });
+                }
+                hir_stmts.push(HirStmt::Return { span: spanned_stmt.span });
+            }
+            past::Stmt::IndexAssign { target, index, value } => {
+                if let Some(stmt) = check_index_assign_stmt(tc, target, index, value, spanned_stmt.span) {
+                    hir_stmts.push(stmt);
+                }
+            }
+            past::Stmt::If { cond, then_block, else_arm } => {
+                if let Some(stmt) = check_if_stmt(tc, cond, then_block, else_arm.as_deref(), spanned_stmt.span) {
+                    hir_stmts.push(HirStmt::If(stmt));
+                }
+            }
+            past::Stmt::For { var, start, end, step, body } => {
+                if let Some(stmt) = check_for_stmt(tc, var, start, end, step.as_ref(), body, spanned_stmt.span) {
+                    hir_stmts.push(HirStmt::ForRange(stmt));
+                }
+            }
+            past::Stmt::While { cond, body } => {
+                if let Some(stmt) = check_while_stmt(tc, cond, body, spanned_stmt.span) {
+                    hir_stmts.push(HirStmt::While(stmt));
+                }
+            }
+            past::Stmt::Break => {
+                if !tc.loop_stack.is_in_loop() {
+                    tc.errors.push(TypecheckError::BreakOutsideLoop { span: spanned_stmt.span });
+                } else {
+                    hir_stmts.push(HirStmt::Break { span: spanned_stmt.span });
+                }
+            }
+            past::Stmt::Continue => {
+                if !tc.loop_stack.is_in_loop() {
+                    tc.errors.push(TypecheckError::ContinueOutsideLoop { span: spanned_stmt.span });
+                } else {
+                    hir_stmts.push(HirStmt::Continue { span: spanned_stmt.span });
+                }
+            }
+        }
+    }
+    hir_stmts
 }
 
 // ── Convert TypeRef to ScalarTy ───────────────────────────────────────────────
@@ -2012,6 +2512,356 @@ mod tests {
             matches!(s, HirStmt::BufferWrite { .. })
         });
         assert!(has_buf_write, "expected BufferWrite in HIR body");
+    }
+
+    // ── M1.3 control flow typecheck tests ─────────────────────────────────────
+
+    // AT-307: basic if with bool condition
+    #[test]
+    fn tc_if_bool_cond_happy() {
+        let (body, errors) = tc_body("if true { return; }");
+        assert!(errors.is_empty(), "simple if should succeed: {errors:?}");
+        let has_if = body.stmts.iter().any(|s| matches!(s, HirStmt::If(_)));
+        assert!(has_if, "expected If stmt in body");
+    }
+
+    // AT-321: if condition must be bool — reject non-bool
+    #[test]
+    #[allow(non_snake_case)]
+    fn hir_rejects_if_with_int_cond_as_NonBoolCondition() {
+        let (_, errors) = tc_body("let x: i32 = 1i32; if x { return; }");
+        assert!(
+            errors.iter().any(|e| matches!(e, TypecheckError::NonBoolCondition { .. })),
+            "expected NonBoolCondition: {errors:?}"
+        );
+    }
+
+    // AT-309: if-else parses and typechecks
+    #[test]
+    fn tc_if_else_happy() {
+        let (body, errors) = tc_body("let mut x: i32 = 1i32; if true { x = 2i32; } else { x = 3i32; } return;");
+        assert!(errors.is_empty(), "if-else should succeed: {errors:?}");
+        let has_if = body.stmts.iter().any(|s| matches!(s, HirStmt::If(_)));
+        assert!(has_if, "expected If stmt with else arm");
+    }
+
+    // AT-310: else-if chain typechecks
+    #[test]
+    fn tc_if_else_if_chain_happy() {
+        let (body, errors) = tc_body(
+            "let mut x: i32 = 1i32; if false { x = 2i32; } else if true { x = 3i32; } return;"
+        );
+        assert!(errors.is_empty(), "else-if chain should succeed: {errors:?}");
+        let has_if = body.stmts.iter().any(|s| matches!(s, HirStmt::If(_)));
+        assert!(has_if, "expected If stmt");
+    }
+
+    // AT-311: short-circuit in if header must be rejected (CRITICAL-1)
+    #[test]
+    fn tc_short_circuit_in_if_cond_rejected() {
+        let (_, errors) = tc_body("let x: bool = true; let y: bool = false; if x and y { return; }");
+        assert!(
+            errors.iter().any(|e| matches!(e, TypecheckError::UnsupportedShortCircuitInHeader { .. })),
+            "expected UnsupportedShortCircuitInHeader: {errors:?}"
+        );
+    }
+
+    // AT-311b: short-circuit or in if header must be rejected
+    #[test]
+    fn tc_short_circuit_or_in_if_header_rejected() {
+        let (_, errors) = tc_body("let x: bool = true; let y: bool = false; if x or y { return; }");
+        assert!(
+            errors.iter().any(|e| matches!(e, TypecheckError::UnsupportedShortCircuitInHeader { .. })),
+            "expected UnsupportedShortCircuitInHeader for `or`: {errors:?}"
+        );
+    }
+
+    // AT-312: for-range basic
+    #[test]
+    fn tc_for_range_happy() {
+        let (body, errors) = tc_body(
+            "for i in range(0u32, 10u32) { } return;"
+        );
+        assert!(errors.is_empty(), "for-range should succeed: {errors:?}");
+        let has_for = body.stmts.iter().any(|s| matches!(s, HirStmt::ForRange(_)));
+        assert!(has_for, "expected ForRange stmt");
+    }
+
+    // AT-313: for-range with explicit step
+    #[test]
+    fn tc_for_range_with_step_happy() {
+        let (body, errors) = tc_body(
+            "for i in range(0u32, 10u32, 2u32) { } return;"
+        );
+        assert!(errors.is_empty(), "for-range with step should succeed: {errors:?}");
+        let has_for = body.stmts.iter().any(|s| {
+            if let HirStmt::ForRange(f) = s { f.step.value == 2 } else { false }
+        });
+        assert!(has_for, "expected ForRange with step 2");
+    }
+
+    // AT-313: induction variable is out of scope after the for loop
+    #[test]
+    fn hir_induction_variable_out_of_scope_after_for() {
+        // After the for loop, `i` must not be visible — accessing it is UnknownBinding.
+        let (_, errors) = tc_body(
+            "for i in range(0u32, 5u32) { } let x: u32 = i; return;"
+        );
+        assert!(
+            errors.iter().any(|e| matches!(e, TypecheckError::UnknownBinding { name, .. } if name == "i")),
+            "expected UnknownBinding{{name:'i'}} after for loop: {errors:?}"
+        );
+    }
+
+    // AT-322: assign to for induction variable is rejected
+    #[test]
+    #[allow(non_snake_case)]
+    fn hir_for_body_assigns_induction_is_AssignToForInductionVar() {
+        let (_, errors) = tc_body(
+            "for i in range(0u32, 10u32) { i = 5u32; } return;"
+        );
+        assert!(
+            errors.iter().any(|e| matches!(e, TypecheckError::AssignToForInductionVar { .. })),
+            "expected AssignToForInductionVar: {errors:?}"
+        );
+    }
+
+    // AT-316: while basic
+    #[test]
+    fn tc_while_happy() {
+        let (body, errors) = tc_body(
+            "let mut x: i32 = 0i32; while false { x = 1i32; } return;"
+        );
+        assert!(errors.is_empty(), "while should succeed: {errors:?}");
+        let has_while = body.stmts.iter().any(|s| matches!(s, HirStmt::While(_)));
+        assert!(has_while, "expected While stmt");
+    }
+
+    // AT-317: while condition must be bool
+    #[test]
+    fn tc_while_non_bool_cond_rejected() {
+        let (_, errors) = tc_body("let x: i32 = 1i32; while x { } return;");
+        assert!(
+            errors.iter().any(|e| matches!(e, TypecheckError::NonBoolCondition { .. })),
+            "expected NonBoolCondition for while: {errors:?}"
+        );
+    }
+
+    // AT-318: short-circuit in while header is rejected (CRITICAL-1)
+    #[test]
+    fn tc_short_circuit_in_while_cond_rejected() {
+        let (_, errors) = tc_body(
+            "let x: bool = true; let y: bool = false; while x and y { } return;"
+        );
+        assert!(
+            errors.iter().any(|e| matches!(e, TypecheckError::UnsupportedShortCircuitInHeader { .. })),
+            "expected UnsupportedShortCircuitInHeader in while header: {errors:?}"
+        );
+    }
+
+    // AT-319: break inside loop is valid
+    #[test]
+    fn tc_break_inside_loop_happy() {
+        let (body, errors) = tc_body(
+            "while false { break; } return;"
+        );
+        assert!(errors.is_empty(), "break inside loop should succeed: {errors:?}");
+        let has_break = body.stmts.iter().any(|s| {
+            if let HirStmt::While(w) = s {
+                w.body.iter().any(|bs| matches!(bs, HirStmt::Break { .. }))
+            } else { false }
+        });
+        assert!(has_break, "expected Break in while body");
+    }
+
+    // AT-312: break outside loop is rejected
+    #[test]
+    #[allow(non_snake_case)]
+    fn hir_break_outside_loop_is_BreakOutsideLoop() {
+        let (_, errors) = tc_body("break; return;");
+        assert!(
+            errors.iter().any(|e| matches!(e, TypecheckError::BreakOutsideLoop { .. })),
+            "expected BreakOutsideLoop: {errors:?}"
+        );
+    }
+
+    // AT-321: continue inside loop is valid
+    #[test]
+    fn tc_continue_inside_loop_happy() {
+        let (body, errors) = tc_body(
+            "for i in range(0u32, 5u32) { continue; } return;"
+        );
+        assert!(errors.is_empty(), "continue inside loop should succeed: {errors:?}");
+        let has_continue = body.stmts.iter().any(|s| {
+            if let HirStmt::ForRange(f) = s {
+                f.body.iter().any(|bs| matches!(bs, HirStmt::Continue { .. }))
+            } else { false }
+        });
+        assert!(has_continue, "expected Continue in for body");
+    }
+
+    // AT-322: continue outside loop is rejected
+    #[test]
+    fn tc_continue_outside_loop_rejected() {
+        let (_, errors) = tc_body("continue; return;");
+        assert!(
+            errors.iter().any(|e| matches!(e, TypecheckError::ContinueOutsideLoop { .. })),
+            "expected ContinueOutsideLoop: {errors:?}"
+        );
+    }
+
+    // AT-323: return inside loop produces ReturnInsideLoopDeferred only at codegen
+    // At typecheck level, return inside loop is ACCEPTED (deferred to codegen).
+    #[test]
+    fn tc_return_inside_loop_accepted_at_typecheck() {
+        let (_, errors) = tc_body(
+            "while false { return; }"
+        );
+        // Typecheck should NOT produce any error — return inside loop deferred to codegen.
+        assert!(
+            !errors.iter().any(|e| matches!(e, TypecheckError::BreakOutsideLoop { .. }
+                | TypecheckError::ContinueOutsideLoop { .. })),
+            "unexpected loop-context errors: {errors:?}"
+        );
+    }
+
+    // AT-314: nested for loop with same induction variable name (scoping)
+    // Two distinct BindingIds must be assigned to the two `i` names.
+    #[test]
+    fn hir_nested_for_with_shadowed_induction_is_accepted() {
+        let (body, errors) = tc_body(
+            "for i in range(0u32, 2u32) { for i in range(0u32, 3u32) { } } return;"
+        );
+        assert!(errors.is_empty(), "nested for with same induction name should succeed: {errors:?}");
+        // Collect the two ForRange statements and check their induction BindingIds differ.
+        let outer = body.stmts.iter().find_map(|s| {
+            if let HirStmt::ForRange(f) = s { Some(f) } else { None }
+        }).expect("expected outer ForRange");
+        let inner = outer.body.iter().find_map(|s| {
+            if let HirStmt::ForRange(f) = s { Some(f) } else { None }
+        }).expect("expected inner ForRange");
+        assert_ne!(
+            outer.induction, inner.induction,
+            "outer and inner `i` must have distinct BindingIds: outer={:?} inner={:?}",
+            outer.induction, inner.induction
+        );
+    }
+
+    // AT-315: for-induction variable that shadows a kernel-scope `let` binding
+    // must produce RedeclaredBinding.
+    #[test]
+    #[allow(non_snake_case)]
+    fn hir_for_induction_shadowing_kernel_scope_let_is_RedeclaredBinding() {
+        // `let i: u32 = 5u32; for i in range(0u32, 10u32) { }` — the for-induction
+        // `i` redeclares the kernel-scope let binding `i`.
+        let (_, errors) = tc_body(
+            "let i: u32 = 5u32; for i in range(0u32, 10u32) { } return;"
+        );
+        let redeclared = errors.iter().filter(|e| {
+            matches!(e, TypecheckError::RedeclaredBinding { name, .. } if name == "i")
+        }).count();
+        assert_eq!(
+            redeclared, 1,
+            "expected exactly one RedeclaredBinding{{name:'i'}} for kernel-scope let + for-induction: {errors:?}"
+        );
+    }
+
+    // AT-325: for-range end bound must be U32-typed
+    #[test]
+    fn tc_for_range_non_u32_start_rejected() {
+        let (_, errors) = tc_body(
+            "for i in range(0i32, 10i32) { } return;"
+        );
+        // start and end must be U32 — signed i32 should produce TypeMismatch or similar
+        assert!(!errors.is_empty(), "for-range with i32 bounds should produce errors: {errors:?}");
+    }
+
+    // AT-326: let inside for body is scoped (not visible after loop)
+    #[test]
+    fn tc_let_inside_for_not_visible_after() {
+        let (_, errors) = tc_body(
+            "for i in range(0u32, 2u32) { let inner: i32 = 1i32; } let x: i32 = inner; return;"
+        );
+        // `inner` is not in scope after the for loop
+        assert!(
+            errors.iter().any(|e| matches!(e, TypecheckError::UnknownBinding { .. })),
+            "expected UnknownBinding for out-of-scope variable: {errors:?}"
+        );
+    }
+
+    // AT-327: if with let in then-block doesn't leak to outer scope
+    #[test]
+    fn tc_let_inside_if_not_visible_after() {
+        let (_, errors) = tc_body(
+            "if true { let inner: i32 = 1i32; } let x: i32 = inner; return;"
+        );
+        assert!(
+            errors.iter().any(|e| matches!(e, TypecheckError::UnknownBinding { .. })),
+            "expected UnknownBinding for let inside if-block: {errors:?}"
+        );
+    }
+
+    // AT-328: for-range step must be a compile-time constant
+    #[test]
+    fn tc_for_step_variable_rejected() {
+        let (_, errors) = tc_body(
+            "let s: u32 = 2u32; for i in range(0u32, 10u32, s) { } return;"
+        );
+        assert!(
+            errors.iter().any(|e| matches!(e, TypecheckError::ForStepNotConstant { .. })),
+            "expected ForStepNotConstant: {errors:?}"
+        );
+    }
+
+    // AT-318: for-range step must be positive (non-zero)
+    #[test]
+    #[allow(non_snake_case)]
+    fn hir_for_step_zero_is_ForStepNotPositive() {
+        let (_, errors) = tc_body(
+            "for i in range(0u32, 10u32, 0u32) { } return;"
+        );
+        assert!(
+            errors.iter().any(|e| matches!(e, TypecheckError::ForStepNotPositive { .. })),
+            "expected ForStepNotPositive: {errors:?}"
+        );
+    }
+
+    // AT-330: if body can read enclosing scope bindings
+    #[test]
+    fn tc_if_reads_outer_binding() {
+        let (_, errors) = tc_body(
+            "let x: i32 = 5i32; if true { let y: i32 = x; } return;"
+        );
+        assert!(errors.is_empty(), "if body should read outer bindings: {errors:?}");
+    }
+
+    // AT-331: while body can read enclosing scope bindings
+    #[test]
+    fn tc_while_reads_outer_binding() {
+        let (_, errors) = tc_body(
+            "let x: bool = false; while x { } return;"
+        );
+        assert!(errors.is_empty(), "while cond should read outer bindings: {errors:?}");
+    }
+
+    // AT-332: for body can use induction variable
+    #[test]
+    fn tc_for_body_reads_induction_var() {
+        let (_, errors) = tc_with_params(
+            "out: writeonly_buffer[u32]",
+            "for i in range(0u32, 10u32) { out[i] = i; } return;"
+        );
+        assert!(errors.is_empty(), "for body should read induction var: {errors:?}");
+    }
+
+    // AT-333: dead code after break is silently allowed (at typecheck level)
+    #[test]
+    fn tc_dead_code_after_break_allowed() {
+        let (_, errors) = tc_body(
+            "while false { break; let x: i32 = 1i32; } return;"
+        );
+        // Typecheck allows dead code — codegen skips it via current_block_terminated
+        assert!(errors.is_empty(), "dead code after break should not produce TC errors: {errors:?}");
     }
 }
 

@@ -261,4 +261,53 @@ mod tests {
         let (errors, _) = validate(&m);
         assert!(!errors.is_empty());
     }
+
+    // ── M1.3 validate.rs tests ────────────────────────────────────────────────
+
+    use axc_parser::parse;
+    use crate::lower::lower_module;
+    use crate::typecheck::TypecheckError;
+
+    /// Run full pipeline (parse → lower → validate) and return HirErrors.
+    fn pipeline_errors(src: &str) -> Vec<HirError> {
+        let (ast, lex_errs, parse_errs) = parse(src);
+        assert!(lex_errs.is_empty(), "lex errors: {lex_errs:?}");
+        assert!(parse_errs.is_empty(), "parse errors: {parse_errs:?}");
+        let (_, errors, _) = lower_module(&ast);
+        errors
+    }
+
+    #[test]
+    fn validate_break_outside_loop_rejected_end_to_end() {
+        // Full pipeline: bare `break;` outside any loop must produce
+        // exactly one HirError wrapping TypecheckError::BreakOutsideLoop.
+        let errors = pipeline_errors(
+            "@kernel @workgroup(1,1,1) fn k() -> void { break; return; }",
+        );
+        let found = errors.iter().any(|e| {
+            if let HirError::Typecheck(tc_err) = e {
+                matches!(tc_err, TypecheckError::BreakOutsideLoop { .. })
+            } else {
+                false
+            }
+        });
+        assert!(found, "expected HirError::Typecheck(BreakOutsideLoop): {errors:?}");
+    }
+
+    #[test]
+    fn validate_continue_outside_loop_rejected_end_to_end() {
+        // Full pipeline: bare `continue;` outside any loop must produce
+        // exactly one HirError wrapping TypecheckError::ContinueOutsideLoop.
+        let errors = pipeline_errors(
+            "@kernel @workgroup(1,1,1) fn k() -> void { continue; return; }",
+        );
+        let found = errors.iter().any(|e| {
+            if let HirError::Typecheck(tc_err) = e {
+                matches!(tc_err, TypecheckError::ContinueOutsideLoop { .. })
+            } else {
+                false
+            }
+        });
+        assert!(found, "expected HirError::Typecheck(ContinueOutsideLoop): {errors:?}");
+    }
 }

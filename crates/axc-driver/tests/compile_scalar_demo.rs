@@ -10,32 +10,16 @@
 //! - No debug opcodes are emitted in the output (AT-13 in integration form).
 //! - spirv-val accepts the output (when spirv-val is on PATH).
 
-use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::path::PathBuf;
 
-/// Locate `spirv-val` by walking `PATH` without shelling out.
-fn which_spirv_val() -> Option<PathBuf> {
-    let path_var: std::ffi::OsString = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate: PathBuf = dir.join("spirv-val");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        let candidate_exe: PathBuf = dir.join("spirv-val.exe");
-        if candidate_exe.is_file() {
-            return Some(candidate_exe);
-        }
-    }
-    None
-}
-
-/// Run `spirv-val --target-env vulkan1.1 <path>` and return the process output.
-fn run_spirv_val(spirv_val: &Path, spv_path: &Path) -> std::io::Result<Output> {
-    std::process::Command::new(spirv_val)
-        .arg("--target-env")
-        .arg("vulkan1.1")
-        .arg(spv_path)
-        .output()
+/// Validate SPIR-V words using the in-process spirv-tools crate.
+/// This is always mandatory — no PATH dependency, no silent skip.
+fn validate_spirv(words: &[u32], label: &str) {
+    use spirv_tools::val::{Validator, create as create_validator};
+    use spirv_tools::TargetEnv;
+    let validator = create_validator(Some(TargetEnv::Vulkan_1_1));
+    validator.validate(words, None)
+        .unwrap_or_else(|e| panic!("AT-101: spirv-tools rejected {label} SPIR-V: {e}"));
 }
 
 /// Iterate SPIR-V instructions in a word stream (caller must skip 5-word header).
@@ -130,32 +114,8 @@ fn test_compile_scalar_demo_produces_valid_spirv() {
         "scalar_demo uses i64/u64, so Int64 capability (11) must be present"
     );
 
-    // 6. Run spirv-val if available
-    match which_spirv_val() {
-        Some(sv_path) => {
-            let output: Output = run_spirv_val(&sv_path, &out_path)
-                .expect("failed to execute spirv-val");
-            assert!(
-                output.status.success(),
-                "spirv-val rejected scalar_demo output:\nstdout: {}\nstderr: {}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            );
-        }
-        None => {
-            if std::env::var("AXC_REQUIRE_SPIRV_VAL").as_deref() == Ok("1") {
-                panic!(
-                    "spirv-val required by CI but not found on PATH; \
-                    install SPIRV-Tools or set AXC_REQUIRE_SPIRV_VAL=0 to skip"
-                );
-            } else {
-                eprintln!(
-                    "note: spirv-val not found on PATH; \
-                    skipping spirv-val validation for scalar_demo."
-                );
-            }
-        }
-    }
+    // 6. In-process SPIR-V validation via spirv-tools crate (always mandatory).
+    validate_spirv(&all_words, "scalar_demo");
 
     // 7. Assert required arithmetic opcodes are present in the SPIR-V output.
     //    AT-101 expected_behavior: the scalar_demo output must contain at least

@@ -19,29 +19,28 @@
 use axc_lexer::{Token, TokenKind, Span, Spanned, LexError};
 use crate::ast::{
     Module, Item, KernelDecl, Annotation, AnnotationArg, Block, Stmt, Expr, TypeRef, Param,
-    BinOp, UnaryOp, ShortCircuitOp, ScalarTypeRef,
+    BinOp, UnaryOp, ShortCircuitOp, ScalarTypeRef, ElseArm,
 };
 
 /// Maximum expression nesting depth before emitting ExpressionNestingTooDeep.
 const MAX_EXPR_DEPTH: u32 = 256;
 
-/// M1.1-reserved keywords (all still deferred past this milestone).
-/// Let and Mut were in this list in M0 but are now valid syntax.
+/// M1.3-reserved keywords — keywords still deferred past this milestone.
 ///
-/// Comment: M1.1 implements let/mut/return/arithmetic. Everything below is
-/// deferred to M1.3 (control-flow) or M2 (struct).
+/// M1.1 removed Let/Mut from this list (now valid syntax).
+/// M1.3 removes If/Else/For/While/Break/Continue (now valid control-flow syntax).
+/// Only Struct remains — deferred to M2.
 ///
 /// This constant mirrors `TokenKind::m1_reserved_detail()`'s Some-returning set
-/// and is used in `parse_stmt` (via `m1_reserved_detail()` dispatch) and in tests.
-pub const M1_1_RESERVED_KEYWORDS: &[TokenKind] = &[
-    TokenKind::If,
-    TokenKind::Else,
-    TokenKind::For,
-    TokenKind::While,
-    TokenKind::Break,
-    TokenKind::Continue,
+/// and is used in `parse_stmt` (deny-list check) and in tests.
+pub const M1_3_RESERVED_KEYWORDS: &[TokenKind] = &[
     TokenKind::Struct,
 ];
+
+/// Backward-compat alias pointing at the current reserved-keyword table.
+///
+/// Prior milestones used this name. New code should reference `M1_3_RESERVED_KEYWORDS`.
+pub const M1_1_RESERVED_KEYWORDS: &[TokenKind] = M1_3_RESERVED_KEYWORDS;
 
 /// Error produced by the parser.
 #[derive(Debug, thiserror::Error, miette::Diagnostic)]
@@ -62,6 +61,17 @@ pub enum ParseError {
     /// let/mut/return, but control flow (if/for/while/etc.) is still deferred.
     #[error("unsupported syntax in M1.1: {detail}")]
     UnsupportedInM1_1 {
+        detail: String,
+        #[label("here")]
+        span: Span,
+    },
+    /// M1.3-specific rejection — for features still deferred past M1.3 (e.g. struct).
+    ///
+    /// Emitted by `parse_stmt` when a keyword listed in `M1_3_RESERVED_KEYWORDS` is
+    /// encountered.  The `detail` field carries a roadmap hint (e.g.
+    /// "`struct` is deferred to M2").
+    #[error("unsupported syntax in M1.3: {detail}")]
+    UnsupportedInM1_3 {
         detail: String,
         #[label("here")]
         span: Span,
@@ -523,9 +533,11 @@ impl<'tok> Parser<'tok> {
         let tok: &Token = self.current_token();
         let span: Span = tok.span;
 
-        // §3.2: M1.1-reserved keyword pre-check (Let and Mut are NO LONGER here)
+        // §3.2: M1.3-reserved keyword pre-check (only Struct remains deferred).
+        // Emit UnsupportedInM1_3 for features deferred past M1.3.
+        // UnsupportedInM1_1 is kept for backward compatibility with M1.1/M1.2 error paths.
         if let Some(detail) = tok.kind.m1_reserved_detail() {
-            self.errors.push(ParseError::UnsupportedInM1_1 {
+            self.errors.push(ParseError::UnsupportedInM1_3 {
                 detail: detail.to_owned(),
                 span,
             });
@@ -542,8 +554,29 @@ impl<'tok> Parser<'tok> {
         }
 
         match self.peek_kind().clone() {
-            TokenKind::Let => self.parse_let_stmt(),
+            TokenKind::Let    => self.parse_let_stmt(),
             TokenKind::Return => self.parse_return_stmt(),
+            TokenKind::If     => self.parse_if_stmt(),
+            TokenKind::For    => self.parse_for_stmt(),
+            TokenKind::While  => self.parse_while_stmt(),
+            TokenKind::Break  => {
+                let break_span: Span = self.peek_span();
+                self.advance(); // consume `break`
+                let semi_span: Span = self.peek_span();
+                if !self.expect_token(TokenKind::Semicolon, ";") {
+                    return None;
+                }
+                Some(Spanned::new(Stmt::Break, break_span.merge(semi_span)))
+            }
+            TokenKind::Continue => {
+                let cont_span: Span = self.peek_span();
+                self.advance(); // consume `continue`
+                let semi_span: Span = self.peek_span();
+                if !self.expect_token(TokenKind::Semicolon, ";") {
+                    return None;
+                }
+                Some(Spanned::new(Stmt::Continue, cont_span.merge(semi_span)))
+            }
             TokenKind::Ident(_) => {
                 // Lookahead: pos+1 is `=` → scalar assign; pos+1 is `[` → buffer index assign.
                 let next_pos: usize = (self.pos + 1).min(self.tokens.len() - 1);
@@ -556,10 +589,10 @@ impl<'tok> Parser<'tok> {
                     }
                     _ => {}
                 }
-                // Else: bare expression statements are not allowed in M1.2
+                // Else: bare expression statements are not allowed in M1.3
                 let found: String = format!("{:?}", self.peek_kind());
                 self.errors.push(ParseError::Unexpected {
-                    expected: "let, return, or assignment".into(),
+                    expected: "let, return, assignment, or control flow".into(),
                     found,
                     span,
                 });
@@ -569,7 +602,7 @@ impl<'tok> Parser<'tok> {
             _ => {
                 let found: String = format!("{:?}", self.peek_kind());
                 self.errors.push(ParseError::Unexpected {
-                    expected: "let, return, or assignment".into(),
+                    expected: "let, return, assignment, or control flow".into(),
                     found,
                     span,
                 });
@@ -577,6 +610,177 @@ impl<'tok> Parser<'tok> {
                 None
             }
         }
+    }
+
+    /// Parse `if cond { then } [else (if_stmt | block)]`
+    fn parse_if_stmt(&mut self) -> Option<Spanned<Stmt>> {
+        let if_span: Span = self.peek_span();
+        self.advance(); // consume `if`
+
+        // Condition expression
+        let cond: Spanned<Expr> = match self.parse_expr(0) {
+            Some(e) => e,
+            None => {
+                self.recover_to_semicolon_or_brace();
+                return None;
+            }
+        };
+
+        // Then-block
+        let then_block: Spanned<Block> = self.parse_block()?;
+
+        // Optional else arm
+        let else_arm: Option<Box<ElseArm>> = if self.peek_kind() == &TokenKind::Else {
+            self.advance(); // consume `else`
+            if self.peek_kind() == &TokenKind::If {
+                // else if → recurse; produce ElseArm::If wrapping a Stmt::If
+                let nested: Spanned<Stmt> = self.parse_if_stmt()?;
+                Some(Box::new(ElseArm::If(Box::new(nested))))
+            } else {
+                // else { block }
+                let else_block: Spanned<Block> = self.parse_block()?;
+                Some(Box::new(ElseArm::Block(else_block)))
+            }
+        } else {
+            None
+        };
+
+        let end_span: Span = then_block.span;
+        Some(Spanned::new(
+            Stmt::If { cond, then_block, else_arm },
+            if_span.merge(end_span),
+        ))
+    }
+
+    /// Parse `for var in range(start, end [, step]) { body }`
+    fn parse_for_stmt(&mut self) -> Option<Spanned<Stmt>> {
+        let for_span: Span = self.peek_span();
+        self.advance(); // consume `for`
+
+        // Induction variable name
+        let var_span: Span = self.peek_span();
+        let var: String = match self.peek_kind().clone() {
+            TokenKind::Ident(n) => { self.advance(); n }
+            _ => {
+                self.errors.push(ParseError::Unexpected {
+                    expected: "induction variable name (identifier)".into(),
+                    found: format!("{:?}", self.peek_kind()),
+                    span: self.peek_span(),
+                });
+                self.recover_to_semicolon_or_brace();
+                return None;
+            }
+        };
+
+        // `in` keyword
+        if self.peek_kind() != &TokenKind::In {
+            self.errors.push(ParseError::Unexpected {
+                expected: "`in` keyword after loop variable".into(),
+                found: format!("{:?}", self.peek_kind()),
+                span: self.peek_span(),
+            });
+            self.recover_to_semicolon_or_brace();
+            return None;
+        }
+        self.advance(); // consume `in`
+
+        // `range` identifier (special form, not a general call)
+        match self.peek_kind().clone() {
+            TokenKind::Ident(ref name) if name == "range" => {
+                self.advance(); // consume `range`
+            }
+            _ => {
+                self.errors.push(ParseError::Unexpected {
+                    expected: "`range` after `in` in for-loop header".into(),
+                    found: format!("{:?}", self.peek_kind()),
+                    span: self.peek_span(),
+                });
+                self.recover_to_semicolon_or_brace();
+                return None;
+            }
+        }
+
+        // `(` start, end [, step] `)`
+        if !self.expect_token(TokenKind::LParen, "(") {
+            self.recover_to_semicolon_or_brace();
+            return None;
+        }
+
+        let start: Spanned<Expr> = match self.parse_expr(0) {
+            Some(e) => e,
+            None => {
+                self.recover_to_semicolon_or_brace();
+                return None;
+            }
+        };
+
+        if !self.expect_token(TokenKind::Comma, ",") {
+            self.recover_to_semicolon_or_brace();
+            return None;
+        }
+
+        let end: Spanned<Expr> = match self.parse_expr(0) {
+            Some(e) => e,
+            None => {
+                self.recover_to_semicolon_or_brace();
+                return None;
+            }
+        };
+
+        // Optional step
+        let step: Option<Spanned<Expr>> = if self.peek_kind() == &TokenKind::Comma {
+            self.advance(); // consume `,`
+            match self.parse_expr(0) {
+                Some(e) => Some(e),
+                None => {
+                    self.recover_to_semicolon_or_brace();
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+
+        if !self.expect_token(TokenKind::RParen, ")") {
+            self.recover_to_semicolon_or_brace();
+            return None;
+        }
+
+        let body: Spanned<Block> = self.parse_block()?;
+        let end_span: Span = body.span;
+
+        Some(Spanned::new(
+            Stmt::For {
+                var: Spanned::new(var, var_span),
+                start,
+                end,
+                step,
+                body,
+            },
+            for_span.merge(end_span),
+        ))
+    }
+
+    /// Parse `while cond { body }`
+    fn parse_while_stmt(&mut self) -> Option<Spanned<Stmt>> {
+        let while_span: Span = self.peek_span();
+        self.advance(); // consume `while`
+
+        let cond: Spanned<Expr> = match self.parse_expr(0) {
+            Some(e) => e,
+            None => {
+                self.recover_to_semicolon_or_brace();
+                return None;
+            }
+        };
+
+        let body: Spanned<Block> = self.parse_block()?;
+        let end_span: Span = body.span;
+
+        Some(Spanned::new(
+            Stmt::While { cond, body },
+            while_span.merge(end_span),
+        ))
     }
 
     /// Parse `let [mut] name: type = expr;`
@@ -1121,30 +1325,160 @@ mod tests {
         assert!(matches!(kd.body.node.stmts[1].node, Stmt::Return(None)));
     }
 
-    // ── §7.6 audit table row 5,6: renamed tests ──────────────────────────────
+    // ── §7.6 audit table row 5,6: these were removed in M1.3 (if/for/while now parse)
+    // Old tests deleted; new M1.3 tests below verify correct parsing.
+
+    // ── AT-301: `if true { return; }` parses without errors ──────────────────
 
     #[test]
-    fn nonempty_body_rejects_if_as_unsupported_in_m1_1() {
-        let src = "@kernel @workgroup(64,1,1) fn k() -> void { if true { return; } return; }";
+    fn parse_if_then_only() {
+        let src = "@kernel @workgroup(64,1,1) fn k() -> void { if true { return; } }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        assert_eq!(kd.body.node.stmts.len(), 1);
+        assert!(matches!(kd.body.node.stmts[0].node, Stmt::If { .. }));
+    }
+
+    // ── AT-302: if/else parses correctly ──────────────────────────────────────
+
+    #[test]
+    fn parse_if_else_correctly() {
+        let src = "@kernel @workgroup(64,1,1) fn k() -> void { if true { return; } else { return; } }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        if let Stmt::If { ref else_arm, .. } = kd.body.node.stmts[0].node {
+            assert!(else_arm.is_some(), "expected else arm");
+            assert!(matches!(else_arm.as_ref().unwrap().as_ref(), ElseArm::Block(_)));
+        } else {
+            panic!("expected Stmt::If");
+        }
+    }
+
+    // ── AT-303: else-if chain parses as nested If ─────────────────────────────
+
+    #[test]
+    fn parse_else_if_chain_as_nested_if() {
+        let src = "@kernel @workgroup(64,1,1) fn k() -> void { if true { return; } else if false { return; } else { return; } }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        if let Stmt::If { ref else_arm, .. } = kd.body.node.stmts[0].node {
+            // Outer else arm is ElseArm::If(nested)
+            match else_arm.as_ref().unwrap().as_ref() {
+                ElseArm::If(inner_spanned) => {
+                    assert!(matches!(inner_spanned.node, Stmt::If { .. }));
+                }
+                other => panic!("expected ElseArm::If, got: {other:?}"),
+            }
+        } else {
+            panic!("expected Stmt::If");
+        }
+    }
+
+    // ── AT-304: for-range default step parses as Stmt::For { step: None } ────
+
+    #[test]
+    fn parse_for_range_default_step() {
+        let src = "@kernel @workgroup(64,1,1) fn k() -> void { for i in range(0u32, 10u32) { return; } }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        if let Stmt::For { ref var, ref step, .. } = kd.body.node.stmts[0].node {
+            assert_eq!(var.node, "i");
+            assert!(step.is_none(), "expected step=None for default step");
+        } else {
+            panic!("expected Stmt::For");
+        }
+    }
+
+    // ── AT-305: for-range explicit step parses with step: Some(IntLit) ────────
+
+    #[test]
+    fn parse_for_range_explicit_step() {
+        let src = "@kernel @workgroup(64,1,1) fn k() -> void { for i in range(0u32, 10u32, 2u32) { return; } }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        if let Stmt::For { ref step, .. } = kd.body.node.stmts[0].node {
+            assert!(step.is_some(), "expected step=Some");
+            assert!(matches!(step.as_ref().unwrap().node, Expr::IntLit { value: 2, .. }));
+        } else {
+            panic!("expected Stmt::For");
+        }
+    }
+
+    // ── AT-306: missing `in` keyword rejected at parse time ───────────────────
+
+    #[test]
+    fn parse_for_missing_in_rejected() {
+        let src = "@kernel @workgroup(64,1,1) fn k() -> void { for i range(0u32, 10u32) { return; } }";
         let (_, errors) = parse_src(src);
-        let found = errors.iter().find(|e| matches!(e, ParseError::UnsupportedInM1_1 { detail, .. } if detail == "if statement"));
-        assert!(found.is_some(), "expected UnsupportedInM1_1 with detail 'if statement', got: {errors:?}");
+        assert!(!errors.is_empty(), "expected parse error for missing `in`");
+    }
+
+    // ── AT-327 parser mirror: reserved-keyword list contains only Struct in M1.3 ─
+
+    #[test]
+    fn parse_m1_3_reserved_keywords_contains_only_struct() {
+        // In M1.3, break/continue parse as valid statements inside a loop.
+        // The reserved-keyword list now contains only Struct.
+        assert_eq!(M1_3_RESERVED_KEYWORDS.len(), 1);
+        assert!(matches!(M1_3_RESERVED_KEYWORDS[0], TokenKind::Struct));
+    }
+
+    // ── AT-328: struct keyword still rejected ─────────────────────────────────
+
+    #[test]
+    fn parse_struct_still_rejected_in_m1_3() {
+        let src = "@kernel @workgroup(64,1,1) fn k() -> void { struct Foo {} return; }";
+        let (_, errors) = parse_src(src);
+        assert!(
+            errors.iter().any(|e| matches!(e, ParseError::UnsupportedInM1_3 { detail, .. } if detail.contains("struct"))),
+            "expected UnsupportedInM1_3 for struct, got: {errors:?}"
+        );
+    }
+
+    // ── break and continue parse correctly ────────────────────────────────────
+
+    #[test]
+    fn parse_break_and_continue_in_for_loop() {
+        let src = "@kernel @workgroup(64,1,1) fn k() -> void {
+            for i in range(0u32, 10u32) {
+                break;
+            }
+        }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        if let Stmt::For { ref body, .. } = kd.body.node.stmts[0].node {
+            assert!(matches!(body.node.stmts[0].node, Stmt::Break));
+        } else {
+            panic!("expected Stmt::For");
+        }
     }
 
     #[test]
-    fn nonempty_body_rejects_for_as_unsupported_in_m1_1() {
-        let src = "@kernel @workgroup(64,1,1) fn k() -> void { for i in 0..1 {} return; }";
-        let (_, errors) = parse_src(src);
-        let found = errors.iter().find(|e| matches!(e, ParseError::UnsupportedInM1_1 { detail, .. } if detail == "for loop"));
-        assert!(found.is_some(), "expected UnsupportedInM1_1 with detail 'for loop', got: {errors:?}");
+    fn parse_while_stmt() {
+        let src = "@kernel @workgroup(64,1,1) fn k() -> void { while true { return; } }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        assert!(matches!(kd.body.node.stmts[0].node, Stmt::While { .. }));
     }
 
     #[test]
-    fn nonempty_body_rejects_while_as_unsupported_in_m1_1() {
-        let src = "@kernel @workgroup(64,1,1) fn k() -> void { while true { } return; }";
-        let (_, errors) = parse_src(src);
-        let found = errors.iter().find(|e| matches!(e, ParseError::UnsupportedInM1_1 { detail, .. } if detail == "while loop"));
-        assert!(found.is_some(), "expected UnsupportedInM1_1 'while loop', got: {errors:?}");
+    fn parse_continue_in_while_loop() {
+        let src = "@kernel @workgroup(64,1,1) fn k() -> void { while true { continue; } }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        if let Stmt::While { ref body, .. } = kd.body.node.stmts[0].node {
+            assert!(matches!(body.node.stmts[0].node, Stmt::Continue));
+        } else {
+            panic!("expected Stmt::While");
+        }
     }
 
     // ── §7.6 audit table row 7: kernel params now SUPPORTED in M1.2 ──────────
