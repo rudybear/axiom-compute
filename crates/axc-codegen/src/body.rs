@@ -550,17 +550,18 @@ fn emit_for_range(em: &mut BodyEmitter<'_>, hir_for: &HirForRange) -> Result<(),
         .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
     em.current_block_terminated = false;
 
-    // OpLoopMerge MUST be first instruction in the header block.
-    em.b.loop_merge(merge_label, continue_label, LoopControl::NONE, [])
-        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
-
-    // Load induction var and check condition.
+    // Load induction var and check condition first.
+    // OpLoopMerge MUST immediately precede the branch terminator (i.e., be second-to-last
+    // in the header block). SPIR-V §2.11 / §3.32.17: "OpLoopMerge must immediately precede
+    // either an OpBranch or OpBranchConditional instruction."
     let u32_ty_id = em.type_id(ScalarTy::U32);
     let bool_ty_id = em.type_id(ScalarTy::Bool);
     let i_cur = em.b.load(u32_ty_id, None, i_var_id, None, None)
         .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
     let end_id = emit_expr(em, &hir_for.end)?;
     let cond_id = em.b.u_less_than(bool_ty_id, None, i_cur, end_id)
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    em.b.loop_merge(merge_label, continue_label, LoopControl::NONE, [])
         .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
     em.b.branch_conditional(cond_id, body_label, merge_label, [])
         .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
@@ -636,11 +637,12 @@ fn emit_while(em: &mut BodyEmitter<'_>, hir_while: &HirWhile) -> Result<(), Body
         .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
     em.current_block_terminated = false;
 
+    // Evaluate condition first (HIR guarantees non-short-circuit per CRITICAL-1).
+    // OpLoopMerge MUST immediately precede the branch terminator (second-to-last in block).
+    // SPIR-V §2.11 / §3.32.17.
+    let cond_id = emit_expr(em, &hir_while.cond)?;
     em.b.loop_merge(merge_label, continue_label, LoopControl::NONE, [])
         .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
-
-    // Evaluate condition (HIR guarantees non-short-circuit per CRITICAL-1).
-    let cond_id = emit_expr(em, &hir_while.cond)?;
     em.b.branch_conditional(cond_id, body_label, merge_label, [])
         .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
 
