@@ -1,0 +1,53 @@
+{
+  "id": "M1.5-vulkan-dispatch",
+  "title": "Vulkan compute runtime dispatch via ash",
+  "phase": "M1",
+  "goal": "Realize CLAUDE.md anti-pattern #9 (no mocking GPU execution) by actually running emitted SPIR-V on a Vulkan compute queue via ash. Lavapipe (mesa software Vulkan) as CI fallback. Proves end-to-end: .axc source → HIR → SPIR-V → Vulkan shader module → compute pipeline → dispatch → readback → CPU verification. Unlocks all subsequent milestones' correctness claims.",
+  "scope_in": [
+    "axc-runtime crate: real content (was placeholder M0 stub). Vulkan instance+device+queue+command pool setup via ash 0.38.",
+    "Physical device selection: prefer a device matching $AXC_PHYSICAL_DEVICE (env, device index), else first discrete GPU, else software Lavapipe (VK_DRIVER_FILES / VK_ICD_FILENAMES).",
+    "Device features: enable VK_KHR_subgroup (required for M1.4 output) + VK_KHR_storage_buffer_storage_class. Require device support; fall back to skipping tests if unsupported.",
+    "Public API: `pub fn dispatch(spirv: &[u32], bindings: &BindingPlan, workgroups: (u32,u32,u32), inputs: &[&[u8]], output_sizes: &[usize], push_constants: &[u8]) -> Result<Vec<Vec<u8>>, DispatchError>` -- single-shot dispatch, reads back output buffers as bytes.",
+    "Per binding: create host-visible SSBO (buffer + memory), memcpy input bytes, bind to descriptor set 0 at the correct binding index.",
+    "Push constants: map the scalar params to a flat byte blob per M1.2 layout; supplied by caller.",
+    "Descriptor set layout + descriptor pool + descriptor set allocation automatic from BindingPlan.",
+    "Compute pipeline creation: shader module (from spirv words), pipeline layout (descriptor set + push constant range), pipeline.",
+    "Command buffer recording: bind pipeline, bind descriptor set, push constants, vkCmdDispatch with workgroups, pipeline barrier (HOST_READ after SHADER_WRITE).",
+    "Submit to compute queue + wait on fence (synchronous; no async for M1.5).",
+    "Readback: map memory, copy bytes to Vec<u8>, return.",
+    "Correctness-oracle integration tests for saxpy and vector_add: compile .axc → dispatch → compare against CPU f32 reference with @equiv_fp_tol(1e-6)",
+    "CI: install mesa-vulkan-drivers + vulkan-tools on Ubuntu, export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json to force Lavapipe, run the integration tests — on actual GPU execution."
+  ],
+  "scope_out": [
+    "Multi-dispatch / dependent kernels (M2)",
+    "Pipeline caching (perf)",
+    "Async compute queues",
+    "Timeline semaphores / fine-grained sync",
+    "Staging buffers / device-local memory heuristics (host-visible for M1.5 simplicity; M2 adds device-local + staging)",
+    "Windows / macOS (MoltenVK) CI — Linux Lavapipe only for M1.5",
+    "Profile-guided optimization / @strategy hole resolution (M2)",
+    "MCP server (M2)",
+    "`axc run` CLI subcommand (keep API-only for M1.5; CLI is trivial wrapper added in M2)"
+  ],
+  "acceptance_criteria": [
+    "cargo test --workspace passes on CI with Lavapipe (expected floor ~420 after M1.5 additions; integration tests are ignored by default, gated on env var AXC_ENABLE_GPU_TESTS=1 + Lavapipe availability)",
+    "cargo clippy --workspace --all-targets -- -D warnings clean",
+    "Integration test `dispatch_saxpy_matches_cpu_reference` passes when Lavapipe is available; skips gracefully otherwise with a printed note",
+    "Integration test `dispatch_vector_add_matches_cpu_reference` passes similarly",
+    "DispatchError variants cover: VulkanInitFailed, NoSupportedDevice, ShaderCompilationFailed, BufferAllocationFailed, DescriptorSetFailed, CommandSubmitFailed, FenceTimeout, ReadbackFailed",
+    "Memory cap: total GPU-allocated buffers per test must not exceed 100 MB (tiny for M1.5)",
+    "Regression: all M0..M1.4 tests still pass (405 baseline)"
+  ],
+  "memory_limit_gb": 50,
+  "dependencies": ["M1.4-subgroup-ops"],
+  "blocks": ["M2-cooperative-matrix", "M2-autotuner", "M2-mcp-server"],
+  "estimated_loc": "1500-2500",
+  "estimated_tests_added": "20-30",
+  "open_questions_for_architect": [
+    "ash 0.38 version pin: already in workspace.dependencies — confirm it's usable for Vulkan 1.1.",
+    "Lavapipe install method on Ubuntu CI: `apt install mesa-vulkan-drivers` should suffice. Confirm the ICD path.",
+    "BindingPlan serialization: currently axc-hir owns BindingPlan. Does axc-runtime depend on axc-hir directly, or do we define a minimal runtime-side BindingPlan struct to decouple? Recommend direct dep for M1.5 (simplest); refactor if needed in M2.",
+    "Workgroup count: should `axc compile` emit a metadata sidecar with @workgroup dims + binding plan? Or does the runtime re-parse the source? Recommend metadata sidecar (small JSON alongside .spv) so runtime doesn't re-parse.",
+    "Synchronous vs async dispatch API: synchronous for M1.5 (simple). M2 adds handle-based async."
+  ]
+}
