@@ -1,0 +1,86 @@
+{
+  "verdict": "IMPLEMENTED",
+  "agent": "coder",
+  "milestone_id": "M2.2-bench-harness",
+  "branch": "coder/M2.2-bench-harness",
+  "git_commits": [
+    "feat(bench): M2.2 bench harness — criterion benches, regression gate, baselines schema",
+    "feat(bench): baselines.json, CI jobs, BENCHMARKS.md, DESIGN.md update"
+  ],
+  "files_created": [
+    "crates/axc-driver/benches/common.rs",
+    "crates/axc-driver/benches/compile.rs",
+    "crates/axc-driver/benches/cpu_reference.rs",
+    "crates/axc-driver/benches/dispatch.rs",
+    "crates/axc-driver/benches/postprocess.rs",
+    "crates/axc-driver/tests/common_helpers.rs",
+    "crates/axc-driver/tests/bench_regression.rs",
+    ".pipeline/benchmarks/baselines.json",
+    ".pipeline/benchmarks/.gitignore",
+    "BENCHMARKS.md"
+  ],
+  "files_modified": [
+    "crates/axc-driver/Cargo.toml",
+    "Cargo.toml",
+    "DESIGN.md",
+    ".github/workflows/ci.yml",
+    "crates/axc-runtime/src/icd.rs",
+    "crates/axc-runtime/src/lib.rs"
+  ],
+  "public_apis_implemented": [
+    "pub fn make_saxpy_inputs(n: usize, seed: u64) -> (Vec<f32>, Vec<f32>, f32)",
+    "pub fn make_vector_add_inputs(n: usize, seed: u64) -> (Vec<f32>, Vec<f32>)",
+    "pub fn f32_slice_to_bytes(data: &[f32]) -> Vec<u8>",
+    "pub fn bytes_to_f32_vec(bytes: &[u8]) -> Vec<f32>",
+    "pub fn bytes_to_words(bytes: &[u8]) -> Vec<u32>",
+    "pub fn saxpy_cpu_reference(x: &[f32], y: &[f32], alpha: f32) -> Vec<f32>",
+    "pub fn vector_add_cpu_reference(a: &[f32], b: &[f32]) -> Vec<f32>",
+    "pub fn assemble_saxpy_push_constants(plan: &ParamBindingPlan, n: u32, alpha: f32) -> Vec<u8>",
+    "pub fn assemble_vector_add_push_constants(plan: &ParamBindingPlan, n: u32) -> Vec<u8>",
+    "pub fn cpu_model_probe() -> String",
+    "pub fn captured_icd_path() -> String  (axc-runtime::icd)"
+  ],
+  "tests_written": [
+    "determinism_make_saxpy_inputs_same_seed_same_output",
+    "determinism_make_vector_add_inputs_same_seed_same_output",
+    "different_seeds_produce_different_saxpy_inputs",
+    "different_seeds_produce_different_vector_add_inputs",
+    "cpu_reference_saxpy_matches_naive_formula",
+    "cpu_reference_vector_add_matches_naive_formula",
+    "assemble_saxpy_push_constants_writes_at_plan_offsets",
+    "assemble_vector_add_push_constants_writes_at_plan_offsets",
+    "f32_slice_roundtrip",
+    "bytes_to_words_roundtrip_length_invariant",
+    "cpu_model_probe_platform_contract",
+    "bench_regression_detects_over_threshold_slowdown",
+    "unit_tests::check_regression_ok_within_threshold",
+    "unit_tests::check_regression_fails_above_threshold",
+    "unit_tests::check_regression_speedup_below_threshold",
+    "unit_tests::check_regression_zero_baseline_is_skipped",
+    "unit_tests::warm_samples_is_11",
+    "unit_tests::regression_threshold_is_15",
+    "at_709_captured_icd_path_empty_when_no_env",
+    "at_709_captured_icd_path_returns_vk_driver_files_verbatim"
+  ],
+  "cargo_check_status": "pass",
+  "cargo_clippy_status": "pass",
+  "cargo_test_status": "492 tests pass (floor 492 per spec)",
+  "cargo_bench_status": "compile + cpu_reference complete; dispatch skipped (no AXC_ENABLE_GPU_BENCHES=1 on this runner)",
+  "spirv_val_status": "n/a (no new SPIR-V codegen in M2.2)",
+  "fault_injection_status": "AT-714 PASS — fault-injection (bench_regression_fixture_slowdown) correctly triggers exit=1 with 2 regression messages containing cpu_saxpy_",
+  "regression_gate_status": "PASS — AXC_ENABLE_BENCH_REGRESSION=1 cargo test --release passes without fault-injection",
+  "baselines_blessed": true,
+  "baselines_machine": "Intel i9-14900KF + NVIDIA RTX PRO 6000 Blackwell (Linux, rustc 1.94.1)",
+  "self_assessment": {
+    "spec_coverage": "All 29 ATs implemented. All [[bench]] entries, all helper functions, regression gate, fault-injection, baselines schema v1 with BTreeMap ordering, CI jobs (AT-714b two-job discipline).",
+    "known_limitations": [
+      "Regression gate baselines are from cargo bench (release-optimized profile); CI regression gate runs cargo test --release to match. If CI uses cargo test (debug), timings will differ significantly from baselines — this is why the CI job explicitly uses --release.",
+      "dispatch_gpu benches produce empty timing entries in baselines.json when no AXC_ENABLE_GPU_BENCHES=1 during bench run. Lavapipe numbers require running benches with GPU env vars set.",
+      "cpu_saxpy_1024 baseline (288ns from Criterion) may appear as 'possible speedup' in the regression gate on the same machine due to Criterion's finer sampling methodology vs 11-sample median."
+    ],
+    "deviations": [
+      "Criterion writes bench output to target/criterion/<bench_name>/ (flat), not target/criterion/<binary>/<bench_name>/. postprocess.rs KNOWN_BENCHES table corrected from the spec's assumed hierarchical layout.",
+      "AT-714b fault-injection: vector_add benches may show 'possible speedup' (not regression) because the slowdown feature only affects saxpy_cpu_reference. This is correct per spec — only saxpy benches are slowed by the accumulator loop."
+    ]
+  }
+}
