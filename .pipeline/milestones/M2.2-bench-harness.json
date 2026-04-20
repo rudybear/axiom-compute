@@ -1,0 +1,53 @@
+{
+  "id": "M2.2-bench-harness",
+  "title": "Benchmark harness + baseline timings",
+  "phase": "M2",
+  "goal": "Ship a reproducible bench harness that measures AXIOM-Compute kernels end-to-end on CPU (reference) and Lavapipe (Vulkan software), records JSON baselines in .pipeline/benchmarks/, and establishes the scaffolding for future real-GPU + llama.cpp-Vulkan comparisons. Without this, the DESIGN.md §5 kill criteria are unprovable.",
+  "scope_in": [
+    "Criterion-based microbench crate in `benches/` at workspace level (or axc-driver) timing: (a) source→SPIR-V compile time, (b) Vulkan dispatch time for saxpy + vector_add on Lavapipe, (c) CPU reference equivalent (Rust loop) for same N",
+    "Bench run via `cargo bench` at the workspace or crate level",
+    "Baseline JSON: `.pipeline/benchmarks/baselines.json` containing per-kernel per-machine metrics (compile_ns, dispatch_ns_1k/1m, cpu_ns_1m, compile_size_bytes) with timestamp and git SHA",
+    "Regression gate: new `axc bench` CLI subcommand (or standalone integration test) that runs the bench suite and fails if any metric regresses > 15% vs checked-in baseline (configurable threshold)",
+    "Two benchmarked kernels in scope: saxpy (1024-element + 1M-element), vector_add (1024 + 1M)",
+    "CPU reference: identical math in a Rust function, timed separately via criterion",
+    "Correctness check: each bench iteration also runs a CPU reference on the same inputs and panics if GPU output diverges > 1e-6 (piggyback on existing M1.5 correctness machinery)",
+    "Machine metadata recorded: ICD name (Lavapipe vs vendor), device name (llvmpipe vs RTX/RDNA/Arc), OS, rustc version, axiom-compute git SHA",
+    "Reproducibility: `cargo bench` in a fresh clone should produce a baseline JSON with the same STRUCTURE (values vary by hardware); run order deterministic, warmup configurable",
+    "Documentation: `BENCHMARKS.md` at repo root explaining how to run, read, and interpret results — and a MILESTONE-EXIT matrix showing which baseline metrics correspond to which kill criteria"
+  ],
+  "scope_out": [
+    "llama.cpp Vulkan comparison baselines (M2.5 — depends on Q4_K_M kernel)",
+    "Real tensor-core dispatch timing (depends on CI hardware)",
+    "FlashAttention benchmark (M3)",
+    "KernelBench-Vulkan submission harness (M3)",
+    "Auto-tuning (depends on M2.3 @strategy holes)",
+    "Cross-machine perf regression tracking (needs DB / CI harness)",
+    "Flamegraph / profiling integration (M3 tooling)",
+    "Power measurement (specialized hw)"
+  ],
+  "acceptance_criteria": [
+    "cargo test --workspace: 471 baseline preserved, +N new tests from bench-correctness gate",
+    "cargo clippy --workspace --all-targets -- -D warnings clean (bench crate included)",
+    "cargo bench --workspace completes in < 120s on Lavapipe with default warmup + sample count",
+    "baselines.json contains at least 4 entries (saxpy_1k, saxpy_1m, vector_add_1k, vector_add_1m) with all required metadata fields present",
+    "Regression gate: intentionally slowing a kernel by inserting a dummy for-loop (in a test fixture) makes the regression test fail with > 15% slowdown detected",
+    "BENCHMARKS.md present at repo root and gittracked",
+    "All GPU bench iterations panic on correctness divergence (not silent)",
+    "Machine metadata includes all 6 required fields"
+  ],
+  "memory_limit_gb": 50,
+  "dependencies": ["M2.1-cooperative-matrix"],
+  "blocks": ["M2.5-matmul-q4km"],
+  "estimated_loc": "1000-2000",
+  "estimated_tests_added": "15-25",
+  "open_questions_for_architect": [
+    "Where does the bench crate live: workspace-level `benches/` or a new `axc-bench` crate? Workspace-level is simpler; separate crate is more modular. Recommend workspace-level `benches/` inside axc-driver for simplicity.",
+    "Criterion settings: default 100 samples + 3s measurement + 3s warmup sufficient? For sub-microsecond dispatches (tiny N), may be too coarse. Custom profiling config per kernel?",
+    "CPU reference: run on same thread or spawn new one? Same thread is simpler. Criterion handles measurement.",
+    "Baseline update workflow: auto-update on CI main branch, or manual `axc bench --bless` command? Recommend manual blessing to avoid baseline drift from noise.",
+    "Regression threshold: 15% default, configurable per kernel in baselines.json? Recommend uniform 15% for simplicity.",
+    "Machine metadata: how is ICD name captured? Query VulkanContext's physical device name + driver version. Recommend storing the device name string verbatim.",
+    "Bench correctness check: if a kernel diverges by 1e-6, criterion discards that sample but continues? Or panics? Panic is safer — silent perf of wrong output is worse than loud failure.",
+    "Reproducibility fixture: deterministic input data (fixed seed, known values) vs random? Use fixed-seed PRNG (StdRng::seed_from_u64(42)) for reproducibility."
+  ]
+}
