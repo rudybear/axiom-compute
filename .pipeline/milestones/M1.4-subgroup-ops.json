@@ -1,0 +1,46 @@
+{
+  "id": "M1.4-subgroup-ops",
+  "title": "Subgroup operations + workgroup barrier",
+  "phase": "M1",
+  "goal": "Expose portable subgroup/wave-level primitives (reductions, broadcast, ballot) and workgroup barriers via SPV_KHR_shader_subgroup_* extensions. Enables per-warp/wave reductions, prefix scan primitives, and warp-cooperative work. Unlocks real parallel algorithms beyond single-threaded reductions.",
+  "scope_in": [
+    "Subgroup builtins: subgroup_invocation_id() -> u32, subgroup_size() -> u32, subgroup_elect() -> bool",
+    "Subgroup reductions: subgroup_reduce_add(T) -> T, subgroup_reduce_min/max(T) -> T for T in {i32, u32, f32, f64}",
+    "Subgroup broadcast: subgroup_broadcast_first(T) -> T (broadcasts from first active invocation)",
+    "Subgroup ballot: subgroup_ballot(bool) -> u32x4 (4-lane bitmask — AXIOM uses uvec4); subgroup_all(bool) -> bool; subgroup_any(bool) -> bool",
+    "Workgroup barrier: workgroup_barrier() — OpControlBarrier with Workgroup execution scope + AcquireRelease|WorkgroupMemory semantics",
+    "Capabilities emitted lazily per usage: GroupNonUniform (invocation_id, size, elect, ballot, broadcast_first), GroupNonUniformArithmetic (reduce), GroupNonUniformBallot (ballot/any/all), GroupNonUniformShuffle (broadcast_first requires this on some drivers; or use GroupNonUniformBallot path)",
+    "Extensions emitted lazily: SPV_KHR_shader_subgroup_basic, SPV_KHR_shader_subgroup_arithmetic, SPV_KHR_shader_subgroup_ballot",
+    "HIR type checking: every subgroup op rejects non-numeric / non-scalar types with a clear error",
+    "HIR constraint: subgroup ops must be in 'convergent' context (i.e., not inside divergent control flow) — for M1.4, we ACCEPT with a warning; strict enforcement deferred to M1.5",
+    "Example: examples/subgroup_reduce.axc — per-subgroup sum of buffer, one thread per subgroup writes result"
+  ],
+  "scope_out": [
+    "Atomic ops (M1.5 bundled with Vulkan dispatch)",
+    "Subgroup shuffle by lane id (broadcast_first only for M1.4)",
+    "Subgroup prefix sum / inclusive scan (M2)",
+    "Cooperative matrix (M2)",
+    "Subgroup voting (vote_all, vote_any — equivalent to _all/_any, just naming)",
+    "Divergent control flow validation — deferred with a warning"
+  ],
+  "acceptance_criteria": [
+    "cargo test --workspace passes (floor 380 tests after M1.4)",
+    "cargo clippy --workspace --all-targets -- -D warnings clean",
+    "In-process spirv-tools validates every emitted kernel (no regressions from M1.3)",
+    "subgroup_reduce.axc compiles and validates for Vulkan 1.1",
+    "Capability + extension pairs emit correctly for each subgroup op used",
+    "Workgroup barrier emits OpControlBarrier with correct memory semantics (AcquireRelease | WorkgroupMemory = 0x8 | 0x100 = 0x108)"
+  ],
+  "memory_limit_gb": 50,
+  "dependencies": ["M1.3-control-flow"],
+  "blocks": ["M1.5-vulkan-dispatch", "M2-cooperative-matrix"],
+  "estimated_loc": "1500-2500",
+  "estimated_tests_added": "40-55",
+  "open_questions_for_architect": [
+    "Subgroup Execution Scope: spec mandates Subgroup (3) for all OpGroupNonUniform* ops. Confirm uint32 value.",
+    "Subgroup reduce operation: SPIR-V defines OpGroupNonUniformIAdd / OpGroupNonUniformFAdd / etc. Operation scope = Reduce (2) vs InclusiveScan/ExclusiveScan — M1.4 uses Reduce only.",
+    "Ballot result type: SPIR-V returns u32x4 (uvec4). AXIOM has uvec4 type? If not, return as tuple (u32, u32, u32, u32) or add uvec4 type. Recommend uvec4 builtin type since DESIGN.md §3.1 already lists it.",
+    "workgroup_barrier memory semantics: only WorkgroupMemory? Or also StorageBuffer? Spec both with AcquireRelease for safety.",
+    "Capability/extension dedup: multiple subgroup ops needing same capability must emit capability ONCE. Use the existing M1.1 capability-escalation pattern."
+  ]
+}
