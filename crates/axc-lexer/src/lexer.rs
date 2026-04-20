@@ -849,4 +849,37 @@ mod tests {
         assert_eq!(TokenKind::Return.m1_reserved_detail(),   None);
         assert_eq!(TokenKind::Fn.m1_reserved_detail(),       None);
     }
+
+    // ── M2.1: F16 suffix and matrix ident (AT-604, AT-605) ───────────────────
+
+    /// AT-604: The lexer tokenizes `0.5f16` as FloatLiteral with F16 suffix.
+    #[test]
+    fn float_literal_f16_suffix_parses() {
+        let kinds = lex_kinds("0.5f16");
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::FloatLiteral {
+                    value: 0.5,
+                    suffix: Some(FloatSuffix::F16),
+                },
+                TokenKind::Eof,
+            ],
+            "0.5f16 should lex as FloatLiteral {{ value: 0.5, suffix: Some(F16) }}"
+        );
+    }
+
+    /// AT-605: `matrix` is a plain Ident at the lexer layer — not a keyword.
+    ///
+    /// `matrix[T, M, N, use]` is parsed entirely by the parser; the lexer does
+    /// NOT reserve `matrix` as a token. This test verifies the lexer contract.
+    #[test]
+    fn ident_matrix_is_plain_ident() {
+        let kinds = lex_kinds("matrix");
+        assert_eq!(
+            kinds,
+            vec![TokenKind::Ident("matrix".to_string()), TokenKind::Eof],
+            "matrix must be a plain Ident at the lexer layer, not a keyword"
+        );
+    }
 }

@@ -541,14 +541,21 @@ impl<'tok> Parser<'tok> {
     }
 
     /// Parse a cooperative-matrix element type from the M2.1 allowed set.
+    ///
+    /// `bf16` is accepted at the parser layer so that the HIR can emit a precise
+    /// `CoopMatrixElementTypeUnsupported` diagnostic (AT-609). All other unknown
+    /// types are rejected here with `ParseError::Unexpected`.
     fn parse_coopmat_elem_type(&mut self) -> Option<ScalarTypeRef> {
         match self.peek_kind().clone() {
-            TokenKind::I8  => { self.advance(); Some(ScalarTypeRef::I8) }
-            TokenKind::U8  => { self.advance(); Some(ScalarTypeRef::U8) }
-            TokenKind::I32 => { self.advance(); Some(ScalarTypeRef::I32) }
-            TokenKind::U32 => { self.advance(); Some(ScalarTypeRef::U32) }
-            TokenKind::F16 => { self.advance(); Some(ScalarTypeRef::F16) }
-            TokenKind::F32 => { self.advance(); Some(ScalarTypeRef::F32) }
+            TokenKind::I8   => { self.advance(); Some(ScalarTypeRef::I8) }
+            TokenKind::U8   => { self.advance(); Some(ScalarTypeRef::U8) }
+            TokenKind::I32  => { self.advance(); Some(ScalarTypeRef::I32) }
+            TokenKind::U32  => { self.advance(); Some(ScalarTypeRef::U32) }
+            TokenKind::F16  => { self.advance(); Some(ScalarTypeRef::F16) }
+            // Bf16 is accepted by the parser but rejected by the HIR typechecker
+            // with CoopMatrixElementTypeUnsupported (AT-609).
+            TokenKind::Bf16 => { self.advance(); Some(ScalarTypeRef::Bf16) }
+            TokenKind::F32  => { self.advance(); Some(ScalarTypeRef::F32) }
             other => {
                 self.errors.push(ParseError::Unexpected {
                     expected: "cooperative-matrix element type (i8, u8, i32, u32, f16, f32)".into(),
@@ -2207,5 +2214,70 @@ mod tests {
         } else {
             panic!("expected Let stmt for subgroup_broadcast_first");
         }
+    }
+
+    // ── M2.1: Cooperative-matrix type parsing (AT-606, AT-607, AT-608) ────────
+
+    /// AT-606: `matrix[f16, 16, 16, a]` parses as TypeRef::CoopMatrix.
+    #[test]
+    fn parse_matrix_type_f16_16_16_a() {
+        // Embed in a valid let binding to exercise the type-ref parser in context.
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { \
+            let m: matrix[f16, 16, 16, a] = coopmat_zero(); return; }";
+        let (module, errors) = parse_src(src);
+        let Item::Kernel(ref kd) = module.items[0].node;
+        // The let statement is stmts[0].
+        if let Stmt::Let { ty, .. } = &kd.body.node.stmts[0].node {
+            assert!(
+                matches!(
+                    &ty.node,
+                    TypeRef::CoopMatrix {
+                        elem: crate::ast::ScalarTypeRef::F16,
+                        m: 16,
+                        n: 16,
+                        use_: crate::ast::CoopMatUseAst::A,
+                    }
+                ),
+                "expected CoopMatrix {{ F16, 16, 16, A }}; got: {:?}", ty.node
+            );
+        } else {
+            panic!("expected Let stmt; got: {:?}", kd.body.node.stmts[0].node);
+        }
+        // Note: parse errors may occur for the unresolved coopmat_zero() call
+        // at parser level (it's a Call expr which is fine). We only validate the type ref.
+        let _ = errors; // errors may include unresolved ident warnings — not our concern here
+    }
+
+    /// AT-607: `matrix[f16, 16u32, 16, a]` is rejected with
+    /// `CoopMatrixDimMustBeUnsuffixedIntegerLiteral`.
+    #[test]
+    fn parse_matrix_type_suffixed_dim_rejected() {
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { \
+            let m: matrix[f16, 16u32, 16, a] = coopmat_zero(); return; }";
+        let (_, errors) = parse_src(src);
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ParseError::CoopMatrixDimMustBeUnsuffixedIntegerLiteral { .. }
+            )),
+            "expected CoopMatrixDimMustBeUnsuffixedIntegerLiteral in: {errors:?}"
+        );
+    }
+
+    /// AT-608: `matrix[f16, 16, 16, c]` is rejected with
+    /// `CoopMatrixUseMustBeABOrAccumulator { found: "c" }`.
+    #[test]
+    fn parse_matrix_type_unknown_use_rejected() {
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { \
+            let m: matrix[f16, 16, 16, c] = coopmat_zero(); return; }";
+        let (_, errors) = parse_src(src);
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ParseError::CoopMatrixUseMustBeABOrAccumulator { found, .. }
+                    if found == "c"
+            )),
+            "expected CoopMatrixUseMustBeABOrAccumulator {{ found: \"c\" }} in: {errors:?}"
+        );
     }
 }

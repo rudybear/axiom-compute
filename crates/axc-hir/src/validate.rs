@@ -97,6 +97,16 @@ pub enum HirError {
         #[label("here")]
         span: Span,
     },
+
+    /// M2.1: cooperative-matrix type used as a kernel parameter (not allowed).
+    ///
+    /// Cooperative-matrix values are function-local only in M2.1.
+    #[error("cooperative-matrix type cannot appear as a kernel parameter (`{param_name}`) in M2.1; matrix values are function-local only")]
+    UnsupportedCoopMatrixAsParamInM2_1 {
+        param_name: String,
+        #[label("here")]
+        span: Span,
+    },
 }
 
 /// Non-fatal diagnostic warning from HIR validation.
@@ -371,6 +381,45 @@ mod tests {
         assert!(
             hir_errs.iter().any(|e| matches!(e, HirError::Typecheck(TypecheckError::SubgroupArity { .. }))),
             "expected HirError::Typecheck(SubgroupArity): {hir_errs:?}"
+        );
+    }
+
+    // ── M2.1 acceptance tests ─────────────────────────────────────────────────
+
+    /// AT-609: HIR typechecker rejects `matrix[bf16, 16, 16, a]` element type
+    /// with CoopMatrixElementTypeUnsupported.
+    #[test]
+    fn tc_coopmat_type_bf16_element_rejected() {
+        // bf16 is accepted by the parser (ScalarTypeRef::Bf16) but rejected by the HIR.
+        let errors = pipeline_errors(
+            "@kernel @workgroup(1,1,1) fn k() -> void { \
+             let m: matrix[bf16, 16, 16, a] = coopmat_zero(); return; }",
+        );
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                HirError::Typecheck(TypecheckError::CoopMatrixElementTypeUnsupported { ty, .. })
+                    if *ty == "bf16"
+            )),
+            "expected CoopMatrixElementTypeUnsupported {{ ty: \"bf16\" }}; got: {errors:?}"
+        );
+    }
+
+    /// AT-610: HIR rejects cooperative-matrix type used as a kernel parameter.
+    ///
+    /// Cooperative-matrix values are function-local only in M2.1.
+    #[test]
+    fn tc_coopmat_as_kernel_param_rejected() {
+        let errors = pipeline_errors(
+            "@kernel @workgroup(1,1,1) fn k(m: matrix[f16, 16, 16, a]) -> void { return; }",
+        );
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                HirError::UnsupportedCoopMatrixAsParamInM2_1 { param_name, .. }
+                    if param_name == "m"
+            )),
+            "expected UnsupportedCoopMatrixAsParamInM2_1 {{ param_name: \"m\" }}; got: {errors:?}"
         );
     }
 }

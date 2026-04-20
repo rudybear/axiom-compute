@@ -762,6 +762,16 @@ fn pre_register_lets_in_block(block: &past::Block, tc: &mut TypeChecker<'_>) {
         if let past::Stmt::Let { name, ty, is_mut, .. } = &spanned_stmt.node {
             // CoopMatrix bindings are handled differently: register via register_coopmat_binding.
             if let past::TypeRef::CoopMatrix { elem, m, n, use_ } = &ty.node {
+                // Bf16 is accepted by the parser but rejected here (AT-609).
+                // Must check BEFORE calling lower_scalar_type_ref_tc (which panics for Bf16).
+                if *elem == past::ScalarTypeRef::Bf16 {
+                    tc.errors.push(TypecheckError::CoopMatrixElementTypeUnsupported {
+                        ty: "bf16",
+                        span: ty.span,
+                    });
+                    tc.register_binding(&name.node, ScalarTy::I32, *is_mut, name.span);
+                    continue;
+                }
                 let elem_scalar = lower_scalar_type_ref_tc(elem);
                 if !is_allowed_coopmat_element(elem_scalar) {
                     tc.errors.push(TypecheckError::CoopMatrixElementTypeUnsupported {
@@ -800,6 +810,10 @@ fn pre_register_lets_in_block(block: &past::Block, tc: &mut TypeChecker<'_>) {
 ///
 /// Mirrors `lower::lower_scalar_type_ref` but is used in typecheck where
 /// we can't call into the lower module to avoid circular concerns.
+///
+/// PRECONDITION: callers must check for `ScalarTypeRef::Bf16` BEFORE calling
+/// this function and emit `CoopMatrixElementTypeUnsupported { ty: "bf16" }`.
+/// Bf16 is not represented in `ScalarTy`; calling this function with Bf16 panics.
 fn lower_scalar_type_ref_tc(str_ref: &past::ScalarTypeRef) -> ScalarTy {
     match str_ref {
         past::ScalarTypeRef::I8  => ScalarTy::I8,
@@ -811,6 +825,12 @@ fn lower_scalar_type_ref_tc(str_ref: &past::ScalarTypeRef) -> ScalarTy {
         past::ScalarTypeRef::F16 => ScalarTy::F16,
         past::ScalarTypeRef::F32 => ScalarTy::F32,
         past::ScalarTypeRef::F64 => ScalarTy::F64,
+        past::ScalarTypeRef::Bf16 => {
+            // This should never be reached: callers must filter Bf16 before calling.
+            // If it does, this is a compiler bug.
+            panic!("lower_scalar_type_ref_tc: bf16 is not a valid HIR ScalarTy; \
+                    callers must check ScalarTypeRef::Bf16 and emit CoopMatrixElementTypeUnsupported")
+        }
     }
 }
 

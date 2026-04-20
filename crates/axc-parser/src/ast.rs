@@ -54,7 +54,12 @@ pub enum ScalarTypeRef {
     U32,
     I64,
     U64,
+    /// IEEE-754 binary16 half-precision float.
     F16,
+    /// Google bfloat16 (brain float). NOT a valid cooperative-matrix element
+    /// type in M2.1; the parser accepts this token so the HIR can emit a
+    /// precise `CoopMatrixElementTypeUnsupported` diagnostic (AT-609).
+    Bf16,
     F32,
     F64,
 }

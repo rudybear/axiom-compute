@@ -297,7 +297,14 @@ fn lower_type_ref(
         })),
         TypeRef::F16 => Some(ParamTy::Scalar(ScalarTy::F16)),
         // CoopMatrix is not a valid kernel parameter type in M2.1 (only let-bindings).
-        TypeRef::CoopMatrix { .. } | TypeRef::Void | TypeRef::Bool => {
+        TypeRef::CoopMatrix { .. } => {
+            errors.push(HirError::UnsupportedCoopMatrixAsParamInM2_1 {
+                param_name: param_name.to_owned(),
+                span,
+            });
+            None
+        }
+        TypeRef::Void | TypeRef::Bool => {
             errors.push(HirError::UnsupportedParamType {
                 ty_name: format!("{:?}", tr),
                 param_name: param_name.to_owned(),
@@ -309,6 +316,10 @@ fn lower_type_ref(
 }
 
 /// Convert an AST `ScalarTypeRef` to an HIR `ScalarTy`.
+///
+/// `Bf16` is accepted by the parser but has no HIR representation; it should
+/// never appear in a BUFFER element type (the parser's `parse_buffer_elem` does
+/// not accept it). If encountered here it is a compiler bug.
 fn lower_scalar_type_ref(str_ref: &ScalarTypeRef) -> ScalarTy {
     match str_ref {
         ScalarTypeRef::I8  => ScalarTy::I8,
@@ -320,6 +331,12 @@ fn lower_scalar_type_ref(str_ref: &ScalarTypeRef) -> ScalarTy {
         ScalarTypeRef::F16 => ScalarTy::F16,
         ScalarTypeRef::F32 => ScalarTy::F32,
         ScalarTypeRef::F64 => ScalarTy::F64,
+        ScalarTypeRef::Bf16 => {
+            // Bf16 cannot appear in buffer element types (parser rejects it there).
+            // If we reach this, it is a compiler bug.
+            panic!("lower_scalar_type_ref: bf16 has no HIR ScalarTy representation; \
+                    this path should be unreachable for buffer element types")
+        }
     }
 }
 
