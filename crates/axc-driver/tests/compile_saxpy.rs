@@ -193,6 +193,43 @@ fn design_md_m1_2_docs_present() {
     );
 }
 
+// ── AT-419: design_md_contains_section_3_1_5_subgroup_ops ────────────────────
+// Verifies DESIGN.md §3.1.5 documents subgroup ops + workgroup barrier (M1.4).
+#[test]
+fn design_md_contains_section_3_1_5_subgroup_ops() {
+    let manifest_dir = PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"),
+    );
+    let design_md_path = manifest_dir.join("..").join("..").join("DESIGN.md");
+    let content = std::fs::read_to_string(&design_md_path)
+        .unwrap_or_else(|e| panic!("failed to read DESIGN.md at {:?}: {e}", design_md_path));
+
+    assert!(
+        content.contains("3.1.5"),
+        "DESIGN.md must contain '3.1.5'"
+    );
+    assert!(
+        content.contains("Subgroup operations and workgroup barrier"),
+        "DESIGN.md must contain 'Subgroup operations and workgroup barrier'"
+    );
+    assert!(
+        content.contains("OpGroupNonUniform"),
+        "DESIGN.md must contain 'OpGroupNonUniform'"
+    );
+    assert!(
+        content.contains("OpControlBarrier"),
+        "DESIGN.md must contain 'OpControlBarrier'"
+    );
+    assert!(
+        content.contains("SPV_KHR_shader_subgroup_basic"),
+        "DESIGN.md must contain 'SPV_KHR_shader_subgroup_basic'"
+    );
+    assert!(
+        content.contains("0x108"),
+        "DESIGN.md must contain '0x108' (workgroup_barrier semantics)"
+    );
+}
+
 // ── AT-229: design_md_m1_2_saxpy_binding_example_present ─────────────────────
 // Verifies DESIGN.md contains the saxpy binding example with correct labels.
 #[test]

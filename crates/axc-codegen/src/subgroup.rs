@@ -389,10 +389,10 @@ mod tests {
         assert!(caps.subgroup_basic, "subgroup_basic must be true (GroupNonUniformVote requires GroupNonUniform)");
     }
 
-    // ── AT-417: reduce add f32 emits FAdd ────────────────────────────────────
+    // ── AT-414: reduce add f32 emits FAdd ────────────────────────────────────
 
     #[test]
-    fn sg_emit_reduce_add_f32_emits_op_group_non_uniform_f_add() {
+    fn cg_subgroup_reduce_add_f32_emits_op_group_non_uniform_f_add() {
         let (mut b, mut tc, mut caps) = make_test_context();
         let f32_ty = tc.scalar_id(&mut b, ScalarTy::F32);
         let v = b.constant_bit32(f32_ty, 0x3f800000u32); // 1.0f32
@@ -470,10 +470,10 @@ mod tests {
         assert!(!caps.subgroup_vote, "subgroup_vote must be false (BroadcastFirst does not need Vote)");
     }
 
-    // ── AT-415: workgroup barrier emits OpControlBarrier with scope=2 semant=0x108
+    // ── AT-415 / AT-422: workgroup barrier emits OpControlBarrier with scope=2 semant=0x108
 
     #[test]
-    fn sg_emit_workgroup_barrier_emits_op_control_barrier_with_expected_constants() {
+    fn cg_workgroup_barrier_emits_op_control_barrier_with_scope_2_and_semantics_0x108() {
         let (mut b, mut tc, mut _caps) = make_test_context();
         emit_workgroup_barrier(&mut b, &mut tc).expect("emit_workgroup_barrier");
 
