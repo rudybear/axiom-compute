@@ -196,6 +196,38 @@ AXIOM-Compute lowers all control flow to SPIR-V §2.11 structured CFG:
 `and`/`or` short-circuit expressions are not allowed in if/while condition
 position (use a temp bool). `return` inside a loop is rejected (deferred to M1.4).
 
+### 3.1.5 Subgroup operations and workgroup barrier (M1.4)
+
+AXIOM-Compute exposes portable subgroup/wave-level primitives via SPV_KHR_shader_subgroup_*
+extensions. Ten builtin call names:
+
+- Basic (GroupNonUniform cap, SPV_KHR_shader_subgroup_basic):
+  - `subgroup_invocation_id() -> u32` → OpLoad of SubgroupLocalInvocationId
+  - `subgroup_size() -> u32` → OpLoad of SubgroupSize
+  - `subgroup_elect() -> bool` → OpGroupNonUniformElect
+- Arithmetic (GroupNonUniformArithmetic cap, SPV_KHR_shader_subgroup_arithmetic):
+  - `subgroup_reduce_add/min/max(T) -> T` → OpGroupNonUniformIAdd/FAdd with Reduce op
+- Ballot (GroupNonUniformBallot cap, SPV_KHR_shader_subgroup_ballot):
+  - `subgroup_broadcast_first(T) -> T` → OpGroupNonUniformBroadcastFirst
+- Vote (GroupNonUniformVote cap, SPV_KHR_shader_subgroup_vote):
+  - `subgroup_all(bool) -> bool` → OpGroupNonUniformAll
+  - `subgroup_any(bool) -> bool` → OpGroupNonUniformAny
+- Synchronization:
+  - `workgroup_barrier()` → OpControlBarrier with exec=Workgroup, mem=Workgroup,
+    semantics=AcquireRelease|WorkgroupMemory (0x108)
+
+**Parent capability chain.** Every child capability implicitly requires GroupNonUniform (basic).
+AXIOM-Compute mechanically forces this in the capability aggregation step to avoid spirv-val
+rejection (SPIR-V §3.31).
+
+**Divergent-context warning.** Subgroup collective operations inside divergent control flow
+(if/while bodies, but not for-range bodies since induction is uniform) emit a non-fatal
+HirWarning::SubgroupOpInDivergentContext. The canonical pattern `if subgroup_elect() { ... }`
+does NOT trigger at the condition position (cond runs at parent depth). Strict enforcement
+deferred to M1.5.
+
+**Subgroup ballot (`subgroup_ballot(bool) -> uvec4`) deferred to M1.5** pending uvec4 primitive type.
+
 ### 3.1 Types
 
 ```
