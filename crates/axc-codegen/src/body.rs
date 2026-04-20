@@ -33,7 +33,7 @@ use rspirv::spirv::{
 };
 use axc_hir::expr::{
     KernelBodyTyped, HirExpr, HirExprKind, HirStmt, BinOp, UnaryOp,
-    ShortCircuitOp, BitwiseOp, BindingId,
+    ShortCircuitOp, BitwiseOp, BindingId, BindingTy,
 };
 use axc_hir::ty::ScalarTy;
 use axc_hir::subgroup::{SubgroupOp, SubgroupReduceKind, BarrierKind};
@@ -118,6 +118,7 @@ impl ScalarTypeCache {
             ScalarTy::U16  => b.type_int(16, 0),
             ScalarTy::U32  => b.type_int(32, 0),
             ScalarTy::U64  => b.type_int(64, 0),
+            ScalarTy::F16  => b.type_float(16),
             ScalarTy::F32  => b.type_float(32),
             ScalarTy::F64  => b.type_float(64),
             ScalarTy::Bool => b.type_bool(),
@@ -366,11 +367,16 @@ pub fn emit_kernel_body(
     // including those inside nested scopes or after break statements. This costs
     // a few extra OpVariable words but matches glslang's behavior (AT-316).
     for binding in &body.bindings {
-        emitter.caps.observe_type(binding.ty);
-        let ptr_ty = emitter.ptr_type_id(binding.ty);
-        let var_id = emitter.b
-            .variable(ptr_ty, None, StorageClass::Function, None);
-        emitter.var_ids.insert(binding.id, var_id);
+        // CoopMatrix bindings use SSA values (not OpVariable) — skip the prelude allocation.
+        // Only scalar bindings get an OpVariable in Function storage class.
+        if let BindingTy::Scalar(scalar_ty) = binding.ty {
+            emitter.caps.observe_type(scalar_ty);
+            let ptr_ty = emitter.ptr_type_id(scalar_ty);
+            let var_id = emitter.b
+                .variable(ptr_ty, None, StorageClass::Function, None);
+            emitter.var_ids.insert(binding.id, var_id);
+        }
+        // CoopMatrix bindings: var_ids entry will be inserted on first CoopMatBuiltin emit.
     }
 
     // ── Emit statements ───────────────────────────────────────────────────────
@@ -465,6 +471,15 @@ fn emit_stmt(em: &mut BodyEmitter<'_>, stmt: &HirStmt) -> Result<(), BodyCodegen
                     Ok(())
                 }
             }
+        }
+        HirStmt::CoopMatStore { .. } => {
+            // M2.1: Cooperative-matrix store lowering (OpCooperativeMatrixStoreKHR).
+            // Full implementation deferred to the coopmat.rs codegen module.
+            // Returning an error here is intentional: coopmat_store is only valid
+            // in M2.1 kernels which are not yet compiled to SPIR-V.
+            Err(BodyCodegenError::UnexpectedHir(
+                "CoopMatStore: cooperative-matrix codegen not yet implemented"
+            ))
         }
     }
 }
@@ -782,6 +797,14 @@ fn emit_expr(em: &mut BodyEmitter<'_>, expr: &HirExpr) -> Result<Word, BodyCodeg
         }
         HirExprKind::SubgroupBuiltin { op, args } => {
             emit_subgroup_builtin(em, *op, args, expr.ty)
+        }
+        HirExprKind::CoopMatBuiltin { .. } => {
+            // M2.1: Cooperative-matrix expression lowering (OpCooperativeMatrixLoadKHR,
+            // OpCooperativeMatrixMulAddKHR, OpConstantNull for zero).
+            // Full implementation deferred to the coopmat.rs codegen module.
+            Err(BodyCodegenError::UnexpectedHir(
+                "CoopMatBuiltin: cooperative-matrix codegen not yet implemented"
+            ))
         }
     }
 }

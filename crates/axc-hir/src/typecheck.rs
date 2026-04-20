@@ -20,7 +20,7 @@
 use axc_lexer::Span;
 use axc_parser::ast as past;
 use crate::expr::{
-    Binding, BindingId, HirExpr, HirExprKind, HirStmt, KernelBodyTyped,
+    Binding, BindingId, BindingTy, HirExpr, HirExprKind, HirStmt, KernelBodyTyped,
     BinOp, UnaryOp, ShortCircuitOp, BitwiseOp,
 };
 use crate::ty::{ScalarTy, fit_int_literal, fit_float_literal};
@@ -28,6 +28,10 @@ use crate::param::{KernelParam, Ty as ParamTy};
 use crate::buffer::BufferAccess;
 use crate::control_flow::{HirIf, HirElse, HirForRange, HirWhile, ForStep};
 use crate::loop_ctx::{HirLoopStack, ScopeStack};
+use crate::coopmat::{
+    CoopMatUse, CoopMatKey, CoopMatrixShapeKind, CoopMatrixShape,
+    is_allowed_coopmat_element,
+};
 
 /// Typecheck error — emitted from `typecheck_kernel_body`.
 ///
@@ -343,6 +347,133 @@ pub enum TypecheckError {
         #[label("here")]
         span: Span,
     },
+
+    // ── M2.1 cooperative-matrix errors ────────────────────────────────────────
+
+    #[error("cooperative-matrix element type `{ty}` is not supported in M2.1 (allowed: f16, f32, i8, u8, i32, u32)")]
+    CoopMatrixElementTypeUnsupported {
+        ty: &'static str,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("cooperative-matrix dimension {dim_name} = {value} is out of range (must be 1..=65535)")]
+    CoopMatrixDimOutOfRange {
+        dim_name: &'static str,
+        value: u64,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("cooperative-matrix type cannot appear as a kernel parameter (`{param_name}`) in M2.1; matrix values are function-local only")]
+    UnsupportedCoopMatrixAsParamInM2_1 {
+        param_name: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("cooperative-matrix builtin `{name}` requires {expected} argument(s); got {found}")]
+    CoopMatArity {
+        name: &'static str,
+        expected: usize,
+        found: usize,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("cooperative-matrix builtin `{name}` requires an expected matrix type context (use `let x: matrix[T, M, N, use] = {name}(...);`)")]
+    CoopMatrixBuiltinRequiresExpectedType {
+        name: &'static str,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("`{found_kind}` is not a buffer parameter; coopmat_load requires a buffer kernel parameter as its first argument")]
+    CoopMatLoadArgMustBeBufferParam {
+        found_kind: &'static str,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("coopmat_load element type mismatch: matrix expects `{matrix_elem}` but buffer contains `{buffer_elem}`")]
+    CoopMatLoadElementTypeMismatch {
+        matrix_elem: &'static str,
+        buffer_elem: &'static str,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("coopmat_store requires a mutable buffer parameter; `{param_name}` is read-only")]
+    CoopMatStoreToReadonlyBuffer {
+        param_name: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("coopmat_store element type mismatch: matrix has `{matrix_elem}` but buffer has `{buffer_elem}`")]
+    CoopMatStoreElementTypeMismatch {
+        matrix_elem: &'static str,
+        buffer_elem: &'static str,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("cooperative-matrix shape mismatch in coopmat_mul_add")]
+    CoopMatrixShapeMismatch {
+        kind: CoopMatrixShapeKind,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("@cooperative_matrix annotation on kernel `{kernel}` has no matching coopmat_mul_add call")]
+    CooperativeMatrixAnnotationUnused {
+        kernel: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("@cooperative_matrix annotation mismatch: declared ({em:?}) but body uses ({fm:?})")]
+    CooperativeMatrixAnnotationMismatch {
+        em: CoopMatrixShape,
+        fm: CoopMatrixShape,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("coopmat_load / coopmat_zero stride and element_offset must be `u32`; got `{found_ty}`")]
+    CoopMatLoadStrideMustBeU32 {
+        found_ty: &'static str,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("`{name}` is a reserved cooperative-matrix builtin identifier and cannot be used as a variable name")]
+    ReservedCoopMatBuiltinName {
+        name: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("`matrix` is a reserved keyword in M2.1 and cannot be used as a variable name")]
+    ReservedKeyword {
+        name: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("f16 literal out of range for bin16 (value {value} overflows to infinity)")]
+    F16LiteralOutOfRange {
+        value: f64,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("f16 literal silent underflow: {value} rounds to zero in binary16 (use 0.0f16 for explicit zero)")]
+    F16LiteralSubnormalPrecisionLoss {
+        value: f64,
+        #[label("here")]
+        span: Span,
+    },
 }
 
 // ── Internal binding table ────────────────────────────────────────────────────
@@ -395,7 +526,9 @@ impl<'p> TypeChecker<'p> {
     }
 
     /// Find a binding by name: traverse scope_stack from inner to outer.
-    fn find_binding(&self, name: &str) -> Option<(BindingId, ScalarTy, bool, Span)> {
+    ///
+    /// Returns `(BindingId, BindingTy, is_mutable, span)`.
+    fn find_binding(&self, name: &str) -> Option<(BindingId, BindingTy, bool, Span)> {
         if let Some(idx) = self.scope_stack.get(name) {
             let b = &self.bindings[idx];
             Some((b.id, b.ty, b.is_mutable, b.span))
@@ -404,14 +537,30 @@ impl<'p> TypeChecker<'p> {
         }
     }
 
-    /// Register a new binding in the innermost scope frame.
-    ///
-    /// Duplicate detection is within the SAME scope frame only.
-    /// Shadowing across frames (e.g. nested for loops with same induction var name) is allowed.
+    /// Find a binding and return its scalar type only. Returns `None` if not found
+    /// or if the binding is a cooperative-matrix value.
+    #[allow(dead_code)] // Used by check_coopmat_call (M2.1 — not yet wired in)
+    fn find_scalar_binding(&self, name: &str) -> Option<(BindingId, ScalarTy, bool, Span)> {
+        self.find_binding(name).and_then(|(id, bty, is_mut, span)| {
+            bty.as_scalar().map(|st| (id, st, is_mut, span))
+        })
+    }
+
+    /// Register a new scalar binding in the innermost scope frame.
     fn register_binding(&mut self, name: &str, ty: ScalarTy, is_mutable: bool, span: Span) -> Option<BindingId> {
+        self.register_binding_typed(name, BindingTy::Scalar(ty), is_mutable, span)
+    }
+
+    /// Register a new cooperative-matrix binding in the innermost scope frame.
+    fn register_coopmat_binding(&mut self, name: &str, key: CoopMatKey, is_mutable: bool, span: Span) -> Option<BindingId> {
+        self.register_binding_typed(name, BindingTy::CoopMatrix(key), is_mutable, span)
+    }
+
+    /// Core binding registration. Duplicate detection is within the SAME scope frame only.
+    ///
+    /// Shadowing across frames (e.g. nested for loops with same induction var name) is allowed.
+    fn register_binding_typed(&mut self, name: &str, ty: BindingTy, is_mutable: bool, span: Span) -> Option<BindingId> {
         // Check for duplicate in the CURRENT frame only (not outer scopes — shadowing is OK).
-        // Using get_in_current_frame ensures that nested scopes (e.g. nested for loops with
-        // the same induction variable name) do not falsely trigger RedeclaredBinding.
         if let Some(idx) = self.scope_stack.get_in_current_frame(name) {
             let orig_span = self.bindings[idx].span;
             self.errors.push(TypecheckError::RedeclaredBinding {
@@ -474,9 +623,11 @@ pub fn typecheck_kernel_body(
 
                 // Lookup the binding registered in pass 1.
                 let maybe_binding = tc.find_binding(&name.node);
-                let expected_ty = maybe_binding.map(|(_, t, _, _)| t);
+                // For coopmat bindings, scalar expected_ty is None (coopmat check is
+                // dispatched separately below). For scalar bindings, extract ScalarTy.
+                let expected_scalar_ty = maybe_binding.and_then(|(_, bty, _, _)| bty.as_scalar());
 
-                let hir_init = check_expr(&mut tc, &init.node, init.span, expected_ty);
+                let hir_init = check_expr(&mut tc, &init.node, init.span, expected_scalar_ty);
 
                 if let Some((bid, _, _, _)) = maybe_binding {
                     if let Some(init_expr) = hir_init {
@@ -522,7 +673,10 @@ pub fn typecheck_kernel_body(
                                     original_span: orig_span,
                                 });
                             }
-                            let hir_value = check_expr(&mut tc, &value.node, value.span, Some(binding_ty));
+                            // For scalar bindings, pass expected type; coopmat assignment
+                            // is not supported in M2.1 (coopmat values are immutable).
+                            let scalar_expected = binding_ty.as_scalar();
+                            let hir_value = check_expr(&mut tc, &value.node, value.span, scalar_expected);
                             if let Some(val_expr) = hir_value {
                                 hir_stmts.push(HirStmt::Assign {
                                     binding: bid,
@@ -606,8 +760,29 @@ pub fn typecheck_kernel_body(
 fn pre_register_lets_in_block(block: &past::Block, tc: &mut TypeChecker<'_>) {
     for spanned_stmt in &block.stmts {
         if let past::Stmt::Let { name, ty, is_mut, .. } = &spanned_stmt.node {
+            // CoopMatrix bindings are handled differently: register via register_coopmat_binding.
+            if let past::TypeRef::CoopMatrix { elem, m, n, use_ } = &ty.node {
+                let elem_scalar = lower_scalar_type_ref_tc(elem);
+                if !is_allowed_coopmat_element(elem_scalar) {
+                    tc.errors.push(TypecheckError::CoopMatrixElementTypeUnsupported {
+                        ty: elem_scalar.display_name(),
+                        span: ty.span,
+                    });
+                    // Register as a placeholder scalar to allow further analysis.
+                    tc.register_binding(&name.node, ScalarTy::I32, *is_mut, name.span);
+                    continue;
+                }
+                let coopmat_use = coopmat_use_ast_to_hir(use_);
+                let key = CoopMatKey { elem: elem_scalar, m: *m, n: *n, use_: coopmat_use };
+                tc.register_coopmat_binding(&name.node, key, *is_mut, name.span);
+                continue;
+            }
             let scalar_ty = match typeref_to_scalar(&ty.node) {
                 Ok(t) => t,
+                Err("__coopmat__") => {
+                    // Should have been caught above; this branch is unreachable but safe.
+                    ScalarTy::I32
+                }
                 Err(detail) => {
                     tc.errors.push(TypecheckError::UnsupportedExprInM1_1 {
                         detail,
@@ -618,6 +793,33 @@ fn pre_register_lets_in_block(block: &past::Block, tc: &mut TypeChecker<'_>) {
             };
             tc.register_binding(&name.node, scalar_ty, *is_mut, name.span);
         }
+    }
+}
+
+/// Convert an AST `ScalarTypeRef` to a HIR `ScalarTy` (typecheck-layer helper).
+///
+/// Mirrors `lower::lower_scalar_type_ref` but is used in typecheck where
+/// we can't call into the lower module to avoid circular concerns.
+fn lower_scalar_type_ref_tc(str_ref: &past::ScalarTypeRef) -> ScalarTy {
+    match str_ref {
+        past::ScalarTypeRef::I8  => ScalarTy::I8,
+        past::ScalarTypeRef::U8  => ScalarTy::U8,
+        past::ScalarTypeRef::I32 => ScalarTy::I32,
+        past::ScalarTypeRef::U32 => ScalarTy::U32,
+        past::ScalarTypeRef::I64 => ScalarTy::I64,
+        past::ScalarTypeRef::U64 => ScalarTy::U64,
+        past::ScalarTypeRef::F16 => ScalarTy::F16,
+        past::ScalarTypeRef::F32 => ScalarTy::F32,
+        past::ScalarTypeRef::F64 => ScalarTy::F64,
+    }
+}
+
+/// Convert a parsed `CoopMatUseAst` to the HIR `CoopMatUse`.
+fn coopmat_use_ast_to_hir(use_: &past::CoopMatUseAst) -> CoopMatUse {
+    match use_ {
+        past::CoopMatUseAst::A           => CoopMatUse::MatrixA,
+        past::CoopMatUseAst::B           => CoopMatUse::MatrixB,
+        past::CoopMatUseAst::Accumulator => CoopMatUse::Accumulator,
     }
 }
 
@@ -962,7 +1164,9 @@ fn typecheck_block_stmts(tc: &mut TypeChecker<'_>, stmts: &[axc_lexer::Spanned<p
                                     original_span: _orig_span,
                                 });
                             }
-                            let hir_value = check_expr(tc, &value.node, value.span, Some(binding_ty));
+                            // Coopmat values are immutable; use scalar expected or None.
+                            let scalar_expected = binding_ty.as_scalar();
+                            let hir_value = check_expr(tc, &value.node, value.span, scalar_expected);
                             if let Some(val_expr) = hir_value {
                                 hir_stmts.push(HirStmt::Assign {
                                     binding: bid,
@@ -1035,6 +1239,7 @@ fn typeref_to_scalar(tr: &past::TypeRef) -> Result<ScalarTy, &'static str> {
         past::TypeRef::U32  => Ok(ScalarTy::U32),
         past::TypeRef::I64  => Ok(ScalarTy::I64),
         past::TypeRef::U64  => Ok(ScalarTy::U64),
+        past::TypeRef::F16  => Ok(ScalarTy::F16),
         past::TypeRef::F32  => Ok(ScalarTy::F32),
         past::TypeRef::F64  => Ok(ScalarTy::F64),
         past::TypeRef::Bool => Ok(ScalarTy::Bool),
@@ -1043,6 +1248,11 @@ fn typeref_to_scalar(tr: &past::TypeRef) -> Result<ScalarTy, &'static str> {
         | past::TypeRef::ReadonlyBuffer(_)
         | past::TypeRef::WriteonlyBuffer(_) => {
             Err("buffer types are not valid for let bindings; use as kernel parameters only")
+        }
+        // CoopMatrix is handled separately via pre_register_coopmat / check_coopmat_let.
+        // Return a sentinel error so callers fall back to the coopmat path.
+        past::TypeRef::CoopMatrix { .. } => {
+            Err("__coopmat__")
         }
     }
 }
@@ -1137,19 +1347,22 @@ fn check_expr(
         past::Expr::Ident(name) => {
             // Check local bindings first, then params.
             match tc.find_binding(name) {
-                Some((bid, ty, _, _)) => {
+                Some((bid, bty, _, _)) => {
+                    // HirExpr.ty is ScalarTy; for coopmat bindings we use a U32 sentinel.
+                    // The CoopMatBuiltin codegen uses the result_ty field, not HirExpr.ty.
+                    let scalar_ty: ScalarTy = bty.as_scalar().unwrap_or(ScalarTy::U32);
                     if let Some(exp) = expected {
-                        if exp != ty {
+                        if exp != scalar_ty {
                             tc.errors.push(TypecheckError::TypeMismatch {
                                 expected: exp.display_name(),
-                                got: ty.display_name(),
+                                got: bty.display_name(),
                                 span,
                             });
                         }
                     }
                     Some(HirExpr {
                         kind: HirExprKind::LocalRead(bid),
-                        ty,
+                        ty: scalar_ty,
                         span,
                     })
                 }
@@ -2267,7 +2480,7 @@ mod tests {
         let (body, errors) = tc_body("let x: i32 = 42; return;");
         assert!(errors.is_empty(), "errors: {errors:?}");
         assert_eq!(body.bindings.len(), 1);
-        assert_eq!(body.bindings[0].ty, ScalarTy::I32);
+        assert_eq!(body.bindings[0].ty, BindingTy::Scalar(ScalarTy::I32));
     }
 
     // 2. tc_let_u64_literal_happy
@@ -2275,7 +2488,7 @@ mod tests {
     fn tc_let_u64_literal_happy() {
         let (body, errors) = tc_body("let x: u64 = 42; return;");
         assert!(errors.is_empty(), "errors: {errors:?}");
-        assert_eq!(body.bindings[0].ty, ScalarTy::U64);
+        assert_eq!(body.bindings[0].ty, BindingTy::Scalar(ScalarTy::U64));
     }
 
     // 3. tc_let_i32_float_lit_rejected
@@ -2363,7 +2576,7 @@ mod tests {
     fn tc_comparison_yields_bool() {
         let (body, errors) = tc_body("let b: bool = 1i32 < 2i32; return;");
         assert!(errors.is_empty(), "errors: {errors:?}");
-        assert_eq!(body.bindings[0].ty, ScalarTy::Bool);
+        assert_eq!(body.bindings[0].ty, BindingTy::Scalar(ScalarTy::Bool));
     }
 
     // 13. tc_short_circuit_requires_bool_operands
@@ -2449,7 +2662,7 @@ mod tests {
     fn tc_bool_eq_happy() {
         let (body, errors) = tc_body("let b: bool = true == false; return;");
         assert!(errors.is_empty(), "errors: {errors:?}");
-        assert_eq!(body.bindings[0].ty, ScalarTy::Bool);
+        assert_eq!(body.bindings[0].ty, BindingTy::Scalar(ScalarTy::Bool));
     }
 
     // 23. tc_shr_on_u32_rejected
@@ -3193,7 +3406,7 @@ mod tests {
     fn tc_subgroup_invocation_id_returns_u32() {
         let (body, errors) = tc_body("let id: u32 = subgroup_invocation_id(); return;");
         assert!(errors.is_empty(), "errors: {errors:?}");
-        assert_eq!(body.bindings[0].ty, ScalarTy::U32);
+        assert_eq!(body.bindings[0].ty, BindingTy::Scalar(ScalarTy::U32));
     }
 
     // AT-402: subgroup_size() -> u32
@@ -3201,7 +3414,7 @@ mod tests {
     fn tc_subgroup_size_returns_u32() {
         let (body, errors) = tc_body("let sz: u32 = subgroup_size(); return;");
         assert!(errors.is_empty(), "errors: {errors:?}");
-        assert_eq!(body.bindings[0].ty, ScalarTy::U32);
+        assert_eq!(body.bindings[0].ty, BindingTy::Scalar(ScalarTy::U32));
     }
 
     // AT-403: subgroup_elect() -> bool
@@ -3209,7 +3422,7 @@ mod tests {
     fn tc_subgroup_elect_returns_bool() {
         let (body, errors) = tc_body("let e: bool = subgroup_elect(); return;");
         assert!(errors.is_empty(), "errors: {errors:?}");
-        assert_eq!(body.bindings[0].ty, ScalarTy::Bool);
+        assert_eq!(body.bindings[0].ty, BindingTy::Scalar(ScalarTy::Bool));
     }
 
     // AT-404: subgroup_reduce_add(i32) -> i32
@@ -3217,7 +3430,7 @@ mod tests {
     fn tc_sg_reduce_add_i32_happy() {
         let (body, errors) = tc_body("let v: i32 = 1i32; let r: i32 = subgroup_reduce_add(v); return;");
         assert!(errors.is_empty(), "errors: {errors:?}");
-        assert_eq!(body.bindings[1].ty, ScalarTy::I32);
+        assert_eq!(body.bindings[1].ty, BindingTy::Scalar(ScalarTy::I32));
     }
 
     // AT-404: subgroup_reduce_add(f32) -> f32
@@ -3225,7 +3438,7 @@ mod tests {
     fn tc_subgroup_reduce_add_f32_accepted() {
         let (body, errors) = tc_body("let v: f32 = 1.0f32; let r: f32 = subgroup_reduce_add(v); return;");
         assert!(errors.is_empty(), "errors: {errors:?}");
-        assert_eq!(body.bindings[1].ty, ScalarTy::F32);
+        assert_eq!(body.bindings[1].ty, BindingTy::Scalar(ScalarTy::F32));
     }
 
     // AT-406: subgroup_reduce_min(u32) -> u32
@@ -3233,7 +3446,7 @@ mod tests {
     fn tc_sg_reduce_min_u32_happy() {
         let (body, errors) = tc_body("let v: u32 = 1u32; let r: u32 = subgroup_reduce_min(v); return;");
         assert!(errors.is_empty(), "errors: {errors:?}");
-        assert_eq!(body.bindings[1].ty, ScalarTy::U32);
+        assert_eq!(body.bindings[1].ty, BindingTy::Scalar(ScalarTy::U32));
     }
 
     // AT-407: subgroup_reduce_max(f64) -> f64
@@ -3241,7 +3454,7 @@ mod tests {
     fn tc_sg_reduce_max_f64_happy() {
         let (body, errors) = tc_body("let v: f64 = 1.0f64; let r: f64 = subgroup_reduce_max(v); return;");
         assert!(errors.is_empty(), "errors: {errors:?}");
-        assert_eq!(body.bindings[1].ty, ScalarTy::F64);
+        assert_eq!(body.bindings[1].ty, BindingTy::Scalar(ScalarTy::F64));
     }
 
     // AT-408: subgroup_broadcast_first(f32) -> f32
@@ -3249,7 +3462,7 @@ mod tests {
     fn tc_sg_broadcast_first_f32_happy() {
         let (body, errors) = tc_body("let v: f32 = 1.0f32; let r: f32 = subgroup_broadcast_first(v); return;");
         assert!(errors.is_empty(), "errors: {errors:?}");
-        assert_eq!(body.bindings[1].ty, ScalarTy::F32);
+        assert_eq!(body.bindings[1].ty, BindingTy::Scalar(ScalarTy::F32));
     }
 
     // AT-409: subgroup_all(bool) -> bool
@@ -3257,7 +3470,7 @@ mod tests {
     fn tc_sg_all_happy() {
         let (body, errors) = tc_body("let p: bool = true; let r: bool = subgroup_all(p); return;");
         assert!(errors.is_empty(), "errors: {errors:?}");
-        assert_eq!(body.bindings[1].ty, ScalarTy::Bool);
+        assert_eq!(body.bindings[1].ty, BindingTy::Scalar(ScalarTy::Bool));
     }
 
     // AT-410: subgroup_any(bool) -> bool
@@ -3265,7 +3478,7 @@ mod tests {
     fn tc_sg_any_happy() {
         let (body, errors) = tc_body("let p: bool = false; let r: bool = subgroup_any(p); return;");
         assert!(errors.is_empty(), "errors: {errors:?}");
-        assert_eq!(body.bindings[1].ty, ScalarTy::Bool);
+        assert_eq!(body.bindings[1].ty, BindingTy::Scalar(ScalarTy::Bool));
     }
 
     // AT-407: workgroup_barrier() as statement — accepted, produces HirStmt::Barrier

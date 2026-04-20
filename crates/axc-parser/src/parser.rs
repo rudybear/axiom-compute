@@ -19,7 +19,7 @@
 use axc_lexer::{Token, TokenKind, Span, Spanned, LexError, is_reserved_subgroup_builtin};
 use crate::ast::{
     Module, Item, KernelDecl, Annotation, AnnotationArg, Block, Stmt, Expr, TypeRef, Param,
-    BinOp, UnaryOp, ShortCircuitOp, ScalarTypeRef, ElseArm,
+    BinOp, UnaryOp, ShortCircuitOp, ScalarTypeRef, ElseArm, CoopMatUseAst,
 };
 
 /// Maximum expression nesting depth before emitting ExpressionNestingTooDeep.
@@ -95,6 +95,22 @@ pub enum ParseError {
     },
     #[error(transparent)]
     LexerError(#[from] LexError),
+
+    // ── M2.1 cooperative-matrix parse errors ────────────────────────────────
+
+    #[error("cooperative-matrix dimension must be an unsuffixed positive integer literal; got {found_kind}")]
+    CoopMatrixDimMustBeUnsuffixedIntegerLiteral {
+        found_kind: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("cooperative-matrix `use` must be `a`, `b`, or `accumulator`; got `{found}`")]
+    CoopMatrixUseMustBeABOrAccumulator {
+        found: String,
+        #[label("here")]
+        span: Span,
+    },
 }
 
 /// Internal enum for infix operators used by the Pratt parser.
@@ -427,6 +443,8 @@ impl<'tok> Parser<'tok> {
             TokenKind::U32  => { self.advance(); TypeRef::U32 }
             TokenKind::I64  => { self.advance(); TypeRef::I64 }
             TokenKind::U64  => { self.advance(); TypeRef::U64 }
+            // M2.1: F16 scalar type
+            TokenKind::F16  => { self.advance(); TypeRef::F16 }
             TokenKind::F32  => { self.advance(); TypeRef::F32 }
             TokenKind::F64  => { self.advance(); TypeRef::F64 }
             // M1.2: buffer types — buffer[elem], readonly_buffer[elem], writeonly_buffer[elem]
@@ -448,9 +466,19 @@ impl<'tok> Parser<'tok> {
                 let end_span: Span = self.last_span();
                 return Some(Spanned::new(TypeRef::WriteonlyBuffer(elem), span.merge(end_span)));
             }
+            // M2.1: `matrix[T, M, N, use]` cooperative-matrix type.
+            // `matrix` is a plain Ident (NOT a keyword) — the parser matches on the ident string.
+            TokenKind::Ident(ref ident) if ident == "matrix" => {
+                self.advance();
+                if let Some(cm) = self.parse_coopmat_type_args() {
+                    let end_span: Span = self.last_span();
+                    return Some(Spanned::new(cm, span.merge(end_span)));
+                }
+                return None;
+            }
             other => {
                 self.errors.push(ParseError::Unexpected {
-                    expected: "type (void, bool, i32, u32, i64, u64, f32, f64, buffer[T], readonly_buffer[T], writeonly_buffer[T])".into(),
+                    expected: "type (void, bool, i32, u32, i64, u64, f16, f32, f64, buffer[T], readonly_buffer[T], writeonly_buffer[T], matrix[T, M, N, use])".into(),
                     found: format!("{:?}", other),
                     span,
                 });
@@ -460,7 +488,114 @@ impl<'tok> Parser<'tok> {
         Some(Spanned::new(ty, span))
     }
 
+    /// Parse `[T, M, N, use]` for `matrix[T, M, N, use]` cooperative-matrix type.
+    ///
+    /// Called after `matrix` ident is consumed. Produces `TypeRef::CoopMatrix { ... }`.
+    fn parse_coopmat_type_args(&mut self) -> Option<TypeRef> {
+        if !self.expect_token(TokenKind::LBracket, "[") {
+            return None;
+        }
+        // Arg 1: element scalar type from the M2.1 allowed set.
+        let elem: ScalarTypeRef = self.parse_coopmat_elem_type()?;
+        if !self.expect_token(TokenKind::Comma, ",") {
+            return None;
+        }
+        // Arg 2: M dimension — unsuffixed positive integer literal.
+        let m: u32 = self.parse_coopmat_dim("M")?;
+        if !self.expect_token(TokenKind::Comma, ",") {
+            return None;
+        }
+        // Arg 3: N dimension.
+        let n: u32 = self.parse_coopmat_dim("N")?;
+        if !self.expect_token(TokenKind::Comma, ",") {
+            return None;
+        }
+        // Arg 4: use tag — bare ident `a`, `b`, or `accumulator`.
+        let use_span: Span = self.peek_span();
+        let use_: CoopMatUseAst = match self.peek_kind().clone() {
+            TokenKind::Ident(ref s) if s == "a" => { self.advance(); CoopMatUseAst::A }
+            TokenKind::Ident(ref s) if s == "b" => { self.advance(); CoopMatUseAst::B }
+            TokenKind::Ident(ref s) if s == "accumulator" => { self.advance(); CoopMatUseAst::Accumulator }
+            TokenKind::Ident(ref s) => {
+                let found = s.clone();
+                self.advance();
+                self.errors.push(ParseError::CoopMatrixUseMustBeABOrAccumulator {
+                    found,
+                    span: use_span,
+                });
+                return None;
+            }
+            other => {
+                self.errors.push(ParseError::Unexpected {
+                    expected: "cooperative-matrix use (`a`, `b`, or `accumulator`)".into(),
+                    found: format!("{:?}", other),
+                    span: use_span,
+                });
+                return None;
+            }
+        };
+        if !self.expect_token(TokenKind::RBracket, "]") {
+            return None;
+        }
+        Some(TypeRef::CoopMatrix { elem, m, n, use_ })
+    }
+
+    /// Parse a cooperative-matrix element type from the M2.1 allowed set.
+    fn parse_coopmat_elem_type(&mut self) -> Option<ScalarTypeRef> {
+        match self.peek_kind().clone() {
+            TokenKind::I8  => { self.advance(); Some(ScalarTypeRef::I8) }
+            TokenKind::U8  => { self.advance(); Some(ScalarTypeRef::U8) }
+            TokenKind::I32 => { self.advance(); Some(ScalarTypeRef::I32) }
+            TokenKind::U32 => { self.advance(); Some(ScalarTypeRef::U32) }
+            TokenKind::F16 => { self.advance(); Some(ScalarTypeRef::F16) }
+            TokenKind::F32 => { self.advance(); Some(ScalarTypeRef::F32) }
+            other => {
+                self.errors.push(ParseError::Unexpected {
+                    expected: "cooperative-matrix element type (i8, u8, i32, u32, f16, f32)".into(),
+                    found: format!("{:?}", other),
+                    span: self.peek_span(),
+                });
+                None
+            }
+        }
+    }
+
+    /// Parse an unsuffixed positive integer literal for a cooperative-matrix dimension.
+    fn parse_coopmat_dim(&mut self, dim_name: &str) -> Option<u32> {
+        let dim_span = self.peek_span();
+        match self.peek_kind().clone() {
+            TokenKind::IntLiteral { value, suffix: None, .. } => {
+                self.advance();
+                if value <= 0 || value > 65535 {
+                    self.errors.push(ParseError::CoopMatrixDimMustBeUnsuffixedIntegerLiteral {
+                        found_kind: format!("{value} (out of range 1..=65535 for {dim_name})"),
+                        span: dim_span,
+                    });
+                    return None;
+                }
+                Some(value as u32)
+            }
+            TokenKind::IntLiteral { suffix: Some(_), .. } => {
+                self.advance();
+                self.errors.push(ParseError::CoopMatrixDimMustBeUnsuffixedIntegerLiteral {
+                    found_kind: "suffixed integer literal (remove the suffix)".into(),
+                    span: dim_span,
+                });
+                None
+            }
+            other => {
+                self.errors.push(ParseError::CoopMatrixDimMustBeUnsuffixedIntegerLiteral {
+                    found_kind: format!("{:?}", other),
+                    span: dim_span,
+                });
+                None
+            }
+        }
+    }
+
     /// Parse `[scalar_type]` after a buffer keyword.
+    ///
+    /// M2.1: f16 is now accepted as a buffer element type.
     fn parse_buffer_elem(&mut self) -> Option<ScalarTypeRef> {
         if !self.expect_token(TokenKind::LBracket, "[") {
             return None;
@@ -470,11 +605,13 @@ impl<'tok> Parser<'tok> {
             TokenKind::U32 => { self.advance(); ScalarTypeRef::U32 }
             TokenKind::I64 => { self.advance(); ScalarTypeRef::I64 }
             TokenKind::U64 => { self.advance(); ScalarTypeRef::U64 }
+            // M2.1: f16 buffer elements allowed.
+            TokenKind::F16 => { self.advance(); ScalarTypeRef::F16 }
             TokenKind::F32 => { self.advance(); ScalarTypeRef::F32 }
             TokenKind::F64 => { self.advance(); ScalarTypeRef::F64 }
             other => {
                 self.errors.push(ParseError::Unexpected {
-                    expected: "buffer element type (i32, u32, i64, u64, f32, f64)".into(),
+                    expected: "buffer element type (i32, u32, i64, u64, f16, f32, f64)".into(),
                     found: format!("{:?}", other),
                     span: self.peek_span(),
                 });

@@ -295,7 +295,9 @@ fn lower_type_ref(
             elem: lower_scalar_type_ref(elem),
             access: BufferAccess::WriteOnly,
         })),
-        TypeRef::Void | TypeRef::Bool => {
+        TypeRef::F16 => Some(ParamTy::Scalar(ScalarTy::F16)),
+        // CoopMatrix is not a valid kernel parameter type in M2.1 (only let-bindings).
+        TypeRef::CoopMatrix { .. } | TypeRef::Void | TypeRef::Bool => {
             errors.push(HirError::UnsupportedParamType {
                 ty_name: format!("{:?}", tr),
                 param_name: param_name.to_owned(),
@@ -309,10 +311,13 @@ fn lower_type_ref(
 /// Convert an AST `ScalarTypeRef` to an HIR `ScalarTy`.
 fn lower_scalar_type_ref(str_ref: &ScalarTypeRef) -> ScalarTy {
     match str_ref {
+        ScalarTypeRef::I8  => ScalarTy::I8,
+        ScalarTypeRef::U8  => ScalarTy::U8,
         ScalarTypeRef::I32 => ScalarTy::I32,
         ScalarTypeRef::U32 => ScalarTy::U32,
         ScalarTypeRef::I64 => ScalarTy::I64,
         ScalarTypeRef::U64 => ScalarTy::U64,
+        ScalarTypeRef::F16 => ScalarTy::F16,
         ScalarTypeRef::F32 => ScalarTy::F32,
         ScalarTypeRef::F64 => ScalarTy::F64,
     }
@@ -1017,7 +1022,7 @@ mod tests {
             KernelBody::Empty => panic!("expected Typed"),
         };
         // The second binding is the reduce result.
-        assert_eq!(typed.bindings[1].ty, crate::ty::ScalarTy::F32, "reduce result must be f32");
+        assert_eq!(typed.bindings[1].ty, crate::expr::BindingTy::Scalar(crate::ty::ScalarTy::F32), "reduce result must be f32");
         // Find the Let stmt for `r` and check the SubgroupBuiltin node.
         let r_stmt = typed.stmts.iter()
             .filter_map(|s| if let HirStmt::Let { init, .. } = s { Some(init) } else { None })

@@ -357,6 +357,9 @@ fn stmt_uses_gid(stmt: &HirStmt) -> bool {
         HirStmt::While(hir_while) => {
             expr_uses_gid(&hir_while.cond) || hir_while.body.iter().any(stmt_uses_gid)
         }
+        HirStmt::CoopMatStore { element_offset, stride, .. } => {
+            expr_uses_gid(element_offset) || expr_uses_gid(stride)
+        }
     }
 }
 
@@ -380,6 +383,7 @@ fn expr_uses_gid(expr: &axc_hir::expr::HirExpr) -> bool {
         HirExprKind::ShortCircuit { lhs, rhs, .. } => expr_uses_gid(lhs) || expr_uses_gid(rhs),
         HirExprKind::BitwiseBuiltin { args, .. } => args.iter().any(expr_uses_gid),
         HirExprKind::SubgroupBuiltin { args, .. } => args.iter().any(expr_uses_gid),
+        HirExprKind::CoopMatBuiltin { args, .. } => args.iter().any(expr_uses_gid),
         HirExprKind::IntLit { .. }
         | HirExprKind::FloatLit { .. }
         | HirExprKind::BoolLit(_)
@@ -426,6 +430,10 @@ fn stmt_uses_subgroup_op(stmt: &HirStmt, target: SubgroupOp) -> bool {
             expr_uses_subgroup_op(&hir_while.cond, target)
                 || hir_while.body.iter().any(|s| stmt_uses_subgroup_op(s, target))
         }
+        HirStmt::CoopMatStore { element_offset, stride, .. } => {
+            expr_uses_subgroup_op(element_offset, target)
+                || expr_uses_subgroup_op(stride, target)
+        }
     }
 }
 
@@ -458,6 +466,9 @@ fn expr_uses_subgroup_op(expr: &axc_hir::expr::HirExpr, target: SubgroupOp) -> b
             expr_uses_subgroup_op(lhs, target) || expr_uses_subgroup_op(rhs, target)
         }
         HirExprKind::BitwiseBuiltin { args, .. } => {
+            args.iter().any(|a| expr_uses_subgroup_op(a, target))
+        }
+        HirExprKind::CoopMatBuiltin { args, .. } => {
             args.iter().any(|a| expr_uses_subgroup_op(a, target))
         }
         HirExprKind::GidBuiltin { .. }

@@ -2,13 +2,14 @@
 //!
 //! Separate module so it can be reused by buffer/vector types in M1.2+.
 //! `ScalarTy` is the only type in scope for M1.1; `Ty` wraps it for extensibility.
+//! M2.1 adds `F16` (IEEE 754 binary16) for cooperative-matrix element support.
 
-/// The set of scalar types supported in M1.1.
+/// The set of scalar types supported in M1.1+.
 ///
-/// Smaller integer widths (i8/i16/u8/u16) and reduced-precision floats (f16/bf16)
-/// are deferred to a focused M1.x; they are not in scope for M1.1.
+/// `F16` is added in M2.1 as a cooperative-matrix element type and buffer element type.
+/// `bf16` remains deferred to a later milestone (not in M2.1 scope).
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ScalarTy {
     I8,
     I16,
@@ -18,6 +19,7 @@ pub enum ScalarTy {
     U16,
     U32,
     U64,
+    F16,
     F32,
     F64,
     Bool,
@@ -43,9 +45,9 @@ impl ScalarTy {
         matches!(self, ScalarTy::U8 | ScalarTy::U16 | ScalarTy::U32 | ScalarTy::U64)
     }
 
-    /// True for floating-point types (F32, F64).
+    /// True for floating-point types (F16, F32, F64).
     pub fn is_float(&self) -> bool {
-        matches!(self, ScalarTy::F32 | ScalarTy::F64)
+        matches!(self, ScalarTy::F16 | ScalarTy::F32 | ScalarTy::F64)
     }
 
     /// True for the boolean type.
@@ -59,7 +61,7 @@ impl ScalarTy {
     pub fn bit_width(&self) -> u32 {
         match self {
             ScalarTy::I8  | ScalarTy::U8  => 8,
-            ScalarTy::I16 | ScalarTy::U16 => 16,
+            ScalarTy::I16 | ScalarTy::U16 | ScalarTy::F16 => 16,
             ScalarTy::I32 | ScalarTy::U32 | ScalarTy::F32 => 32,
             ScalarTy::I64 | ScalarTy::U64 | ScalarTy::F64 => 64,
             ScalarTy::Bool => 1,
@@ -77,6 +79,7 @@ impl ScalarTy {
             ScalarTy::U16  => "u16",
             ScalarTy::U32  => "u32",
             ScalarTy::U64  => "u64",
+            ScalarTy::F16  => "f16",
             ScalarTy::F32  => "f32",
             ScalarTy::F64  => "f64",
             ScalarTy::Bool => "bool",
@@ -128,11 +131,21 @@ pub struct FloatLiteralValue {
 }
 
 /// Error from range-checking a literal against a target type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LiteralRangeErr {
     IntegerOutOfRange { value: i128, target: ScalarTy },
     FloatTargetInvalid { target: ScalarTy },
     FloatNonFinite,
+    /// The f64 value converts to ±infinity in IEEE-754 binary16.
+    ///
+    /// M2.1: f16 has a much narrower range than f32 (max finite ≈ 65504).
+    /// Values that round to +inf/-inf under bin16 conversion are rejected.
+    FloatOutOfRangeForF16 { value: f64, target: ScalarTy },
+    /// The f64 value is non-zero but rounds to zero (or a subnormal that has
+    /// zero bin16 representation), causing silent precision loss in f16.
+    ///
+    /// M2.1 AT-630: reject `1.0e-6f16` etc. to prevent silent underflow.
+    FloatSubnormalPrecisionLoss { value: f64, target: ScalarTy },
 }
 
 /// Fit an integer literal `value` into `ty`, checking the type's range.
@@ -163,7 +176,9 @@ pub fn fit_int_literal(value: i128, ty: ScalarTy) -> Result<IntLiteralValue, Lit
 
 /// Fit a float literal `value` into `ty`.
 ///
-/// Checks that `ty` is F32 or F64, and that `value` is finite.
+/// Checks that `ty` is F16, F32, or F64, and that `value` is finite.
+/// For F16: also rejects values that overflow to infinity or that silently
+/// underflow to zero from a non-zero input (AT-630).
 pub fn fit_float_literal(value: f64, ty: ScalarTy) -> Result<FloatLiteralValue, LiteralRangeErr> {
     if !ty.is_float() {
         return Err(LiteralRangeErr::FloatTargetInvalid { target: ty });
@@ -172,9 +187,24 @@ pub fn fit_float_literal(value: f64, ty: ScalarTy) -> Result<FloatLiteralValue, 
         return Err(LiteralRangeErr::FloatNonFinite);
     }
     let bits: u64 = match ty {
+        ScalarTy::F16 => {
+            // Use the half crate for bin16 conversion.
+            let h = half::f16::from_f64(value);
+            // Reject values that overflowed to ±infinity under bin16.
+            if h.is_infinite() {
+                return Err(LiteralRangeErr::FloatOutOfRangeForF16 { value, target: ty });
+            }
+            // Reject non-zero inputs that silently underflow to zero in bin16 (AT-630).
+            // A non-zero f64 producing a bin16 representation of zero means we lost ALL
+            // information — this is a silent precision loss that must be explicit.
+            if value != 0.0 && h.to_bits() == 0 {
+                return Err(LiteralRangeErr::FloatSubnormalPrecisionLoss { value, target: ty });
+            }
+            h.to_bits() as u64
+        }
         ScalarTy::F32 => (value as f32).to_bits() as u64,
         ScalarTy::F64 => value.to_bits(),
-        _ => unreachable!(),
+        _ => unreachable!("fit_float_literal: unexpected non-float ScalarTy"),
     };
     Ok(FloatLiteralValue { ty, bits })
 }
@@ -203,6 +233,69 @@ mod tests {
         assert_eq!(ScalarTy::F32.bit_width(), 32);
         assert_eq!(ScalarTy::F64.bit_width(), 64);
         assert_eq!(ScalarTy::Bool.bit_width(), 1);
+    }
+
+    // ── M2.1: F16 tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn scalar_ty_f16_is_float_not_integer() {
+        assert!(ScalarTy::F16.is_float(), "F16 must be a float type");
+        assert!(!ScalarTy::F16.is_integer(), "F16 is not an integer");
+        assert!(!ScalarTy::F16.is_signed_integer(), "F16 is not signed integer");
+        assert!(!ScalarTy::F16.is_unsigned_integer(), "F16 is not unsigned integer");
+        assert!(!ScalarTy::F16.is_bool(), "F16 is not bool");
+    }
+
+    #[test]
+    fn scalar_ty_f16_bit_width_16() {
+        assert_eq!(ScalarTy::F16.bit_width(), 16, "F16 must have bit width 16");
+    }
+
+    #[test]
+    fn scalar_ty_f16_display_name() {
+        assert_eq!(ScalarTy::F16.display_name(), "f16", "F16 display name must be \"f16\"");
+    }
+
+    #[test]
+    fn fit_float_literal_f16_happy() {
+        // 1.5 is exactly representable in bin16.
+        let v = fit_float_literal(1.5, ScalarTy::F16).expect("1.5 should fit in f16");
+        assert_eq!(v.ty, ScalarTy::F16);
+        let expected_bits: u64 = half::f16::from_f64(1.5).to_bits() as u64;
+        assert_eq!(v.bits, expected_bits, "bits must match half::f16::from_f64(1.5)");
+    }
+
+    #[test]
+    fn fit_float_literal_f16_overflow_rejected() {
+        // 1.0e10 overflows to infinity in bin16.
+        let e = fit_float_literal(1.0e10, ScalarTy::F16).unwrap_err();
+        assert!(
+            matches!(e, LiteralRangeErr::FloatOutOfRangeForF16 { .. }),
+            "expected FloatOutOfRangeForF16, got {e:?}"
+        );
+    }
+
+    /// AT-630: f16 subnormal underflow.
+    #[test]
+    fn fit_float_literal_f16_subnormal_underflow_rejected() {
+        // 1.0e-10 is smaller than the smallest f16 subnormal (5.96e-8) and rounds
+        // to zero in bin16 — silent underflow, must be rejected.
+        let e = fit_float_literal(1.0e-10, ScalarTy::F16).unwrap_err();
+        assert!(
+            matches!(e, LiteralRangeErr::FloatSubnormalPrecisionLoss { .. }),
+            "expected FloatSubnormalPrecisionLoss for 1.0e-10, got {e:?}"
+        );
+
+        // Exact zero is always fine.
+        let v = fit_float_literal(0.0, ScalarTy::F16).expect("0.0 must be accepted for f16");
+        assert_eq!(v.bits, 0, "0.0 in f16 must have bits == 0");
+
+        // 5.96e-8 is approximately the smallest f16 subnormal and has non-zero bin16 bits.
+        // half::f16::MIN_POSITIVE_SUBNORMAL is 5.96046e-8 (2^-24).
+        let small = half::f16::MIN_POSITIVE_SUBNORMAL.to_f64();
+        let v2 = fit_float_literal(small, ScalarTy::F16)
+            .expect("smallest f16 subnormal (non-zero bin16 bits) must be accepted");
+        assert_ne!(v2.bits, 0, "smallest f16 subnormal must have non-zero bin16 bits");
     }
 
     #[test]
