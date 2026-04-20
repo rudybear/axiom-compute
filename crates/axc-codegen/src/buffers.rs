@@ -36,7 +36,7 @@
 //!
 //! The input variable is included in the OpEntryPoint interface list.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use rspirv::dr::{Builder, Operand};
 use rspirv::spirv::{
     Word, StorageClass, Decoration, BuiltIn,
@@ -89,6 +89,12 @@ pub fn emit_buffer_globals(
     buffers: &[BufferBindingSlot],
 ) -> BufferBindings {
     let mut out = BufferBindings::new();
+    // Track runtime-array type ids that have already received an ArrayStride decoration.
+    // rspirv deduplicates OpTypeRuntimeArray for the same element type, so multiple SSBOs
+    // with the same element type share one arr_id. Without this guard, each SSBO loop
+    // iteration would emit a second identical OpDecorate ArrayStride on the same id —
+    // spirv-val rejects "ID decorated with ArrayStride multiple times" (SPIR-V §3.20).
+    let mut decorated_array_ids: BTreeSet<Word> = BTreeSet::new();
 
     for slot in buffers {
         let bp = slot.buffer_position;
@@ -117,7 +123,12 @@ pub fn emit_buffer_globals(
         let var_id: Word = b.variable(ptr_to_struct_id, None, StorageClass::StorageBuffer, None);
 
         // 7. OpDecorate arr_T ArrayStride <bytes>
-        b.decorate(arr_id, Decoration::ArrayStride, [Operand::LiteralBit32(elem_byte_size)]);
+        // Only decorate each unique arr_id once. rspirv deduplicates OpTypeRuntimeArray
+        // across SSBOs with the same element type, so without this guard the same arr_id
+        // would receive multiple identical ArrayStride decorations — rejected by spirv-val.
+        if decorated_array_ids.insert(arr_id) {
+            b.decorate(arr_id, Decoration::ArrayStride, [Operand::LiteralBit32(elem_byte_size)]);
+        }
 
         // 8. OpDecorate struct Block
         b.decorate(struct_type_id, Decoration::Block, []);
