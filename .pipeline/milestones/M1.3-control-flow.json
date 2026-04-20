@@ -1,0 +1,55 @@
+{
+  "id": "M1.3-control-flow",
+  "title": "Structured control flow: if/else, for/while loops, break/continue",
+  "phase": "M1",
+  "goal": "Extend M1.2 with structured selection (if/else) and iteration (for-range, while) constructs, lowered to SPIR-V structured control flow (OpLoopMerge, OpSelectionMerge, OpBranchConditional). Unlocks real algorithms inside kernels: reductions, prefix scans, any-thread iteration over work-per-thread.",
+  "scope_in": [
+    "if / else if / else chains with bool condition",
+    "for i in range(start, end) { body } — inclusive-start, exclusive-end, u32 induction var",
+    "for i in range(start, end, step) { body } — with step (must be positive, compile-time constant for M1.3)",
+    "while condition { body } — bool condition, unbounded iteration",
+    "break; — exits innermost enclosing loop only",
+    "continue; — jumps to next iteration of innermost loop",
+    "Structured SPIR-V: OpLoopMerge(merge, continue_target, None) + OpSelectionMerge(merge) + OpBranchConditional; header-body-continue-merge block scheme per SPIR-V §2.11",
+    "HIR validation: break/continue outside a loop → error; break/continue in wrong scope (inside nested fn — but M1.3 has no nested fns) is N/A",
+    "HIR: for-range step must be a compile-time positive integer constant; variable step rejected as UnsupportedForStepInM1_3 or similar",
+    "Escape analysis for induction variable: it's immutable inside body (HIR rejects `i = 0;` inside for-body)",
+    "Example: examples/reduction.axc — per-workgroup sum of an SSBO via loop (single-threaded per workgroup for now; atomics + subgroup come M1.4)",
+    "Example: examples/vector_axpy.axc — non-parallel saxpy using a for loop (one thread does N multiplies/adds) — illustrates loop codegen without needing M1.4 subgroup"
+  ],
+  "scope_out": [
+    "Early return from kernel (M1.4; SPIR-V 1.3 structured return is tricky)",
+    "Iterator protocol / for x in container (never — AXIOM is explicit)",
+    "Match expression with control flow (later; match on ints per AXIOM parent)",
+    "Nested break/continue with labeled scopes (never; single-level only)",
+    "Loop unrolling hints (M2 — @vectorizable)",
+    "Recursive functions (likely never on GPU)",
+    "goto (never)",
+    "Subgroup barriers inside loops (M1.4)",
+    "Atomics (M1.4)"
+  ],
+  "acceptance_criteria": [
+    "cargo test --workspace passes (expected ≥300 tests after M1.3 additions; target floor 310)",
+    "cargo clippy --workspace --all-targets -- -D warnings clean",
+    "spirv-val passes on emitted SPIR-V for examples/reduction.axc and examples/vector_axpy.axc (verified on CI where spirv-tools is installed)",
+    "HIR rejects break/continue outside a loop with UnsupportedBreakOutsideLoop / UnsupportedContinueOutsideLoop",
+    "HIR rejects for-step that is not a positive compile-time integer constant",
+    "HIR rejects assignment to for-loop induction variable inside body",
+    "Emitted SPIR-V contains OpLoopMerge for every loop and OpSelectionMerge for every if",
+    "Regression: all M0+M1.1+M1.2 tests still pass (252 baseline)",
+    "Determinism: compile same source twice → bytewise-identical SPIR-V"
+  ],
+  "memory_limit_gb": 50,
+  "dependencies": ["M1.2-buffers"],
+  "blocks": ["M1.4-subgroup-ops", "M1.5-vulkan-dispatch"],
+  "estimated_loc": "2500-4000",
+  "estimated_tests_added": "60-80",
+  "open_questions_for_architect": [
+    "for-loop step: compile-time constant only, or runtime-variable? Latter is harder (no unroll), former simpler but less flexible. Recommend compile-time constant for M1.3; relax in M2.",
+    "Should break/continue be keywords (TokenKind::Break/Continue) that are already reserved in parser's M1_1_RESERVED_KEYWORDS? Check and remove from the reserved list.",
+    "Do we need a do-while or loop{} infinite-loop construct? Skip for M1.3; add if users request.",
+    "Structured control flow: SPIR-V §2.11 requires strict single-entry-single-exit headers. Any way to violate this from the surface language? E.g., `break; return;` — the second statement is unreachable. Treat as UnreachableCode warning or silent OK?",
+    "Induction variable scope: does `for i in range(0,10) { } let x = i;` reference i after the loop? Per usual semantics, no — i is loop-scoped. Spec it.",
+    "Loop header condition evaluated once or every iteration? Every iteration (standard). Spec it clearly."
+  ]
+}
