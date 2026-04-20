@@ -61,7 +61,8 @@ pub struct KernelParam {
 ///   - `a`  → push-constant scalar (position=0)
 ///   - `x`  → buffer_position=0, binding=0
 ///   - `y`  → buffer_position=1, binding=1
-#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BufferBindingSlot {
     /// Parameter name (for diagnostics and codegen variable naming).
     pub name: String,
@@ -71,7 +72,8 @@ pub struct BufferBindingSlot {
     pub position: u32,
     /// 0-based index among buffer params only. Used as `Decoration::Binding N`.
     pub buffer_position: u32,
-    /// Source span.
+    /// Source span — skipped during serde serialization (not meaningful at runtime).
+    #[cfg_attr(feature = "serde", serde(skip))]
     pub span: Span,
 }
 
@@ -85,7 +87,8 @@ pub struct BufferBindingSlot {
 ///   - `x`  → buffer (skipped in scalar counter)
 ///   - `a`  → position=1, member_index=0, offset=0
 ///   - `b`  → position=2, member_index=1, offset=4
-#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScalarPushConstantSlot {
     /// Parameter name.
     pub name: String,
@@ -98,7 +101,8 @@ pub struct ScalarPushConstantSlot {
     pub member_index: u32,
     /// 0-based position in the kernel's full parameter list.
     pub position: u32,
-    /// Source span.
+    /// Source span — skipped during serde serialization (not meaningful at runtime).
+    #[cfg_attr(feature = "serde", serde(skip))]
     pub span: Span,
 }
 
@@ -110,7 +114,8 @@ pub const MAX_PUSH_CONSTANT_BYTES: u32 = 128;
 ///
 /// Computed by `compute_binding_plan` during HIR lowering.
 /// Consumed by codegen to emit SPIR-V descriptors and push-constant blocks.
-#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParamBindingPlan {
     /// SSBO bindings, ordered by `buffer_position`.
     pub buffers: Vec<BufferBindingSlot>,
@@ -221,6 +226,68 @@ mod tests {
     use super::*;
     use crate::buffer::BufferAccess;
     use axc_lexer::Span;
+
+    /// AT-508: ParamBindingPlan serde roundtrip preserves all bindings.
+    ///
+    /// Constructs a saxpy-shaped plan (scalars: n:u32 + alpha:f32; buffers: x:f32_ro + y:f32_rw),
+    /// serializes to JSON, deserializes back, and asserts equality via PartialEq.
+    /// Span fields are skipped (deserialized as Span::default()) per the serde skip rule.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn at_508_param_binding_plan_serde_roundtrip_preserves_bindings() {
+        use crate::ty::ScalarTy;
+        use crate::buffer::{BufferAccess, BufferTy};
+
+        let plan: ParamBindingPlan = ParamBindingPlan {
+            buffers: vec![
+                BufferBindingSlot {
+                    name: "x".to_owned(),
+                    ty: BufferTy { elem: ScalarTy::F32, access: BufferAccess::ReadOnly },
+                    position: 2,
+                    buffer_position: 0,
+                    span: Span::default(),
+                },
+                BufferBindingSlot {
+                    name: "y".to_owned(),
+                    ty: BufferTy { elem: ScalarTy::F32, access: BufferAccess::ReadWrite },
+                    position: 3,
+                    buffer_position: 1,
+                    span: Span::default(),
+                },
+            ],
+            scalars: vec![
+                ScalarPushConstantSlot {
+                    name: "n".to_owned(),
+                    ty: ScalarTy::U32,
+                    offset: 0,
+                    member_index: 0,
+                    position: 0,
+                    span: Span::default(),
+                },
+                ScalarPushConstantSlot {
+                    name: "alpha".to_owned(),
+                    ty: ScalarTy::F32,
+                    offset: 4,
+                    member_index: 1,
+                    position: 1,
+                    span: Span::default(),
+                },
+            ],
+            push_constant_total_bytes: 8,
+        };
+
+        let json: String = serde_json::to_string(&plan).expect("serialize should succeed");
+        let roundtripped: ParamBindingPlan =
+            serde_json::from_str(&json).expect("deserialize should succeed");
+
+        // PartialEq compares all fields; Span fields will be Span::default() after roundtrip.
+        assert_eq!(plan, roundtripped, "serde roundtrip must preserve all binding plan fields");
+        assert_eq!(roundtripped.buffers[0].name, "x");
+        assert_eq!(roundtripped.buffers[1].buffer_position, 1);
+        assert_eq!(roundtripped.scalars[0].offset, 0);
+        assert_eq!(roundtripped.scalars[1].offset, 4);
+        assert_eq!(roundtripped.push_constant_total_bytes, 8);
+    }
 
     fn dummy_span() -> Span {
         Span::new(0, 1)

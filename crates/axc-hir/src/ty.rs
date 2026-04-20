@@ -7,6 +7,7 @@
 ///
 /// Smaller integer widths (i8/i16/u8/u16) and reduced-precision floats (f16/bf16)
 /// are deferred to a focused M1.x; they are not in scope for M1.1.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScalarTy {
     I8,

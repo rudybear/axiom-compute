@@ -29,6 +29,16 @@ impl From<Span> for miette::SourceSpan {
     }
 }
 
+impl Default for Span {
+    /// Returns the zero span `Span { start: 0, end: 0 }`.
+    ///
+    /// Used as the serde-skip default for `Span` fields in HIR binding plan types.
+    /// Serde calls `Default::default()` automatically for skipped fields on deserialization.
+    fn default() -> Self {
+        Self { start: 0, end: 0 }
+    }
+}
+
 impl Span {
     /// Create a new span from inclusive `start` to exclusive `end` byte offsets.
     pub fn new(start: u32, end: u32) -> Self {
@@ -438,6 +448,20 @@ mod tests {
         assert_eq!(s.end, 7);
         assert_eq!(s.len(), 4);
         assert!(!s.is_empty());
+    }
+
+    /// AT-508a: Span::default returns Span { start: 0, end: 0 }.
+    ///
+    /// This is required so that serde-skipped Span fields on HIR binding-plan
+    /// types (BufferBindingSlot, ScalarPushConstantSlot) deserialize correctly
+    /// via `serde(skip)` — serde calls Default::default() for skipped fields.
+    #[test]
+    fn at_508a_span_default_impl_returns_zero_zero() {
+        let d: Span = Span::default();
+        assert_eq!(d, Span::new(0, 0), "Span::default() must equal Span::new(0, 0)");
+        assert_eq!(d.start, 0);
+        assert_eq!(d.end, 0);
+        assert!(d.is_empty());
     }
 
     #[test]

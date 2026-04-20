@@ -12,6 +12,7 @@ use crate::ty::ScalarTy;
 /// - `ReadWrite` → no extra decoration (default SSBO)
 /// - `ReadOnly`  → `Decoration::NonWritable`
 /// - `WriteOnly` → `Decoration::NonReadable`
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BufferAccess {
     /// Buffer is readable and writable. No extra decoration.
@@ -37,6 +38,7 @@ impl BufferAccess {
 ///
 /// Corresponds to `buffer[T]`, `readonly_buffer[T]`, `writeonly_buffer[T]`
 /// in the source language.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BufferTy {
     /// Element type. Only 32-bit and 64-bit scalars are supported in M1.2.
