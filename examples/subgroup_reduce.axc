@@ -1,0 +1,24 @@
+// subgroup_reduce.axc — M1.4 example: subgroup reduction using subgroup_reduce_add.
+//
+// Each invocation contributes its own value; the subgroup reduce sums them
+// and the elected invocation writes the result to the output buffer.
+//
+// Demonstrates:
+//   - subgroup_invocation_id() for lane identification
+//   - subgroup_elect() for selecting a single writer per subgroup
+//   - subgroup_reduce_add() for reduction across the subgroup
+
+@kernel
+@workgroup(64,1,1)
+@intent("subgroup-local sum reduction: out[subgroup_id] = sum of all invocation values in subgroup")
+fn subgroup_reduce_demo(n: u32, data: readonly_buffer[f32], out: buffer[f32]) -> void {
+    let gid: u32 = gid(0u32);
+    let lane: u32 = subgroup_invocation_id();
+    let val: f32 = data[gid];
+    let sum: f32 = subgroup_reduce_add(val);
+    let is_leader: bool = subgroup_elect();
+    if is_leader {
+        out[gid] = sum;
+    }
+    return;
+}

@@ -171,6 +171,15 @@ pub enum Stmt {
     Break,
     /// `continue;`
     Continue,
+    /// A bare `IDENT(args);` call to a reserved subgroup builtin at statement position.
+    ///
+    /// Only `workgroup_barrier()` returns void and is the canonical use here.
+    /// All other reserved builtin names at statement position are rejected at HIR
+    /// typecheck with `NonVoidSubgroupCallAsStatement`. The parser does NOT check
+    /// return type; that is HIR's responsibility.
+    ///
+    /// The inner `Expr` is always `Expr::Call { name, args }`.
+    BuiltinCallStmt { call: Spanned<Expr> },
 }
 
 /// Binary arithmetic / comparison operator.

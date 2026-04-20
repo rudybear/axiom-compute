@@ -1,0 +1,29 @@
+// workgroup_barrier_demo.axc — M1.4 example: workgroup barrier synchronization.
+//
+// Demonstrates workgroup_barrier() to synchronize all invocations in a workgroup
+// before reading back computed values.
+//
+// Pattern:
+//   1. Each invocation computes a value and writes to output.
+//   2. workgroup_barrier() ensures all writes are visible.
+//   3. Each invocation reads a neighbor's value.
+//
+// Note: This is a pedagogical example; in practice you would use workgroup shared memory
+// (not available until M1.5 shared memory feature). Here we use the global buffer
+// as a stand-in to demonstrate the barrier emission pattern.
+
+@kernel
+@workgroup(64,1,1)
+@intent("demonstrate workgroup barrier: write, synchronize, re-read")
+fn workgroup_barrier_demo(n: u32, buf: buffer[f32]) -> void {
+    let gid: u32 = gid(0u32);
+    let v: f32 = buf[gid];
+    buf[gid] = v + 1.0f32;
+    workgroup_barrier();
+    let neighbor: u32 = gid + 1u32;
+    if neighbor < n {
+        let nb_val: f32 = buf[neighbor];
+        buf[gid] = nb_val;
+    }
+    return;
+}
