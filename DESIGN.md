@@ -220,6 +220,79 @@ extensions. Ten builtin call names:
 AXIOM-Compute mechanically forces this in the capability aggregation step to avoid spirv-val
 rejection (SPIR-V §3.31).
 
+### 3.1.6 Runtime dispatch (M1.5)
+
+#### VulkanContext lifecycle
+
+`VulkanContext::new()` initializes Vulkan 1.1: loads `ash::Entry`, creates an `Instance`,
+selects the first physical device with a compute queue family (or the index in
+`AXC_PHYSICAL_DEVICE_INDEX`), creates a logical `Device` + `Queue`, and a
+`CommandPool` with `RESET_COMMAND_BUFFER`. Cached fields:
+- `max_compute_work_group_count: [u32; 3]` — for dispatch pre-validation
+- `memory_properties: VkPhysicalDeviceMemoryProperties` — for buffer allocation
+
+`Drop` calls `vkDeviceWaitIdle` then destroys: CommandPool → Device → Instance.
+This order is critical on Lavapipe to prevent `VK_ERROR_DEVICE_LOST` shutdown races.
+
+#### DispatchRequest API
+
+```rust
+pub struct DispatchRequest<'a> {
+    pub spirv: &'a [u32],
+    pub binding_plan: &'a ParamBindingPlan,
+    pub workgroups: [u32; 3],
+    pub inputs: &'a [&'a [u8]],
+    pub output_sizes: &'a [usize],
+    pub push_constants: &'a [u8],
+    pub entry_point: &'a str,
+}
+```
+
+`VulkanContext::dispatch(req)` returns `Vec<Vec<u8>>` — one output per buffer binding.
+All Vulkan resources (shader module, pipeline, buffers, descriptors, command buffer, fence)
+are freed via `DispatchResources` RAII on both success and error paths.
+
+#### Metadata sidecar schema v1
+
+Written by `axc_driver::compile_file` as `<output>.axc.meta.json`. Fields:
+- `schema_version: 1`
+- `kernel_name: String`
+- `workgroup_size: [u32; 3]`
+- `binding_plan: ParamBindingPlan` (serde-enabled; Span fields skipped)
+- `push_constant_total_bytes: u32`
+- `entry_point: String` (always `"main"` in M1.5)
+
+#### Host-visible memory + M2 staging-buffer plan
+
+M1.5 allocates all buffers in `HOST_VISIBLE | HOST_COHERENT` memory. This avoids
+explicit `vkFlushMappedMemoryRanges` / `vkInvalidateMappedMemoryRanges`. Mobile GPUs
+that lack coherent host-visible memory will hit `DispatchError::NoCompatibleMemoryType`
+until M2 adds a staging-buffer fallback path.
+
+#### Fence timeout
+
+Default: 10,000 ms. Override via `AXC_FENCE_TIMEOUT_MS` environment variable.
+
+#### Push-constant byte-assembly discipline
+
+Callers MUST iterate `binding_plan.scalars` in stored order, dispatch on `scalar.ty`,
+and write `scalar.offset` bytes. Never hardcode layout. This ensures correctness if
+future milestones add alignment padding or reorder scalars.
+
+#### Workgroup-count device-limit pre-validation
+
+Before any resource allocation, `dispatch()` checks that all three workgroup dimensions
+do not exceed `VkPhysicalDeviceLimits::max_compute_work_group_count` (cached at
+`VulkanContext::new()`). Returns `DispatchError::WorkgroupCountExceedsDeviceLimit`
+if any dimension exceeds the limit.
+
+#### Vulkan 1.1 subgroup capability notes
+
+Vulkan 1.1 core REQUIRES `GroupNonUniform` + `GroupNonUniformVote` (BASIC + VOTE).
+`GroupNonUniformArithmetic`, `GroupNonUniformBallot`, `GroupNonUniformShuffle`,
+`GroupNonUniformClustered`, `GroupNonUniformQuad` are device-OPTIONAL. Lavapipe (Mesa 23+)
+supports all. M2 adds `VulkanContext::preflight()` for real-GPU capability checks.
+
 **Divergent-context warning.** Subgroup collective operations inside divergent control flow
 (if/while bodies, but not for-range bodies since induction is uniform) emit a non-fatal
 HirWarning::SubgroupOpInDivergentContext. The canonical pattern `if subgroup_elect() { ... }`
@@ -394,3 +467,4 @@ trigger UB) may be rejected at HIR typecheck in a future milestone.
 - **2026-04-18:** M1.1 revision — added §3 integer division UB note (CRITICAL-2 fix from pessimistic review).
 - **2026-04-18:** M1.2 revision — added §3.1 M1.2 parameter binding model (buffer types, scalar params, gid builtin), saxpy binding assignment walkthrough, and interface-list SPIR-V 1.3 rule.
 - **2026-04-18:** M1.3 revision — added §3.1.4 Control flow (M1.3): OpLoopMerge, continue_target, structured CFG for if/for/while/break/continue.
+- **2026-04-18:** M1.5 revision — added §3.1.6 Runtime dispatch (M1.5): VulkanContext lifecycle + Drop ordering, DispatchRequest API + ownership model, metadata sidecar schema v1, host-visible memory simplification + M2 staging-buffer plan, fence timeout default, push-constant byte-assembly discipline, workgroup-count device-limit pre-validation, Vulkan 1.1 subgroup BASIC+VOTE guaranteed / ARITHMETIC+BALLOT+SHUFFLE+CLUSTERED+QUAD device-optional note.

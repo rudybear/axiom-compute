@@ -151,3 +151,21 @@ Templates live under `.pipeline/templates/`. Config under `.pipeline/config.json
 ## Current feature set
 
 M0 complete: 7 crate skeletons, empty-kernel SPIR-V 1.3 codegen, spirv-val integration test. GPU execution (Lavapipe fallback) begins M1 — anti-pattern #9 is formally relaxed for M0 codegen-only milestone (syntactic validation via spirv-val substitutes).
+
+M1.5 complete: real Vulkan compute dispatch via ash 0.38; saxpy + vector_add execute on Lavapipe (CI) with bit-close-to-CPU-reference correctness; anti-pattern #9 formally re-armed.
+
+---
+
+## GPU test execution (M1.5+)
+
+GPU-dispatch integration tests are `#[ignore]`-gated and require `AXC_ENABLE_GPU_TESTS=1` plus a responsive Vulkan ICD. CI uses Lavapipe via `VK_DRIVER_FILES`. Env vars:
+
+- `AXC_ENABLE_GPU_TESTS=1` — enables GPU integration tests
+- `AXC_PHYSICAL_DEVICE_INDEX=N` — override physical device selection (default: first compute-capable)
+- `AXC_FENCE_TIMEOUT_MS=N` — fence wait timeout in milliseconds (default: 10000)
+- `VK_DRIVER_FILES=<path>` — Vulkan ICD JSON path (Vulkan Loader 1.3.207+, Mesa 23+)
+- `VK_ICD_FILENAMES=<path>` — legacy ICD path (older Vulkan Loaders)
+
+CI runs `cargo test --workspace && cargo test --workspace -- --ignored`.
+
+For Lavapipe: `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json`

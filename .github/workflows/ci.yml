@@ -14,6 +14,9 @@ jobs:
     # the correct scope (per spec §7.2 NEW-4 resolution).
     env:
       AXC_REQUIRE_SPIRV_VAL: "1"
+      VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+      VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+      AXC_ENABLE_GPU_TESTS: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -24,7 +27,13 @@ jobs:
       - name: Presence-gate spirv-val
         # Fail loudly if SPIRV-Tools installation didn't produce spirv-val
         run: spirv-val --version
+      - name: Install Vulkan + Lavapipe
+        run: sudo apt-get install -y mesa-vulkan-drivers vulkan-tools libvulkan-dev
+      - name: Probe Vulkan with Lavapipe
+        run: vulkaninfo --summary || echo 'vulkaninfo probe non-fatal'
+        env:
+          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace && cargo test --workspace -- --ignored
