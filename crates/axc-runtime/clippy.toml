@@ -1,0 +1,3 @@
+# crates/axc-runtime clippy configuration
+# Enforces undocumented_unsafe_blocks at warn level (re-enforced in lib.rs via #![warn(...)]).
+# CI runs clippy with -D warnings, so any undocumented unsafe block becomes a CI failure.

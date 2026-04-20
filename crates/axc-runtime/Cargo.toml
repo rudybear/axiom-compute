@@ -4,4 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "AXIOM-Compute Vulkan/OpenCL dispatcher (placeholder; real content in M1)"
+description = "AXIOM-Compute Vulkan 1.1 compute dispatcher — real GPU execution via ash 0.38"
+
+[dependencies]
+ash = { workspace = true }
+axc-hir = { path = "../axc-hir", features = ["serde"] }
+thiserror = { workspace = true }
+miette = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+axc-driver = { path = "../axc-driver" }
+axc-lexer = { path = "../axc-lexer" }
+rspirv = { workspace = true }

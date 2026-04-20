@@ -1,21 +1,49 @@
-//! AXIOM-Compute Vulkan/OpenCL runtime dispatcher — placeholder for M1.
+//! AXIOM-Compute Vulkan 1.1 runtime dispatcher — M1.5.
 //!
-//! Real content (kernel upload, dispatch, synchronization, Lavapipe fallback)
-//! arrives at M1. This stub exists to keep the workspace coherent.
+//! This crate provides the real GPU execution layer for AXIOM-Compute kernels.
+//! It replaces the placeholder from M0-M1.4.
+//!
+//! # Pipeline
+//!
+//! ```text
+//! .axc source ──► axc_driver::compile_source_with_meta
+//!                   ├─► .spv (SPIR-V bytes)
+//!                   └─► KernelMetadata (binding plan, workgroup size, entry point)
+//!                         │
+//!                         ▼
+//!               VulkanContext::new()
+//!                   └─► VulkanContext::dispatch(DispatchRequest)
+//!                         └─► Vec<Vec<u8>> (output buffers)
+//! ```
+//!
+//! # GPU test gating
+//!
+//! Integration tests are `#[ignore]` by default. They run when:
+//! - `AXC_ENABLE_GPU_TESTS=1` is set in the environment
+//! - `probe_vulkan_available()` returns `true`
+//! - `cargo test -- --ignored` is used
+//!
+//! CI sets `AXC_ENABLE_GPU_TESTS=1` and uses Lavapipe (Mesa software Vulkan)
+//! via `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json`.
+//!
+//! # Safety
+//!
+//! Every `unsafe` block has a `// SAFETY:` comment explaining the Vulkan spec
+//! invariants being honored. The crate-level lint below enforces this.
 
-/// Placeholder function. Returns a deterministic sentinel string.
-///
-/// Will be removed when M1 Vulkan dispatcher logic replaces this module.
-pub fn placeholder() -> &'static str {
-    "axc-runtime placeholder (M1)"
-}
+#![warn(clippy::undocumented_unsafe_blocks)]
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod error;
+pub mod context;
+pub mod dispatch;
+pub mod metadata;
+pub mod icd;
+pub(crate) mod buffers;
+pub(crate) mod pipeline;
+pub(crate) mod resources;
 
-    #[test]
-    fn placeholder_returns_sentinel() {
-        assert_eq!(placeholder(), "axc-runtime placeholder (M1)");
-    }
-}
+pub use error::{DispatchError, DispatchResult};
+pub use context::VulkanContext;
+pub use dispatch::DispatchRequest;
+pub use metadata::{KernelMetadata, load_kernel_metadata, CURRENT_SCHEMA_VERSION};
+pub use icd::{probe_vulkan_available, gpu_tests_enabled};
