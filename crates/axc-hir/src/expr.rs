@@ -6,6 +6,7 @@
 //!
 //! M1.2 adds `BufferRead`, `GidBuiltin`, and the `BufferWrite` / `BufferWriteStmt`
 //! statement kinds for buffer I/O.
+//! M1.3 adds `If`, `ForRange`, `While`, `Break`, `Continue` for structured control flow.
 
 use axc_lexer::Span;
 use crate::ty::{ScalarTy, IntLiteralValue, FloatLiteralValue};
@@ -125,6 +126,8 @@ pub enum BitwiseOp {
 }
 
 /// A typed HIR statement.
+///
+/// M1.3 adds `If`, `ForRange`, `While`, `Break`, `Continue`.
 #[derive(Debug, Clone)]
 pub enum HirStmt {
     Let {
@@ -137,7 +140,7 @@ pub enum HirStmt {
         value: HirExpr,
         span: Span,
     },
-    /// `return;` — only void return is valid in M1.1.
+    /// `return;` — only void return is valid in M1.1/M1.2/M1.3.
     Return { span: Span },
     /// Write one element to a buffer parameter: `buf[index] = value`.
     ///
@@ -151,6 +154,16 @@ pub enum HirStmt {
         value: HirExpr,
         span: Span,
     },
+    /// `if cond { then } [else ...]` — structured selection (M1.3).
+    If(crate::control_flow::HirIf),
+    /// `for i in range(start, end [, step]) { body }` — structured iteration (M1.3).
+    ForRange(crate::control_flow::HirForRange),
+    /// `while cond { body }` — structured iteration (M1.3).
+    While(crate::control_flow::HirWhile),
+    /// `break;` — targets the innermost enclosing loop's merge block.
+    Break { span: Span },
+    /// `continue;` — targets the innermost enclosing loop's continue block.
+    Continue { span: Span },
 }
 
 /// The typed body of a kernel: a binding table plus ordered statements.

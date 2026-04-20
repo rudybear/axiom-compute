@@ -6,6 +6,7 @@
 //!
 //! M1.1 adds scalar types, let/let-mut bindings, and a full two-pass typechecker.
 //! M1.2 adds buffer types, kernel parameters, and push-constant binding plans.
+//! M1.3 adds structured control flow: if/else, for-range, while, break, continue.
 
 pub mod hir;
 pub mod lower;
@@ -15,6 +16,8 @@ pub mod expr;
 pub mod typecheck;
 pub mod buffer;
 pub mod param;
+pub mod loop_ctx;
+pub mod control_flow;
 
 pub use hir::{
     Module as HirModule,
@@ -42,3 +45,5 @@ pub use param::{
     Ty as ParamTy, KernelParam, BufferBindingSlot, ScalarPushConstantSlot,
     ParamBindingPlan, BindingPlanError, compute_binding_plan, MAX_PUSH_CONSTANT_BYTES,
 };
+pub use control_flow::{HirIf, HirElse, HirForRange, HirWhile, ForStep};
+pub use loop_ctx::{HirLoopStack, ScopeStack};
