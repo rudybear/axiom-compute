@@ -53,11 +53,14 @@ fn saxpy_plan() -> ParamBindingPlan {
 #[test]
 fn metadata_save_load_roundtrip_preserves_bindings() {
     let plan: ParamBindingPlan = saxpy_plan();
+    // AT-512a: entry_point field holds the SPIR-V OpEntryPoint name, which the
+    // codegen sets to the kernel name (e.g. `"saxpy"`). Hardcoding `"main"`
+    // caused VUID-VkPipelineShaderStageCreateInfo-pName-00707 on Lavapipe.
     let original: KernelMetadata = KernelMetadata::new(
         "saxpy".to_owned(),
         [64, 1, 1],
         plan.clone(),
-        "main".to_owned(),
+        "saxpy".to_owned(),
     );
 
     // Write to a temporary file.
@@ -74,7 +77,7 @@ fn metadata_save_load_roundtrip_preserves_bindings() {
     // Verify key fields.
     assert_eq!(loaded.kernel_name, "saxpy");
     assert_eq!(loaded.workgroup_size, [64, 1, 1]);
-    assert_eq!(loaded.entry_point, "main");
+    assert_eq!(loaded.entry_point, "saxpy");
     assert_eq!(loaded.schema_version, CURRENT_SCHEMA_VERSION);
     assert_eq!(loaded.push_constant_total_bytes, 8);
 

@@ -73,6 +73,8 @@ fn dispatch_rejects_binding_count_mismatch() {
     let data: Vec<u8> = vec![0u8; 16];
 
     // Only 1 input instead of 2.
+    // Entry point name must match OpEntryPoint in the compiled SPIR-V, which
+    // is the kernel name — "trivial" for compile_trivial_kernel — not "main".
     let req = DispatchRequest {
         spirv: &spirv_words,
         binding_plan: &plan,
@@ -80,7 +82,7 @@ fn dispatch_rejects_binding_count_mismatch() {
         inputs: &[&data],
         output_sizes: &[16, 16],
         push_constants: &[],
-        entry_point: "main",
+        entry_point: "trivial",
     };
 
     match ctx.dispatch(req) {
@@ -119,6 +121,9 @@ fn dispatch_rejects_push_constant_size_mismatch() {
     let spirv_words: Vec<u32> = bytes_to_words(&spirv_bytes);
 
     // Provide 0 bytes instead of 4.
+    // Use meta.entry_point (kernel.name) to match the SPIR-V OpEntryPoint; the
+    // older hardcoded "main" would raise VUID-...-pName-00707 before the push-
+    // constant size check can report.
     let req = DispatchRequest {
         spirv: &spirv_words,
         binding_plan: &meta.binding_plan,
@@ -126,7 +131,7 @@ fn dispatch_rejects_push_constant_size_mismatch() {
         inputs: &[],
         output_sizes: &[],
         push_constants: &[],  // 0 bytes, plan expects 4
-        entry_point: "main",
+        entry_point: &meta.entry_point,
     };
 
     match ctx.dispatch(req) {
@@ -163,6 +168,7 @@ fn at_506a_dispatch_rejects_workgroup_count_over_device_limit() {
     // Request max+1 in x-axis (always exceeds).
     let requested: [u32; 3] = [max_wg[0].saturating_add(1), 1, 1];
 
+    // Entry point matches OpEntryPoint in compile_trivial_kernel output.
     let req = DispatchRequest {
         spirv: &spirv_words,
         binding_plan: &plan,
@@ -170,7 +176,7 @@ fn at_506a_dispatch_rejects_workgroup_count_over_device_limit() {
         inputs: &[&data, &data],
         output_sizes: &[16, 16],
         push_constants: &[],
-        entry_point: "main",
+        entry_point: "trivial",
     };
 
     match ctx.dispatch(req) {

@@ -111,11 +111,17 @@ pub fn compile_source_with_meta(source: &str) -> Result<(Vec<u8>, KernelMetadata
     let workgroup_size: [u32; 3] = extract_workgroup_dims(&hir);
     let kernel = hir.kernels.first()
         .expect("codegen succeeded, so at least one kernel exists");
+    // The SPIR-V emitter writes `OpEntryPoint GLCompute %main "<kernel.name>"`
+    // (see axc-codegen/src/emit.rs — `b.entry_point(..., &kernel.name, ...)`),
+    // so the runtime must pass `kernel.name` as `pName` to vkCreateComputePipelines
+    // or Lavapipe/validation layers raise
+    // `VUID-VkPipelineShaderStageCreateInfo-pName-00707` (pName `main` entrypoint
+    // not found). Keep this consistent with codegen rather than hardcoding "main".
     let metadata: KernelMetadata = KernelMetadata::new(
         kernel.name.clone(),
         workgroup_size,
         kernel.binding_plan.clone(),
-        "main".to_owned(),
+        kernel.name.clone(),
     );
 
     Ok((bytes, metadata))
@@ -335,7 +341,9 @@ mod tests {
         // Metadata fields
         assert_eq!(meta.kernel_name, "saxpy");
         assert_eq!(meta.workgroup_size, [64, 1, 1]);
-        assert_eq!(meta.entry_point, "main");
+        // Entry point name equals kernel name (matches OpEntryPoint emitted by
+        // axc-codegen; avoids VUID-VkPipelineShaderStageCreateInfo-pName-00707).
+        assert_eq!(meta.entry_point, "saxpy");
         assert_eq!(meta.schema_version, axc_runtime::CURRENT_SCHEMA_VERSION);
 
         // Binding plan: saxpy has 2 buffers + 2 scalars

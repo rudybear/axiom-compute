@@ -46,7 +46,10 @@ fn compile_saxpy_emits_metadata_sidecar() {
     assert_eq!(meta.schema_version, CURRENT_SCHEMA_VERSION);
     assert_eq!(meta.kernel_name, "saxpy");
     assert_eq!(meta.workgroup_size, [64, 1, 1]);
-    assert_eq!(meta.entry_point, "main");
+    // Entry point name equals kernel name (codegen writes `OpEntryPoint
+    // GLCompute %main "saxpy"`); runtime passes this to vkCreateComputePipelines.
+    // Hardcoding "main" would raise VUID-VkPipelineShaderStageCreateInfo-pName-00707.
+    assert_eq!(meta.entry_point, "saxpy");
     assert_eq!(meta.binding_plan.buffers.len(), 2,
         "saxpy has 2 buffer bindings (x, y)");
     assert_eq!(meta.binding_plan.scalars.len(), 2,

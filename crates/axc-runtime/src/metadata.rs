@@ -53,7 +53,17 @@ pub struct KernelMetadata {
     pub binding_plan: ParamBindingPlan,
     /// Total push-constant block size in bytes (std430 layout).
     pub push_constant_total_bytes: u32,
-    /// SPIR-V entry-point name (always `"main"` for M1.5).
+    /// SPIR-V entry-point name.
+    ///
+    /// This is the name written to `OpEntryPoint <ExecModel> %id "<name>"` in
+    /// the compiled SPIR-V module and is the `pName` passed to
+    /// `vkCreateComputePipelines`. The AXIOM-Compute codegen uses the source-
+    /// level kernel name as the SPIR-V entry-point name (see
+    /// `axc-codegen::emit`), so this field typically equals `kernel_name`.
+    /// The runtime MUST pass this value (not a hard-coded `"main"`) to
+    /// `VkPipelineShaderStageCreateInfo.pName` — otherwise Vulkan raises
+    /// `VUID-VkPipelineShaderStageCreateInfo-pName-00707` ("entrypoint not
+    /// found"), surfaced by Lavapipe as `ERROR_UNKNOWN`.
     pub entry_point: String,
 }
 
@@ -164,17 +174,20 @@ mod tests {
     fn at_503_metadata_current_schema_is_1_and_new_sets_it() {
         assert_eq!(CURRENT_SCHEMA_VERSION, 1, "CURRENT_SCHEMA_VERSION must be 1 for M1.5");
 
+        // AT-503a: entry_point is set to the kernel name (matches OpEntryPoint
+        // emitted by axc-codegen), not a hard-coded `"main"`. See the fix for
+        // VUID-VkPipelineShaderStageCreateInfo-pName-00707.
         let meta: KernelMetadata = KernelMetadata::new(
             "saxpy".to_owned(),
             [64, 1, 1],
             saxpy_plan(),
-            "main".to_owned(),
+            "saxpy".to_owned(),
         );
 
         assert_eq!(meta.schema_version, 1);
         assert_eq!(meta.kernel_name, "saxpy");
         assert_eq!(meta.workgroup_size, [64, 1, 1]);
-        assert_eq!(meta.entry_point, "main");
+        assert_eq!(meta.entry_point, "saxpy");
         assert_eq!(meta.push_constant_total_bytes, 8);
     }
 
