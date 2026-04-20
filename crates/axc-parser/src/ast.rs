@@ -3,6 +3,7 @@
 //! Every node is wrapped in `Spanned<T>` so that diagnostic messages can
 //! point at the exact source location. M1.1 adds scalar types, let/let-mut
 //! bindings, assignments, and a full Pratt-parsed expression tree.
+//! M1.3 adds structured control flow: if/else, for-range, while, break, continue.
 
 use axc_lexer::{Spanned, IntSuffix, FloatSuffix};
 
@@ -103,10 +104,24 @@ pub struct Block {
     pub stmts: Vec<Spanned<Stmt>>,
 }
 
+/// The else-arm of an if statement.
+///
+/// `Block` is a plain else-block; `If` is an else-if (recursive nesting).
+/// The `If` variant's inner `Stmt` is ALWAYS `Stmt::If`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ElseArm {
+    /// `else { block }`
+    Block(Spanned<Block>),
+    /// `else if cond { block } ...` — stored as the nested `Stmt::If`, boxed to avoid
+    /// infinite recursive sizing in the enum.
+    If(Box<Spanned<Stmt>>),
+}
+
 /// A statement inside a kernel body.
 ///
 /// M1.1 adds Let and Assign. Return remains from M0.
 /// M1.2 adds IndexAssign for buffer writes.
+/// M1.3 adds If, For, While, Break, Continue for structured control flow.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
     /// `return;` or `return expr;` (only void return is used in M1.1).
@@ -129,6 +144,33 @@ pub enum Stmt {
         index: Spanned<Expr>,
         value: Spanned<Expr>,
     },
+    /// `if cond { then } [else { else } | else if cond { ... }]`
+    If {
+        cond: Spanned<Expr>,
+        then_block: Spanned<Block>,
+        else_arm: Option<Box<ElseArm>>,
+    },
+    /// `for var in range(start, end [, step]) { body }`
+    ///
+    /// `range` is a special form recognized by the parser when immediately
+    /// following the `in` keyword; it is NOT a general function call.
+    For {
+        var: Spanned<String>,
+        start: Spanned<Expr>,
+        end: Spanned<Expr>,
+        /// `None` means no explicit step was written → HIR uses step=1.
+        step: Option<Spanned<Expr>>,
+        body: Spanned<Block>,
+    },
+    /// `while cond { body }`
+    While {
+        cond: Spanned<Expr>,
+        body: Spanned<Block>,
+    },
+    /// `break;`
+    Break,
+    /// `continue;`
+    Continue,
 }
 
 /// Binary arithmetic / comparison operator.
