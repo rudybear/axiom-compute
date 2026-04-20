@@ -724,9 +724,12 @@ impl<'tok> Parser<'tok> {
             TokenKind::Ident(ref ident_name) => {
                 // M1.4: if the ident is a reserved subgroup builtin followed by `(`,
                 // parse it as a BuiltinCallStmt (the HIR will validate return type).
+                // M2.1: coopmat_store also dispatches as BuiltinCallStmt (void-returning
+                // statement-level coopmat builtin).
                 let ident_name_clone: String = ident_name.clone();
                 let next_pos: usize = (self.pos + 1).min(self.tokens.len() - 1);
-                if is_reserved_subgroup_builtin(&ident_name_clone)
+                if (is_reserved_subgroup_builtin(&ident_name_clone)
+                    || axc_lexer::is_reserved_coopmat_builtin(&ident_name_clone))
                     && matches!(self.tokens[next_pos].kind, TokenKind::LParen)
                 {
                     return self.parse_builtin_call_stmt();

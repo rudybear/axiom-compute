@@ -560,6 +560,15 @@ impl<'p> TypeChecker<'p> {
     ///
     /// Shadowing across frames (e.g. nested for loops with same induction var name) is allowed.
     fn register_binding_typed(&mut self, name: &str, ty: BindingTy, is_mutable: bool, span: Span) -> Option<BindingId> {
+        // M2.1: `matrix` is reserved so that a future milestone can promote it to a
+        // type-constructor keyword at expression scope. Reject it as a variable name.
+        if name == "matrix" {
+            self.errors.push(TypecheckError::ReservedKeyword {
+                name: name.to_owned(),
+                span,
+            });
+            return None;
+        }
         // Check for duplicate in the CURRENT frame only (not outer scopes — shadowing is OK).
         if let Some(idx) = self.scope_stack.get_in_current_frame(name) {
             let orig_span = self.bindings[idx].span;
@@ -627,7 +636,13 @@ pub fn typecheck_kernel_body(
                 // dispatched separately below). For scalar bindings, extract ScalarTy.
                 let expected_scalar_ty = maybe_binding.and_then(|(_, bty, _, _)| bty.as_scalar());
 
-                let hir_init = check_expr(&mut tc, &init.node, init.span, expected_scalar_ty);
+                // M2.1: if the let target is a CoopMatrix binding, check if the init
+                // is coopmat_zero() or coopmat_load() which need the matrix key as context.
+                let hir_init = if let Some((_, BindingTy::CoopMatrix(matrix_key), _, _)) = maybe_binding {
+                    check_coopmat_init_expr(&mut tc, &init.node, init.span, matrix_key)
+                } else {
+                    check_expr(&mut tc, &init.node, init.span, expected_scalar_ty)
+                };
 
                 if let Some((bid, _, _, _)) = maybe_binding {
                     if let Some(init_expr) = hir_init {
@@ -1131,6 +1146,37 @@ fn typecheck_block_stmts(tc: &mut TypeChecker<'_>, stmts: &[axc_lexer::Spanned<p
                         name: name.node.clone(),
                         span: name.span,
                     });
+                }
+                // M2.1: CoopMatrix let bindings in nested blocks (single-pass).
+                if let past::TypeRef::CoopMatrix { elem, m, n, use_ } = &ty.node {
+                    if *elem == past::ScalarTypeRef::Bf16 {
+                        tc.errors.push(TypecheckError::CoopMatrixElementTypeUnsupported {
+                            ty: "bf16",
+                            span: ty.span,
+                        });
+                        continue;
+                    }
+                    let elem_scalar = lower_scalar_type_ref_tc(elem);
+                    if !is_allowed_coopmat_element(elem_scalar) {
+                        tc.errors.push(TypecheckError::CoopMatrixElementTypeUnsupported {
+                            ty: elem_scalar.display_name(),
+                            span: ty.span,
+                        });
+                        continue;
+                    }
+                    let coopmat_use = coopmat_use_ast_to_hir(use_);
+                    let key = CoopMatKey { elem: elem_scalar, m: *m, n: *n, use_: coopmat_use };
+                    let hir_init = check_coopmat_init_expr(tc, &init.node, init.span, key);
+                    if let Some(bid) = tc.register_coopmat_binding(&name.node, key, *is_mut, name.span) {
+                        if let Some(init_expr) = hir_init {
+                            hir_stmts.push(HirStmt::Let {
+                                binding: bid,
+                                init: init_expr,
+                                span: spanned_stmt.span,
+                            });
+                        }
+                    }
+                    continue;
                 }
                 // Single-pass: register binding immediately on encounter.
                 let scalar_ty = match typeref_to_scalar(&ty.node) {
@@ -1903,6 +1949,21 @@ fn check_builtin_call_stmt(
 ) -> Option<HirStmt> {
     if let axc_parser::ast::Expr::Call { name, args } = &call.node {
         let op_name: &str = &name.node;
+
+        // M2.1: coopmat_store is the ONLY coopmat builtin that appears as a statement.
+        if op_name == "coopmat_store" {
+            return check_coopmat_store_stmt(tc, args, call.span, stmt_span);
+        }
+        // Reject other coopmat builtins used at statement position (they return non-void values).
+        use crate::coopmat::CoopMatBuiltin;
+        if let Some(cm_op) = CoopMatBuiltin::from_source_name(op_name) {
+            tc.errors.push(TypecheckError::UnsupportedStmtInM1_4 {
+                detail: cm_op.source_name(),
+                span: call.span,
+            });
+            return None;
+        }
+
         if op_name == "workgroup_barrier" {
             if !args.is_empty() {
                 tc.errors.push(TypecheckError::SubgroupArity {
@@ -2091,6 +2152,518 @@ fn is_broadcast_first_type(ty: ScalarTy) -> bool {
     matches!(ty, ScalarTy::I32 | ScalarTy::U32 | ScalarTy::F32 | ScalarTy::F64 | ScalarTy::Bool)
 }
 
+// ── Cooperative-matrix let-init expression (M2.1) ────────────────────────────
+
+/// Typecheck the initializer expression for a `let x: matrix[...] = <init>;` binding.
+///
+/// Unlike scalar lets, the expected type is a `CoopMatKey` not a `ScalarTy`. This
+/// function handles `coopmat_zero()` and `coopmat_load(...)` where the matrix type
+/// is inferred from the let-binding context. `coopmat_mul_add()` is also handled
+/// (result type is determined from arguments, not from context).
+///
+/// For any other expression (ident lookup, arithmetic, etc.) we fall through to
+/// `check_expr` with `expected: None` and accept whatever type is produced.
+fn check_coopmat_init_expr(
+    tc: &mut TypeChecker<'_>,
+    expr: &past::Expr,
+    span: Span,
+    matrix_key: CoopMatKey,
+) -> Option<HirExpr> {
+    use crate::coopmat::{CoopMatBuiltin, is_allowed_coopmat_element};
+
+    match expr {
+        past::Expr::Call { name, args } => {
+            let call_name: &str = &name.node;
+            match CoopMatBuiltin::from_source_name(call_name) {
+                Some(CoopMatBuiltin::Zero) => {
+                    // coopmat_zero() → result type is matrix_key.
+                    if !args.is_empty() {
+                        tc.errors.push(TypecheckError::CoopMatArity {
+                            name: "coopmat_zero",
+                            expected: 0,
+                            found: args.len(),
+                            span,
+                        });
+                        return None;
+                    }
+                    if !is_allowed_coopmat_element(matrix_key.elem) {
+                        tc.errors.push(TypecheckError::CoopMatrixElementTypeUnsupported {
+                            ty: matrix_key.elem.display_name(),
+                            span,
+                        });
+                        return None;
+                    }
+                    Some(HirExpr {
+                        kind: HirExprKind::CoopMatBuiltin {
+                            op: CoopMatBuiltin::Zero,
+                            args: vec![],
+                            result_ty: matrix_key,
+                            buf_param_index: None,
+                        },
+                        ty: ScalarTy::U32, // sentinel
+                        span,
+                    })
+                }
+                Some(CoopMatBuiltin::Load) => {
+                    // coopmat_load(buf, element_offset, stride) → result type is matrix_key.
+                    if args.len() != CoopMatBuiltin::Load.arity() {
+                        tc.errors.push(TypecheckError::CoopMatArity {
+                            name: "coopmat_load",
+                            expected: CoopMatBuiltin::Load.arity(),
+                            found: args.len(),
+                            span,
+                        });
+                        return None;
+                    }
+                    // Arg 0: buffer param name.
+                    let buf_ident = match &args[0].node {
+                        past::Expr::Ident(ref s) => s.clone(),
+                        _ => {
+                            tc.errors.push(TypecheckError::CoopMatLoadArgMustBeBufferParam {
+                                found_kind: "non-ident expression",
+                                span: args[0].span,
+                            });
+                            return None;
+                        }
+                    };
+                    // Find the buffer param by name.
+                    let mut buf_slot: Option<u32> = None;
+                    let mut buf_elem: Option<ScalarTy> = None;
+                    let mut buf_access: Option<crate::buffer::BufferAccess> = None;
+                    let mut idx: u32 = 0;
+                    for p in tc.params {
+                        if let crate::param::Ty::Buffer(ref bt) = p.ty {
+                            if p.name == buf_ident {
+                                buf_slot = Some(idx);
+                                buf_elem = Some(bt.elem);
+                                buf_access = Some(bt.access);
+                                break;
+                            }
+                            idx += 1;
+                        }
+                    }
+                    let (buf_slot, buf_elem, _buf_access) = match (buf_slot, buf_elem, buf_access) {
+                        (Some(s), Some(e), Some(a)) => (s, e, a),
+                        _ => {
+                            tc.errors.push(TypecheckError::CoopMatLoadArgMustBeBufferParam {
+                                found_kind: "not a buffer parameter",
+                                span: args[0].span,
+                            });
+                            return None;
+                        }
+                    };
+                    // Check element type matches.
+                    if buf_elem != matrix_key.elem {
+                        tc.errors.push(TypecheckError::CoopMatLoadElementTypeMismatch {
+                            matrix_elem: matrix_key.elem.display_name(),
+                            buffer_elem: buf_elem.display_name(),
+                            span: args[0].span,
+                        });
+                        return None;
+                    }
+                    // Arg 1: element_offset (U32).
+                    let offset_hir = check_expr(tc, &args[1].node, args[1].span, Some(ScalarTy::U32))?;
+                    if offset_hir.ty != ScalarTy::U32 {
+                        tc.errors.push(TypecheckError::CoopMatLoadStrideMustBeU32 {
+                            found_ty: offset_hir.ty.display_name(),
+                            span: args[1].span,
+                        });
+                        return None;
+                    }
+                    // Arg 2: stride (U32).
+                    let stride_hir = check_expr(tc, &args[2].node, args[2].span, Some(ScalarTy::U32))?;
+                    if stride_hir.ty != ScalarTy::U32 {
+                        tc.errors.push(TypecheckError::CoopMatLoadStrideMustBeU32 {
+                            found_ty: stride_hir.ty.display_name(),
+                            span: args[2].span,
+                        });
+                        return None;
+                    }
+                    Some(HirExpr {
+                        kind: HirExprKind::CoopMatBuiltin {
+                            op: CoopMatBuiltin::Load,
+                            args: vec![offset_hir, stride_hir],
+                            result_ty: matrix_key,
+                            buf_param_index: Some(buf_slot),
+                        },
+                        ty: ScalarTy::U32, // sentinel
+                        span,
+                    })
+                }
+                Some(CoopMatBuiltin::MulAdd) => {
+                    // coopmat_mul_add: result type is determined by arguments, not context.
+                    // Delegate to check_coopmat_expr_call (expected: None).
+                    check_coopmat_expr_call(tc, CoopMatBuiltin::MulAdd, name.span, args, span, None)
+                }
+                Some(CoopMatBuiltin::Store) => {
+                    tc.errors.push(TypecheckError::UnsupportedStmtInM1_4 {
+                        detail: "coopmat_store must appear at statement position (it returns void)",
+                        span,
+                    });
+                    None
+                }
+                None => {
+                    // Non-coopmat call in coopmat context — fall through to normal check_expr.
+                    // This will likely produce a type error, which is correct.
+                    check_expr(tc, expr, span, None)
+                }
+            }
+        }
+        past::Expr::Paren(inner) => {
+            check_coopmat_init_expr(tc, &inner.node, inner.span, matrix_key)
+        }
+        _ => {
+            // For other expressions (idents referring to other coopmat bindings, etc.),
+            // fall through to check_expr with no scalar expected type.
+            check_expr(tc, expr, span, None)
+        }
+    }
+}
+
+// ── Cooperative-matrix builtin calls (M2.1) ──────────────────────────────────
+
+/// Helper: extract the `CoopMatKey` from a binding. Returns `None` and pushes
+/// a TypeMismatch error if the binding is not a coopmat type.
+fn expect_coopmat_binding(
+    tc: &mut TypeChecker<'_>,
+    name: &str,
+    name_span: Span,
+) -> Option<(BindingId, CoopMatKey)> {
+    match tc.find_binding(name) {
+        None => {
+            tc.errors.push(TypecheckError::UnknownBinding {
+                name: name.to_owned(),
+                span: name_span,
+            });
+            None
+        }
+        Some((bid, BindingTy::CoopMatrix(key), _, _)) => Some((bid, key)),
+        Some((_, BindingTy::Scalar(st), _, _)) => {
+            tc.errors.push(TypecheckError::TypeMismatch {
+                expected: "matrix",
+                got: st.display_name(),
+                span: name_span,
+            });
+            None
+        }
+    }
+}
+
+
+/// Typecheck a cooperative-matrix expression builtin: Zero, Load, MulAdd.
+/// Store is a statement (void) — handled in check_coopmat_store_stmt.
+fn check_coopmat_expr_call(
+    tc: &mut TypeChecker<'_>,
+    op: crate::coopmat::CoopMatBuiltin,
+    _name_span: Span,
+    args: &[axc_lexer::Spanned<past::Expr>],
+    call_span: Span,
+    expected: Option<ScalarTy>,
+) -> Option<HirExpr> {
+    use crate::coopmat::{CoopMatBuiltin, is_allowed_coopmat_element};
+
+    // Arity check (except Store which is handled as a stmt).
+    if op == CoopMatBuiltin::Store {
+        // coopmat_store used in expression position is an error.
+        tc.errors.push(TypecheckError::UnsupportedStmtInM1_4 {
+            detail: "coopmat_store must appear at statement position (it returns void)",
+            span: call_span,
+        });
+        return None;
+    }
+
+    if args.len() != op.arity() {
+        tc.errors.push(TypecheckError::CoopMatArity {
+            name: op.source_name(),
+            expected: op.arity(),
+            found: args.len(),
+            span: call_span,
+        });
+        return None;
+    }
+
+    match op {
+        CoopMatBuiltin::Zero => {
+            // coopmat_zero() requires expected-type context (let m: matrix[...] = coopmat_zero()).
+            // expected is a ScalarTy here, which can't carry matrix type — we need the BindingTy.
+            // HACK: expected is None in expression position without let context.
+            // We check for it by looking at `expected`: if None, we can't determine the result type.
+            //
+            // Actually, we need the FULL CoopMatKey for Zero, which comes from the let binding's
+            // declared type. The `expected: Option<ScalarTy>` context cannot carry this.
+            // For now, produce an error: coopmat_zero without expected coopmat context.
+            tc.errors.push(TypecheckError::CoopMatrixBuiltinRequiresExpectedType {
+                name: "coopmat_zero",
+                span: call_span,
+            });
+            None
+        }
+        CoopMatBuiltin::Load => {
+            // coopmat_load(buf, element_offset, stride) → matrix[T, M, N, use]
+            // Like Zero, the result type comes from let context.
+            tc.errors.push(TypecheckError::CoopMatrixBuiltinRequiresExpectedType {
+                name: "coopmat_load",
+                span: call_span,
+            });
+            None
+        }
+        CoopMatBuiltin::MulAdd => {
+            // coopmat_mul_add(a, b, c) → matrix[T, M, N, accumulator]
+            // All three args must be coopmat bindings.
+            // Extract arg idents.
+            let get_ident = |arg: &axc_lexer::Spanned<past::Expr>| {
+                if let past::Expr::Ident(ref s) = arg.node {
+                    Some((s.clone(), arg.span))
+                } else if let past::Expr::Paren(ref inner) = arg.node {
+                    if let past::Expr::Ident(ref s) = inner.node {
+                        Some((s.clone(), inner.span))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+
+            let (a_name, a_span) = get_ident(&args[0]).unwrap_or_else(|| ("".to_owned(), args[0].span));
+            let (b_name, b_span) = get_ident(&args[1]).unwrap_or_else(|| ("".to_owned(), args[1].span));
+            let (c_name, c_span) = get_ident(&args[2]).unwrap_or_else(|| ("".to_owned(), args[2].span));
+
+            let (a_bid, a_key) = expect_coopmat_binding(tc, &a_name, a_span)?;
+            let (b_bid, b_key) = expect_coopmat_binding(tc, &b_name, b_span)?;
+            let (c_bid, c_key) = expect_coopmat_binding(tc, &c_name, c_span)?;
+
+            // Validate use tags.
+            if a_key.use_ != CoopMatUse::MatrixA {
+                tc.errors.push(TypecheckError::CoopMatrixShapeMismatch {
+                    kind: CoopMatrixShapeKind::AUseMismatch { found: a_key.use_ },
+                    span: a_span,
+                });
+                return None;
+            }
+            if b_key.use_ != CoopMatUse::MatrixB {
+                tc.errors.push(TypecheckError::CoopMatrixShapeMismatch {
+                    kind: CoopMatrixShapeKind::BUseMismatch { found: b_key.use_ },
+                    span: b_span,
+                });
+                return None;
+            }
+            if c_key.use_ != CoopMatUse::Accumulator {
+                tc.errors.push(TypecheckError::CoopMatrixShapeMismatch {
+                    kind: CoopMatrixShapeKind::CUseMismatch { found: c_key.use_ },
+                    span: c_span,
+                });
+                return None;
+            }
+
+            // Validate K dimension: a.n must equal b.m.
+            if a_key.n != b_key.m {
+                tc.errors.push(TypecheckError::CoopMatrixShapeMismatch {
+                    kind: CoopMatrixShapeKind::KDimMismatch { a_n: a_key.n, b_m: b_key.m },
+                    span: call_span,
+                });
+                return None;
+            }
+
+            // Validate accumulator M: c.m must equal a.m.
+            if c_key.m != a_key.m {
+                tc.errors.push(TypecheckError::CoopMatrixShapeMismatch {
+                    kind: CoopMatrixShapeKind::AccumulatorMMismatch { c_m: c_key.m, a_m: a_key.m },
+                    span: call_span,
+                });
+                return None;
+            }
+
+            // Validate accumulator N: c.n must equal b.n.
+            if c_key.n != b_key.n {
+                tc.errors.push(TypecheckError::CoopMatrixShapeMismatch {
+                    kind: CoopMatrixShapeKind::AccumulatorNMismatch { c_n: c_key.n, b_n: b_key.n },
+                    span: call_span,
+                });
+                return None;
+            }
+
+            // Validate A and B element type match.
+            if a_key.elem != b_key.elem {
+                tc.errors.push(TypecheckError::CoopMatrixShapeMismatch {
+                    kind: CoopMatrixShapeKind::ABElementMismatch { a_elem: a_key.elem, b_elem: b_key.elem },
+                    span: call_span,
+                });
+                return None;
+            }
+
+            // Validate element types are allowed.
+            if !is_allowed_coopmat_element(a_key.elem) || !is_allowed_coopmat_element(c_key.elem) {
+                tc.errors.push(TypecheckError::CoopMatrixElementTypeUnsupported {
+                    ty: if !is_allowed_coopmat_element(a_key.elem) { a_key.elem.display_name() } else { c_key.elem.display_name() },
+                    span: call_span,
+                });
+                return None;
+            }
+
+            // Result type matches the accumulator's type.
+            let result_key = c_key;
+            let _ = expected; // result type is determined by arguments, not context
+
+            // Build HIR expression nodes for the arguments.
+            let a_expr = HirExpr { kind: HirExprKind::LocalRead(a_bid), ty: ScalarTy::U32, span: a_span };
+            let b_expr = HirExpr { kind: HirExprKind::LocalRead(b_bid), ty: ScalarTy::U32, span: b_span };
+            let c_expr = HirExpr { kind: HirExprKind::LocalRead(c_bid), ty: ScalarTy::U32, span: c_span };
+
+            Some(HirExpr {
+                kind: HirExprKind::CoopMatBuiltin {
+                    op: CoopMatBuiltin::MulAdd,
+                    args: vec![a_expr, b_expr, c_expr],
+                    result_ty: result_key,
+                    buf_param_index: None,
+                },
+                ty: ScalarTy::U32, // sentinel: actual type is CoopMatrix(result_key)
+                span: call_span,
+            })
+        }
+        CoopMatBuiltin::Store => unreachable!("Store handled above"),
+    }
+}
+
+/// Typecheck `coopmat_store(m, buf, element_offset, stride);` as a statement.
+fn check_coopmat_store_stmt(
+    tc: &mut TypeChecker<'_>,
+    args: &[axc_lexer::Spanned<past::Expr>],
+    call_span: Span,
+    stmt_span: Span,
+) -> Option<HirStmt> {
+    use crate::coopmat::CoopMatBuiltin;
+
+    if args.len() != CoopMatBuiltin::Store.arity() {
+        tc.errors.push(TypecheckError::CoopMatArity {
+            name: "coopmat_store",
+            expected: CoopMatBuiltin::Store.arity(),
+            found: args.len(),
+            span: call_span,
+        });
+        return None;
+    }
+
+    // Arg 0: matrix binding (must be a coopmat identifier).
+    let matrix_ident = match &args[0].node {
+        past::Expr::Ident(ref s) => s.clone(),
+        _ => {
+            tc.errors.push(TypecheckError::TypeMismatch {
+                expected: "cooperative-matrix binding name",
+                got: "expression",
+                span: args[0].span,
+            });
+            return None;
+        }
+    };
+    let (matrix_bid, matrix_key) = {
+        match tc.find_binding(&matrix_ident) {
+            None => {
+                tc.errors.push(TypecheckError::UnknownBinding {
+                    name: matrix_ident.clone(),
+                    span: args[0].span,
+                });
+                return None;
+            }
+            Some((bid, BindingTy::CoopMatrix(key), _, _)) => (bid, key),
+            Some((_, BindingTy::Scalar(st), _, _)) => {
+                tc.errors.push(TypecheckError::TypeMismatch {
+                    expected: "matrix",
+                    got: st.display_name(),
+                    span: args[0].span,
+                });
+                return None;
+            }
+        }
+    };
+
+    // Arg 1: buffer parameter (must be a writable buffer param).
+    let buf_ident = match &args[1].node {
+        past::Expr::Ident(ref s) => s.clone(),
+        _ => {
+            tc.errors.push(TypecheckError::TypeMismatch {
+                expected: "buffer parameter name",
+                got: "expression",
+                span: args[1].span,
+            });
+            return None;
+        }
+    };
+    let (buf_slot, buf_ty) = {
+        let mut found_slot: Option<u32> = None;
+        let mut found_ty: Option<crate::buffer::BufferTy> = None;
+        let mut buf_idx: u32 = 0;
+        for p in tc.params {
+            if let crate::param::Ty::Buffer(ref bt) = p.ty {
+                if p.name == buf_ident {
+                    found_slot = Some(buf_idx);
+                    found_ty = Some(*bt);
+                    break;
+                }
+                buf_idx += 1;
+            }
+        }
+        match (found_slot, found_ty) {
+            (Some(slot), Some(ty)) => (slot, ty),
+            _ => {
+                tc.errors.push(TypecheckError::TypeMismatch {
+                    expected: "buffer parameter",
+                    got: "not a buffer parameter",
+                    span: args[1].span,
+                });
+                return None;
+            }
+        }
+    };
+
+    // Check that buffer is writable (not readonly).
+    if buf_ty.access == crate::buffer::BufferAccess::ReadOnly {
+        tc.errors.push(TypecheckError::CoopMatStoreToReadonlyBuffer {
+            param_name: buf_ident.clone(),
+            span: args[1].span,
+        });
+        return None;
+    }
+
+    // Check element type compatibility.
+    if buf_ty.elem != matrix_key.elem {
+        tc.errors.push(TypecheckError::CoopMatStoreElementTypeMismatch {
+            matrix_elem: matrix_key.elem.display_name(),
+            buffer_elem: buf_ty.elem.display_name(),
+            span: call_span,
+        });
+        return None;
+    }
+
+    // Arg 2: element_offset (must be U32).
+    let offset_hir = check_expr(tc, &args[2].node, args[2].span, Some(ScalarTy::U32))?;
+    if offset_hir.ty != ScalarTy::U32 {
+        tc.errors.push(TypecheckError::CoopMatLoadStrideMustBeU32 {
+            found_ty: offset_hir.ty.display_name(),
+            span: args[2].span,
+        });
+        return None;
+    }
+
+    // Arg 3: stride (must be U32).
+    let stride_hir = check_expr(tc, &args[3].node, args[3].span, Some(ScalarTy::U32))?;
+    if stride_hir.ty != ScalarTy::U32 {
+        tc.errors.push(TypecheckError::CoopMatLoadStrideMustBeU32 {
+            found_ty: stride_hir.ty.display_name(),
+            span: args[3].span,
+        });
+        return None;
+    }
+
+    Some(HirStmt::CoopMatStore {
+        matrix_binding: matrix_bid,
+        buf_param_index: buf_slot,
+        element_offset: offset_hir,
+        stride: stride_hir,
+        span: stmt_span,
+    })
+}
+
 // ── Bitwise builtin calls ─────────────────────────────────────────────────────
 
 fn check_call(
@@ -2101,6 +2674,13 @@ fn check_call(
     call_span: Span,
     expected: Option<ScalarTy>,
 ) -> Option<HirExpr> {
+    // M2.1: dispatch cooperative-matrix expression builtins (Zero, Load, MulAdd).
+    // Store is a statement (void return) — handled in check_builtin_call_stmt.
+    use crate::coopmat::CoopMatBuiltin;
+    if let Some(cm_op) = CoopMatBuiltin::from_source_name(name) {
+        return check_coopmat_expr_call(tc, cm_op, name_span, args, call_span, expected);
+    }
+
     // M1.4: dispatch subgroup builtins BEFORE bitwise table.
     if let Some(sg_op) = crate::subgroup::SubgroupOp::from_source_name(name) {
         return check_subgroup_call(tc, sg_op, name_span, args, call_span, expected);
@@ -3688,6 +4268,126 @@ mod tests {
             op_name_matches,
             "warning op_name must be 'subgroup_broadcast_first', not 'subgroup_elect'; warn: {:?}",
             divergent_warns[0]
+        );
+    }
+
+    // ── M2.1 acceptance tests ─────────────────────────────────────────────────
+
+    /// AT-631: `let matrix: i32 = 0;` is rejected with ReservedKeyword.
+    ///
+    /// `matrix` is reserved in M2.1 so that a future milestone can promote it
+    /// to a type-constructor keyword at expression scope.
+    #[test]
+    fn tc_let_matrix_ident_rejected() {
+        let (_, errors) = tc_body("let matrix: i32 = 0i32; return;");
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                TypecheckError::ReservedKeyword { name, .. } if name == "matrix"
+            )),
+            "expected ReservedKeyword {{ name: \"matrix\" }}; got: {errors:?}"
+        );
+    }
+
+    // ── M2.1 coopmat typecheck tests ──────────────────────────────────────────
+
+    /// AT-624: coopmat_mul_add K-dimension mismatch (a.n != b.m) → CoopMatrixShapeMismatch.
+    ///
+    /// Matrix A is 16×8 (m=16, n=8), Matrix B is 16×16 (m=16, n=16).
+    /// K dim: a.n=8 != b.m=16 → KDimMismatch.
+    #[test]
+    fn tc_coopmat_mul_add_k_mismatch_rejected() {
+        // A: matrix[f16, 16, 8, a] — 16×8
+        // B: matrix[f16, 16, 16, b] — 16×16
+        // C: matrix[f32, 16, 16, accumulator] — 16×16
+        let (_, errors) = tc_body(
+            "let a: matrix[f16, 16, 8, a] = coopmat_zero(); \
+             let b: matrix[f16, 16, 16, b] = coopmat_zero(); \
+             let c: matrix[f32, 16, 16, accumulator] = coopmat_zero(); \
+             let d: matrix[f32, 16, 16, accumulator] = coopmat_mul_add(a, b, c); \
+             return;"
+        );
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                TypecheckError::CoopMatrixShapeMismatch {
+                    kind: crate::coopmat::CoopMatrixShapeKind::KDimMismatch { a_n: 8, b_m: 16 },
+                    ..
+                }
+            )),
+            "expected KDimMismatch {{ a_n: 8, b_m: 16 }}; got: {errors:?}"
+        );
+    }
+
+    /// AT-625: coopmat_mul_add use-tag mismatch (accumulator where A expected).
+    #[test]
+    fn tc_coopmat_mul_add_use_mismatch_rejected() {
+        // Pass an accumulator matrix where A is expected.
+        let (_, errors) = tc_body(
+            "let c: matrix[f32, 16, 16, accumulator] = coopmat_zero(); \
+             let b: matrix[f16, 16, 16, b] = coopmat_zero(); \
+             let d: matrix[f32, 16, 16, accumulator] = coopmat_zero(); \
+             let r: matrix[f32, 16, 16, accumulator] = coopmat_mul_add(c, b, d); \
+             return;"
+        );
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                TypecheckError::CoopMatrixShapeMismatch {
+                    kind: crate::coopmat::CoopMatrixShapeKind::AUseMismatch {
+                        found: crate::coopmat::CoopMatUse::Accumulator
+                    },
+                    ..
+                }
+            )),
+            "expected AUseMismatch {{ found: Accumulator }}; got: {errors:?}"
+        );
+    }
+
+    /// AT-626: coopmat_store to a readonly_buffer is rejected with CoopMatStoreToReadonlyBuffer.
+    #[test]
+    fn tc_coopmat_store_to_readonly_rejected() {
+        let full = "@kernel @workgroup(1,1,1) fn k(out: readonly_buffer[f16]) -> void { \
+                    let m: matrix[f16, 16, 16, a] = coopmat_zero(); \
+                    coopmat_store(m, out, 0u32, 16u32); \
+                    return; }";
+        let (ast, lex_errs, _parse_errs) = parse(full);
+        assert!(lex_errs.is_empty(), "lex: {lex_errs:?}");
+        let axc_parser::Item::Kernel(ref kd) = ast.items[0].node;
+        let params = crate::lower::lower_params_for_test(&kd.params);
+        let (_, errors, _) = typecheck_kernel_body(&kd.body.node, &params);
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                TypecheckError::CoopMatStoreToReadonlyBuffer { param_name, .. }
+                    if param_name == "out"
+            )),
+            "expected CoopMatStoreToReadonlyBuffer {{ param_name: \"out\" }}; got: {errors:?}"
+        );
+    }
+
+    /// AT-627: coopmat_zero without a let-binding type annotation is rejected with
+    /// CoopMatrixBuiltinRequiresExpectedType.
+    ///
+    /// The HIR can only determine the result matrix type from the let-declared type.
+    /// Using coopmat_zero() directly without any context (e.g. as a statement argument)
+    /// must be rejected.
+    #[test]
+    fn tc_coopmat_zero_without_let_ty_annotation_rejected() {
+        // coopmat_zero() used without a matrix-typed let binding (no expected type context).
+        // Note: the parser parses it as Expr::Call; typecheck sees no expected coopmat type.
+        // We test this by passing it to a non-matrix expression context.
+        let (_, errors) = tc_body(
+            "let x: i32 = coopmat_zero(); return;"
+        );
+        // Should see CoopMatrixBuiltinRequiresExpectedType since there's no matrix context.
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                TypecheckError::CoopMatrixBuiltinRequiresExpectedType { name, .. }
+                    if *name == "coopmat_zero"
+            )),
+            "expected CoopMatrixBuiltinRequiresExpectedType; got: {errors:?}"
         );
     }
 }

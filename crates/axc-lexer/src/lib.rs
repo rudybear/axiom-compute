@@ -13,7 +13,8 @@ pub mod token;
 pub mod lexer;
 
 pub use token::{Token, TokenKind, Span, Spanned, IntBase, IntSuffix, FloatSuffix, LineIndex,
-    RESERVED_SUBGROUP_BUILTIN_NAMES, is_reserved_subgroup_builtin};
+    RESERVED_SUBGROUP_BUILTIN_NAMES, is_reserved_subgroup_builtin,
+    RESERVED_COOPMAT_BUILTIN_NAMES, is_reserved_coopmat_builtin};
 pub use lexer::{Lexer, LexError};
 
 /// Convenience wrapper: lex `source` from start to EOF.
