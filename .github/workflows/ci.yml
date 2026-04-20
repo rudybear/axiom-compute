@@ -37,3 +37,50 @@ jobs:
         run: cargo clippy --workspace -- -D warnings
       - name: Test
         run: cargo test --workspace && cargo test --workspace -- --ignored
+
+  # M2.2: Regression gate — runs cpu_reference benches and checks for >15% slowdown.
+  # Benches are compiled in release mode to match the profile used for baselines.json.
+  # AXC_BLESS_BASELINES is NOT set (AT-714b discipline: never auto-bless in CI).
+  bench-regression:
+    runs-on: ubuntu-latest
+    env:
+      AXC_ENABLE_BENCH_REGRESSION: "1"
+      VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+      VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Vulkan + Lavapipe
+        run: sudo apt-get install -y mesa-vulkan-drivers libvulkan-dev
+      - name: Run regression gate (release mode, no feature flag)
+        # AXC_BLESS_BASELINES must NOT be set (AT-714b).
+        # --release ensures timing matches the baselines.json generation profile.
+        run: >
+          cargo test --release -p axc-driver --test bench_regression
+          -- --nocapture
+        env:
+          # Explicitly unset to guard against accidental blessing in CI.
+          AXC_BLESS_BASELINES: ""
+
+  # M2.2 AT-714b: Fault-injection CI job — verifies the regression gate correctly
+  # detects a >15% slowdown when bench_regression_fixture_slowdown is enabled.
+  # This MUST be a SEPARATE job from bench-regression (AT-714b).
+  # Neither job sets AXC_BLESS_BASELINES.
+  bench-regression-fault-injection:
+    runs-on: ubuntu-latest
+    env:
+      AXC_ENABLE_BENCH_REGRESSION: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run fault-injection regression gate (must exit 1)
+        # Enables the artificial slowdown feature.  The test MUST fail (exit 1).
+        # We invert with `!` so the job succeeds when cargo test fails (as expected).
+        # AXC_BLESS_BASELINES must NOT be set (AT-714b).
+        run: >
+          ! cargo test --release
+          --features bench_regression_fixture_slowdown
+          -p axc-driver --test bench_regression
+          -- bench_regression_detects_over_threshold_slowdown --nocapture
+        env:
+          AXC_BLESS_BASELINES: ""

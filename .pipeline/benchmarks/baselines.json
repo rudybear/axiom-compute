@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "generated": "2026-04-20T18:07:42Z",
+  "git_sha": "0ab989f",
+  "machine": {
+    "os": "linux",
+    "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)",
+    "vulkan_icd": "",
+    "vulkan_device": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+    "cpu_model": "Intel(R) Core(TM) i9-14900KF",
+    "axc_version": "0.0.1"
+  },
+  "benchmarks": [
+    {
+      "group": "compile_pipeline",
+      "bench": "compile_saxpy",
+      "median_ns": 11819,
+      "low_ns": 11310,
+      "high_ns": 11840
+    },
+    {
+      "group": "compile_pipeline",
+      "bench": "compile_vector_add",
+      "median_ns": 9401,
+      "low_ns": 9395,
+      "high_ns": 9409
+    },
+    {
+      "group": "cpu_reference",
+      "bench": "cpu_saxpy_1024",
+      "median_ns": 288,
+      "low_ns": 253,
+      "high_ns": 319
+    },
+    {
+      "group": "cpu_reference",
+      "bench": "cpu_saxpy_1m",
+      "median_ns": 801680,
+      "low_ns": 797002,
+      "high_ns": 805731
+    },
+    {
+      "group": "cpu_reference",
+      "bench": "cpu_vector_add_1024",
+      "median_ns": 68,
+      "low_ns": 68,
+      "high_ns": 69
+    },
+    {
+      "group": "cpu_reference",
+      "bench": "cpu_vector_add_1m",
+      "median_ns": 183632,
+      "low_ns": 182361,
+      "high_ns": 186154
+    }
+  ]
+}

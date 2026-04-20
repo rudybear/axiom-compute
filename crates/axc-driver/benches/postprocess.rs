@@ -92,21 +92,24 @@ struct CriterionCI {
 
 // ── Known bench groups and their Criterion output directory names ──────────────
 
-/// Each entry: (group_name, criterion_bench_name_on_disk, bench_field_name_in_json)
+/// Each entry: (group_name, criterion_dir_name, bench_field_name_in_json).
+///
+/// Criterion 0.5 writes each bench function to `target/criterion/<bench_name>/new/estimates.json`
+/// (the bench function name is the directory, NOT prefixed by the bench binary name).
 const KNOWN_BENCHES: &[(&str, &str, &str)] = &[
     // compile_pipeline group
-    ("compile_pipeline", "compile/compile_saxpy", "compile_saxpy"),
-    ("compile_pipeline", "compile/compile_vector_add", "compile_vector_add"),
+    ("compile_pipeline", "compile_saxpy", "compile_saxpy"),
+    ("compile_pipeline", "compile_vector_add", "compile_vector_add"),
     // cpu_reference group
-    ("cpu_reference", "cpu_reference/cpu_saxpy_1024", "cpu_saxpy_1024"),
-    ("cpu_reference", "cpu_reference/cpu_saxpy_1m", "cpu_saxpy_1m"),
-    ("cpu_reference", "cpu_reference/cpu_vector_add_1024", "cpu_vector_add_1024"),
-    ("cpu_reference", "cpu_reference/cpu_vector_add_1m", "cpu_vector_add_1m"),
+    ("cpu_reference", "cpu_saxpy_1024", "cpu_saxpy_1024"),
+    ("cpu_reference", "cpu_saxpy_1m", "cpu_saxpy_1m"),
+    ("cpu_reference", "cpu_vector_add_1024", "cpu_vector_add_1024"),
+    ("cpu_reference", "cpu_vector_add_1m", "cpu_vector_add_1m"),
     // dispatch_gpu group
-    ("dispatch_gpu", "dispatch/dispatch_saxpy_1024", "dispatch_saxpy_1024"),
-    ("dispatch_gpu", "dispatch/dispatch_saxpy_1m", "dispatch_saxpy_1m"),
-    ("dispatch_gpu", "dispatch/dispatch_vector_add_1024", "dispatch_vector_add_1024"),
-    ("dispatch_gpu", "dispatch/dispatch_vector_add_1m", "dispatch_vector_add_1m"),
+    ("dispatch_gpu", "dispatch_saxpy_1024", "dispatch_saxpy_1024"),
+    ("dispatch_gpu", "dispatch_saxpy_1m", "dispatch_saxpy_1m"),
+    ("dispatch_gpu", "dispatch_vector_add_1024", "dispatch_vector_add_1024"),
+    ("dispatch_gpu", "dispatch_vector_add_1m", "dispatch_vector_add_1m"),
 ];
 
 // ── Helper: probe git SHA ──────────────────────────────────────────────────────

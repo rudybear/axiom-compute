@@ -301,6 +301,24 @@ deferred to M1.5.
 
 **Subgroup ballot (`subgroup_ballot(bool) -> uvec4`) deferred to M1.5** pending uvec4 primitive type.
 
+### 3.1.7 Benchmark harness (M2.2)
+
+The first performance measurement layer for AXIOM-Compute is implemented in
+`crates/axc-driver/benches/` using the Criterion microbenchmark framework.
+Three bench groups are provided:
+
+- `compile_pipeline` (`cargo bench --bench compile -p axc-driver`): measures
+  source → SPIR-V wall time for saxpy and vector_add.
+- `cpu_reference` (`cargo bench --bench cpu_reference -p axc-driver`): measures
+  equivalent Rust loops at N ∈ {1024, 1M}; GPU-independent.
+- `dispatch_gpu` (`cargo bench --bench dispatch -p axc-driver`): measures
+  end-to-end `VulkanContext::dispatch` latency; gated on `AXC_ENABLE_GPU_BENCHES=1`.
+
+A regression gate (`crates/axc-driver/tests/bench_regression.rs`) compares
+11-sample medians against `.pipeline/benchmarks/baselines.json` with a 15%
+threshold.  See `BENCHMARKS.md` for the blessed command, blessing workflow,
+regression gate invocation, and CI matrix.
+
 ### 3.1 Types
 
 ```
@@ -468,3 +486,4 @@ trigger UB) may be rejected at HIR typecheck in a future milestone.
 - **2026-04-18:** M1.2 revision — added §3.1 M1.2 parameter binding model (buffer types, scalar params, gid builtin), saxpy binding assignment walkthrough, and interface-list SPIR-V 1.3 rule.
 - **2026-04-18:** M1.3 revision — added §3.1.4 Control flow (M1.3): OpLoopMerge, continue_target, structured CFG for if/for/while/break/continue.
 - **2026-04-18:** M1.5 revision — added §3.1.6 Runtime dispatch (M1.5): VulkanContext lifecycle + Drop ordering, DispatchRequest API + ownership model, metadata sidecar schema v1, host-visible memory simplification + M2 staging-buffer plan, fence timeout default, push-constant byte-assembly discipline, workgroup-count device-limit pre-validation, Vulkan 1.1 subgroup BASIC+VOTE guaranteed / ARITHMETIC+BALLOT+SHUFFLE+CLUSTERED+QUAD device-optional note.
+- **2026-04-18:** M2.2 revision — added §3.1.7 Benchmark harness: Criterion bench groups (compile_pipeline, cpu_reference, dispatch_gpu), regression gate (11-sample median, 15% threshold), baselines.json schema v1, BENCHMARKS.md forward reference.
