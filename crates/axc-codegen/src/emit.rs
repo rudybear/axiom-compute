@@ -19,6 +19,7 @@ use rspirv::spirv::{
 };
 use axc_hir::{HirModule, KernelBody};
 use axc_hir::expr::{HirExprKind, HirStmt, KernelBodyTyped};
+use axc_hir::coopmat::CoopMatBuiltin;
 use axc_hir::subgroup::SubgroupOp;
 use crate::body::{ScalarTypeCache, CapabilitiesRequired, KernelResources, emit_kernel_body};
 use crate::buffers::{
@@ -100,11 +101,35 @@ pub fn emit_module(hir: &HirModule, opts: &CodegenOptions) -> Result<Vec<u32>, C
     let mut b: Builder = Builder::new();
     b.set_version(opts.spirv_version.0, opts.spirv_version.1);
 
+    // M2.1: Pre-scan the body for cooperative-matrix usage to decide memory model.
+    // `OpMemoryModel` must appear before any function, so we need to know BEFORE
+    // entering the body emit loop whether the Vulkan memory model is required.
+    let uses_coopmat = if let KernelBody::Typed(ref tb) = kernel.body {
+        body_uses_coopmat(tb)
+    } else {
+        false
+    };
+
+    // M2.1: Detect F16 SSBO buffers for StorageBuffer16BitAccess capability.
+    let uses_f16_ssbo = kernel.binding_plan.buffers.iter()
+        .any(|b| b.ty.needs_16bit_storage());
+
     // ── Step 1: Capabilities ─────────────────────────────────────────────────
     b.capability(Capability::Shader);
 
+    // M2.1: VulkanMemoryModel is required when cooperative-matrix ops are used
+    // (SPV_KHR_vulkan_memory_model + SPV_KHR_cooperative_matrix spec requirement).
+    if uses_coopmat {
+        b.capability(Capability::VulkanMemoryModel);
+    }
+
     // ── Step 2: Memory model ─────────────────────────────────────────────────
-    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    // M2.1: When coopmat is used, the memory model MUST be Vulkan (not GLSL450).
+    if uses_coopmat {
+        b.memory_model(AddressingModel::Logical, MemoryModel::Vulkan);
+    } else {
+        b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    }
 
     // ── Steps 3-8: void main() → body ────────────────────────────────────────
     let void_t: u32 = b.type_void();
@@ -201,7 +226,11 @@ pub fn emit_module(hir: &HirModule, opts: &CodegenOptions) -> Result<Vec<u32>, C
             b.begin_block(Some(first_block_id))
                 .expect("rspirv: begin_block should not fail after begin_function");
 
-            let mut caps = CapabilitiesRequired::default();
+            let mut caps = CapabilitiesRequired {
+                // M2.1: Set storage_16bit flag from binding plan (F16 SSBO buffers).
+                storage_16bit: uses_f16_ssbo,
+                ..Default::default()
+            };
 
             let subgroup_vars_ref = if subgroup_vars_emitted { Some(&subgroup_vars) } else { None };
             let res = KernelResources {
@@ -252,6 +281,30 @@ pub fn emit_module(hir: &HirModule, opts: &CodegenOptions) -> Result<Vec<u32>, C
             }
             if caps.subgroup_ballot {
                 b.extension("SPV_KHR_shader_subgroup_ballot");
+            }
+
+            // M2.1: Cooperative-matrix capabilities and extensions (AT-614, AT-615, AT-632, AT-633).
+            // Emitted only when coopmat ops are used (caps.coopmat was set by coopmat module).
+            // VulkanMemoryModel capability and Vulkan MemoryModel were already emitted above.
+            if caps.coopmat {
+                b.capability(Capability::CooperativeMatrixKHR);
+                b.extension("SPV_KHR_cooperative_matrix");
+                b.extension("SPV_KHR_vulkan_memory_model");
+            }
+
+            // M2.1: Float16 capability for F16 cooperative-matrix element types (AT-618).
+            // Required by spirv-val when OpConstantNull or other constant instructions reference
+            // a cooperative-matrix type whose element type is F16 (16-bit float).
+            // Must be emitted BEFORE SpirV uses it, which is why it is placed after the body.
+            if caps.float16 {
+                b.capability(Capability::Float16);
+            }
+
+            // M2.1: 16-bit storage capability for F16 SSBO buffers (AT-618).
+            // `caps.storage_16bit` is set based on the kernel's binding plan, not the body.
+            if caps.storage_16bit {
+                b.capability(Capability::StorageBuffer16BitAccess);
+                b.extension("SPV_KHR_16bit_storage");
             }
 
             // Save for entry_point call below.
@@ -357,6 +410,9 @@ fn stmt_uses_gid(stmt: &HirStmt) -> bool {
         HirStmt::While(hir_while) => {
             expr_uses_gid(&hir_while.cond) || hir_while.body.iter().any(stmt_uses_gid)
         }
+        HirStmt::CoopMatStore { element_offset, stride, .. } => {
+            expr_uses_gid(element_offset) || expr_uses_gid(stride)
+        }
     }
 }
 
@@ -380,6 +436,7 @@ fn expr_uses_gid(expr: &axc_hir::expr::HirExpr) -> bool {
         HirExprKind::ShortCircuit { lhs, rhs, .. } => expr_uses_gid(lhs) || expr_uses_gid(rhs),
         HirExprKind::BitwiseBuiltin { args, .. } => args.iter().any(expr_uses_gid),
         HirExprKind::SubgroupBuiltin { args, .. } => args.iter().any(expr_uses_gid),
+        HirExprKind::CoopMatBuiltin { args, .. } => args.iter().any(expr_uses_gid),
         HirExprKind::IntLit { .. }
         | HirExprKind::FloatLit { .. }
         | HirExprKind::BoolLit(_)
@@ -426,6 +483,10 @@ fn stmt_uses_subgroup_op(stmt: &HirStmt, target: SubgroupOp) -> bool {
             expr_uses_subgroup_op(&hir_while.cond, target)
                 || hir_while.body.iter().any(|s| stmt_uses_subgroup_op(s, target))
         }
+        HirStmt::CoopMatStore { element_offset, stride, .. } => {
+            expr_uses_subgroup_op(element_offset, target)
+                || expr_uses_subgroup_op(stride, target)
+        }
     }
 }
 
@@ -459,6 +520,83 @@ fn expr_uses_subgroup_op(expr: &axc_hir::expr::HirExpr, target: SubgroupOp) -> b
         }
         HirExprKind::BitwiseBuiltin { args, .. } => {
             args.iter().any(|a| expr_uses_subgroup_op(a, target))
+        }
+        HirExprKind::CoopMatBuiltin { args, .. } => {
+            args.iter().any(|a| expr_uses_subgroup_op(a, target))
+        }
+        HirExprKind::GidBuiltin { .. }
+        | HirExprKind::IntLit { .. }
+        | HirExprKind::FloatLit { .. }
+        | HirExprKind::BoolLit(_)
+        | HirExprKind::LocalRead(_) => false,
+    }
+}
+
+// ── M2.1: Cooperative-matrix usage scanner ────────────────────────────────────
+
+/// Scan a typed kernel body for any cooperative-matrix builtin (Zero, Load, MulAdd, or
+/// a CoopMatStore statement). Used to decide whether to emit `MemoryModel Vulkan`.
+fn body_uses_coopmat(body: &KernelBodyTyped) -> bool {
+    body.stmts.iter().any(stmt_uses_coopmat)
+}
+
+fn stmt_uses_coopmat(stmt: &HirStmt) -> bool {
+    match stmt {
+        HirStmt::Let { init, .. } => expr_uses_coopmat(init),
+        HirStmt::Assign { value, .. } => expr_uses_coopmat(value),
+        HirStmt::Return { .. } | HirStmt::Break { .. } | HirStmt::Continue { .. } | HirStmt::Barrier { .. } => false,
+        HirStmt::BufferWrite { index, value, .. } => expr_uses_coopmat(index) || expr_uses_coopmat(value),
+        HirStmt::CoopMatStore { element_offset, stride, .. } => {
+            // A CoopMatStore IS a coopmat op.
+            // Also check element_offset/stride for nested coopmat (unlikely but correct).
+            let _ = element_offset;
+            let _ = stride;
+            true
+        }
+        HirStmt::If(hir_if) => {
+            expr_uses_coopmat(&hir_if.cond)
+                || hir_if.then_block.iter().any(stmt_uses_coopmat)
+                || hir_if.else_arm.as_ref().is_some_and(|arm| else_uses_coopmat(arm))
+        }
+        HirStmt::ForRange(hir_for) => {
+            expr_uses_coopmat(&hir_for.start)
+                || expr_uses_coopmat(&hir_for.end)
+                || hir_for.body.iter().any(stmt_uses_coopmat)
+        }
+        HirStmt::While(hir_while) => {
+            expr_uses_coopmat(&hir_while.cond)
+                || hir_while.body.iter().any(stmt_uses_coopmat)
+        }
+    }
+}
+
+fn else_uses_coopmat(arm: &axc_hir::control_flow::HirElse) -> bool {
+    match arm {
+        axc_hir::control_flow::HirElse::Block(stmts) => stmts.iter().any(stmt_uses_coopmat),
+        axc_hir::control_flow::HirElse::If(hir_if) => {
+            expr_uses_coopmat(&hir_if.cond)
+                || hir_if.then_block.iter().any(stmt_uses_coopmat)
+                || hir_if.else_arm.as_ref().is_some_and(|arm| else_uses_coopmat(arm))
+        }
+    }
+}
+
+fn expr_uses_coopmat(expr: &axc_hir::expr::HirExpr) -> bool {
+    match &expr.kind {
+        HirExprKind::CoopMatBuiltin { op, .. } => {
+            // Only the expression-position ops (Zero, Load, MulAdd) trigger coopmat.
+            // Store is handled as a statement above.
+            matches!(
+                op,
+                CoopMatBuiltin::Zero | CoopMatBuiltin::Load | CoopMatBuiltin::MulAdd
+            )
+        }
+        HirExprKind::BufferRead { index, .. } => expr_uses_coopmat(index),
+        HirExprKind::Unary { operand, .. } => expr_uses_coopmat(operand),
+        HirExprKind::Binary { lhs, rhs, .. } => expr_uses_coopmat(lhs) || expr_uses_coopmat(rhs),
+        HirExprKind::ShortCircuit { lhs, rhs, .. } => expr_uses_coopmat(lhs) || expr_uses_coopmat(rhs),
+        HirExprKind::BitwiseBuiltin { args, .. } | HirExprKind::SubgroupBuiltin { args, .. } => {
+            args.iter().any(expr_uses_coopmat)
         }
         HirExprKind::GidBuiltin { .. }
         | HirExprKind::IntLit { .. }
@@ -649,6 +787,7 @@ mod tests {
                 complexity: None,
                 preconditions: Vec::new(),
                 subgroup_uniform: false,
+                cooperative_matrix: false,
             },
             params: Vec::new(),
             binding_plan: ParamBindingPlan {

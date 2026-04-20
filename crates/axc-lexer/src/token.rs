@@ -393,6 +393,27 @@ pub fn is_reserved_subgroup_builtin(name: &str) -> bool {
     RESERVED_SUBGROUP_BUILTIN_NAMES.binary_search(&name).is_ok()
 }
 
+/// Sorted-for-binary-search list of the four cooperative-matrix builtin call names (M2.1).
+///
+/// These are plain identifiers (not keywords) recognized by the parser and HIR typechecker.
+/// The lexer does NOT create dedicated token kinds for these; they remain `TokenKind::Ident`.
+///
+/// Sorted lexicographically so `binary_search` works correctly.
+/// The HIR crate (`axc_hir::coopmat::RESERVED_COOPMAT_BUILTIN_NAMES`) must stay in sync.
+pub const RESERVED_COOPMAT_BUILTIN_NAMES: &[&str] = &[
+    "coopmat_load",
+    "coopmat_mul_add",
+    "coopmat_store",
+    "coopmat_zero",
+];
+
+/// Returns `true` if `name` is a reserved cooperative-matrix builtin identifier.
+///
+/// Uses binary search on the sorted `RESERVED_COOPMAT_BUILTIN_NAMES` slice.
+pub fn is_reserved_coopmat_builtin(name: &str) -> bool {
+    RESERVED_COOPMAT_BUILTIN_NAMES.binary_search(&name).is_ok()
+}
+
 /// Lookup table mapping byte offsets to (line, column) positions.
 ///
 /// Built on demand for diagnostic rendering; not part of the hot tokenize path.

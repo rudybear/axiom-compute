@@ -41,18 +41,41 @@ pub struct Param {
     pub ty: Spanned<TypeRef>,
 }
 
-/// Scalar element type for buffer parameters.
+/// Scalar element type for buffer parameters and cooperative-matrix elements.
 ///
-/// Mirrors the subset of `ScalarTy` that is valid as a buffer element in M1.2.
-/// I8/I16/U8/U16/F16/Bf16 are excluded until the narrow-type milestone.
+/// M1.2: I32, U32, I64, U64, F32, F64 for buffer[T].
+/// M2.1: adds I8, U8, F16 for cooperative-matrix element types.
+///       F16 is also allowed as a buffer element (triggers StorageBuffer16BitAccess cap).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScalarTypeRef {
+    I8,
+    U8,
     I32,
     U32,
     I64,
     U64,
+    /// IEEE-754 binary16 half-precision float.
+    F16,
+    /// Google bfloat16 (brain float). NOT a valid cooperative-matrix element
+    /// type in M2.1; the parser accepts this token so the HIR can emit a
+    /// precise `CoopMatrixElementTypeUnsupported` diagnostic (AT-609).
+    Bf16,
     F32,
     F64,
+}
+
+/// The `use` tag in a `matrix[T, M, N, use]` type reference.
+///
+/// These are NOT lexer keywords — they are plain `Ident` tokens matched by the
+/// parser when consuming the 4th positional argument of a `matrix` type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoopMatUseAst {
+    /// `a` → MatrixA (MatrixAKHR = 0 in SPIR-V).
+    A,
+    /// `b` → MatrixB (MatrixBKHR = 1 in SPIR-V).
+    B,
+    /// `accumulator` → MatrixAccumulator (MatrixAccumulatorKHR = 2 in SPIR-V).
+    Accumulator,
 }
 
 /// A type reference in source (return type of a kernel declaration, let binding type,
@@ -60,6 +83,7 @@ pub enum ScalarTypeRef {
 ///
 /// M0 only permitted `void`. M1.1 adds scalar types (§3.1 subset).
 /// M1.2 adds buffer types with an element type.
+/// M2.1 adds F16 scalar and `matrix[T, M, N, use]` cooperative-matrix type.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeRef {
     Void,
@@ -68,6 +92,8 @@ pub enum TypeRef {
     U32,
     I64,
     U64,
+    /// M2.1: IEEE-754 binary16 float (half precision).
+    F16,
     F32,
     F64,
     /// `buffer[elem]` — readable and writable SSBO.
@@ -76,6 +102,16 @@ pub enum TypeRef {
     ReadonlyBuffer(ScalarTypeRef),
     /// `writeonly_buffer[elem]` — write-only SSBO.
     WriteonlyBuffer(ScalarTypeRef),
+    /// `matrix[T, M, N, use]` — cooperative-matrix type (M2.1+).
+    ///
+    /// `elem` is the element scalar type. `m` and `n` are positive integer literals
+    /// (1..=65535). `use_` is `a`, `b`, or `accumulator`.
+    CoopMatrix {
+        elem: ScalarTypeRef,
+        m: u32,
+        n: u32,
+        use_: CoopMatUseAst,
+    },
 }
 
 /// An annotation on a kernel: `@name` or `@name(arg, …)`.

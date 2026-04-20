@@ -33,7 +33,7 @@ use rspirv::spirv::{
 };
 use axc_hir::expr::{
     KernelBodyTyped, HirExpr, HirExprKind, HirStmt, BinOp, UnaryOp,
-    ShortCircuitOp, BitwiseOp, BindingId,
+    ShortCircuitOp, BitwiseOp, BindingId, BindingTy,
 };
 use axc_hir::ty::ScalarTy;
 use axc_hir::subgroup::{SubgroupOp, SubgroupReduceKind, BarrierKind};
@@ -45,6 +45,7 @@ use crate::subgroup::{
     emit_subgroup_elect, emit_subgroup_vote, emit_subgroup_reduce,
     emit_subgroup_broadcast_first, emit_workgroup_barrier,
 };
+use crate::coopmat::CoopMatTypeCache;
 
 /// References to pre-emitted global IR structures for M1.2 buffer/scalar/gid support.
 ///
@@ -118,6 +119,7 @@ impl ScalarTypeCache {
             ScalarTy::U16  => b.type_int(16, 0),
             ScalarTy::U32  => b.type_int(32, 0),
             ScalarTy::U64  => b.type_int(64, 0),
+            ScalarTy::F16  => b.type_float(16),
             ScalarTy::F32  => b.type_float(32),
             ScalarTy::F64  => b.type_float(64),
             ScalarTy::Bool => b.type_bool(),
@@ -170,10 +172,28 @@ pub struct CapabilitiesRequired {
     pub subgroup_arith: bool,
     /// True if subgroup_broadcast_first was used — requires `OpCapability GroupNonUniformBallot` (M1.4).
     pub subgroup_ballot: bool,
+    /// M2.1: True if any cooperative-matrix type or builtin was used.
+    ///
+    /// Requires `OpCapability CooperativeMatrixKHR` and the extensions
+    /// `SPV_KHR_cooperative_matrix`, `SPV_KHR_vulkan_memory_model` plus
+    /// `OpCapability VulkanMemoryModel` and
+    /// `OpMemoryModel Logical Vulkan` (instead of GLSL450).
+    pub coopmat: bool,
+    /// M2.1: True if any F16 SSBO buffer was declared (computed in emit.rs from binding plan).
+    ///
+    /// Requires `OpCapability StorageBuffer16BitAccess` and
+    /// `OpExtension "SPV_KHR_16bit_storage"`.
+    pub storage_16bit: bool,
+    /// M2.1: True if any cooperative-matrix type uses F16 as the element type.
+    ///
+    /// Requires `OpCapability Float16`.
+    /// Without this, `OpConstantNull` and `OpConstant` on F16-element coopmat types
+    /// are rejected by spirv-val ("Cannot form constants of 8- or 16-bit types").
+    pub float16: bool,
 }
 
 impl CapabilitiesRequired {
-    fn observe_type(&mut self, ty: ScalarTy) {
+    pub(crate) fn observe_type(&mut self, ty: ScalarTy) {
         match ty {
             ScalarTy::I64 | ScalarTy::U64 => { self.int64 = true; }
             ScalarTy::F64 => { self.float64 = true; }
@@ -207,7 +227,8 @@ struct BodyEmitter<'a> {
     b: &'a mut Builder,
     type_cache: &'a mut ScalarTypeCache,
     caps: &'a mut CapabilitiesRequired,
-    /// Maps BindingId → SPIR-V variable id (OpVariable in Function storage).
+    /// Maps BindingId → SPIR-V variable id (OpVariable in Function storage for scalars;
+    /// SSA result id for cooperative-matrix values — no OpVariable needed for coopmat).
     var_ids: HashMap<BindingId, Word>,
     /// Cached constants: (ScalarTy, bits) → result id.
     const_cache: HashMap<ConstKey, Word>,
@@ -223,6 +244,14 @@ struct BodyEmitter<'a> {
     /// When true, subsequent statements in the same block are silently skipped
     /// (dead code elimination per AT-316 spec).
     current_block_terminated: bool,
+    /// Set of BindingIds that correspond to CoopMatrix (SSA) rather than scalar (OpVariable).
+    ///
+    /// M2.1: Cooperative-matrix values use SSA directly; no OpVariable is allocated.
+    /// Populated in the prelude loop alongside the scalar OpVariable allocation.
+    /// Uses `HashMap`-based set (BindingId has Hash but not Ord).
+    coopmat_binding_ids: std::collections::HashSet<BindingId>,
+    /// Cache of emitted OpTypeCooperativeMatrixKHR type IDs (AT-619).
+    coopmat_type_cache: CoopMatTypeCache,
 }
 
 impl<'a> BodyEmitter<'a> {
@@ -274,6 +303,15 @@ impl<'a> BodyEmitter<'a> {
         let id = self.b.constant_bit64(ty_id, bits);
         self.const_cache.insert(key, id);
         id
+    }
+
+    /// Get or create an `OpConstant u32` for a literal value.
+    ///
+    /// Delegates to `ScalarTypeCache::get_or_emit_u32_const` which uses a BTreeMap
+    /// for deterministic output (AT-418). Used by coopmat scope/layout constants.
+    #[allow(dead_code)] // Used in coopmat.rs via BodyEmitter if needed
+    pub(crate) fn get_or_emit_u32_const(&mut self, value: u32) -> Word {
+        self.type_cache.get_or_emit_u32_const(self.b, value)
     }
 
     fn get_const_bool(&mut self, value: bool) -> Word {
@@ -357,6 +395,8 @@ pub fn emit_kernel_body(
         res,
         loop_stack: Vec::new(),
         current_block_terminated: false,
+        coopmat_binding_ids: std::collections::HashSet::new(),
+        coopmat_type_cache: CoopMatTypeCache::new(),
     };
 
     // ── Prelude: emit ALL OpVariable declarations in the first block ──────────
@@ -366,11 +406,21 @@ pub fn emit_kernel_body(
     // including those inside nested scopes or after break statements. This costs
     // a few extra OpVariable words but matches glslang's behavior (AT-316).
     for binding in &body.bindings {
-        emitter.caps.observe_type(binding.ty);
-        let ptr_ty = emitter.ptr_type_id(binding.ty);
-        let var_id = emitter.b
-            .variable(ptr_ty, None, StorageClass::Function, None);
-        emitter.var_ids.insert(binding.id, var_id);
+        match binding.ty {
+            BindingTy::Scalar(scalar_ty) => {
+                // Scalar bindings get an OpVariable in Function storage class.
+                emitter.caps.observe_type(scalar_ty);
+                let ptr_ty = emitter.ptr_type_id(scalar_ty);
+                let var_id = emitter.b
+                    .variable(ptr_ty, None, StorageClass::Function, None);
+                emitter.var_ids.insert(binding.id, var_id);
+            }
+            BindingTy::CoopMatrix(_) => {
+                // M2.1: CoopMatrix bindings use SSA (no OpVariable). Record the id
+                // in coopmat_binding_ids so the Let handler can use OpStore-free path.
+                emitter.coopmat_binding_ids.insert(binding.id);
+            }
+        }
     }
 
     // ── Emit statements ───────────────────────────────────────────────────────
@@ -400,12 +450,19 @@ fn emit_stmt(em: &mut BodyEmitter<'_>, stmt: &HirStmt) -> Result<(), BodyCodegen
     match stmt {
         HirStmt::Let { binding, init, .. } => {
             let init_id = emit_expr(em, init)?;
-            let var_id = em.var_ids.get(binding).copied()
-                .ok_or(BodyCodegenError::UnexpectedHir("Let binding not in var_ids"))?;
-            let init_ty = em.type_id(init.ty);
-            em.b.store(var_id, init_id, None, None)
-                .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
-            let _ = init_ty;
+            if em.coopmat_binding_ids.contains(binding) {
+                // M2.1: CoopMatrix binding — SSA value, no OpVariable / OpStore.
+                // Store the SSA result id in var_ids so coopmat_store can look it up.
+                em.var_ids.insert(*binding, init_id);
+            } else {
+                // Scalar binding — write to pre-allocated OpVariable.
+                let var_id = em.var_ids.get(binding).copied()
+                    .ok_or(BodyCodegenError::UnexpectedHir("Let binding not in var_ids"))?;
+                let init_ty = em.type_id(init.ty);
+                em.b.store(var_id, init_id, None, None)
+                    .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+                let _ = init_ty;
+            }
             Ok(())
         }
         HirStmt::Assign { binding, value, .. } => {
@@ -465,6 +522,39 @@ fn emit_stmt(em: &mut BodyEmitter<'_>, stmt: &HirStmt) -> Result<(), BodyCodegen
                     Ok(())
                 }
             }
+        }
+        HirStmt::CoopMatStore { matrix_binding, buf_param_index, element_offset, stride, .. } => {
+            // M2.1: Emit OpCooperativeMatrixStoreKHR via coopmat module.
+            let mat_val_id = *em.var_ids.get(matrix_binding)
+                .ok_or(BodyCodegenError::UnexpectedHir(
+                    "CoopMatStore: matrix binding not in var_ids"
+                ))?;
+            let offset_id = emit_expr(em, element_offset)?;
+            let stride_id = emit_expr(em, stride)?;
+            let bindings = em.res.buffer_bindings
+                .ok_or(BodyCodegenError::UnexpectedHir(
+                    "CoopMatStore: no BufferBindings in resources"
+                ))?;
+            // Split borrows: extract what we need before the coopmat call.
+            let buf_param = *buf_param_index;
+            let buf_var_id = *bindings.var_ids.get(&buf_param)
+                .ok_or(BodyCodegenError::UnexpectedHir(
+                    "CoopMatStore: buffer_binding not in var_ids"
+                ))?;
+            let elem_ptr_ty = *bindings.elem_ptr_ids.get(&buf_param)
+                .ok_or(BodyCodegenError::UnexpectedHir(
+                    "CoopMatStore: buffer_binding not in elem_ptr_ids"
+                ))?;
+            crate::coopmat::emit_coopmat_store_inline(
+                em.b,
+                em.type_cache,
+                em.caps,
+                buf_var_id,
+                elem_ptr_ty,
+                mat_val_id,
+                offset_id,
+                stride_id,
+            )
         }
     }
 }
@@ -755,6 +845,15 @@ fn emit_expr(em: &mut BodyEmitter<'_>, expr: &HirExpr) -> Result<Word, BodyCodeg
                 let param_position: u32 = u32::MAX - bid.0;
                 return emit_scalar_param_read(em, param_position, expr.ty);
             }
+            // M2.1: CoopMatrix bindings use SSA directly (no OpVariable / OpLoad).
+            // The var_ids entry holds the SSA result id of the coopmat value.
+            if em.coopmat_binding_ids.contains(bid) {
+                let ssa_id = em.var_ids.get(bid).copied()
+                    .ok_or(BodyCodegenError::UnexpectedHir(
+                        "LocalRead(coopmat): binding not in var_ids"
+                    ))?;
+                return Ok(ssa_id);
+            }
             let var_id = em.var_ids.get(bid).copied()
                 .ok_or(BodyCodegenError::UnexpectedHir("LocalRead: binding not in var_ids"))?;
             let ty_id = em.type_id(expr.ty);
@@ -782,6 +881,67 @@ fn emit_expr(em: &mut BodyEmitter<'_>, expr: &HirExpr) -> Result<Word, BodyCodeg
         }
         HirExprKind::SubgroupBuiltin { op, args } => {
             emit_subgroup_builtin(em, *op, args, expr.ty)
+        }
+        HirExprKind::CoopMatBuiltin { op, args, result_ty, buf_param_index } => {
+            // M2.1: Dispatch to coopmat module.
+            use crate::coopmat as cm;
+            use axc_hir::coopmat::CoopMatBuiltin;
+            match op {
+                CoopMatBuiltin::Zero => {
+                    // Split borrow: extract b, type_cache, caps, coopmat_type_cache.
+                    let result = cm::emit_coopmat_zero(
+                        em.b, em.type_cache, &mut em.coopmat_type_cache, em.caps, *result_ty,
+                    );
+                    Ok(result)
+                }
+                CoopMatBuiltin::Load => {
+                    let buf_slot = buf_param_index.ok_or(BodyCodegenError::UnexpectedHir(
+                        "coopmat_load: buf_param_index is None"
+                    ))?;
+                    if args.len() != 2 {
+                        return Err(BodyCodegenError::UnexpectedHir(
+                            "coopmat_load: expected 2 args (element_offset, stride)"
+                        ));
+                    }
+                    let offset_id = emit_expr(em, &args[0])?;
+                    let stride_id = emit_expr(em, &args[1])?;
+                    let bindings = em.res.buffer_bindings
+                        .ok_or(BodyCodegenError::UnexpectedHir(
+                            "coopmat_load: no BufferBindings in resources"
+                        ))?;
+                    let buf_var_id = *bindings.var_ids.get(&buf_slot)
+                        .ok_or(BodyCodegenError::UnexpectedHir(
+                            "coopmat_load: buffer_binding not in var_ids"
+                        ))?;
+                    let elem_ptr_ty = *bindings.elem_ptr_ids.get(&buf_slot)
+                        .ok_or(BodyCodegenError::UnexpectedHir(
+                            "coopmat_load: buffer_binding not in elem_ptr_ids"
+                        ))?;
+                    cm::emit_coopmat_load_inline(
+                        em.b, em.type_cache, &mut em.coopmat_type_cache, em.caps,
+                        *result_ty, buf_var_id, elem_ptr_ty, offset_id, stride_id,
+                    )
+                }
+                CoopMatBuiltin::MulAdd => {
+                    if args.len() != 3 {
+                        return Err(BodyCodegenError::UnexpectedHir(
+                            "coopmat_mul_add: expected 3 args (a, b, c)"
+                        ));
+                    }
+                    let a_id = emit_expr(em, &args[0])?;
+                    let b_id = emit_expr(em, &args[1])?;
+                    let c_id = emit_expr(em, &args[2])?;
+                    cm::emit_coopmat_mul_add(
+                        em.b, em.type_cache, &mut em.coopmat_type_cache, em.caps,
+                        *result_ty, a_id, b_id, c_id,
+                    )
+                }
+                CoopMatBuiltin::Store => {
+                    Err(BodyCodegenError::UnexpectedHir(
+                        "coopmat_store used in expression position (must be a statement)"
+                    ))
+                }
+            }
         }
     }
 }

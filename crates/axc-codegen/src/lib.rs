@@ -7,6 +7,7 @@ pub mod emit;
 pub mod body;
 pub mod buffers;
 pub mod subgroup;
+pub mod coopmat;
 
 pub use emit::{emit_module, emit_module_bytes, CodegenError, CodegenOptions};
 pub use body::{ScalarTypeCache, CapabilitiesRequired, BodyCodegenError, KernelResources, emit_kernel_body};

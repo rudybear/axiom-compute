@@ -16,6 +16,8 @@ axc-parser = { path = "../axc-parser" }
 thiserror = { workspace = true }
 miette = { workspace = true }
 serde = { workspace = true, optional = true }
+# M2.1: IEEE-754 binary16 conversions for fit_float_literal(f16) and codegen.
+half = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

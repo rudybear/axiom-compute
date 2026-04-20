@@ -30,3 +30,5 @@ insta = { version = "1", features = ["yaml"] }
 rspirv = "0.12"
 spirv = "0.3"
 ash = "0.38"
+# M2.1: IEEE-754 binary16 type for f16 literal conversion.
+half = { version = "2.4", default-features = false }

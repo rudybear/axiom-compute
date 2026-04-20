@@ -8,6 +8,7 @@
 //! M1.2 adds buffer types, kernel parameters, and push-constant binding plans.
 //! M1.3 adds structured control flow: if/else, for-range, while, break, continue.
 //! M1.4 adds subgroup operations and workgroup barrier.
+//! M2.1 adds cooperative-matrix types, F16 primitive, and four coopmat builtins.
 
 pub mod hir;
 pub mod lower;
@@ -20,6 +21,7 @@ pub mod param;
 pub mod loop_ctx;
 pub mod control_flow;
 pub mod subgroup;
+pub mod coopmat;
 
 pub use hir::{
     Module as HirModule,
@@ -37,7 +39,7 @@ pub use lower::lower_module;
 pub use validate::{HirError, HirWarning, validate};
 pub use ty::{ScalarTy, IntLiteralValue, FloatLiteralValue, LiteralRangeErr, fit_int_literal, fit_float_literal};
 pub use expr::{
-    KernelBodyTyped, HirExpr, HirExprKind, HirStmt, Binding, BindingId,
+    KernelBodyTyped, HirExpr, HirExprKind, HirStmt, Binding, BindingId, BindingTy,
     BinOp as HirBinOp, UnaryOp as HirUnaryOp, ShortCircuitOp as HirShortCircuitOp,
     BitwiseOp as HirBitwiseOp,
 };
@@ -50,3 +52,4 @@ pub use param::{
 pub use control_flow::{HirIf, HirElse, HirForRange, HirWhile, ForStep};
 pub use loop_ctx::{HirLoopStack, ScopeStack};
 pub use subgroup::{SubgroupOp, SubgroupReduceKind, BarrierKind};
+pub use coopmat::{CoopMatUse, CoopMatBuiltin, CoopMatrixShapeKind, CoopMatKey, CoopMatrixShape};
