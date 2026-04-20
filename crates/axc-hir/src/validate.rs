@@ -55,7 +55,7 @@ pub enum HirError {
         #[label("duplicate here")]
         span: Span,
     },
-    #[error("unknown annotation `@{name}` (M0 allows: @kernel, @workgroup, @intent, @complexity, @precondition, @subgroup_uniform)")]
+    #[error("unknown annotation `@{name}` (M0 allows: @kernel, @workgroup, @intent, @complexity, @precondition, @subgroup_uniform, @cooperative_matrix)")]
     UnknownAnnotationInM0 {
         name: String,
         #[label("here")]
@@ -207,6 +207,7 @@ mod tests {
                     complexity: None,
                     preconditions: Vec::new(),
                     subgroup_uniform: false,
+                    cooperative_matrix: false,
                 },
                 params: Vec::new(),
                 binding_plan: ParamBindingPlan {

@@ -65,6 +65,8 @@ pub struct KernelAnnotations {
     pub preconditions: Vec<PreconditionTrivial>,
     /// `@subgroup_uniform` flag.
     pub subgroup_uniform: bool,
+    /// `@cooperative_matrix` flag — M2.1.
+    pub cooperative_matrix: bool,
 }
 
 /// Complexity form: the outer function (`O`, `Theta`, `Omega`).

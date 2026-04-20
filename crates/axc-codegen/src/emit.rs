@@ -292,6 +292,14 @@ pub fn emit_module(hir: &HirModule, opts: &CodegenOptions) -> Result<Vec<u32>, C
                 b.extension("SPV_KHR_vulkan_memory_model");
             }
 
+            // M2.1: Float16 capability for F16 cooperative-matrix element types (AT-618).
+            // Required by spirv-val when OpConstantNull or other constant instructions reference
+            // a cooperative-matrix type whose element type is F16 (16-bit float).
+            // Must be emitted BEFORE SpirV uses it, which is why it is placed after the body.
+            if caps.float16 {
+                b.capability(Capability::Float16);
+            }
+
             // M2.1: 16-bit storage capability for F16 SSBO buffers (AT-618).
             // `caps.storage_16bit` is set based on the kernel's binding plan, not the body.
             if caps.storage_16bit {
@@ -779,6 +787,7 @@ mod tests {
                 complexity: None,
                 preconditions: Vec::new(),
                 subgroup_uniform: false,
+                cooperative_matrix: false,
             },
             params: Vec::new(),
             binding_plan: ParamBindingPlan {

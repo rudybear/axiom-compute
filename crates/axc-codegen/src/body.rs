@@ -184,6 +184,12 @@ pub struct CapabilitiesRequired {
     /// Requires `OpCapability StorageBuffer16BitAccess` and
     /// `OpExtension "SPV_KHR_16bit_storage"`.
     pub storage_16bit: bool,
+    /// M2.1: True if any cooperative-matrix type uses F16 as the element type.
+    ///
+    /// Requires `OpCapability Float16`.
+    /// Without this, `OpConstantNull` and `OpConstant` on F16-element coopmat types
+    /// are rejected by spirv-val ("Cannot form constants of 8- or 16-bit types").
+    pub float16: bool,
 }
 
 impl CapabilitiesRequired {
@@ -838,6 +844,15 @@ fn emit_expr(em: &mut BodyEmitter<'_>, expr: &HirExpr) -> Result<Word, BodyCodeg
             if bid.0 >= 0x8000_0000 {
                 let param_position: u32 = u32::MAX - bid.0;
                 return emit_scalar_param_read(em, param_position, expr.ty);
+            }
+            // M2.1: CoopMatrix bindings use SSA directly (no OpVariable / OpLoad).
+            // The var_ids entry holds the SSA result id of the coopmat value.
+            if em.coopmat_binding_ids.contains(bid) {
+                let ssa_id = em.var_ids.get(bid).copied()
+                    .ok_or(BodyCodegenError::UnexpectedHir(
+                        "LocalRead(coopmat): binding not in var_ids"
+                    ))?;
+                return Ok(ssa_id);
             }
             let var_id = em.var_ids.get(bid).copied()
                 .ok_or(BodyCodegenError::UnexpectedHir("LocalRead: binding not in var_ids"))?;

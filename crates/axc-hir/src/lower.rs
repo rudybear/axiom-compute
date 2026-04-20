@@ -35,6 +35,7 @@ pub fn lower_module(ast: &AstModule) -> (HirModule, Vec<HirError>, Vec<HirWarnin
                 let mut complexity: Option<ComplexityForm> = None;
                 let mut preconditions: Vec<PreconditionTrivial> = Vec::new();
                 let mut subgroup_uniform: bool = false;
+                let mut cooperative_matrix: bool = false;
                 let mut seen_workgroup: bool = false;
                 let mut seen_kernel: bool = false;
 
@@ -117,6 +118,9 @@ pub fn lower_module(ast: &AstModule) -> (HirModule, Vec<HirError>, Vec<HirWarnin
                         "subgroup_uniform" => {
                             subgroup_uniform = true;
                         }
+                        "cooperative_matrix" => {
+                            cooperative_matrix = true;
+                        }
                         other => {
                             errors.push(HirError::UnknownAnnotationInM0 {
                                 name: other.to_owned(),
@@ -156,6 +160,7 @@ pub fn lower_module(ast: &AstModule) -> (HirModule, Vec<HirError>, Vec<HirWarnin
                     complexity,
                     preconditions,
                     subgroup_uniform,
+                    cooperative_matrix,
                 };
 
                 // Lower kernel parameters.

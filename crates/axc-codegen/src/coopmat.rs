@@ -45,7 +45,22 @@ use std::collections::BTreeMap;
 use rspirv::dr::Builder;
 use rspirv::spirv::{Word, CooperativeMatrixOperands};
 use axc_hir::coopmat::{CoopMatKey, CoopMatUse};
+use axc_hir::ty::ScalarTy;
 use crate::body::{BodyCodegenError, ScalarTypeCache, CapabilitiesRequired};
+
+// ── Capability helpers ────────────────────────────────────────────────────────
+
+/// Set `caps.float16 = true` when the element type is F16.
+///
+/// Required because `OpConstantNull` and similar constant-forming instructions on
+/// types that contain 16-bit floats are rejected by spirv-val unless `Float16`
+/// capability is declared (see SPIR-V validation rule "Cannot form constants of
+/// 8- or 16-bit types").
+fn observe_coopmat_elem_caps(caps: &mut CapabilitiesRequired, key: CoopMatKey) {
+    if key.elem == ScalarTy::F16 {
+        caps.float16 = true;
+    }
+}
 
 // ── SPIR-V constants ──────────────────────────────────────────────────────────
 
@@ -141,6 +156,7 @@ pub fn emit_coopmat_zero(
     result_ty: CoopMatKey,
 ) -> Word {
     caps.coopmat = true;
+    observe_coopmat_elem_caps(caps, result_ty);
     let mat_type_id = coopmat_cache.get_or_emit(b, type_cache, result_ty);
     b.constant_null(mat_type_id)
 }
@@ -165,6 +181,7 @@ pub fn emit_coopmat_mul_add(
     c_id: Word,
 ) -> Result<Word, BodyCodegenError> {
     caps.coopmat = true;
+    observe_coopmat_elem_caps(caps, result_ty);
 
     let mat_type_id = coopmat_cache.get_or_emit(b, type_cache, result_ty);
 
@@ -253,6 +270,7 @@ pub fn emit_coopmat_load_inline(
     stride_id: Word,
 ) -> Result<Word, BodyCodegenError> {
     caps.coopmat = true;
+    observe_coopmat_elem_caps(caps, result_ty);
 
     let mat_type_id = coopmat_cache.get_or_emit(b, type_cache, result_ty);
 
