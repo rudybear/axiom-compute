@@ -50,13 +50,31 @@ pub struct BufferTy {
 impl BufferTy {
     /// Byte size of a single element for stride computation.
     ///
-    /// Used to compute `Decoration::ArrayStride`: 4 for 32-bit, 8 for 64-bit.
+    /// Used to compute `Decoration::ArrayStride`:
+    /// - 1 byte for 8-bit types (I8, U8)
+    /// - 2 bytes for 16-bit types (F16, I16, U16)
+    /// - 4 bytes for 32-bit types (I32, U32, F32)
+    /// - 8 bytes for 64-bit types (I64, U64, F64)
+    ///
+    /// M2.1: F16 buffers require `StorageBuffer16BitAccess` capability and
+    /// `SPV_KHR_16bit_storage` extension (emitted by codegen).
     pub fn elem_byte_size(&self) -> u32 {
         match self.elem.bit_width() {
+            8  => 1,
+            16 => 2,
             32 => 4,
             64 => 8,
             w  => panic!("unsupported buffer elem bit width {w}"),
         }
+    }
+
+    /// True if this buffer element type requires the `StorageBuffer16BitAccess`
+    /// capability and `SPV_KHR_16bit_storage` extension.
+    ///
+    /// M2.1: Only F16 SSBO elements trigger this. I8/U8 use the 8-bit storage
+    /// extension path (deferred to a later milestone).
+    pub fn needs_16bit_storage(&self) -> bool {
+        self.elem.bit_width() == 16
     }
 }
 
@@ -93,5 +111,22 @@ mod tests {
     fn buffer_ty_elem_byte_size_i64() {
         let bt: BufferTy = BufferTy { elem: ScalarTy::I64, access: BufferAccess::ReadWrite };
         assert_eq!(bt.elem_byte_size(), 8);
+    }
+
+    /// AT-618: F16 buffer element byte size is 2 (16 / 8).
+    #[test]
+    fn buffer_ty_elem_byte_size_f16() {
+        let bt: BufferTy = BufferTy { elem: ScalarTy::F16, access: BufferAccess::ReadWrite };
+        assert_eq!(bt.elem_byte_size(), 2);
+    }
+
+    /// AT-618: F16 buffer needs 16-bit storage capability.
+    #[test]
+    fn buffer_ty_f16_needs_16bit_storage() {
+        let bt_f16: BufferTy = BufferTy { elem: ScalarTy::F16, access: BufferAccess::ReadWrite };
+        assert!(bt_f16.needs_16bit_storage(), "F16 buffer must need 16-bit storage");
+
+        let bt_f32: BufferTy = BufferTy { elem: ScalarTy::F32, access: BufferAccess::ReadWrite };
+        assert!(!bt_f32.needs_16bit_storage(), "F32 buffer must NOT need 16-bit storage");
     }
 }
