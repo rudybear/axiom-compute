@@ -74,6 +74,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "ash"
+version = "0.38.0+1.3.281"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0bb44936d800fea8f016d7f2311c6a4f97aebd5dc86f09906139ec848cf3a46f"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "axc-codegen"
 version = "0.0.1"
 dependencies = [
@@ -93,9 +102,11 @@ dependencies = [
  "axc-hir",
  "axc-lexer",
  "axc-parser",
+ "axc-runtime",
  "clap",
  "miette",
  "rspirv",
+ "serde_json",
  "spirv",
  "spirv-tools",
  "thiserror",
@@ -108,6 +119,8 @@ dependencies = [
  "axc-lexer",
  "axc-parser",
  "miette",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -136,6 +149,17 @@ dependencies = [
 [[package]]
 name = "axc-runtime"
 version = "0.0.1"
+dependencies = [
+ "ash",
+ "axc-driver",
+ "axc-hir",
+ "axc-lexer",
+ "miette",
+ "rspirv",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "backtrace"
@@ -406,6 +430,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52ff2c0fe9bc6cb6b14a0592c2ff4fa9ceb83eea9db979b0487cd054946a2b8f"
 
 [[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -577,6 +611,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 dependencies = [
  "serde_core",
+ "serde_derive",
 ]
 
 [[package]]

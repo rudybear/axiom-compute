@@ -6,8 +6,16 @@ license.workspace = true
 repository.workspace = true
 description = "High-level IR for AXIOM-Compute — validates GPU annotations"
 
+[features]
+default = ["serde"]
+serde = ["dep:serde"]
+
 [dependencies]
 axc-lexer = { path = "../axc-lexer" }
 axc-parser = { path = "../axc-parser" }
 thiserror = { workspace = true }
 miette = { workspace = true }
+serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
