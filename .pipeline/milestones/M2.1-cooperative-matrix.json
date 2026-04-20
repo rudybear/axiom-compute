@@ -1,0 +1,56 @@
+{
+  "id": "M2.1-cooperative-matrix",
+  "title": "Cooperative matrix via SPV_KHR_cooperative_matrix",
+  "phase": "M2",
+  "goal": "Add portable tensor-core access via SPV_KHR_cooperative_matrix (promoted in Vulkan 1.3.300). This is THE defining AXIOM-Compute feature — the point where the project transcends CPU-compiler parity and delivers on the 'AI-first GPU IR' thesis. Portable across NVIDIA Turing+, AMD RDNA3+, Intel Arc.",
+  "scope_in": [
+    "New type: matrix[T, M, N, use] where T in {f16, f32, i8, u8, i32, u32} and use in {'a', 'b', 'accumulator'}",
+    "New builtin calls:",
+    "  - coopmat_load(buffer, offset, stride) -> matrix[T, M, N, use]",
+    "  - coopmat_store(matrix, buffer, offset, stride)",
+    "  - coopmat_mul_add(a: matrix[_, M, K, 'a'], b: matrix[_, K, N, 'b'], c: matrix[_, M, N, 'accumulator']) -> matrix[_, M, N, 'accumulator']",
+    "  - coopmat_zero() -> matrix[T, M, N, use] (initialize accumulator to zero)",
+    "Annotation: @cooperative_matrix(M, N, K, A_type, B_type, C_type) hints codegen + validates dimensions",
+    "SPIR-V lowering: OpTypeCooperativeMatrixKHR + OpCooperativeMatrixLoadKHR/StoreKHR/MulAddKHR",
+    "Required SPIR-V extension: SPV_KHR_cooperative_matrix (emitted via OpExtension when used)",
+    "Required capability: CooperativeMatrixKHR (119)",
+    "New HIR types: Ty::CoopMatrix { elem: ScalarTy, m: u32, n: u32, use: CoopMatUse }",
+    "Dimension constraints enforced at HIR: M*N*K tile shape must match SPIR-V spec's supported shapes (per target hardware query at runtime — for M2.1 just validate shape is positive and accept any combo; runtime preflight to M2.2+)",
+    "Example: examples/matmul_tile.axc — small tile matmul (16x16x16 f16 x f16 -> f32) using cooperative matrix",
+    "Compile + spirv-val integration test; Lavapipe dispatch deferred (software Vulkan lacks cooperative matrix hardware)",
+    "CI: compile-only test passes; runtime GPU test is GPU-gated with 'cooperative_matrix_required' flag — skip on Lavapipe, run on NVIDIA/AMD/Intel self-hosted runners (future)"
+  ],
+  "scope_out": [
+    "NVIDIA-specific SPV_NV_cooperative_matrix2 (vendor fast path, M3)",
+    "Autotuner @strategy holes (M2.2)",
+    "LLM bridge (M2.3)",
+    "MCP server (M2.4)",
+    "Q4_K_M matmul (M2.5)",
+    "Runtime dispatch test on real tensor-core hardware (deferred until GPU CI available)",
+    "Matrix types as kernel parameters (they're function-local only for M2.1)",
+    "Matrix-to-matrix element access (no coopmat[i,j] indexing; only through loads/stores)"
+  ],
+  "acceptance_criteria": [
+    "cargo test --workspace passes (floor ~440 after M2.1)",
+    "cargo clippy --workspace --all-targets -- -D warnings clean",
+    "spirv-val passes on examples/matmul_tile.axc output",
+    "Emitted SPIR-V contains OpExtension SPV_KHR_cooperative_matrix + OpCapability CooperativeMatrixKHR when matrix type used",
+    "matrix type on kernel-scope let binding only; rejected as kernel param type in M2.1 (future milestone)",
+    "Backward compat: all M0..M1.5 tests (426 baseline) pass, all 6 GPU tests on Lavapipe pass"
+  ],
+  "memory_limit_gb": 50,
+  "dependencies": ["M1.5-vulkan-dispatch"],
+  "blocks": ["M2.2-strategy-holes", "M2.5-matmul-q4km"],
+  "estimated_loc": "2000-3000",
+  "estimated_tests_added": "25-40",
+  "open_questions_for_architect": [
+    "Matrix type as let binding vs kernel parameter? M2.1 scope: let binding only. Parameter support in M3.",
+    "coopmat_mul_add: how does the type system enforce that the K dimensions match between a and b? And that the accumulator C matches a's M and b's N? Requires type-level reasoning.",
+    "CoopMatUse: 'a', 'b', 'accumulator' — represent as enum or string? Pick enum per anti-pattern #7.",
+    "Scope for load/store: SPIR-V has Subgroup, Workgroup scope for coopmat load/store. Default Subgroup scope for M2.1.",
+    "Supported dimensions: Vulkan spec requires drivers to expose supported M/N/K triples via VkCooperativeMatrixPropertiesKHR. M2.1 doesn't preflight — any positive M,N,K compiles. Runtime may reject.",
+    "Element stride: coopmat_load takes stride (elements, not bytes); document.",
+    "F16 primitive type: AXIOM-Compute currently supports f16 in type system? If not, add — cooperative matrix is typically f16 inputs.",
+    "Matrix layout: RowMajor vs ColumnMajor — M2.1 hardcodes RowMajor; add as enum parameter in M2.2."
+  ]
+}
