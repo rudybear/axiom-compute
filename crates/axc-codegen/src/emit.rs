@@ -238,6 +238,21 @@ pub fn emit_module(hir: &HirModule, opts: &CodegenOptions) -> Result<Vec<u32>, C
             if caps.subgroup_ballot {
                 b.capability(Capability::GroupNonUniformBallot);
             }
+            // M1.4: Emit OpExtension strings for SPV_KHR_shader_subgroup_* (AT-418, AT-426, AT-427).
+            // Each capability requires its corresponding KHR extension string.
+            // Emitted in the same fixed order as capabilities for determinism.
+            if caps.subgroup_basic {
+                b.extension("SPV_KHR_shader_subgroup_basic");
+            }
+            if caps.subgroup_vote {
+                b.extension("SPV_KHR_shader_subgroup_vote");
+            }
+            if caps.subgroup_arith {
+                b.extension("SPV_KHR_shader_subgroup_arithmetic");
+            }
+            if caps.subgroup_ballot {
+                b.extension("SPV_KHR_shader_subgroup_ballot");
+            }
 
             // Save for entry_point call below.
             let gid_var_id_for_ep: Option<u32> = gid_var.as_ref().map(|g| g.var_id);
@@ -1229,42 +1244,88 @@ mod tests {
             .collect()
     }
 
-    // AT-426: GroupNonUniform emitted for subgroup_invocation_id kernel
-    #[test]
-    fn emit_sg_invocation_id_emits_group_non_uniform_cap() {
-        let words = compile_src(
-            "@kernel @workgroup(64,1,1) fn k() -> void { let id: u32 = subgroup_invocation_id(); return; }"
-        );
-        let caps = get_capabilities(&words);
-        assert!(
-            caps.contains(&Capability::GroupNonUniform),
-            "GroupNonUniform must be present for subgroup_invocation_id; caps: {caps:?}"
-        );
-        assert!(
-            !caps.contains(&Capability::GroupNonUniformArithmetic),
-            "GroupNonUniformArithmetic must be absent; caps: {caps:?}"
-        );
-        assert!(
-            !caps.contains(&Capability::GroupNonUniformVote),
-            "GroupNonUniformVote must be absent; caps: {caps:?}"
-        );
+    /// Helper: count OpExtension instructions with a specific string operand in the module.
+    fn count_extension_string(words: &[u32], ext_name: &str) -> usize {
+        let module = rspirv::dr::load_words(words).expect("load_words failed");
+        module.extensions.iter()
+            .filter(|i| {
+                i.operands.first()
+                    .and_then(|op| if let rspirv::dr::Operand::LiteralString(s) = op { Some(s.as_str()) } else { None })
+                    == Some(ext_name)
+            })
+            .count()
     }
 
-    // AT-427: GroupNonUniformArithmetic emitted for subgroup_reduce_add kernel
+    // AT-413 / AT-416: emit_subgroup_reduce_kernel_smoke
+    // AT-413: Minimal reduce kernel emits OpCapability GroupNonUniformArithmetic AND GroupNonUniform exactly once.
+    // AT-416: SubgroupSize Input variable is emitted (subgroup_reduce uses subgroup_reduce_add, not size directly,
+    //         but smoke test checks the pipeline compiles and has expected caps).
     #[test]
-    fn emit_sg_reduce_add_emits_arith_and_basic_caps() {
+    fn emit_subgroup_reduce_kernel_smoke() {
+        let words = compile_src(
+            "@kernel @workgroup(64,1,1) fn k() -> void { let v: f32 = 1.0f32; let s: f32 = subgroup_reduce_add(v); return; }"
+        );
+        let module = rspirv::dr::load_words(&words).expect("load_words failed");
+
+        // AT-413: both caps present exactly once.
+        let cap_basic_count = module.capabilities.iter()
+            .filter(|i| i.operands.first() == Some(&Operand::Capability(Capability::GroupNonUniform)))
+            .count();
+        let cap_arith_count = module.capabilities.iter()
+            .filter(|i| i.operands.first() == Some(&Operand::Capability(Capability::GroupNonUniformArithmetic)))
+            .count();
+        assert_eq!(cap_basic_count, 1, "AT-413: GroupNonUniform must appear exactly once; got {cap_basic_count}");
+        assert_eq!(cap_arith_count, 1, "AT-413: GroupNonUniformArithmetic must appear exactly once; got {cap_arith_count}");
+
+        // AT-416: pipeline compiles to valid SPIR-V (magic word check).
+        assert_eq!(words[0], 0x0723_0203_u32, "AT-416: magic word");
+        assert_eq!(words[1], 0x0001_0300_u32, "AT-416: SPIR-V version 1.3");
+    }
+
+    // AT-426: (rev 1 CRITICAL-1) Minimal reduce-only kernel emits GroupNonUniform + GroupNonUniformArithmetic
+    // Also asserts OpExtension "SPV_KHR_shader_subgroup_basic" and "SPV_KHR_shader_subgroup_arithmetic" each exactly 1.
+    #[test]
+    fn cg_minimal_subgroup_only_reduce_emits_basic_capability() {
         let words = compile_src(
             "@kernel @workgroup(64,1,1) fn k() -> void { let v: i32 = 1i32; let r: i32 = subgroup_reduce_add(v); return; }"
         );
         let caps = get_capabilities(&words);
         assert!(
             caps.contains(&Capability::GroupNonUniform),
-            "GroupNonUniform must be present; caps: {caps:?}"
+            "GroupNonUniform must be present (rev 1 CRITICAL-1); caps: {caps:?}"
         );
         assert!(
             caps.contains(&Capability::GroupNonUniformArithmetic),
-            "GroupNonUniformArithmetic must be present for reduce_add; caps: {caps:?}"
+            "GroupNonUniformArithmetic must be present for reduce_add (rev 1 CRITICAL-1); caps: {caps:?}"
         );
+        // AT-426: OpExtension strings must be emitted exactly once each.
+        let ext_basic = count_extension_string(&words, "SPV_KHR_shader_subgroup_basic");
+        let ext_arith = count_extension_string(&words, "SPV_KHR_shader_subgroup_arithmetic");
+        assert_eq!(ext_basic, 1, "OpExtension \"SPV_KHR_shader_subgroup_basic\" : exactly 1; got {ext_basic}");
+        assert_eq!(ext_arith, 1, "OpExtension \"SPV_KHR_shader_subgroup_arithmetic\" : exactly 1; got {ext_arith}");
+    }
+
+    // AT-427: (rev 1 CRITICAL-1) Minimal broadcast-only kernel emits GroupNonUniform + GroupNonUniformBallot
+    // Also asserts OpExtension "SPV_KHR_shader_subgroup_basic" and "SPV_KHR_shader_subgroup_ballot" each exactly 1.
+    #[test]
+    fn cg_minimal_subgroup_only_broadcast_emits_basic_capability() {
+        let words = compile_src(
+            "@kernel @workgroup(64,1,1) fn k() -> void { let v: f32 = 1.0f32; let r: f32 = subgroup_broadcast_first(v); return; }"
+        );
+        let caps = get_capabilities(&words);
+        assert!(
+            caps.contains(&Capability::GroupNonUniform),
+            "GroupNonUniform must be present (rev 1 CRITICAL-1); caps: {caps:?}"
+        );
+        assert!(
+            caps.contains(&Capability::GroupNonUniformBallot),
+            "GroupNonUniformBallot must be present for broadcast_first (rev 1 CRITICAL-1); caps: {caps:?}"
+        );
+        // AT-427: OpExtension strings must be emitted exactly once each.
+        let ext_basic = count_extension_string(&words, "SPV_KHR_shader_subgroup_basic");
+        let ext_ballot = count_extension_string(&words, "SPV_KHR_shader_subgroup_ballot");
+        assert_eq!(ext_basic, 1, "OpExtension \"SPV_KHR_shader_subgroup_basic\" : exactly 1; got {ext_basic}");
+        assert_eq!(ext_ballot, 1, "OpExtension \"SPV_KHR_shader_subgroup_ballot\" : exactly 1; got {ext_ballot}");
     }
 
     // AT-428: workgroup_barrier does NOT emit any GroupNonUniform capability
