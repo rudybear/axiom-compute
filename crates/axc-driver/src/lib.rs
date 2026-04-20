@@ -14,11 +14,12 @@ pub mod cli;
 
 pub use cli::{Command, Cli};
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use axc_lexer::{tokenize, Span};
 use axc_parser::{Parser, ParseError};
 use axc_hir::{lower_module, HirError};
-use axc_codegen::{emit_module_bytes, CodegenOptions};
+use axc_codegen::{emit_module_bytes, CodegenOptions, extract_workgroup_dims};
+use axc_runtime::KernelMetadata;
 
 /// Errors that can occur during compilation.
 #[derive(Debug, thiserror::Error, miette::Diagnostic)]
@@ -46,6 +47,9 @@ pub enum DriverError {
     Codegen(#[from] axc_codegen::CodegenError),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// Metadata sidecar emission failed.
+    #[error("metadata emit failed: {0}")]
+    MetadataEmitFailed(axc_runtime::DispatchError),
 }
 
 impl DriverError {
@@ -55,13 +59,18 @@ impl DriverError {
     }
 }
 
-/// Full pipeline: source string → SPIR-V bytes.
+/// Full pipeline: source string → (SPIR-V bytes, KernelMetadata).
+///
+/// This is the primary M1.5 compilation API. It returns both the compiled
+/// SPIR-V bytes and a `KernelMetadata` describing the kernel's binding plan,
+/// workgroup size, and entry-point name.
 ///
 /// Step 0: BOM pre-check (reject immediately if present).
 /// Steps 1-3: Lex, parse, HIR all run to completion even on errors.
 /// Step 4: Codegen runs only if all three error lists are empty.
-pub fn compile_source_to_spirv(source: &str) -> Result<Vec<u8>, DriverError> {
-    // ── Step 0: BOM rejection (NEW rev 2 / anti-pattern #1) ─────────────────
+/// Step 5: Build KernelMetadata from HIR module.
+pub fn compile_source_with_meta(source: &str) -> Result<(Vec<u8>, KernelMetadata), DriverError> {
+    // ── Step 0: BOM rejection (anti-pattern #1) ─────────────────────────────
     // UTF-8 BOM is EF BB BF. We check raw bytes, not the char value, to keep
     // the logic portable across platforms and consistent with the span semantics
     // (spans are byte offsets into the raw source, not char offsets).
@@ -97,14 +106,65 @@ pub fn compile_source_to_spirv(source: &str) -> Result<Vec<u8>, DriverError> {
 
     // ── Phase 4: Codegen (only when all phases are clean) ────────────────────
     let bytes: Vec<u8> = emit_module_bytes(&hir, &CodegenOptions::default())?;
+
+    // ── Phase 5: Build metadata from HIR ─────────────────────────────────────
+    let workgroup_size: [u32; 3] = extract_workgroup_dims(&hir);
+    let kernel = hir.kernels.first()
+        .expect("codegen succeeded, so at least one kernel exists");
+    let metadata: KernelMetadata = KernelMetadata::new(
+        kernel.name.clone(),
+        workgroup_size,
+        kernel.binding_plan.clone(),
+        "main".to_owned(),
+    );
+
+    Ok((bytes, metadata))
+}
+
+/// Full pipeline: source string → SPIR-V bytes.
+///
+/// Preserved verbatim from M1.4 for backward compatibility with all existing callers.
+/// Internally forwards to `compile_source_with_meta` and discards the metadata.
+///
+/// Step 0: BOM pre-check (reject immediately if present).
+/// Steps 1-3: Lex, parse, HIR all run to completion even on errors.
+/// Step 4: Codegen runs only if all three error lists are empty.
+pub fn compile_source_to_spirv(source: &str) -> Result<Vec<u8>, DriverError> {
+    let (bytes, _meta) = compile_source_with_meta(source)?;
     Ok(bytes)
 }
 
-/// Full pipeline: read source from `input`, write SPIR-V to `output`.
+/// Compute the metadata sidecar path from an output path.
+///
+/// Appends `.axc.meta.json` to the full filename (including any extension).
+/// Examples:
+/// - `out.spv` → `out.spv.axc.meta.json`
+/// - `kernel` → `kernel.axc.meta.json`
+/// - `/a/b.c/d.spv` → `/a/b.c/d.spv.axc.meta.json`
+pub(crate) fn metadata_sidecar_path(output: &Path) -> PathBuf {
+    let filename: String = output
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "output".to_owned());
+    let sidecar_name: String = format!("{filename}.axc.meta.json");
+    output
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(sidecar_name)
+}
+
+/// Full pipeline: read source from `input`, write SPIR-V to `output` and metadata sidecar.
+///
+/// Writes two files:
+/// - `output`: SPIR-V binary
+/// - `output.axc.meta.json`: JSON metadata sidecar
 pub fn compile_file(input: &Path, output: &Path) -> Result<(), DriverError> {
     let source: String = std::fs::read_to_string(input)?;
-    let bytes: Vec<u8> = compile_source_to_spirv(&source)?;
+    let (bytes, metadata) = compile_source_with_meta(&source)?;
     std::fs::write(output, &bytes)?;
+    let sidecar_path: PathBuf = metadata_sidecar_path(output);
+    metadata.save(&sidecar_path)
+        .map_err(DriverError::MetadataEmitFailed)?;
     Ok(())
 }
 
@@ -229,6 +289,71 @@ mod tests {
             content.contains("OpSDiv") || content.contains("OpSRem"),
             "DESIGN.md must mention OpSDiv or OpSRem in the UB section; neither found"
         );
+    }
+
+    // ── AT-521: metadata_sidecar_path helper ─────────────────────────────────
+
+    #[test]
+    fn at_521_metadata_sidecar_path_appends_suffix() {
+        use super::metadata_sidecar_path;
+        use std::path::Path;
+
+        // .spv extension → appends .axc.meta.json after the .spv
+        let p = metadata_sidecar_path(Path::new("out.spv"));
+        assert_eq!(p, std::path::PathBuf::from("out.spv.axc.meta.json"));
+
+        // No extension
+        let p = metadata_sidecar_path(Path::new("kernel"));
+        assert_eq!(p, std::path::PathBuf::from("kernel.axc.meta.json"));
+
+        // Dots in directory component should not affect result
+        let p = metadata_sidecar_path(Path::new("/a/b.c/d.spv"));
+        assert_eq!(p, std::path::PathBuf::from("/a/b.c/d.spv.axc.meta.json"));
+    }
+
+    // ── AT-510a: compile_source_with_meta returns bytes + metadata ────────────
+
+    #[test]
+    fn at_510a_compile_source_with_meta_returns_bytes_and_metadata() {
+        let src = concat!(
+            "@kernel\n",
+            "@workgroup(64, 1, 1)\n",
+            "@intent(\"test\")\n",
+            "@complexity(O(n))\n",
+            "fn saxpy(n: u32, alpha: f32, x: readonly_buffer[f32], y: buffer[f32]) -> void {\n",
+            "    let i: u32 = gid(0);\n",
+            "    return;\n",
+            "}\n",
+        );
+
+        let (bytes, meta) = compile_source_with_meta(src)
+            .expect("compile should succeed");
+
+        // SPIR-V magic bytes
+        assert_eq!(&bytes[0..4], &[0x03, 0x02, 0x23, 0x07], "SPIR-V magic mismatch");
+
+        // Metadata fields
+        assert_eq!(meta.kernel_name, "saxpy");
+        assert_eq!(meta.workgroup_size, [64, 1, 1]);
+        assert_eq!(meta.entry_point, "main");
+        assert_eq!(meta.schema_version, axc_runtime::CURRENT_SCHEMA_VERSION);
+
+        // Binding plan: saxpy has 2 buffers + 2 scalars
+        assert_eq!(meta.binding_plan.buffers.len(), 2, "saxpy should have 2 buffer bindings");
+        assert_eq!(meta.binding_plan.scalars.len(), 2, "saxpy should have 2 scalar push constants");
+        assert_eq!(meta.push_constant_total_bytes, 8, "n:u32 + alpha:f32 = 8 bytes");
+
+        // Buffer names and positions
+        assert_eq!(meta.binding_plan.buffers[0].name, "x");
+        assert_eq!(meta.binding_plan.buffers[0].buffer_position, 0);
+        assert_eq!(meta.binding_plan.buffers[1].name, "y");
+        assert_eq!(meta.binding_plan.buffers[1].buffer_position, 1);
+
+        // Scalar offsets per AT-514a discipline
+        assert_eq!(meta.binding_plan.scalars[0].name, "n");
+        assert_eq!(meta.binding_plan.scalars[0].offset, 0);
+        assert_eq!(meta.binding_plan.scalars[1].name, "alpha");
+        assert_eq!(meta.binding_plan.scalars[1].offset, 4);
     }
 
     // ── AT-116: tri-phase error aggregation for scalar code ───────────────────

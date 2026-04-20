@@ -15,9 +15,11 @@ axc-lexer = { path = "../axc-lexer" }
 axc-parser = { path = "../axc-parser" }
 axc-hir = { path = "../axc-hir" }
 axc-codegen = { path = "../axc-codegen" }
+axc-runtime = { path = "../axc-runtime" }
 clap = { workspace = true }
 miette = { workspace = true }
 thiserror = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 rspirv = { workspace = true }
