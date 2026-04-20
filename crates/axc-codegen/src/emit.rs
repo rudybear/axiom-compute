@@ -293,6 +293,31 @@ fn stmt_uses_gid(stmt: &HirStmt) -> bool {
         HirStmt::Assign { value, .. } => expr_uses_gid(value),
         HirStmt::Return { .. } => false,
         HirStmt::BufferWrite { index, value, .. } => expr_uses_gid(index) || expr_uses_gid(value),
+        HirStmt::Break { .. } | HirStmt::Continue { .. } => false,
+        HirStmt::If(hir_if) => {
+            expr_uses_gid(&hir_if.cond)
+                || hir_if.then_block.iter().any(stmt_uses_gid)
+                || hir_if.else_arm.as_ref().is_some_and(|arm| else_uses_gid(arm))
+        }
+        HirStmt::ForRange(hir_for) => {
+            expr_uses_gid(&hir_for.start)
+                || expr_uses_gid(&hir_for.end)
+                || hir_for.body.iter().any(stmt_uses_gid)
+        }
+        HirStmt::While(hir_while) => {
+            expr_uses_gid(&hir_while.cond) || hir_while.body.iter().any(stmt_uses_gid)
+        }
+    }
+}
+
+fn else_uses_gid(arm: &axc_hir::control_flow::HirElse) -> bool {
+    match arm {
+        axc_hir::control_flow::HirElse::Block(stmts) => stmts.iter().any(stmt_uses_gid),
+        axc_hir::control_flow::HirElse::If(hir_if) => {
+            expr_uses_gid(&hir_if.cond)
+                || hir_if.then_block.iter().any(stmt_uses_gid)
+                || hir_if.else_arm.as_ref().is_some_and(|arm| else_uses_gid(arm))
+        }
     }
 }
 
@@ -880,6 +905,60 @@ mod tests {
         // Must be deterministic.
         let words2 = emit_module(&hir, &CodegenOptions::default()).expect("emit2");
         assert_eq!(words, words2, "scalar_demo must be deterministic");
+    }
+
+    // ── M1.3 integration tests via emit_module ───────────────────────────────
+
+    // AT-306em: for-range kernel compiles to valid SPIR-V (magic word check)
+    #[test]
+    fn emit_for_range_kernel_has_spirv_magic() {
+        let src = "@kernel @workgroup(64,1,1) fn k() -> void { for i in range(0u32, 64u32) { } return; }";
+        let words = emit_module(&make_hir(src), &CodegenOptions::default()).expect("emit");
+        assert_eq!(words[0], 0x0723_0203_u32, "magic word");
+        assert_eq!(words[1], 0x0001_0300_u32, "version 1.3");
+    }
+
+    // AT-307em: while loop kernel compiles to valid SPIR-V
+    #[test]
+    fn emit_while_kernel_has_spirv_magic() {
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { while false { } return; }";
+        let words = emit_module(&make_hir(src), &CodegenOptions::default()).expect("emit");
+        assert_eq!(words[0], 0x0723_0203_u32, "magic word");
+        assert_eq!(words[1], 0x0001_0300_u32, "version 1.3");
+    }
+
+    // AT-308em: if-else kernel compiles deterministically
+    #[test]
+    fn emit_if_else_kernel_deterministic() {
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { let mut x: i32 = 0i32; if true { x = 1i32; } else { x = 2i32; } return; }";
+        let hir = make_hir(src);
+        let words1 = emit_module(&hir, &CodegenOptions::default()).expect("emit1");
+        let words2 = emit_module(&hir, &CodegenOptions::default()).expect("emit2");
+        assert_eq!(words1, words2, "if-else codegen must be deterministic");
+    }
+
+    // AT-309em: break-in-for compiles without error
+    #[test]
+    fn emit_break_in_for_no_error() {
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { for i in range(0u32, 10u32) { break; } return; }";
+        let words = emit_module(&make_hir(src), &CodegenOptions::default()).expect("emit");
+        assert!(!words.is_empty(), "expected non-empty SPIR-V");
+    }
+
+    // AT-310em: nested for-range compiles without error
+    #[test]
+    fn emit_nested_for_range_no_error() {
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { for i in range(0u32, 4u32) { for j in range(0u32, 4u32) { } } return; }";
+        let words = emit_module(&make_hir(src), &CodegenOptions::default()).expect("emit");
+        assert!(!words.is_empty(), "expected non-empty SPIR-V");
+    }
+
+    // AT-311em: else-if chain compiles without error
+    #[test]
+    fn emit_else_if_chain_no_error() {
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { let mut x: i32 = 0i32; if false { x = 1i32; } else if true { x = 2i32; } else { x = 3i32; } return; }";
+        let words = emit_module(&make_hir(src), &CodegenOptions::default()).expect("emit");
+        assert!(!words.is_empty(), "expected non-empty SPIR-V");
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

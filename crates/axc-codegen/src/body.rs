@@ -20,17 +20,24 @@
 //! - M1.2: `BufferRead`, `BufferWrite`, and `GidBuiltin` nodes are handled via
 //!   references to pre-emitted global variables (BufferBindings, PushConstantBlock,
 //!   GlobalInvocationIdVar) that `emit.rs` creates before calling this function.
+//! - M1.3: Structured control flow (OpLoopMerge, OpSelectionMerge) is emitted
+//!   for if/else, for-range, while, break, continue. `current_block_terminated`
+//!   tracks reachability so dead code after break/continue/return is silently dropped.
+//!   AT-323: `return` inside a loop is deferred — codegen emits
+//!   `BodyCodegenError::ReturnInsideLoopDeferred`.
 
 use std::collections::HashMap;
 use rspirv::dr::Builder;
 use rspirv::spirv::{
-    Word, StorageClass, SelectionControl,
+    Word, StorageClass, SelectionControl, LoopControl,
 };
 use axc_hir::expr::{
     KernelBodyTyped, HirExpr, HirExprKind, HirStmt, BinOp, UnaryOp,
     ShortCircuitOp, BitwiseOp, BindingId,
 };
 use axc_hir::ty::ScalarTy;
+use axc_hir::control_flow::{HirIf, HirElse, HirForRange, HirWhile};
+use axc_lexer::Span;
 use crate::buffers::{BufferBindings, PushConstantBlock, GlobalInvocationIdVar};
 
 /// References to pre-emitted global IR structures for M1.2 buffer/scalar/gid support.
@@ -57,6 +64,14 @@ pub enum BodyCodegenError {
     Rspirv(String),
     #[error("unexpected HIR node in body codegen: {0}")]
     UnexpectedHir(&'static str),
+    /// AT-323: early return inside a loop is deferred to M1.4.
+    ///
+    /// Typecheck accepts the `return;` (it is syntactically valid), but the
+    /// codegen cannot emit a mid-loop `OpReturn` without structured-exit analysis
+    /// because SPIR-V §2.11 requires that loop dominance structure be preserved.
+    /// M1.4 will add a pre-header-block escape scheme.
+    #[error("return inside a loop is not yet supported in M1.3 (AT-323); restructure as `break;` + result variable, or move the return to after the loop")]
+    ReturnInsideLoopDeferred { span: Span },
 }
 
 /// Cache of SPIR-V type IDs, keyed by `ScalarTy`.
@@ -133,6 +148,18 @@ impl CapabilitiesRequired {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ConstKey(ScalarTy, u64);
 
+/// Codegen-side loop context: the pre-allocated SPIR-V block IDs for a
+/// for-range or while loop, used to resolve `break` and `continue`.
+///
+/// Using `Vec` (not `HashMap`) to keep emission order deterministic (AT-326).
+#[derive(Debug, Clone, Copy)]
+pub struct LoopCodegenCtx {
+    /// The merge block ID (break target).
+    pub merge: Word,
+    /// The continue-target block ID (continue target).
+    pub continue_target: Word,
+}
+
 // ── Emission context ──────────────────────────────────────────────────────────
 
 struct BodyEmitter<'a> {
@@ -145,6 +172,16 @@ struct BodyEmitter<'a> {
     const_cache: HashMap<ConstKey, Word>,
     /// References to pre-emitted global M1.2 resources (buffers, push-constants, gid).
     res: &'a KernelResources<'a>,
+    /// Loop context stack for break/continue target resolution (M1.3).
+    ///
+    /// `Vec` is used (not HashMap) to preserve deterministic emission order per AT-326.
+    loop_stack: Vec<LoopCodegenCtx>,
+    /// Reachability flag: set to true when the current block is terminated
+    /// (by OpReturn, break-OpBranch, or continue-OpBranch). Cleared on `begin_block`.
+    ///
+    /// When true, subsequent statements in the same block are silently skipped
+    /// (dead code elimination per AT-316 spec).
+    current_block_terminated: bool,
 }
 
 impl<'a> BodyEmitter<'a> {
@@ -277,11 +314,16 @@ pub fn emit_kernel_body(
         var_ids: HashMap::new(),
         const_cache: HashMap::new(),
         res,
+        loop_stack: Vec::new(),
+        current_block_terminated: false,
     };
 
     // ── Prelude: emit ALL OpVariable declarations in the first block ──────────
     // SPIR-V §2.16.1: all OpVariable instructions for a function MUST appear in
     // the first block of the function, before any other instructions.
+    // We allocate OpVariable for EVERY binding in KernelBodyTyped.bindings —
+    // including those inside nested scopes or after break statements. This costs
+    // a few extra OpVariable words but matches glslang's behavior (AT-316).
     for binding in &body.bindings {
         emitter.caps.observe_type(binding.ty);
         let ptr_ty = emitter.ptr_type_id(binding.ty);
@@ -291,11 +333,24 @@ pub fn emit_kernel_body(
     }
 
     // ── Emit statements ───────────────────────────────────────────────────────
-    for stmt in &body.stmts {
-        emit_stmt(&mut emitter, stmt)?;
-    }
+    emit_stmts(&mut emitter, &body.stmts)?;
 
     Ok(first_block_label)
+}
+
+/// Emit a sequence of statements, respecting `current_block_terminated`.
+///
+/// When the block is terminated (break/continue/return), remaining statements
+/// are silently dropped — AT-316 dead code behaviour.
+fn emit_stmts(em: &mut BodyEmitter<'_>, stmts: &[HirStmt]) -> Result<(), BodyCodegenError> {
+    for stmt in stmts {
+        if em.current_block_terminated {
+            // Silent dead-code drop (AT-316).
+            break;
+        }
+        emit_stmt(em, stmt)?;
+    }
+    Ok(())
 }
 
 // ── Statement emission ────────────────────────────────────────────────────────
@@ -320,14 +375,303 @@ fn emit_stmt(em: &mut BodyEmitter<'_>, stmt: &HirStmt) -> Result<(), BodyCodegen
                 .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
             Ok(())
         }
-        HirStmt::Return { .. } => {
+        HirStmt::Return { span } => {
+            // AT-323: return inside a loop is deferred to M1.4.
+            if !em.loop_stack.is_empty() {
+                return Err(BodyCodegenError::ReturnInsideLoopDeferred { span: *span });
+            }
             em.b.ret().map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+            em.current_block_terminated = true;
             Ok(())
         }
         HirStmt::BufferWrite { buffer_binding, index, value, .. } => {
             emit_buffer_write(em, *buffer_binding, index, value)
         }
+        HirStmt::If(hir_if) => {
+            emit_if(em, hir_if)
+        }
+        HirStmt::ForRange(hir_for) => {
+            emit_for_range(em, hir_for)
+        }
+        HirStmt::While(hir_while) => {
+            emit_while(em, hir_while)
+        }
+        HirStmt::Break { .. } => {
+            let ctx = em.loop_stack.last()
+                .copied()
+                .ok_or(BodyCodegenError::UnexpectedHir("break with empty loop_stack — HIR should have caught this"))?;
+            em.b.branch(ctx.merge)
+                .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+            em.current_block_terminated = true;
+            Ok(())
+        }
+        HirStmt::Continue { .. } => {
+            let ctx = em.loop_stack.last()
+                .copied()
+                .ok_or(BodyCodegenError::UnexpectedHir("continue with empty loop_stack — HIR should have caught this"))?;
+            em.b.branch(ctx.continue_target)
+                .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+            em.current_block_terminated = true;
+            Ok(())
+        }
     }
+}
+
+// ── Control flow emission (M1.3) ──────────────────────────────────────────────
+
+/// Emit `if cond { then } [else ...]` as a structured selection.
+///
+/// Pattern for plain if (no else):
+/// ```text
+/// ; In current block:
+///   %cond = ...            ; evaluate condition (guaranteed non-short-circuit by HIR)
+///   OpSelectionMerge %merge None
+///   OpBranchConditional %cond %then %merge
+/// %then:
+///   ... then-body ...
+///   OpBranch %merge        ; only if body did not terminate
+/// %merge:
+///   ...
+/// ```
+///
+/// For if/else, a %false block is added between %then and %merge.
+fn emit_if(em: &mut BodyEmitter<'_>, hir_if: &HirIf) -> Result<(), BodyCodegenError> {
+    // Pre-allocate block label IDs BEFORE emitting any instructions.
+    let then_label:  Word = em.b.id();
+    let merge_label: Word = em.b.id();
+    let false_label: Word = match &hir_if.else_arm {
+        None    => merge_label,
+        Some(_) => em.b.id(),
+    };
+
+    // Evaluate condition in the current block.
+    // HIR guarantees this is NOT a short-circuit expression (CRITICAL-1).
+    let cond_id = emit_expr(em, &hir_if.cond)?;
+
+    // Emit OpSelectionMerge + OpBranchConditional.
+    em.b.selection_merge(merge_label, SelectionControl::NONE)
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    em.b.branch_conditional(cond_id, then_label, false_label, [])
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+
+    // ── then block ────────────────────────────────────────────────────────────
+    em.b.begin_block(Some(then_label))
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    em.current_block_terminated = false;
+    emit_stmts(em, &hir_if.then_block)?;
+    if !em.current_block_terminated {
+        em.b.branch(merge_label)
+            .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    }
+
+    // ── else arm (if present) ─────────────────────────────────────────────────
+    match &hir_if.else_arm {
+        None => {}
+        Some(else_arm) => {
+            em.b.begin_block(Some(false_label))
+                .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+            em.current_block_terminated = false;
+            match else_arm.as_ref() {
+                HirElse::Block(stmts) => {
+                    emit_stmts(em, stmts)?;
+                    if !em.current_block_terminated {
+                        em.b.branch(merge_label)
+                            .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+                    }
+                }
+                HirElse::If(nested_if) => {
+                    // Nested else-if: recurse. The nested if will open its own merge block.
+                    // But first we need to emit the nested if in the false_label block.
+                    // The nested if's merge block should branch to OUR merge block.
+                    // We accomplish this by calling emit_if recursively; the nested
+                    // if-else pattern correctly opens/closes all blocks and ends in
+                    // its own merge block, then we emit a branch to OUR merge block.
+                    emit_if(em, nested_if)?;
+                    if !em.current_block_terminated {
+                        em.b.branch(merge_label)
+                            .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+                    }
+                }
+            }
+        }
+    }
+
+    // ── merge block ───────────────────────────────────────────────────────────
+    em.b.begin_block(Some(merge_label))
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    em.current_block_terminated = false;
+
+    Ok(())
+}
+
+/// Emit `for i in range(start, end [, step]) { body }`.
+///
+/// Pattern:
+/// ```text
+///   ; In current block:
+///   OpStore %i_var %start_id
+///   OpBranch %header
+/// %header:
+///   OpLoopMerge %merge %continue None
+///   %i_cur = OpLoad u32 %i_var
+///   %cond = OpULessThan bool %i_cur %end_id
+///   OpBranchConditional %cond %body %merge
+/// %body:
+///   ... body ...
+///   OpBranch %continue       ; if not terminated
+/// %continue:
+///   %i_cur2 = OpLoad u32 %i_var
+///   %i_next = OpIAdd u32 %i_cur2 %step_const
+///   OpStore %i_var %i_next
+///   OpBranch %header
+/// %merge:
+///   ...
+/// ```
+fn emit_for_range(em: &mut BodyEmitter<'_>, hir_for: &HirForRange) -> Result<(), BodyCodegenError> {
+    // Pre-allocate block label IDs before any instruction emission.
+    let header_label:   Word = em.b.id();
+    let body_label:     Word = em.b.id();
+    let continue_label: Word = em.b.id();
+    let merge_label:    Word = em.b.id();
+
+    // Induction variable's OpVariable slot (allocated in prelude).
+    let i_var_id = em.var_ids.get(&hir_for.induction).copied()
+        .ok_or(BodyCodegenError::UnexpectedHir("ForRange induction binding not in var_ids"))?;
+
+    // Emit start store and branch to header.
+    let start_id = emit_expr(em, &hir_for.start)?;
+    em.b.store(i_var_id, start_id, None, None)
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    em.b.branch(header_label)
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+
+    // ── header block ──────────────────────────────────────────────────────────
+    em.b.begin_block(Some(header_label))
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    em.current_block_terminated = false;
+
+    // OpLoopMerge MUST be first instruction in the header block.
+    em.b.loop_merge(merge_label, continue_label, LoopControl::NONE, [])
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+
+    // Load induction var and check condition.
+    let u32_ty_id = em.type_id(ScalarTy::U32);
+    let bool_ty_id = em.type_id(ScalarTy::Bool);
+    let i_cur = em.b.load(u32_ty_id, None, i_var_id, None, None)
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    let end_id = emit_expr(em, &hir_for.end)?;
+    let cond_id = em.b.u_less_than(bool_ty_id, None, i_cur, end_id)
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    em.b.branch_conditional(cond_id, body_label, merge_label, [])
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+
+    // ── body block ────────────────────────────────────────────────────────────
+    em.b.begin_block(Some(body_label))
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    em.current_block_terminated = false;
+
+    // Push loop context so break/continue work correctly.
+    em.loop_stack.push(LoopCodegenCtx { merge: merge_label, continue_target: continue_label });
+    emit_stmts(em, &hir_for.body)?;
+    em.loop_stack.pop();
+
+    if !em.current_block_terminated {
+        em.b.branch(continue_label)
+            .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    }
+
+    // ── continue block ────────────────────────────────────────────────────────
+    em.b.begin_block(Some(continue_label))
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    em.current_block_terminated = false;
+
+    // Increment: load i, add step, store.
+    let i_cur2 = em.b.load(u32_ty_id, None, i_var_id, None, None)
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    let step_const = em.get_const_int(ScalarTy::U32, hir_for.step.value as u64);
+    let i_next = em.b.i_add(u32_ty_id, None, i_cur2, step_const)
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    em.b.store(i_var_id, i_next, None, None)
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    em.b.branch(header_label)
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+
+    // ── merge block ───────────────────────────────────────────────────────────
+    em.b.begin_block(Some(merge_label))
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    em.current_block_terminated = false;
+
+    Ok(())
+}
+
+/// Emit `while cond { body }`.
+///
+/// Pattern:
+/// ```text
+///   OpBranch %header
+/// %header:
+///   OpLoopMerge %merge %continue None
+///   %cond = ...
+///   OpBranchConditional %cond %body %merge
+/// %body:
+///   ... body ...
+///   OpBranch %continue     ; if not terminated
+/// %continue:
+///   OpBranch %header
+/// %merge:
+///   ...
+/// ```
+fn emit_while(em: &mut BodyEmitter<'_>, hir_while: &HirWhile) -> Result<(), BodyCodegenError> {
+    let header_label:   Word = em.b.id();
+    let body_label:     Word = em.b.id();
+    let continue_label: Word = em.b.id();
+    let merge_label:    Word = em.b.id();
+
+    // Branch from current block into the loop header.
+    em.b.branch(header_label)
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+
+    // ── header block ──────────────────────────────────────────────────────────
+    em.b.begin_block(Some(header_label))
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    em.current_block_terminated = false;
+
+    em.b.loop_merge(merge_label, continue_label, LoopControl::NONE, [])
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+
+    // Evaluate condition (HIR guarantees non-short-circuit per CRITICAL-1).
+    let cond_id = emit_expr(em, &hir_while.cond)?;
+    em.b.branch_conditional(cond_id, body_label, merge_label, [])
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+
+    // ── body block ────────────────────────────────────────────────────────────
+    em.b.begin_block(Some(body_label))
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    em.current_block_terminated = false;
+
+    em.loop_stack.push(LoopCodegenCtx { merge: merge_label, continue_target: continue_label });
+    emit_stmts(em, &hir_while.body)?;
+    em.loop_stack.pop();
+
+    if !em.current_block_terminated {
+        em.b.branch(continue_label)
+            .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    }
+
+    // ── continue block ────────────────────────────────────────────────────────
+    em.b.begin_block(Some(continue_label))
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    em.current_block_terminated = false;
+
+    em.b.branch(header_label)
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+
+    // ── merge block ───────────────────────────────────────────────────────────
+    em.b.begin_block(Some(merge_label))
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    em.current_block_terminated = false;
+
+    Ok(())
 }
 
 // ── Expression emission ───────────────────────────────────────────────────────
@@ -1085,6 +1429,116 @@ mod tests {
         let words1 = compile_to_words(src);
         let words2 = compile_to_words(src);
         assert_eq!(words1, words2, "codegen must be deterministic");
+    }
+
+    // ── M1.3 control flow codegen tests ──────────────────────────────────────
+
+    // AT-301cg: if statement emits OpSelectionMerge + OpBranchConditional
+    #[test]
+    fn cg_if_emits_selection_merge_and_branch_conditional() {
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { if true { } return; }";
+        let words = compile_to_words(src);
+        assert!(has_op(&words, Op::SelectionMerge), "expected OpSelectionMerge for if");
+        assert!(has_op(&words, Op::BranchConditional), "expected OpBranchConditional for if");
+    }
+
+    // AT-302cg: if-else emits selection merge targeting else-side merge block
+    #[test]
+    fn cg_if_else_emits_selection_merge() {
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { let mut x: i32 = 1i32; if true { x = 2i32; } else { x = 3i32; } return; }";
+        let words = compile_to_words(src);
+        assert!(has_op(&words, Op::SelectionMerge), "expected OpSelectionMerge");
+        assert!(has_op(&words, Op::BranchConditional), "expected OpBranchConditional");
+        assert!(has_op(&words, Op::Branch), "expected OpBranch");
+    }
+
+    // AT-303cg: while loop emits OpLoopMerge + OpBranchConditional
+    #[test]
+    fn cg_while_emits_loop_merge_and_branch_conditional() {
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { while false { } return; }";
+        let words = compile_to_words(src);
+        assert!(has_op(&words, Op::LoopMerge), "expected OpLoopMerge for while");
+        assert!(has_op(&words, Op::BranchConditional), "expected OpBranchConditional for while");
+    }
+
+    // AT-304cg: for-range loop emits OpLoopMerge
+    #[test]
+    fn cg_for_range_emits_loop_merge() {
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { for i in range(0u32, 10u32) { } return; }";
+        let words = compile_to_words(src);
+        assert!(has_op(&words, Op::LoopMerge), "expected OpLoopMerge for for-range");
+    }
+
+    // AT-305cg: for-range emits IAdd for increment
+    #[test]
+    fn cg_for_range_emits_iadd_for_increment() {
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { for i in range(0u32, 10u32) { } return; }";
+        let words = compile_to_words(src);
+        assert!(has_op(&words, Op::IAdd), "expected OpIAdd for loop increment");
+    }
+
+    // AT-306cg: break inside while emits OpBranch to merge block
+    #[test]
+    fn cg_break_in_while_emits_branch() {
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { while true { break; } return; }";
+        let words = compile_to_words(src);
+        assert!(has_op(&words, Op::LoopMerge), "expected OpLoopMerge for while");
+        assert!(has_op(&words, Op::Branch), "expected OpBranch for break");
+    }
+
+    // AT-307cg: continue inside for-range emits OpBranch to continue-target block
+    #[test]
+    fn cg_continue_in_for_emits_branch() {
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { for i in range(0u32, 5u32) { continue; } return; }";
+        let words = compile_to_words(src);
+        assert!(has_op(&words, Op::LoopMerge), "expected OpLoopMerge");
+        assert!(has_op(&words, Op::Branch), "expected OpBranch for continue");
+    }
+
+    // AT-308cg: codegen for if is deterministic
+    #[test]
+    fn cg_if_deterministic() {
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { let mut x: i32 = 1i32; if true { x = 2i32; } return; }";
+        let words1 = compile_to_words(src);
+        let words2 = compile_to_words(src);
+        assert_eq!(words1, words2, "if codegen must be deterministic");
+    }
+
+    // AT-309cg: for-range with explicit step=2 still emits IAdd (multiplied step)
+    #[test]
+    fn cg_for_range_step_2_emits_iadd() {
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { for i in range(0u32, 10u32, 2u32) { } return; }";
+        let words = compile_to_words(src);
+        assert!(has_op(&words, Op::IAdd), "expected OpIAdd for step-2 increment");
+    }
+
+    // AT-310cg: nested if inside while produces both SelectionMerge and LoopMerge
+    #[test]
+    fn cg_if_inside_while_emits_both_merge_types() {
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { while false { if true { } } return; }";
+        let words = compile_to_words(src);
+        assert!(has_op(&words, Op::LoopMerge), "expected OpLoopMerge");
+        assert!(has_op(&words, Op::SelectionMerge), "expected OpSelectionMerge inside while");
+    }
+
+    // AT-311cg: return inside loop produces error (AT-323 deferred)
+    #[test]
+    fn cg_return_inside_loop_deferred_error() {
+        use crate::emit::{emit_module, CodegenOptions};
+        use axc_hir::lower_module;
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { while false { return; } }";
+        let (ast, lex, parse_errs) = axc_parser::parse(src);
+        assert!(lex.is_empty());
+        assert!(parse_errs.is_empty());
+        let (hir, hir_errs, _) = lower_module(&ast);
+        assert!(hir_errs.is_empty());
+        let result = emit_module(&hir, &CodegenOptions::default());
+        assert!(result.is_err(), "return inside loop should produce codegen error");
+        let err_str = result.unwrap_err().to_string();
+        assert!(
+            err_str.contains("return inside a loop") || err_str.contains("M1.3"),
+            "error should mention return-inside-loop: {err_str}"
+        );
     }
 
     // Utility: iterate instructions in word stream (skip 5-word header).
