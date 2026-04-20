@@ -1671,7 +1671,7 @@ fn check_builtin_call_stmt(
     if let axc_parser::ast::Expr::Call { name, args } = &call.node {
         let op_name: &str = &name.node;
         if op_name == "workgroup_barrier" {
-            if args.len() != 0 {
+            if !args.is_empty() {
                 tc.errors.push(TypecheckError::SubgroupArity {
                     op: "workgroup_barrier",
                     expected_arity: 0,

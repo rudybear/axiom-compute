@@ -510,7 +510,7 @@ mod tests {
                 _ => None,
             }
         };
-        let exec_scope_val = barrier.operands.get(0).and_then(resolve_op_id);
+        let exec_scope_val = barrier.operands.first().and_then(resolve_op_id);
         let mem_scope_val = barrier.operands.get(1).and_then(resolve_op_id);
         let semantics_val = barrier.operands.get(2).and_then(resolve_op_id);
 
