@@ -155,6 +155,22 @@ impl ScopeStack {
     pub fn get_in_current_frame(&self, name: &str) -> Option<usize> {
         self.frames.last().and_then(|f| f.get(name))
     }
+
+    /// Look up a name in the OUTERMOST (kernel-scope) frame only.
+    ///
+    /// Used by for-induction variable registration to detect redeclaration of a
+    /// `let`-bound kernel-scope name by a for-induction variable (AT-315).
+    ///
+    /// Rule (§7 M1.3 spec):
+    ///   - `let i: u32 = 0u32; for i in range(...) { }` → RedeclaredBinding.
+    ///     The outer `let i` lives in frame 0 (kernel scope); the for tries to
+    ///     register `i` in frame 1 — rejected via this check.
+    ///   - `for i in ... { for i in ... { } }` → allowed.
+    ///     The outer for's `i` lives in frame 1; the inner for registers in frame 2.
+    ///     Frame 0 (kernel scope) does NOT contain `i`, so this check returns None.
+    pub fn get_in_kernel_scope_frame(&self, name: &str) -> Option<usize> {
+        self.frames.first().and_then(|f| f.get(name))
+    }
 }
 
 #[cfg(test)]

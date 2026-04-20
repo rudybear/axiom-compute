@@ -181,6 +181,21 @@ Rules:
   of how many times `gid()` is called. The variable's ID appears in the OpEntryPoint
   interface list (required for Input variables in SPIR-V 1.3).
 
+### 3.1.4 Control flow (M1.3)
+
+AXIOM-Compute lowers all control flow to SPIR-V §2.11 structured CFG:
+
+- `if cond { ... } else { ... }` → OpSelectionMerge + OpBranchConditional
+- `for i in range(start, end[, step]) { body }` → OpLoopMerge with induction-
+  variable OpVariable in Function storage, header-body-continue_target-merge
+  4-block shape
+- `while cond { body }` → OpLoopMerge with dedicated continue_target
+- `break;` → OpBranch to innermost loop's merge block
+- `continue;` → OpBranch to innermost loop's continue_target
+
+`and`/`or` short-circuit expressions are not allowed in if/while condition
+position (use a temp bool). `return` inside a loop is rejected (deferred to M1.4).
+
 ### 3.1 Types
 
 ```
@@ -346,3 +361,4 @@ trigger UB) may be rejected at HIR typecheck in a future milestone.
 - **2026-04-18:** Initial draft (v0.1), pre-architect review. To be revised through dual design review.
 - **2026-04-18:** M1.1 revision — added §3 integer division UB note (CRITICAL-2 fix from pessimistic review).
 - **2026-04-18:** M1.2 revision — added §3.1 M1.2 parameter binding model (buffer types, scalar params, gid builtin), saxpy binding assignment walkthrough, and interface-list SPIR-V 1.3 rule.
+- **2026-04-18:** M1.3 revision — added §3.1.4 Control flow (M1.3): OpLoopMerge, continue_target, structured CFG for if/for/while/break/continue.

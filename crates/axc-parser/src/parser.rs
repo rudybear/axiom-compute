@@ -65,6 +65,17 @@ pub enum ParseError {
         #[label("here")]
         span: Span,
     },
+    /// M1.3-specific rejection — for features still deferred past M1.3 (e.g. struct).
+    ///
+    /// Emitted by `parse_stmt` when a keyword listed in `M1_3_RESERVED_KEYWORDS` is
+    /// encountered.  The `detail` field carries a roadmap hint (e.g.
+    /// "`struct` is deferred to M2").
+    #[error("unsupported syntax in M1.3: {detail}")]
+    UnsupportedInM1_3 {
+        detail: String,
+        #[label("here")]
+        span: Span,
+    },
     #[error("unterminated annotation argument list")]
     UnterminatedAnnotationArgs {
         #[label("here")]
@@ -522,9 +533,11 @@ impl<'tok> Parser<'tok> {
         let tok: &Token = self.current_token();
         let span: Span = tok.span;
 
-        // §3.2: M1.1-reserved keyword pre-check (Let and Mut are NO LONGER here)
+        // §3.2: M1.3-reserved keyword pre-check (only Struct remains deferred).
+        // Emit UnsupportedInM1_3 for features deferred past M1.3.
+        // UnsupportedInM1_1 is kept for backward compatibility with M1.1/M1.2 error paths.
         if let Some(detail) = tok.kind.m1_reserved_detail() {
-            self.errors.push(ParseError::UnsupportedInM1_1 {
+            self.errors.push(ParseError::UnsupportedInM1_3 {
                 detail: detail.to_owned(),
                 span,
             });
@@ -1318,7 +1331,7 @@ mod tests {
     // ── AT-301: `if true { return; }` parses without errors ──────────────────
 
     #[test]
-    fn at301_if_true_return_parses_without_errors() {
+    fn parse_if_then_only() {
         let src = "@kernel @workgroup(64,1,1) fn k() -> void { if true { return; } }";
         let (module, errors) = parse_src(src);
         assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
@@ -1330,7 +1343,7 @@ mod tests {
     // ── AT-302: if/else parses correctly ──────────────────────────────────────
 
     #[test]
-    fn at302_if_else_parses_correctly() {
+    fn parse_if_else_correctly() {
         let src = "@kernel @workgroup(64,1,1) fn k() -> void { if true { return; } else { return; } }";
         let (module, errors) = parse_src(src);
         assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
@@ -1346,7 +1359,7 @@ mod tests {
     // ── AT-303: else-if chain parses as nested If ─────────────────────────────
 
     #[test]
-    fn at303_else_if_chain_parses_as_nested_if() {
+    fn parse_else_if_chain_as_nested_if() {
         let src = "@kernel @workgroup(64,1,1) fn k() -> void { if true { return; } else if false { return; } else { return; } }";
         let (module, errors) = parse_src(src);
         assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
@@ -1367,7 +1380,7 @@ mod tests {
     // ── AT-304: for-range default step parses as Stmt::For { step: None } ────
 
     #[test]
-    fn at304_for_range_default_step_is_none() {
+    fn parse_for_range_default_step() {
         let src = "@kernel @workgroup(64,1,1) fn k() -> void { for i in range(0u32, 10u32) { return; } }";
         let (module, errors) = parse_src(src);
         assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
@@ -1383,7 +1396,7 @@ mod tests {
     // ── AT-305: for-range explicit step parses with step: Some(IntLit) ────────
 
     #[test]
-    fn at305_for_range_explicit_step_is_some() {
+    fn parse_for_range_explicit_step() {
         let src = "@kernel @workgroup(64,1,1) fn k() -> void { for i in range(0u32, 10u32, 2u32) { return; } }";
         let (module, errors) = parse_src(src);
         assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
@@ -1399,16 +1412,16 @@ mod tests {
     // ── AT-306: missing `in` keyword rejected at parse time ───────────────────
 
     #[test]
-    fn at306_missing_in_keyword_rejected() {
+    fn parse_for_missing_in_rejected() {
         let src = "@kernel @workgroup(64,1,1) fn k() -> void { for i range(0u32, 10u32) { return; } }";
         let (_, errors) = parse_src(src);
         assert!(!errors.is_empty(), "expected parse error for missing `in`");
     }
 
-    // ── AT-327: break and continue are no longer reserved ─────────────────────
+    // ── AT-327 parser mirror: reserved-keyword list contains only Struct in M1.3 ─
 
     #[test]
-    fn at327_break_continue_unreserved_in_m1_3() {
+    fn parse_m1_3_reserved_keywords_contains_only_struct() {
         // In M1.3, break/continue parse as valid statements inside a loop.
         // The reserved-keyword list now contains only Struct.
         assert_eq!(M1_3_RESERVED_KEYWORDS.len(), 1);
@@ -1418,12 +1431,12 @@ mod tests {
     // ── AT-328: struct keyword still rejected ─────────────────────────────────
 
     #[test]
-    fn at328_struct_still_rejected_in_m1_3() {
+    fn parse_struct_still_rejected_in_m1_3() {
         let src = "@kernel @workgroup(64,1,1) fn k() -> void { struct Foo {} return; }";
         let (_, errors) = parse_src(src);
         assert!(
-            errors.iter().any(|e| matches!(e, ParseError::UnsupportedInM1_1 { detail, .. } if detail.contains("struct"))),
-            "expected UnsupportedInM1_1 for struct, got: {errors:?}"
+            errors.iter().any(|e| matches!(e, ParseError::UnsupportedInM1_3 { detail, .. } if detail.contains("struct"))),
+            "expected UnsupportedInM1_3 for struct, got: {errors:?}"
         );
     }
 

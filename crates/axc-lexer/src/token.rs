@@ -493,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn reserved_detail_after_m1_3_delists_control_flow() {
+    fn m1_reserved_detail_control_flow_unreserved_after_m1_3() {
         // M1.1 delists Let and Mut — they are now valid syntax, not reserved.
         assert_eq!(TokenKind::Let.m1_reserved_detail(), None);
         assert_eq!(TokenKind::Mut.m1_reserved_detail(), None);

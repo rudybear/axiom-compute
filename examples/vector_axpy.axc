@@ -1,0 +1,34 @@
+// vector_axpy.axc — per-thread K-way AXPY kernel
+//
+// Each thread performs K AXPY iterations on its own slice of the output buffer.
+// The base index is determined by gid(0); stride separates the per-thread slots.
+// Uses a for-range loop with an explicit step of 1u32 to exercise M1.3 loop codegen
+// with a buffer write inside the loop body.
+//
+// Drives:
+//   AT-320 (HIR: lower_vector_axpy_example_produces_one_for_range)
+//   AT-325 (driver integration: test_compile_vector_axpy_produces_valid_spirv)
+//
+// Parameters:
+//   k      — number of AXPY iterations per thread (u32, push-constant)
+//   stride — element stride between consecutive thread slots (u32, push-constant)
+//   alpha  — scalar multiplier (f32, push-constant)
+//   x      — input vector (readonly_buffer[f32], binding=0)
+//   y      — input/output vector (buffer[f32], binding=1)
+
+@kernel
+@workgroup(64, 1, 1)
+@intent("per-thread K-way axpy: for each j in [0,k): y[base+j*stride] = alpha*x[base+j*stride] + y[base+j*stride]")
+@complexity(O(n))
+@precondition(true)
+fn per_thread_axpy(k: u32, stride: u32, alpha: f32, x: readonly_buffer[f32], y: buffer[f32]) -> void {
+    let base: u32 = gid(0);
+    for j in range(0u32, k, 1u32) {
+        let idx: u32 = base + j * stride;
+        let xi: f32 = x[idx];
+        let yi: f32 = y[idx];
+        let result: f32 = alpha * xi + yi;
+        y[idx] = result;
+    }
+    return;
+}

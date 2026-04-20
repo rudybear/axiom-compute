@@ -1433,7 +1433,7 @@ mod tests {
 
     // ── M1.3 control flow codegen tests ──────────────────────────────────────
 
-    // AT-301cg: if statement emits OpSelectionMerge + OpBranchConditional
+    // AT-301: if statement emits OpSelectionMerge + OpBranchConditional
     #[test]
     fn cg_if_emits_selection_merge_and_branch_conditional() {
         let src = "@kernel @workgroup(1,1,1) fn k() -> void { if true { } return; }";
@@ -1442,60 +1442,106 @@ mod tests {
         assert!(has_op(&words, Op::BranchConditional), "expected OpBranchConditional for if");
     }
 
-    // AT-302cg: if-else emits selection merge targeting else-side merge block
+    // AT-302: if-else emits exactly 1 OpSelectionMerge, 1 OpBranchConditional, 2 OpBranch
     #[test]
-    fn cg_if_else_emits_selection_merge() {
+    fn cg_if_else_emits_three_blocks() {
         let src = "@kernel @workgroup(1,1,1) fn k() -> void { let mut x: i32 = 1i32; if true { x = 2i32; } else { x = 3i32; } return; }";
         let words = compile_to_words(src);
-        assert!(has_op(&words, Op::SelectionMerge), "expected OpSelectionMerge");
-        assert!(has_op(&words, Op::BranchConditional), "expected OpBranchConditional");
-        assert!(has_op(&words, Op::Branch), "expected OpBranch");
+        let sm_count = count_op(&words, Op::SelectionMerge);
+        let bc_count = count_op(&words, Op::BranchConditional);
+        let br_count = count_op(&words, Op::Branch);
+        assert_eq!(sm_count, 1, "expected exactly 1 OpSelectionMerge; got {sm_count}");
+        assert_eq!(bc_count, 1, "expected exactly 1 OpBranchConditional; got {bc_count}");
+        assert_eq!(br_count, 2, "expected exactly 2 OpBranch (one from then, one from else); got {br_count}");
     }
 
-    // AT-303cg: while loop emits OpLoopMerge + OpBranchConditional
+    // AT-307: for-range loop emits OpLoopMerge + OpULessThan + OpIAdd, block count >= 4
     #[test]
-    fn cg_while_emits_loop_merge_and_branch_conditional() {
-        let src = "@kernel @workgroup(1,1,1) fn k() -> void { while false { } return; }";
-        let words = compile_to_words(src);
-        assert!(has_op(&words, Op::LoopMerge), "expected OpLoopMerge for while");
-        assert!(has_op(&words, Op::BranchConditional), "expected OpBranchConditional for while");
-    }
-
-    // AT-304cg: for-range loop emits OpLoopMerge
-    #[test]
-    fn cg_for_range_emits_loop_merge() {
+    fn cg_for_range_emits_loop_merge_and_header_body_continue_merge() {
         let src = "@kernel @workgroup(1,1,1) fn k() -> void { for i in range(0u32, 10u32) { } return; }";
         let words = compile_to_words(src);
-        assert!(has_op(&words, Op::LoopMerge), "expected OpLoopMerge for for-range");
-    }
-
-    // AT-305cg: for-range emits IAdd for increment
-    #[test]
-    fn cg_for_range_emits_iadd_for_increment() {
-        let src = "@kernel @workgroup(1,1,1) fn k() -> void { for i in range(0u32, 10u32) { } return; }";
-        let words = compile_to_words(src);
+        let lm_count = count_op(&words, Op::LoopMerge);
+        assert_eq!(lm_count, 1, "expected exactly 1 OpLoopMerge; got {lm_count}");
+        assert!(has_op(&words, Op::ULessThan), "expected OpULessThan for loop condition");
         assert!(has_op(&words, Op::IAdd), "expected OpIAdd for loop increment");
+        // 4-block shape: header, body, continue_target, merge (plus entry block)
+        let block_count = count_op(&words, Op::Label);
+        assert!(block_count >= 4, "expected >= 4 blocks for for-range; got {block_count}");
     }
 
-    // AT-306cg: break inside while emits OpBranch to merge block
+    // AT-308 + AT-317: while loop emits OpLoopMerge AND has Op::Load of cond var in header block
     #[test]
-    fn cg_break_in_while_emits_branch() {
+    fn cg_while_emits_loop_merge() {
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { let mut i: u32 = 0u32; while i < 10u32 { i = i + 1u32; } return; }";
+        let words = compile_to_words(src);
+        // (a) exactly 1 OpLoopMerge
+        let lm_count = count_op(&words, Op::LoopMerge);
+        assert_eq!(lm_count, 1, "expected exactly 1 OpLoopMerge; got {lm_count}");
+        // (b) AT-317 integration / rev-1 WARNING-2: the header block must contain
+        //     at least one Op::Load for condition re-evaluation each iteration.
+        //     Find the header block: the block whose label immediately precedes the
+        //     first OpLoopMerge instruction.
+        let header_has_load = header_block_contains_load(&words);
+        assert!(header_has_load, "AT-317: header block must contain Op::Load of cond variable");
+    }
+
+    // AT-309: break emits OpBranch targeting the LoopMerge merge_id (scan-for-IdRef)
+    #[test]
+    fn cg_break_emits_branch_to_merge() {
         let src = "@kernel @workgroup(1,1,1) fn k() -> void { while true { break; } return; }";
         let words = compile_to_words(src);
-        assert!(has_op(&words, Op::LoopMerge), "expected OpLoopMerge for while");
-        assert!(has_op(&words, Op::Branch), "expected OpBranch for break");
+        // Extract merge_id from the unique Op::LoopMerge (first IdRef operand = word[1]).
+        let merge_id = find_loop_merge_id(&words, 0);
+        let continue_id = find_loop_continue_id(&words, 0);
+        // Find all Op::Branch instructions targeting merge_id.
+        let branch_to_merge: Vec<_> = iter_instructions(&words[5..])
+            .filter(|(op, slice)| *op == Op::Branch as u16 && slice.len() >= 2 && slice[1] == merge_id)
+            .collect();
+        assert_eq!(branch_to_merge.len(), 1,
+            "expected exactly 1 Op::Branch targeting merge_id={merge_id}; got {} (continue_id={continue_id})",
+            branch_to_merge.len());
     }
 
-    // AT-307cg: continue inside for-range emits OpBranch to continue-target block
+    // AT-310: continue emits OpBranch targeting the LoopMerge continue_id (scan-for-IdRef)
     #[test]
-    fn cg_continue_in_for_emits_branch() {
-        let src = "@kernel @workgroup(1,1,1) fn k() -> void { for i in range(0u32, 5u32) { continue; } return; }";
+    fn cg_continue_emits_branch_to_continue_target() {
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { while true { continue; } return; }";
         let words = compile_to_words(src);
-        assert!(has_op(&words, Op::LoopMerge), "expected OpLoopMerge");
-        assert!(has_op(&words, Op::Branch), "expected OpBranch for continue");
+        // Extract continue_id from the unique Op::LoopMerge (second IdRef operand = word[2]).
+        let continue_id = find_loop_continue_id(&words, 0);
+        // Find all Op::Branch targeting continue_id (the user's `continue` statement).
+        let branch_to_cont: Vec<_> = iter_instructions(&words[5..])
+            .filter(|(op, slice)| *op == Op::Branch as u16 && slice.len() >= 2 && slice[1] == continue_id)
+            .collect();
+        assert_eq!(branch_to_cont.len(), 1,
+            "expected exactly 1 Op::Branch targeting continue_id={continue_id}; got {}",
+            branch_to_cont.len());
     }
 
-    // AT-308cg: codegen for if is deterministic
+    // AT-316: unreachable code after break emits zero Op::Store for x
+    #[test]
+    fn cg_unreachable_after_break_is_silent() {
+        // `while true { break; let x: i32 = 1i32; }` — the store for `x` must NOT appear.
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { while true { break; let x: i32 = 1i32; } return; }";
+        let words = compile_to_words(src);
+        // The assignment `let x: i32 = 1i32` after break must be dropped silently.
+        // We assert the compilation succeeds (compile_to_words would panic on error).
+        // Additionally, there must be exactly 0 Op::Store instructions for `x` after the break.
+        // Because `x` is in dead code, no Store should be emitted for it.
+        // We verify this by checking that the Store count does NOT exceed what a bare
+        // while-break (no dead code) would produce.
+        let src_no_dead = "@kernel @workgroup(1,1,1) fn k() -> void { while true { break; } return; }";
+        let words_no_dead = compile_to_words(src_no_dead);
+        let store_with_dead = count_op(&words, Op::Store);
+        let store_no_dead = count_op(&words_no_dead, Op::Store);
+        assert_eq!(store_with_dead, store_no_dead,
+            "dead code after break must emit 0 extra Op::Store: with_dead={store_with_dead} no_dead={store_no_dead}");
+    }
+
+    // AT-311: nested for — break targets the INNER for's merge, not the outer's
+    // (moved to emit.rs: cg_nested_for_break_targets_innermost)
+
+    // Codegen determinism — if is deterministic
     #[test]
     fn cg_if_deterministic() {
         let src = "@kernel @workgroup(1,1,1) fn k() -> void { let mut x: i32 = 1i32; if true { x = 2i32; } return; }";
@@ -1504,41 +1550,90 @@ mod tests {
         assert_eq!(words1, words2, "if codegen must be deterministic");
     }
 
-    // AT-309cg: for-range with explicit step=2 still emits IAdd (multiplied step)
+    // AT-326: reduction kernel compiles deterministically (same SPIR-V both times)
     #[test]
-    fn cg_for_range_step_2_emits_iadd() {
-        let src = "@kernel @workgroup(1,1,1) fn k() -> void { for i in range(0u32, 10u32, 2u32) { } return; }";
-        let words = compile_to_words(src);
-        assert!(has_op(&words, Op::IAdd), "expected OpIAdd for step-2 increment");
+    fn cg_deterministic_reduction_source() {
+        // Inline the reduction kernel source (reduction.axc contents)
+        let src = "\
+@kernel\n\
+@workgroup(1, 1, 1)\n\
+@intent(\"single-threaded SSBO reduction: dst[0] = sum(src[0..n])\")\n\
+@complexity(O(n))\n\
+@precondition(true)\n\
+fn reduce_sum(n: u32, src: readonly_buffer[f32], dst: buffer[f32]) -> void {\n\
+    let mut total: f32 = 0.0f32;\n\
+    for i in range(0u32, n) {\n\
+        total = total + src[i];\n\
+    }\n\
+    dst[0u32] = total;\n\
+    return;\n\
+}";
+        let words1 = compile_to_words(src);
+        let words2 = compile_to_words(src);
+        assert_eq!(words1, words2, "reduction kernel codegen must be byte-identical on two runs");
     }
 
-    // AT-310cg: nested if inside while produces both SelectionMerge and LoopMerge
-    #[test]
-    fn cg_if_inside_while_emits_both_merge_types() {
-        let src = "@kernel @workgroup(1,1,1) fn k() -> void { while false { if true { } } return; }";
-        let words = compile_to_words(src);
-        assert!(has_op(&words, Op::LoopMerge), "expected OpLoopMerge");
-        assert!(has_op(&words, Op::SelectionMerge), "expected OpSelectionMerge inside while");
+    // AT-326 support: count occurrences of an opcode
+    fn count_op(words: &[u32], target_op: Op) -> usize {
+        iter_instructions(&words[5..]).filter(|(opcode, _)| *opcode == target_op as u16).count()
     }
 
-    // AT-311cg: return inside loop produces error (AT-323 deferred)
-    #[test]
-    fn cg_return_inside_loop_deferred_error() {
-        use crate::emit::{emit_module, CodegenOptions};
-        use axc_hir::lower_module;
-        let src = "@kernel @workgroup(1,1,1) fn k() -> void { while false { return; } }";
-        let (ast, lex, parse_errs) = axc_parser::parse(src);
-        assert!(lex.is_empty());
-        assert!(parse_errs.is_empty());
-        let (hir, hir_errs, _) = lower_module(&ast);
-        assert!(hir_errs.is_empty());
-        let result = emit_module(&hir, &CodegenOptions::default());
-        assert!(result.is_err(), "return inside loop should produce codegen error");
-        let err_str = result.unwrap_err().to_string();
-        assert!(
-            err_str.contains("return inside a loop") || err_str.contains("M1.3"),
-            "error should mention return-inside-loop: {err_str}"
-        );
+    /// Find the merge_id (word[1]) from the N-th (0-indexed) Op::LoopMerge in the word stream.
+    fn find_loop_merge_id(words: &[u32], nth: usize) -> u32 {
+        iter_instructions(&words[5..])
+            .filter(|(op, _)| *op == Op::LoopMerge as u16)
+            .nth(nth)
+            .map(|(_, slice)| slice[1])
+            .expect("no Op::LoopMerge found")
+    }
+
+    /// Find the continue_id (word[2]) from the N-th (0-indexed) Op::LoopMerge.
+    fn find_loop_continue_id(words: &[u32], nth: usize) -> u32 {
+        iter_instructions(&words[5..])
+            .filter(|(op, _)| *op == Op::LoopMerge as u16)
+            .nth(nth)
+            .map(|(_, slice)| slice[2])
+            .expect("no Op::LoopMerge found")
+    }
+
+    /// Check that the header block (the block containing Op::LoopMerge) also
+    /// contains at least one Op::Load — confirming condition re-evaluation (AT-317).
+    ///
+    /// Strategy: collect all instructions into blocks; the block containing
+    /// Op::LoopMerge is the header; check that block also has an Op::Load.
+    fn header_block_contains_load(words: &[u32]) -> bool {
+        // Walk instructions after the 5-word header, collecting blocks.
+        // A block starts at Op::Label and ends at the next Op::Label or end-of-stream.
+        let body = &words[5..];
+        let insts: Vec<(u16, Vec<u32>)> = iter_instructions(body)
+            .map(|(op, slice)| (op, slice.to_vec()))
+            .collect();
+
+        let mut current_block_has_loop_merge = false;
+        let mut current_block_has_load = false;
+
+        for (op, _) in &insts {
+            if *op == Op::Label as u16 {
+                // New block starts: reset per-block flags.
+                current_block_has_loop_merge = false;
+                current_block_has_load = false;
+            } else if *op == Op::LoopMerge as u16 {
+                current_block_has_loop_merge = true;
+            } else if *op == Op::Load as u16 {
+                current_block_has_load = true;
+            }
+            // At end of block (terminator), check if this was the header block.
+            let is_terminator = matches!(*op as u32,
+                x if x == Op::Branch as u32
+                  || x == Op::BranchConditional as u32
+                  || x == Op::Return as u32
+                  || x == Op::Unreachable as u32
+            );
+            if is_terminator && current_block_has_loop_merge && current_block_has_load {
+                return true;
+            }
+        }
+        false
     }
 
     // Utility: iterate instructions in word stream (skip 5-word header).

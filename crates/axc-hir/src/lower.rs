@@ -796,4 +796,161 @@ mod tests {
                 "expected 1 scalar for {ty_str}");
         }
     }
+
+    // ── M1.3 lower.rs tests (AT-319 / AT-320 and related) ────────────────────
+
+    use crate::expr::HirStmt;
+    use crate::hir::KernelBody;
+
+    /// Helper: compile source and return the typed HIR statements from the first kernel.
+    fn lower_stmts(src: &str) -> Vec<HirStmt> {
+        let (hir, errors, _) = lower_src(src);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        let kernel = &hir.kernels[0];
+        match &kernel.body {
+            KernelBody::Typed(typed) => typed.stmts.clone(),
+            KernelBody::Empty => panic!("expected Typed body, got Empty"),
+        }
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn lower_if_stmt_produces_HirStmt_If() {
+        let stmts = lower_stmts(
+            "@kernel @workgroup(1,1,1) fn k() -> void { if true { } return; }",
+        );
+        assert!(
+            stmts.iter().any(|s| matches!(s, HirStmt::If(_))),
+            "expected HirStmt::If: {stmts:?}"
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn lower_for_range_produces_HirStmt_ForRange_with_induction_binding() {
+        let stmts = lower_stmts(
+            "@kernel @workgroup(1,1,1) fn k() -> void { for i in range(0u32, 5u32) { } return; }",
+        );
+        let found = stmts.iter().any(|s| matches!(s, HirStmt::ForRange(_)));
+        assert!(found, "expected HirStmt::ForRange: {stmts:?}");
+        // Verify the induction BindingId is non-zero (was allocated).
+        if let Some(HirStmt::ForRange(f)) = stmts.iter().find(|s| matches!(s, HirStmt::ForRange(_))) {
+            assert_eq!(f.step.value, 1, "default step must be 1");
+        }
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn lower_while_produces_HirStmt_While() {
+        let stmts = lower_stmts(
+            "@kernel @workgroup(1,1,1) fn k() -> void { while false { } return; }",
+        );
+        assert!(
+            stmts.iter().any(|s| matches!(s, HirStmt::While(_))),
+            "expected HirStmt::While: {stmts:?}"
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn lower_break_in_while_produces_HirStmt_Break() {
+        let stmts = lower_stmts(
+            "@kernel @workgroup(1,1,1) fn k() -> void { while false { break; } return; }",
+        );
+        let w = stmts.iter().find_map(|s| if let HirStmt::While(w) = s { Some(w) } else { None })
+            .expect("expected While");
+        assert!(
+            w.body.iter().any(|s| matches!(s, HirStmt::Break { .. })),
+            "expected Break inside while body"
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn lower_continue_in_for_produces_HirStmt_Continue() {
+        let stmts = lower_stmts(
+            "@kernel @workgroup(1,1,1) fn k() -> void { for i in range(0u32, 3u32) { continue; } return; }",
+        );
+        let f = stmts.iter().find_map(|s| if let HirStmt::ForRange(f) = s { Some(f) } else { None })
+            .expect("expected ForRange");
+        assert!(
+            f.body.iter().any(|s| matches!(s, HirStmt::Continue { .. })),
+            "expected Continue inside for body"
+        );
+    }
+
+    #[test]
+    fn lower_nested_if_inside_for_has_break_targeting_for() {
+        // `for i in range(...) { if true { break; } }` — break should be inside
+        // the for body, inside the if then-block.
+        let stmts = lower_stmts(
+            "@kernel @workgroup(1,1,1) fn k() -> void { for i in range(0u32, 5u32) { if true { break; } } return; }",
+        );
+        let f = stmts.iter().find_map(|s| if let HirStmt::ForRange(f) = s { Some(f) } else { None })
+            .expect("expected ForRange");
+        // The if stmt must be in the for body.
+        let has_if_with_break = f.body.iter().any(|s| {
+            if let HirStmt::If(hir_if) = s {
+                hir_if.then_block.iter().any(|ts| matches!(ts, HirStmt::Break { .. }))
+            } else {
+                false
+            }
+        });
+        assert!(has_if_with_break, "expected If containing Break inside ForRange body");
+    }
+
+    // AT-319: reduction.axc lowers to HIR with exactly one HirStmt::ForRange
+    #[test]
+    fn lower_reduction_example_produces_one_for_range() {
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR not set");
+        let examples_dir = std::path::PathBuf::from(&manifest_dir)
+            .join("..").join("..").join("examples");
+        let source_path = examples_dir.join("reduction.axc");
+        assert!(source_path.exists(), "examples/reduction.axc not found at {:?}", source_path);
+
+        let src = std::fs::read_to_string(&source_path)
+            .expect("failed to read reduction.axc");
+        let (hir, errors, _) = lower_src(&src);
+        assert!(errors.is_empty(), "expected no HirErrors for reduction.axc: {errors:?}");
+
+        let kernel = &hir.kernels[0];
+        let stmts = match &kernel.body {
+            KernelBody::Typed(t) => &t.stmts,
+            KernelBody::Empty => panic!("expected Typed body for reduction.axc"),
+        };
+        let for_count = stmts.iter().filter(|s| matches!(s, HirStmt::ForRange(_))).count();
+        assert_eq!(for_count, 1, "expected exactly 1 HirStmt::ForRange in reduction.axc; got {for_count}");
+    }
+
+    // AT-320: vector_axpy.axc lowers to HIR with exactly one HirStmt::ForRange
+    // and a HirStmt::BufferWrite inside the loop body.
+    #[test]
+    fn lower_vector_axpy_example_produces_one_for_range() {
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR not set");
+        let examples_dir = std::path::PathBuf::from(&manifest_dir)
+            .join("..").join("..").join("examples");
+        let source_path = examples_dir.join("vector_axpy.axc");
+        assert!(source_path.exists(), "examples/vector_axpy.axc not found at {:?}", source_path);
+
+        let src = std::fs::read_to_string(&source_path)
+            .expect("failed to read vector_axpy.axc");
+        let (hir, errors, _) = lower_src(&src);
+        assert!(errors.is_empty(), "expected no HirErrors for vector_axpy.axc: {errors:?}");
+
+        let kernel = &hir.kernels[0];
+        let stmts = match &kernel.body {
+            KernelBody::Typed(t) => &t.stmts,
+            KernelBody::Empty => panic!("expected Typed body for vector_axpy.axc"),
+        };
+        // Exactly one ForRange at the top level.
+        let for_count = stmts.iter().filter(|s| matches!(s, HirStmt::ForRange(_))).count();
+        assert_eq!(for_count, 1, "expected exactly 1 HirStmt::ForRange in vector_axpy.axc; got {for_count}");
+        // The for loop body must contain at least one HirStmt::BufferWrite.
+        let for_stmt = stmts.iter().find_map(|s| if let HirStmt::ForRange(f) = s { Some(f) } else { None })
+            .expect("expected ForRange");
+        let has_buffer_write = for_stmt.body.iter().any(|s| matches!(s, HirStmt::BufferWrite { .. }));
+        assert!(has_buffer_write, "expected HirStmt::BufferWrite inside the for loop body of vector_axpy.axc");
+    }
 }

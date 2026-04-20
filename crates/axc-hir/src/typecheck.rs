@@ -713,8 +713,23 @@ fn check_for_stmt(
         }
     };
 
-    // Register induction variable in a new nested scope frame (immutable u32)
+    // AT-315: reject redeclaration of a kernel-scope `let` binding by a for-induction.
+    // `let i = ...; for i in range(...) { }` must produce RedeclaredBinding.
+    // `for i in ... { for i in ... { } }` is allowed (outer `i` lives in for-scope
+    // frame 1, NOT kernel-scope frame 0, so the check below returns None for
+    // the inner for's `i` lookup in the kernel-scope frame).
     tc.scope_stack.push_frame();
+    // Check the outermost (kernel-scope) frame only.
+    if let Some(orig_idx) = tc.scope_stack.get_in_kernel_scope_frame(&var.node) {
+        let orig_span = tc.bindings[orig_idx].span;
+        tc.errors.push(TypecheckError::RedeclaredBinding {
+            name: var.node.clone(),
+            span: var.span,
+            original_span: orig_span,
+        });
+        tc.scope_stack.pop_frame();
+        return None;
+    }
     let induction_id: BindingId = match tc.register_binding(&var.node, ScalarTy::U32, false, var.span) {
         Some(id) => id,
         None => {
@@ -2510,9 +2525,10 @@ mod tests {
         assert!(has_if, "expected If stmt in body");
     }
 
-    // AT-308: if condition must be bool — reject non-bool
+    // AT-321: if condition must be bool — reject non-bool
     #[test]
-    fn tc_if_non_bool_cond_rejected() {
+    #[allow(non_snake_case)]
+    fn hir_rejects_if_with_int_cond_as_NonBoolCondition() {
         let (_, errors) = tc_body("let x: i32 = 1i32; if x { return; }");
         assert!(
             errors.iter().any(|e| matches!(e, TypecheckError::NonBoolCondition { .. })),
@@ -2542,7 +2558,7 @@ mod tests {
 
     // AT-311: short-circuit in if header must be rejected (CRITICAL-1)
     #[test]
-    fn tc_short_circuit_in_if_header_rejected() {
+    fn tc_short_circuit_in_if_cond_rejected() {
         let (_, errors) = tc_body("let x: bool = true; let y: bool = false; if x and y { return; }");
         assert!(
             errors.iter().any(|e| matches!(e, TypecheckError::UnsupportedShortCircuitInHeader { .. })),
@@ -2584,18 +2600,23 @@ mod tests {
         assert!(has_for, "expected ForRange with step 2");
     }
 
-    // AT-314: induction variable scoped inside for body
+    // AT-313: induction variable is out of scope after the for loop
     #[test]
-    fn tc_for_induction_var_scoped() {
+    fn hir_induction_variable_out_of_scope_after_for() {
+        // After the for loop, `i` must not be visible — accessing it is UnknownBinding.
         let (_, errors) = tc_body(
-            "for i in range(0u32, 5u32) { } return;"
+            "for i in range(0u32, 5u32) { } let x: u32 = i; return;"
         );
-        assert!(errors.is_empty(), "for loop scoping should succeed: {errors:?}");
+        assert!(
+            errors.iter().any(|e| matches!(e, TypecheckError::UnknownBinding { name, .. } if name == "i")),
+            "expected UnknownBinding{{name:'i'}} after for loop: {errors:?}"
+        );
     }
 
-    // AT-315: assign to for induction variable is rejected
+    // AT-322: assign to for induction variable is rejected
     #[test]
-    fn tc_assign_to_for_induction_var_rejected() {
+    #[allow(non_snake_case)]
+    fn hir_for_body_assigns_induction_is_AssignToForInductionVar() {
         let (_, errors) = tc_body(
             "for i in range(0u32, 10u32) { i = 5u32; } return;"
         );
@@ -2628,7 +2649,7 @@ mod tests {
 
     // AT-318: short-circuit in while header is rejected (CRITICAL-1)
     #[test]
-    fn tc_short_circuit_in_while_header_rejected() {
+    fn tc_short_circuit_in_while_cond_rejected() {
         let (_, errors) = tc_body(
             "let x: bool = true; let y: bool = false; while x and y { } return;"
         );
@@ -2653,9 +2674,10 @@ mod tests {
         assert!(has_break, "expected Break in while body");
     }
 
-    // AT-320: break outside loop is rejected
+    // AT-312: break outside loop is rejected
     #[test]
-    fn tc_break_outside_loop_rejected() {
+    #[allow(non_snake_case)]
+    fn hir_break_outside_loop_is_BreakOutsideLoop() {
         let (_, errors) = tc_body("break; return;");
         assert!(
             errors.iter().any(|e| matches!(e, TypecheckError::BreakOutsideLoop { .. })),
@@ -2703,15 +2725,45 @@ mod tests {
         );
     }
 
-    // AT-324: nested for loop with same induction variable name (scoping)
+    // AT-314: nested for loop with same induction variable name (scoping)
+    // Two distinct BindingIds must be assigned to the two `i` names.
     #[test]
-    fn tc_nested_for_same_induction_name_ok() {
+    fn hir_nested_for_with_shadowed_induction_is_accepted() {
         let (body, errors) = tc_body(
             "for i in range(0u32, 2u32) { for i in range(0u32, 3u32) { } } return;"
         );
         assert!(errors.is_empty(), "nested for with same induction name should succeed: {errors:?}");
-        let has_outer_for = body.stmts.iter().any(|s| matches!(s, HirStmt::ForRange(_)));
-        assert!(has_outer_for, "expected nested ForRange");
+        // Collect the two ForRange statements and check their induction BindingIds differ.
+        let outer = body.stmts.iter().find_map(|s| {
+            if let HirStmt::ForRange(f) = s { Some(f) } else { None }
+        }).expect("expected outer ForRange");
+        let inner = outer.body.iter().find_map(|s| {
+            if let HirStmt::ForRange(f) = s { Some(f) } else { None }
+        }).expect("expected inner ForRange");
+        assert_ne!(
+            outer.induction, inner.induction,
+            "outer and inner `i` must have distinct BindingIds: outer={:?} inner={:?}",
+            outer.induction, inner.induction
+        );
+    }
+
+    // AT-315: for-induction variable that shadows a kernel-scope `let` binding
+    // must produce RedeclaredBinding.
+    #[test]
+    #[allow(non_snake_case)]
+    fn hir_for_induction_shadowing_kernel_scope_let_is_RedeclaredBinding() {
+        // `let i: u32 = 5u32; for i in range(0u32, 10u32) { }` — the for-induction
+        // `i` redeclares the kernel-scope let binding `i`.
+        let (_, errors) = tc_body(
+            "let i: u32 = 5u32; for i in range(0u32, 10u32) { } return;"
+        );
+        let redeclared = errors.iter().filter(|e| {
+            matches!(e, TypecheckError::RedeclaredBinding { name, .. } if name == "i")
+        }).count();
+        assert_eq!(
+            redeclared, 1,
+            "expected exactly one RedeclaredBinding{{name:'i'}} for kernel-scope let + for-induction: {errors:?}"
+        );
     }
 
     // AT-325: for-range end bound must be U32-typed
@@ -2761,9 +2813,10 @@ mod tests {
         );
     }
 
-    // AT-329: for-range step must be positive (non-zero)
+    // AT-318: for-range step must be positive (non-zero)
     #[test]
-    fn tc_for_step_zero_rejected() {
+    #[allow(non_snake_case)]
+    fn hir_for_step_zero_is_ForStepNotPositive() {
         let (_, errors) = tc_body(
             "for i in range(0u32, 10u32, 0u32) { } return;"
         );

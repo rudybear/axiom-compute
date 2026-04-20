@@ -1,0 +1,29 @@
+// reduction.axc — single-threaded SSBO reduction kernel
+//
+// Computes dst[0] = sum(src[0..n]) by iterating over all n elements with a
+// for-range loop.  Runs as a single workgroup (1,1,1) — this is intentionally
+// serial to demonstrate M1.3 for-loop semantics, not a parallel reduction.
+//
+// Drives:
+//   AT-319 (HIR: lower_reduction_example_produces_one_for_range)
+//   AT-324 (driver integration: test_compile_reduction_produces_valid_spirv)
+//   AT-326 (determinism: cg_deterministic_reduction_source)
+//
+// Parameters:
+//   n    — number of elements to sum (u32, push-constant scalar)
+//   src  — input SSBO (readonly_buffer[f32], binding=0)
+//   dst  — output SSBO (buffer[f32], binding=1); dst[0] receives the sum
+
+@kernel
+@workgroup(1, 1, 1)
+@intent("single-threaded SSBO reduction: dst[0] = sum(src[0..n])")
+@complexity(O(n))
+@precondition(true)
+fn reduce_sum(n: u32, src: readonly_buffer[f32], dst: buffer[f32]) -> void {
+    let mut total: f32 = 0.0f32;
+    for i in range(0u32, n) {
+        total = total + src[i];
+    }
+    dst[0u32] = total;
+    return;
+}
