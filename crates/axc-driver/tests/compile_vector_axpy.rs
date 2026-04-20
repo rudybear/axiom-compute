@@ -1,5 +1,5 @@
 //! AT-325: Integration test — compile `examples/vector_axpy.axc` to SPIR-V
-//! and validate with `spirv-val` (if available).
+//! and validate with the spirv-tools crate (in-process, always mandatory).
 //!
 //! Exercises M1.3 for-loop codegen with buffer reads and writes inside the loop:
 //!   - k: u32, stride: u32, alpha: f32 push-constant scalars
@@ -15,7 +15,7 @@
 //!   AT-325-e: OpLoad present (buffer reads inside loop)
 //!   AT-325-f: OpVariable StorageBuffer present (SSBO for x and y)
 //!   AT-325-g: OpVariable PushConstant present (scalar params k, stride, alpha)
-//!   AT-325-h: spirv-val accepts output (if AXC_REQUIRE_SPIRV_VAL or spirv-val on PATH)
+//!   AT-325-h: in-process spirv-tools validation (always mandatory, no PATH dependency)
 
 use std::path::PathBuf;
 use rspirv::spirv::{Op, StorageClass};
@@ -31,19 +31,14 @@ fn load_words(bytes: &[u8]) -> Vec<u32> {
     words
 }
 
-fn which_spirv_val() -> Option<PathBuf> {
-    let path_var: std::ffi::OsString = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join("spirv-val");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        let candidate_exe = dir.join("spirv-val.exe");
-        if candidate_exe.is_file() {
-            return Some(candidate_exe);
-        }
-    }
-    None
+/// Validate SPIR-V words using the in-process spirv-tools crate.
+/// This is always mandatory — no PATH dependency, no silent skip.
+fn validate_spirv(words: &[u32], label: &str) {
+    use spirv_tools::val::{Validator, create as create_validator};
+    use spirv_tools::TargetEnv;
+    let validator = create_validator(Some(TargetEnv::Vulkan_1_1));
+    validator.validate(words, None)
+        .unwrap_or_else(|e| panic!("AT-325-h: spirv-tools rejected {label} SPIR-V: {e}"));
 }
 
 fn iter_instructions(words: &[u32]) -> impl Iterator<Item = (u16, &[u32])> {
@@ -147,33 +142,8 @@ fn test_compile_vector_axpy_produces_valid_spirv() {
     });
     assert!(has_push_const_var, "AT-325-g: expected Op::Variable PushConstant for scalar params");
 
-    // AT-325-h: spirv-val (optional, guarded by AXC_REQUIRE_SPIRV_VAL).
-    match which_spirv_val() {
-        Some(sv_path) => {
-            let output = std::process::Command::new(&sv_path)
-                .arg("--target-env")
-                .arg("vulkan1.1")
-                .arg(&out_path)
-                .output()
-                .expect("failed to execute spirv-val");
-            assert!(
-                output.status.success(),
-                "AT-325-h: spirv-val rejected vector_axpy output:\nstdout: {}\nstderr: {}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            );
-        }
-        None => {
-            if std::env::var("AXC_REQUIRE_SPIRV_VAL").as_deref() == Ok("1") {
-                panic!(
-                    "spirv-val required by CI (AXC_REQUIRE_SPIRV_VAL=1) but not found on PATH; \
-                    install SPIRV-Tools or set AXC_REQUIRE_SPIRV_VAL=0"
-                );
-            } else {
-                eprintln!("note: spirv-val not found on PATH; skipping spirv-val validation for vector_axpy.");
-            }
-        }
-    }
+    // AT-325-h: in-process SPIR-V validation via spirv-tools crate (always mandatory).
+    validate_spirv(&words, "vector_axpy");
 
     let _ = std::fs::remove_file(&out_path);
 }

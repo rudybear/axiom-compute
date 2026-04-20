@@ -22,3 +22,4 @@ thiserror = { workspace = true }
 [dev-dependencies]
 rspirv = { workspace = true }
 spirv = { workspace = true }
+spirv-tools = "0.13"
