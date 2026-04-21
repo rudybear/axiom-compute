@@ -1,7 +1,53 @@
-# AXIOM-Compute Benchmark Harness (M2.2)
+# AXIOM-Compute Benchmark Harness
 
 This document describes the Criterion-based benchmark harness for AXIOM-Compute.
 See also `DESIGN.md §3.1.7` for the design-level context.
+
+---
+
+## Measured results
+
+Baselines live at `.pipeline/benchmarks/baselines.json`. Run
+`AXC_BLESS_BASELINES=1 cargo bench -p axc-driver` on your own machine to
+regenerate for your hardware.
+
+### NVIDIA RTX PRO 6000 Blackwell Workstation
+
+Intel i9-14900KF host, driver 580.126.09 / CUDA 13.0, 96 GB VRAM.
+
+| Bench | Size | Median | Notes |
+|---|---|---|---|
+| `compile_saxpy` | — | **11.8 μs** | Source → SPIR-V codegen time |
+| `compile_vector_add` | — | **9.1 μs** | |
+| `cpu_saxpy` | 1 K / 1 M | 265 ns / 721 μs | Rust reference |
+| `cpu_vector_add` | 1 K / 1 M | 63 ns / 211 μs | Rust reference |
+| `dispatch_saxpy` | 1 K | **1.22 ms** | One-shot: includes pipeline compile + staging |
+| `dispatch_saxpy` | 1 M | **23.0 ms** | Staging-bound |
+| `dispatch_vector_add` | 1 K | 2.58 ms | |
+| `dispatch_vector_add` | 1 M | 52.1 ms | |
+| `dispatch_handle_saxpy_1m` (amortized) | 1 M | **22.2 ms** | Pipeline cache reused |
+| `dispatch_gpu_q4_0_128` | 128 blocks (4 K elem) | **2.56 ms** | Q4_0 dequant + matvec |
+| `dispatch_gpu_q4_0_1024` | 1024 blocks (32 K elem) | **3.26 ms** | |
+| `dispatch_gpu_q4km_128` | 128 SB (32 K elem) | **3.38 ms** | Q4_K_M — llama.cpp beachhead |
+| `dispatch_gpu_q4km_512` | 512 SB (131 K elem) | **8.84 ms** | Bandwidth-bound |
+
+All numbers include the full host-round-trip: `memcpy` → staging → device-local copy → compute → device-local → staging → memcpy + fence wait.
+
+**Correctness**: every GPU kernel produces bit-exact output vs CPU reference within its declared FP tolerance. `AT-1331_gpu_dispatch_nvidia_matches_cpu_reference_within_1e_3` is green for Q4_K_M.
+
+**Ceiling at 1M elements**: ~23 ms is ~100× off theoretical PCIe peak — the staging-buffer copy path dominates. Pinned memory + concurrent transfer (deferred to M3) closes this gap.
+
+**Pipeline cache impact**: `dispatch_saxpy_1m` one-shot (23.0 ms) → amortized (22.2 ms) saves ~800 μs per call on NVIDIA; expected to be much larger on AMD/Intel where shader compile is slower.
+
+### Lavapipe (software Vulkan, CI)
+
+Not a GPU perf signal — validates dispatch plumbing.
+
+| Bench | Lavapipe median |
+|---|---|
+| `dispatch_saxpy_1024` | ~290 μs |
+| `dispatch_saxpy_1m` | ~4.2 ms |
+| `dispatch_q4km_128` | ~1.3 ms |
 
 ---
 
