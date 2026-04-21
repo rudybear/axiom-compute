@@ -4,4 +4,18 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "AXIOM-Compute autotuner and LLM bridge (placeholder; real content in M2)"
+description = "AXIOM-Compute autotuner: @strategy hole enumerator and grid-search harness"
+
+[dependencies]
+axc-lexer   = { path = "../axc-lexer" }
+axc-parser  = { path = "../axc-parser" }
+axc-hir     = { path = "../axc-hir" }
+axc-codegen = { path = "../axc-codegen" }
+thiserror.workspace  = true
+miette.workspace     = true
+serde.workspace      = true
+serde_json.workspace = true
+xxhash-rust          = { workspace = true }
+
+[dev-dependencies]
+# No extra dev deps beyond workspace defaults.
