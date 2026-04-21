@@ -28,7 +28,9 @@ use std::path::PathBuf;
 mod spv {
     pub const OP_CAPABILITY:          u16 = 17;
     pub const OP_EXTENSION:           u16 = 10;
+    #[allow(dead_code)]
     pub const OP_TYPE_INT:            u16 = 21;
+    #[allow(dead_code)]
     pub const OP_TYPE_FLOAT:          u16 = 22;
     pub const OP_VARIABLE:            u16 = 59;
     pub const OP_F_CONVERT:           u16 = 115;
@@ -36,11 +38,14 @@ mod spv {
 
     /// Capability enum values.
     pub mod cap {
+        #[allow(dead_code)]
         pub const SHADER:                        u32 = 1;
         pub const INT8:                          u32 = 39;
         pub const INT16:                         u32 = 22;
+        #[allow(dead_code)]
         pub const INT64:                         u32 = 11;
         pub const FLOAT16:                       u32 = 9;
+        #[allow(dead_code)]
         pub const FLOAT64:                       u32 = 10;
         pub const STORAGE_BUFFER_8BIT_ACCESS:    u32 = 4448;
         pub const STORAGE_BUFFER_16BIT_ACCESS:   u32 = 4433;
@@ -56,7 +61,9 @@ mod spv {
     pub mod dec {
         pub const NON_WRITABLE:  u32 = 24;
         pub const NON_READABLE:  u32 = 25;
+        #[allow(dead_code)]
         pub const BINDING:       u32 = 33;
+        #[allow(dead_code)]
         pub const DESCRIPTOR_SET: u32 = 34;
     }
 }
@@ -102,7 +109,7 @@ fn decode_spirv_string(words: &[u32]) -> String {
 
 /// Load words from a SPIR-V byte blob.
 fn load_words(bytes: &[u8]) -> Vec<u32> {
-    assert!(bytes.len() % 4 == 0, "SPIR-V byte length must be divisible by 4");
+    assert!(bytes.len().is_multiple_of(4), "SPIR-V byte length must be divisible by 4");
     let n = bytes.len() / 4;
     let mut words = Vec::with_capacity(n);
     for i in 0..n {
@@ -485,11 +492,8 @@ fn at_918_q4_0_dispatch_matches_cpu_reference() {
     let mut push_data: Vec<u8> = vec![0u8; binding_plan.push_constant_total_bytes as usize];
     for scalar in &binding_plan.scalars {
         let start: usize = scalar.offset as usize;
-        match scalar.ty {
-            axc_hir::ScalarTy::U32 => {
-                push_data[start..start + 4].copy_from_slice(&n_blocks_val.to_le_bytes());
-            }
-            _ => {}
+        if scalar.ty == axc_hir::ScalarTy::U32 {
+            push_data[start..start + 4].copy_from_slice(&n_blocks_val.to_le_bytes());
         }
     }
 
