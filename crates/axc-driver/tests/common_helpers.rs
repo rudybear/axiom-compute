@@ -235,6 +235,107 @@ fn bytes_to_words_roundtrip_length_invariant() {
     assert_eq!(words_out, words_in, "words_roundtrip: value mismatch");
 }
 
+// ── Q4_0 CPU reference layout tests (M2.5 regression guard) ──────────────────
+//
+// These tests independently pin the llama.cpp / GGUF Q4_0 layout convention —
+// byte k in a block encodes the weight at index k (low nibble) and the weight
+// at index k+16 (high nibble).  An earlier revision of
+// `q4_0_dequant_matvec_cpu` used the WRONG interleaved layout (lo=2k, hi=2k+1)
+// which silently produced wrong CPU reference values and caused AT-918 to fail
+// with GPU/CPU ratio ≈ 0.41 (which is the ratio between the two layouts on
+// random data, not a GPU correctness issue).
+//
+// Keep these tests alive even if the bench infrastructure evolves.
+
+/// A single Q4_0 block where:
+///   - scale = 1.0 (f16 0x3C00, bytes 0x00, 0x3C)
+///   - every data byte = 0x80  →  lo_nibble=0, hi_nibble=8
+///   → dequantized weight at index k (0..16) = (0 - 8) * 1.0 = -8.0
+///   → dequantized weight at index k+16 (16..32) = (8 - 8) * 1.0 = 0.0
+fn fixture_single_block_scale_one_half_weights() -> Vec<u8> {
+    let mut q: Vec<u8> = Vec::with_capacity(18);
+    // f16 scale 1.0 bits = 0x3C00, little-endian.
+    q.push(0x00);
+    q.push(0x3C);
+    // 16 data bytes each 0x80 → low nibble=0x0, high nibble=0x8.
+    for _ in 0..16 {
+        q.push(0x80);
+    }
+    q
+}
+
+/// Q4_0 CPU reference obeys the GGUF layout: byte k → lo at index k, hi at index k+16.
+///
+/// With scale=1.0 and every byte=0x80:
+///   - indices 0..16 weigh -8.0 (low nibble 0 − 8 = −8)
+///   - indices 16..32 weigh  0.0 (high nibble 8 − 8 =  0)
+///
+/// With x[i] = 1.0 for all i, the expected accumulator is `-8.0 * 16 + 0 * 16 = -128.0`.
+#[test]
+fn q4_0_cpu_reference_uses_gguf_layout_index_k_and_k_plus_16() {
+    let q = fixture_single_block_scale_one_half_weights();
+    let x: Vec<f32> = vec![1.0_f32; 32];
+
+    let acc = common::q4_0_dequant_matvec_cpu(&q, &x, 1);
+
+    // Under the CORRECT (k, k+16) layout:
+    //   sum = Σ_{k=0..16} (0 − 8) * 1.0 * x[k]  +  Σ_{k=0..16} (8 − 8) * 1.0 * x[k+16]
+    //       = -8 * 16 + 0 = -128.0
+    let expected: f32 = -128.0;
+    assert!(
+        (acc - expected).abs() < 1e-6,
+        "q4_0_dequant_matvec_cpu single-block layout: expected {expected}, got {acc}"
+    );
+
+    // Also pin the WRONG answer we would have produced under the old interleaved
+    // (2k, 2k+1) layout, so a regression swaps this test from red→green visibly:
+    //   sum = Σ_{k=0..16} (-8) * 1.0 * x[2k]  +  Σ_{k=0..16} (0) * 1.0 * x[2k+1]
+    //       = -8 * 16 = -128.0  (with uniform x this happens to also be -128;
+    // use a discriminating x below to separate layouts).
+}
+
+/// Discriminating test: choose x so the two layouts produce different sums.
+///
+/// x[k] = 1.0 for k in 0..16, x[k] = 0.0 for k in 16..32.
+///   - Correct (k, k+16) layout: only indices 0..16 contribute via the LO nibble
+///     (byte 0x80 → lo=0 → weight = -8).  Sum = -8.0 * 16 = -128.0.
+///   - Interleaved (2k, 2k+1) layout: both lo (-8) and hi (0) touch the first
+///     half of x via `2*k` / `2*k+1`; the hi nibble contributes 0, so the sum
+///     is -8 * 16 = -128.0 as well under this specific fixture.
+///
+/// So we use asymmetric weights instead: byte 0x12 → lo=0x2 (weight -6), hi=0x1 (weight -7).
+/// With x[k]=1.0 for k∈0..16 and x[k]=0 for k∈16..32:
+///   - Correct layout: only low nibbles × x[0..16] contribute → -6 * 16 = -96.0.
+///   - Interleaved layout: (lo=-6 at 2k) + (hi=-7 at 2k+1), over k=0..8 only
+///     (since x=0 for indices ≥16): sum = (-6 + -7) * 8 = -104.0.
+#[test]
+fn q4_0_cpu_reference_layout_discriminating_fixture() {
+    let mut q: Vec<u8> = Vec::with_capacity(18);
+    // Scale = 1.0 (f16 0x3C00).
+    q.push(0x00);
+    q.push(0x3C);
+    // All data bytes = 0x12 → lo=0x2, hi=0x1.
+    for _ in 0..16 {
+        q.push(0x12);
+    }
+
+    let mut x: Vec<f32> = vec![0.0_f32; 32];
+    for xk in x.iter_mut().take(16) {
+        *xk = 1.0_f32;
+    }
+
+    let acc = common::q4_0_dequant_matvec_cpu(&q, &x, 1);
+
+    // CORRECT (k, k+16): -6.0 * 16 = -96.0 (only lo nibbles × first-half x).
+    let expected: f32 = -96.0;
+    // WRONG interleaved layout would have given -104.0.
+    assert!(
+        (acc - expected).abs() < 1e-6,
+        "q4_0_dequant_matvec_cpu layout-discriminating fixture: expected {expected}, got {acc} \
+         (if acc is ~-104.0, the reference has regressed to the wrong interleaved layout)"
+    );
+}
+
 // ── CPU model probe platform contract (AT-709b) ────────────────────────────────
 
 /// AT-709b: cpu_model_probe returns a String (never panics; possibly empty).

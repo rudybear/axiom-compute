@@ -137,8 +137,13 @@ pub fn vector_add_cpu_reference(a: &[f32], b: &[f32]) -> Vec<f32> {
 // Q4_0 block layout (matches llama.cpp gguf format):
 //   18 bytes per block, 32 f32 elements per block
 //   byte  0..1:  f16 scale (little-endian IEEE 754 half-precision)
-//   bytes 2..17: 16 packed nibble pairs (byte k holds nibble k*2 in low 4 bits,
-//                nibble k*2+1 in high 4 bits)
+//   bytes 2..17: 16 packed nibble pairs
+//                byte k (k in 0..16):
+//                  low  4 bits = weight at index k
+//                  high 4 bits = weight at index k + 16
+//                (This is the canonical llama.cpp / GGUF Q4_0 convention, NOT
+//                the interleaved `[2*k, 2*k+1]` layout. See DESIGN.md §3.1.8
+//                and examples/q4_0_dequant_matvec.axc.)
 //
 // Dequant formula: value_i = (nibble_i - 8) * f16_to_f32(scale)
 // where nibble is unsigned 0..15 and the offset 8 centers it at zero.
@@ -228,19 +233,25 @@ pub fn q4_0_dequant_matvec_cpu(q: &[u8], x: &[f32], n_blocks: usize) -> f32 {
         let scale: f32 = half::f16::from_bits(scale_bits).to_f32();
 
         // 16 packed nibble bytes → 32 nibble values.
+        //
+        // GGUF Q4_0 layout: for k in 0..16, byte k encodes two weights:
+        //   lo nibble = weight at index k
+        //   hi nibble = weight at index k + 16
+        //
+        // This matches `examples/q4_0_dequant_matvec.axc` and DESIGN.md §3.1.8.
         let x_base: usize = block_idx * Q4_0_BLOCK_ELEMS;
         for byte_k in 0..16_usize {
             let packed: u8 = q[block_byte_offset + 2 + byte_k];
             let lo_nibble: u8 = packed & 0x0F;
             let hi_nibble: u8 = (packed >> 4) & 0x0F;
 
-            // Element 2*byte_k: low nibble.
-            let w0: f32 = (lo_nibble as f32 - 8.0_f32) * scale;
-            acc += w0 * x[x_base + 2 * byte_k];
+            // Element byte_k: low nibble.
+            let w_lo: f32 = (lo_nibble as f32 - 8.0_f32) * scale;
+            acc += w_lo * x[x_base + byte_k];
 
-            // Element 2*byte_k + 1: high nibble.
-            let w1: f32 = (hi_nibble as f32 - 8.0_f32) * scale;
-            acc += w1 * x[x_base + 2 * byte_k + 1];
+            // Element byte_k + 16: high nibble.
+            let w_hi: f32 = (hi_nibble as f32 - 8.0_f32) * scale;
+            acc += w_hi * x[x_base + byte_k + 16];
         }
     }
 
