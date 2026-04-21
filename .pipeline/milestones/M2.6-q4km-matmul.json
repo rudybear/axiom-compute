@@ -1,0 +1,52 @@
+{
+  "id": "M2.6-q4km-matmul",
+  "title": "Q4_K_M superblock matmul — llama.cpp beachhead",
+  "phase": "M2",
+  "goal": "Implement the full ggml Q4_K_M format: 256-element superblocks with f16 scale/min, 8× 32-element sub-blocks with 6-bit packed scales+mins, and 4-bit packed weights. This is THE llama.cpp beachhead kernel — the quantization scheme used by mainstream LLM deployments (Llama 3 70B-Q4_K_M, Mistral, etc.). Proves AXIOM-Compute can match llama.cpp's Vulkan backend functionally.",
+  "scope_in": [
+    "Q4_K_M superblock layout (144 bytes per 256-element superblock):",
+    "  - 2 bytes: f16 super_scale d",
+    "  - 2 bytes: f16 super_min m",
+    "  - 12 bytes: 8 × (6-bit scale + 6-bit min) packed (12 bytes = 96 bits = 8 × 12 bits)",
+    "  - 128 bytes: 256 × 4-bit weights (2 nibbles per byte)",
+    "6-bit scale/min unpacking: nibble-spread layout per ggml source. Scales in bytes[0..12], packed with 4-bit lo in bytes[0..4] and 2-bit hi in bytes[8..12] (and same for mins via byte overlap)",
+    "Dequant per element: value = d * scale[sub] * (nibble - 0) - m * min[sub] where scale/min are the unpacked 6-bit values [0..63]",
+    "Actually per ggml: value = d * (scale[sub]/63) * nibble - m * (min[sub]/63) — sub is the sub-block index (k / 32)",
+    "Wait — spec per llama.cpp GGML_TYPE_Q4_K: `y[l] = d * scale[is] * (q4 - 8) - dmin * m_[is]` where scales is lookup table of 4-byte packed 6-bit values. Re-read ggml source to pin exact formula.",
+    "Example: examples/q4km_dequant_matvec.axc — 256-element superblock matvec",
+    "Integration test: AT-1201 asserts bit-exact with ggml reference (within 1e-3 relative) on real GPU",
+    "CPU reference in common_helpers.rs: `q4km_dequant_matvec_cpu(q: &[u8], x: &[f32], n_superblocks: u32) -> f32`",
+    "Bench: dispatch_gpu_q4km_128 (128 superblocks = 18 KB weights, 32K elements) + dispatch_gpu_q4km_512 (128K elements)",
+    "Document Q4_K_M layout in DESIGN.md §3.1.11"
+  ],
+  "scope_out": [
+    "Q5_K_M / Q6_K (future milestones)",
+    "Row-tiled matmul (M3; M2.6 is matvec)",
+    "Cooperative matrix for the inner 4-bit dot products (M3; Q4_K_M uses f16 scales so coopmat math won't directly apply without dequant to f16 first)",
+    "Direct GGUF file loading (application layer, not compiler)",
+    "Perf parity with llama.cpp Vulkan (M3 after bandwidth work)"
+  ],
+  "acceptance_criteria": [
+    "cargo test --workspace passes (≥700 after M2.6)",
+    "cargo clippy --workspace --all-targets -- -D warnings clean",
+    "q4km_dequant_matvec compiles to valid SPIR-V (in-process spirv-tools)",
+    "GPU dispatch matches CPU reference within 1e-3 relative tolerance on real GPU (NVIDIA RTX PRO 6000 Blackwell)",
+    "CPU reference exactly matches ggml's `dequantize_row_q4_K` semantics (bit-exact modulo f16 rounding)",
+    "New bench entries for dispatch_gpu_q4km_128 + dispatch_gpu_q4km_512 in baselines.json",
+    "DESIGN.md §3.1.11 documents Q4_K_M layout",
+    "Regression: 676 tests from prior milestones preserved"
+  ],
+  "memory_limit_gb": 50,
+  "dependencies": ["M2.5-q4_0-matmul"],
+  "blocks": ["M3.1-flash-attention"],
+  "estimated_loc": "1500-2500",
+  "estimated_tests_added": "25-40",
+  "open_questions_for_architect": [
+    "Exact 6-bit scale/min unpacking algorithm: ggml uses a cumbersome bit-spreading layout. Reference: llama.cpp ggml-quants.c `get_scale_min_k4()` function. Need to replicate in AXIOM-Compute kernel.",
+    "Dequant formula: `y[l] = d * scale[is] * q4 - dmin * m[is]` where q4 is the 4-bit unsigned nibble (no -8 offset unlike Q4_0). Verify.",
+    "Scales/mins are 6-bit unsigned [0..63], not signed. Verify semantics.",
+    "Byte indexing within the packed scale region: 8 sub-blocks × 6 bits = 48 bits = 12 bytes. 8 × 6-bit scales + 8 × 6-bit mins = 96 bits = 12 bytes total. Confirmed.",
+    "Do we need new AXIOM-Compute builtins? Probably not — existing ptr_read_u8_zext + band/lshr/bor cover it.",
+    "Workgroup size: one output element per invocation? Or sub-block-level parallelism? Start simple (one per output) for M2.6; tiling is M3."
+  ]
+}
