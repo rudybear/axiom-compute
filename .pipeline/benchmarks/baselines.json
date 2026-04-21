@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
-  "generated": "2026-04-21T09:15:35Z",
-  "git_sha": "435cf28",
+  "generated": "2026-04-21T23:21:45Z",
+  "git_sha": "6944359",
   "machine": {
     "os": "linux",
     "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)",
-    "vulkan_icd": "/usr/share/vulkan/icd.d/lvp_icd.json",
-    "vulkan_device": "llvmpipe (LLVM 20.1.2, 256 bits)",
+    "vulkan_icd": "",
+    "vulkan_device": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
     "cpu_model": "Intel(R) Core(TM) i9-14900KF",
     "axc_version": "0.0.1"
   },
@@ -14,107 +14,107 @@
     {
       "group": "compile_pipeline",
       "bench": "compile_saxpy",
-      "median_ns": 11425,
-      "low_ns": 11261,
-      "high_ns": 11488
+      "median_ns": 11837,
+      "low_ns": 11828,
+      "high_ns": 11851
     },
     {
       "group": "compile_pipeline",
       "bench": "compile_vector_add",
-      "median_ns": 9314,
-      "low_ns": 9241,
-      "high_ns": 9352
+      "median_ns": 9076,
+      "low_ns": 9073,
+      "high_ns": 9078
     },
     {
       "group": "cpu_reference",
       "bench": "cpu_saxpy_1024",
-      "median_ns": 209,
-      "low_ns": 186,
-      "high_ns": 248
+      "median_ns": 265,
+      "low_ns": 231,
+      "high_ns": 302
     },
     {
       "group": "cpu_reference",
       "bench": "cpu_saxpy_1m",
-      "median_ns": 677534,
-      "low_ns": 670949,
-      "high_ns": 685493
+      "median_ns": 721485,
+      "low_ns": 713120,
+      "high_ns": 734248
     },
     {
       "group": "cpu_reference",
       "bench": "cpu_vector_add_1024",
-      "median_ns": 64,
-      "low_ns": 64,
-      "high_ns": 65
+      "median_ns": 63,
+      "low_ns": 61,
+      "high_ns": 63
     },
     {
       "group": "cpu_reference",
       "bench": "cpu_vector_add_1m",
-      "median_ns": 151674,
-      "low_ns": 149805,
-      "high_ns": 154978
+      "median_ns": 211032,
+      "low_ns": 209173,
+      "high_ns": 211678
     },
     {
       "group": "dispatch_gpu",
       "bench": "dispatch_saxpy_1024",
-      "median_ns": 38404,
-      "low_ns": 37735,
-      "high_ns": 39086
+      "median_ns": 1221667,
+      "low_ns": 756421,
+      "high_ns": 1499827
     },
     {
       "group": "dispatch_gpu",
       "bench": "dispatch_saxpy_1m",
-      "median_ns": 3248060,
-      "low_ns": 3224402,
-      "high_ns": 3274789
+      "median_ns": 23047104,
+      "low_ns": 22749601,
+      "high_ns": 23341983
     },
     {
       "group": "dispatch_gpu",
       "bench": "dispatch_vector_add_1024",
-      "median_ns": 193408,
-      "low_ns": 188761,
-      "high_ns": 203232
+      "median_ns": 2575112,
+      "low_ns": 2495674,
+      "high_ns": 2602558
     },
     {
       "group": "dispatch_gpu",
       "bench": "dispatch_vector_add_1m",
-      "median_ns": 10324623,
-      "low_ns": 10245444,
-      "high_ns": 10373911
+      "median_ns": 52110861,
+      "low_ns": 51459715,
+      "high_ns": 64515850
     },
     {
       "group": "dispatch_gpu_amortized",
       "bench": "dispatch_handle_saxpy_1m",
-      "median_ns": 3248215,
-      "low_ns": 3206830,
-      "high_ns": 3292413
+      "median_ns": 22247633,
+      "low_ns": 21979548,
+      "high_ns": 22465355
     },
     {
       "group": "dispatch_gpu_q4_0",
       "bench": "dispatch_gpu_q4_0_1024",
-      "median_ns": 1326084,
-      "low_ns": 1321950,
-      "high_ns": 1333883
+      "median_ns": 3255213,
+      "low_ns": 3188545,
+      "high_ns": 3278820
     },
     {
       "group": "dispatch_gpu_q4_0",
       "bench": "dispatch_gpu_q4_0_128",
-      "median_ns": 1293460,
-      "low_ns": 1267890,
-      "high_ns": 1321722
+      "median_ns": 2555453,
+      "low_ns": 2503897,
+      "high_ns": 2591243
     },
     {
       "group": "dispatch_gpu_q4km",
       "bench": "dispatch_q4km_128",
-      "median_ns": 0,
-      "low_ns": 0,
-      "high_ns": 0
+      "median_ns": 3380241,
+      "low_ns": 3306786,
+      "high_ns": 3443232
     },
     {
       "group": "dispatch_gpu_q4km",
       "bench": "dispatch_q4km_512",
-      "median_ns": 0,
-      "low_ns": 0,
-      "high_ns": 0
+      "median_ns": 8836038,
+      "low_ns": 8575548,
+      "high_ns": 9201722
     }
   ]
 }
