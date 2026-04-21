@@ -50,6 +50,7 @@ pub(crate) mod buffers;
 pub(crate) mod pipeline;
 pub(crate) mod resources;
 pub(crate) mod device_owner;
+pub(crate) mod instance_owner;
 pub(crate) mod pipeline_cache;
 pub mod kernel_handle;
 

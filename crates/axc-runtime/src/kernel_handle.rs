@@ -28,6 +28,7 @@ use axc_hir::ParamBindingPlan;
 use parking_lot::Mutex;
 
 use crate::device_owner::DeviceOwner;
+use crate::instance_owner::InstanceOwner;
 use crate::error::{DispatchError, CopyDirection};
 use crate::buffers::{
     allocate_device_local_buffer, allocate_staging_buffer,
@@ -64,9 +65,30 @@ pub(crate) struct BufferSlot {
 ///
 /// Owned inside an `Arc`; dropped when the last `Arc` reference is released.
 /// All Vulkan cleanup happens in `KernelHandleInner::drop`.
+///
+/// # Field drop ordering
+///
+/// Rust drops struct fields in **declaration order** (first-to-last) after
+/// `Drop::drop()` returns. To satisfy Vulkan spec §3.3.3 (VkDevice must be
+/// destroyed before VkInstance), `device` is declared **before** `_instance_owner`:
+/// - `device` (Arc<DeviceOwner>) drops FIRST (declared first) → `vkDestroyDevice`.
+/// - `_instance_owner` (Arc<InstanceOwner>) drops SECOND → `vkDestroyInstance`.
+///
+/// The explicit Vulkan object cleanups in `Drop::drop()` use `device` before
+/// the automatic Arc drops. Both Arcs are still alive during `drop()` since
+/// they haven't been auto-dropped yet.
 pub(crate) struct KernelHandleInner {
     /// Keeps the Vulkan device alive even after `VulkanContext` is dropped.
+    ///
+    /// Declared FIRST so it auto-drops FIRST (declaration order). This ensures
+    /// `vkDestroyDevice` fires before `vkDestroyInstance`, satisfying Vulkan
+    /// spec §3.3.3 (VkDevice-before-VkInstance).
     pub(crate) device: Arc<DeviceOwner>,
+    /// Keeps the Vulkan instance alive until after the device is destroyed.
+    ///
+    /// Declared AFTER `device` so it auto-drops SECOND (declaration order).
+    /// This ensures `vkDestroyInstance` fires only after `vkDestroyDevice`.
+    pub(crate) _instance_owner: Arc<InstanceOwner>,
     /// SPIR-V shader module (no-op compilation already done at prepare_kernel time).
     pub(crate) shader_module: vk::ShaderModule,
     /// Descriptor set layout; `None` for 0-buffer kernels (P-5).
@@ -180,8 +202,11 @@ impl Drop for KernelHandleInner {
         // SAFETY: all pipelines using this shader module have been destroyed above.
         unsafe { device.destroy_shader_module(self.shader_module, None); }
 
-        // Arc<DeviceOwner> drops implicitly at end of scope.
-        // If this was the last Arc reference, vkDestroyDevice fires exactly once.
+        // Arc<DeviceOwner> and Arc<InstanceOwner> drop implicitly via field auto-drop
+        // after this body returns. Order is: device (declared after _instance_owner) drops
+        // first (reverse field order), then _instance_owner drops.
+        // If device was the last Arc<DeviceOwner> ref → vkDestroyDevice fires.
+        // If _instance_owner was the last Arc<InstanceOwner> ref → vkDestroyInstance fires.
     }
 }
 

@@ -12,6 +12,8 @@
 //! ## M2.3a additions
 //!
 //! - `Arc<DeviceOwner>` for shared device lifetime between context and `KernelHandle`s.
+//! - `Arc<InstanceOwner>` for shared instance lifetime — ensures VkInstance outlives
+//!   VkDevice even when `KernelHandle`s outlive `VulkanContext` (AT-827).
 //! - `PipelineCache` for Vulkan pipeline caching (disk-backed via options).
 //! - `parking_lot::Mutex<BTreeMap<KernelCacheKey, Weak<KernelHandleInner>>>` in-process
 //!   kernel cache (no HashMap — anti-pattern #14).
@@ -24,12 +26,17 @@
 //! 2. `pipeline_cache.save()` (non-fatal, logs via `tracing::warn!` on error)
 //! 3. Destroy `vk::PipelineCache` handle
 //! 4. Destroy command pool
-//! 5. Drop `in_mem_kernel_cache` (releases all Weak refs)
-//! 6. Drop `Arc<DeviceOwner>` (calls `vkDestroyDevice` iff strong_count was 1)
-//! 7. Destroy instance
+//! 5. Drop `ManuallyDrop<Arc<DeviceOwner>>` explicitly → `vkDestroyDevice` if last ref
+//! 6. Drop `ManuallyDrop<Arc<InstanceOwner>>` explicitly → `vkDestroyInstance` if last ref
 //!
-//! If a `KernelHandle` outlives the context, step 6 does NOT destroy the device.
-//! The device is destroyed when the last `KernelHandle` drops its `Arc<DeviceOwner>`.
+//! Steps 5 and 6 use `ManuallyDrop` to enforce VkDevice-before-VkInstance ordering
+//! (Vulkan spec §3.3.3). Without `ManuallyDrop`, Rust field-drop order would run
+//! AFTER the drop body, meaning step 6 (`destroy_instance`) would execute in the body
+//! while `device_owner` had not yet been dropped by the field auto-drop.
+//!
+//! When `KernelHandle`s outlive the context (AT-827), both Arcs have `strong_count > 1`
+//! at context drop time, so neither `vkDestroyDevice` nor `vkDestroyInstance` fires
+//! until the last `KernelHandle` drops its Arc.
 //!
 //! ## Device selection
 //!
@@ -39,6 +46,7 @@
 //!    that has a compute queue family.
 
 use std::collections::BTreeMap;
+use std::mem::ManuallyDrop;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
@@ -47,6 +55,7 @@ use axc_hir::ParamBindingPlan;
 use parking_lot::Mutex;
 
 use crate::device_owner::DeviceOwner;
+use crate::instance_owner::InstanceOwner;
 use crate::error::DispatchError;
 use crate::pipeline_cache::{PipelineCache, resolve_pipeline_cache_path_from_env};
 use crate::pipeline::build_compute_pipeline;
@@ -104,16 +113,24 @@ impl VulkanContextOptions {
 /// One context per process is typical. Multiple contexts are safe (AT-516) but
 /// each has its own device and command pool — useful for testing, not for production.
 pub struct VulkanContext {
-    /// Vulkan entry (function table loader).
-    #[allow(dead_code)]
-    pub(crate) entry: ash::Entry,
-    /// Vulkan instance.
-    pub(crate) instance: ash::Instance,
+    /// Shared ownership of the Vulkan instance and entry.
+    ///
+    /// Wrapped in `ManuallyDrop` so `VulkanContext::drop` can explicitly take
+    /// and drop it AFTER explicitly dropping `device_owner`. This satisfies
+    /// Vulkan spec §3.3.3: VkDevice before VkInstance.
+    ///
+    /// `KernelHandleInner` also holds an `Arc<InstanceOwner>` clone, so the
+    /// instance is not destroyed until all KernelHandles have been dropped.
+    pub(crate) instance_owner: ManuallyDrop<Arc<InstanceOwner>>,
     /// Selected physical device.
     #[allow(dead_code)]
     pub(crate) physical_device: vk::PhysicalDevice,
     /// Arc-wrapped device owner — shared with any KernelHandles created from this context.
-    pub(crate) device_owner: Arc<DeviceOwner>,
+    ///
+    /// Wrapped in `ManuallyDrop` so `VulkanContext::drop` can take ownership and
+    /// explicitly drop it **before** dropping `instance_owner`. Vulkan spec §3.3.3
+    /// requires all VkDevice objects to be destroyed before their parent VkInstance.
+    pub(crate) device_owner: ManuallyDrop<Arc<DeviceOwner>>,
     /// Compute queue handle.
     pub(crate) queue: vk::Queue,
     /// Queue family index used for the command pool and queue.
@@ -179,23 +196,33 @@ impl VulkanContext {
 
         // SAFETY: instance_info is valid for the duration of this call. No validation
         // layers are enabled by default (opt-in via AXC_VULKAN_VALIDATION in M2+).
-        let instance: ash::Instance =
+        let raw_instance: ash::Instance =
             unsafe { entry.create_instance(&instance_info, None) }
                 .map_err(|e| DispatchError::NoVulkanInstance(e.to_string()))?;
+
+        // Wrap entry + instance in Arc<InstanceOwner> so they can be shared with
+        // KernelHandles that outlive this VulkanContext (AT-827). vkDestroyInstance
+        // fires when the last Arc<InstanceOwner> drops.
+        let instance_owner: Arc<InstanceOwner> = Arc::new(InstanceOwner {
+            instance: raw_instance,
+            entry,
+        });
+
+        // Alias for brevity in the remainder of this function.
+        let instance: &ash::Instance = &instance_owner.instance;
 
         // ── Step 3: Physical device selection ─────────────────────────────────
         // SAFETY: instance is valid; enumerate_physical_devices is a read-only query.
         let physical_devices: Vec<vk::PhysicalDevice> =
             unsafe { instance.enumerate_physical_devices() }
                 .map_err(|e| {
-                    // SAFETY: must clean up the instance on error.
-                    unsafe { instance.destroy_instance(None); }
+                    // Drop Arc<InstanceOwner> — fires vkDestroyInstance.
+                    drop(Arc::clone(&instance_owner));
                     DispatchError::NoVulkanInstance(format!("enumerate_physical_devices: {e}"))
                 })?;
 
         if physical_devices.is_empty() {
-            // SAFETY: no devices found; destroy instance before returning error.
-            unsafe { instance.destroy_instance(None); }
+            // InstanceOwner drops here → vkDestroyInstance.
             return Err(DispatchError::NoSupportedDevice);
         }
 
@@ -214,28 +241,20 @@ impl VulkanContext {
                 Some(idx) => {
                     let pd: vk::PhysicalDevice = physical_devices[idx];
                     // SAFETY: pd is a valid physical device.
-                    let qf_idx = find_compute_queue_family(&instance, pd)
-                        .ok_or_else(|| {
-                            // SAFETY: destroy instance on error.
-                            unsafe { instance.destroy_instance(None); }
-                            DispatchError::NoComputeQueue
-                        })?;
+                    let qf_idx = find_compute_queue_family(instance, pd)
+                        .ok_or(DispatchError::NoComputeQueue)?;
                     (pd, qf_idx)
                 }
                 None => {
                     let mut found: Option<(vk::PhysicalDevice, u32)> = None;
                     for &pd in &physical_devices {
                         // SAFETY: pd is a valid physical device.
-                        if let Some(qf) = find_compute_queue_family(&instance, pd) {
+                        if let Some(qf) = find_compute_queue_family(instance, pd) {
                             found = Some((pd, qf));
                             break;
                         }
                     }
-                    found.ok_or_else(|| {
-                        // SAFETY: destroy instance; no usable device found.
-                        unsafe { instance.destroy_instance(None); }
-                        DispatchError::NoSupportedDevice
-                    })?
+                    found.ok_or(DispatchError::NoSupportedDevice)?
                 }
             };
 
@@ -263,17 +282,20 @@ impl VulkanContext {
         // runtime checks are enabled (M1.5 only uses f32 arithmetic which is core 1.1).
         let raw_device: ash::Device =
             unsafe { instance.create_device(physical_device, &device_create_info, None) }
-                .map_err(|e| {
-                    // SAFETY: destroy instance on device creation failure.
-                    unsafe { instance.destroy_instance(None); }
-                    DispatchError::DeviceCreationFailed(e.to_string())
-                })?;
+                .map_err(|e| DispatchError::DeviceCreationFailed(e.to_string()))?;
 
         // SAFETY: raw_device is valid; queue was created with queue_family_index and index 0.
         let queue: vk::Queue = unsafe { raw_device.get_device_queue(queue_family_index, 0) };
 
-        // Wrap device in Arc<DeviceOwner> — vkDestroyDevice fires when the last Arc drops.
-        let device_owner: Arc<DeviceOwner> = Arc::new(DeviceOwner { device: raw_device });
+        // Wrap device in Arc<DeviceOwner> inside ManuallyDrop — vkDestroyDevice fires
+        // when the last Arc drops. ManuallyDrop allows VulkanContext::drop to explicitly
+        // take ownership and drop the Arc before instance_owner (Vulkan spec §3.3.3).
+        let device_owner: ManuallyDrop<Arc<DeviceOwner>> =
+            ManuallyDrop::new(Arc::new(DeviceOwner { device: raw_device }));
+
+        // Wrap instance_owner in ManuallyDrop so Drop can explicitly take it AFTER
+        // device_owner has been dropped, satisfying VkDevice-before-VkInstance ordering.
+        let instance_owner: ManuallyDrop<Arc<InstanceOwner>> = ManuallyDrop::new(instance_owner);
 
         // ── Step 6: Command pool ──────────────────────────────────────────────
         let cp_info = vk::CommandPoolCreateInfo::default()
@@ -284,20 +306,13 @@ impl VulkanContext {
         let command_pool: vk::CommandPool =
             unsafe { device_owner.create_command_pool(&cp_info, None) }
                 .map_err(|e| {
-                    // Clone the Arc so the closure captures by value; when the closure
-                    // returns the cloned Arc drops → triggers DeviceOwner::drop → vkDestroyDevice.
-                    let _owner_ref: Arc<DeviceOwner> = Arc::clone(&device_owner);
-                    drop(_owner_ref);
-                    // SAFETY: instance was created above; the device using it has been
-                    // destroyed via DeviceOwner::drop triggered by the Arc drop above.
-                    unsafe { instance.destroy_instance(None); }
                     DispatchError::DeviceCreationFailed(format!("create_command_pool: {e}"))
                 })?;
 
         // ── Step 7: Cache memory properties ──────────────────────────────────
         // SAFETY: physical_device is valid; this is a read-only query.
         let memory_properties: vk::PhysicalDeviceMemoryProperties =
-            unsafe { instance.get_physical_device_memory_properties(physical_device) };
+            unsafe { instance_owner.instance.get_physical_device_memory_properties(physical_device) };
 
         // ── Step 8: Cache device limits ───────────────────────────────────────
         // SAFETY: physical_device is valid; this is a read-only query.
@@ -327,8 +342,7 @@ impl VulkanContext {
             .unwrap_or(crate::dispatch::DEFAULT_FENCE_TIMEOUT_MS);
 
         Ok(Self {
-            entry,
-            instance,
+            instance_owner,
             physical_device,
             device_owner,
             queue,
@@ -441,6 +455,7 @@ impl VulkanContext {
                 })?;
 
         let inner_fresh: Arc<KernelHandleInner> = Arc::new(KernelHandleInner {
+            _instance_owner: Arc::clone(&self.instance_owner),
             device: Arc::clone(&self.device_owner),
             shader_module: compiled.shader_module,
             descriptor_set_layout: compiled.descriptor_set_layout,
@@ -565,7 +580,7 @@ impl Drop for VulkanContext {
         }
 
         // Step 3: destroy the vk::PipelineCache handle.
-        // SAFETY: pipeline_cache.vk_handle was created from this device.
+        // SAFETY: pipeline_cache.vk_handle was created from this device and is valid.
         unsafe {
             self.device_owner
                 .destroy_pipeline_cache(self.pipeline_cache.vk_handle, None);
@@ -575,16 +590,36 @@ impl Drop for VulkanContext {
         // SAFETY: command_pool was created from this device; it is valid.
         unsafe { self.device_owner.destroy_command_pool(self.command_pool, None); }
 
-        // Step 5: drop in_mem_kernel_cache (releases all Weak refs).
-        // (Automatic via field drop order — Mutex<BTreeMap<…, Weak<…>>>)
+        // Step 5: explicitly drop Arc<DeviceOwner> via ManuallyDrop::take.
+        //
+        // This fires vkDestroyDevice HERE if this context holds the last Arc ref.
+        // If KernelHandles still hold Arcs, strong_count > 1 and the device lives
+        // until the last KernelHandle drops.
+        //
+        // SAFETY: device_owner was initialized in new_with_options() and has not
+        // been taken before (this Drop impl runs exactly once per VulkanContext).
+        // After ManuallyDrop::take, self.device_owner is uninitialized — no code
+        // below accesses it.
+        let owned_device: Arc<DeviceOwner> =
+            unsafe { ManuallyDrop::take(&mut self.device_owner) };
+        drop(owned_device); // → vkDestroyDevice if last Arc ref.
 
-        // Step 6: Arc<DeviceOwner> drops here (end of Drop body).
-        // If this is the last Arc ref, DeviceOwner::drop fires → vkDestroyDevice.
-        // If KernelHandles still hold Arcs, device survives until those drop.
-
-        // Step 7: destroy instance.
-        // SAFETY: instance was created in new_with_options(); device has been
-        // destroyed (or will be when last KernelHandle drops).
-        unsafe { self.instance.destroy_instance(None); }
+        // Step 6: explicitly drop Arc<InstanceOwner> via ManuallyDrop::take.
+        //
+        // This fires vkDestroyInstance HERE if this context holds the last Arc ref.
+        // Both Arcs must be taken explicitly because ManuallyDrop fields are NOT
+        // auto-dropped by Rust — the code here IS the only destructor that runs.
+        //
+        // SAFETY: instance_owner was initialized in new_with_options() and has not
+        // been taken before. After ManuallyDrop::take, self.instance_owner is
+        // uninitialized — this is the last operation in the drop body.
+        //
+        // Ordering guarantee: step 5 (vkDestroyDevice) executes before step 6
+        // (vkDestroyInstance), satisfying Vulkan spec §3.3.3 (VkDevice-before-VkInstance).
+        // If KernelHandles outlive this context, both vkDestroyDevice AND vkDestroyInstance
+        // are deferred to when the last KernelHandle drops (which holds Arcs to both).
+        let owned_instance: Arc<InstanceOwner> =
+            unsafe { ManuallyDrop::take(&mut self.instance_owner) };
+        drop(owned_instance); // → vkDestroyInstance if last Arc ref.
     }
 }
