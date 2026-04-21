@@ -33,6 +33,13 @@ name = "postprocess"
 path = "benches/postprocess.rs"
 harness = false
 
+# M2.6: Q4_K_M dequant+matvec dispatch bench.
+# Isolated from dispatch.rs for per-bench-binary Criterion state independence.
+[[bench]]
+name = "dispatch_q4km"
+path = "benches/dispatch_q4km.rs"
+harness = false
+
 [features]
 # M2.2 AT-714: fault-injection feature for regression-gate CI validation.
 # When enabled, cpu_saxpy_reference adds a 100M-iteration accumulator loop

@@ -101,6 +101,20 @@
       "median_ns": 1293460,
       "low_ns": 1267890,
       "high_ns": 1321722
+    },
+    {
+      "group": "dispatch_gpu_q4km",
+      "bench": "dispatch_q4km_128",
+      "median_ns": 0,
+      "low_ns": 0,
+      "high_ns": 0
+    },
+    {
+      "group": "dispatch_gpu_q4km",
+      "bench": "dispatch_q4km_512",
+      "median_ns": 0,
+      "low_ns": 0,
+      "high_ns": 0
     }
   ]
 }

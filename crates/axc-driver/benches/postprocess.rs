@@ -115,6 +115,9 @@ const KNOWN_BENCHES: &[(&str, &str, &str)] = &[
     // dispatch_gpu_q4_0 group (M2.5)
     ("dispatch_gpu_q4_0", "dispatch_gpu_q4_0_128", "dispatch_gpu_q4_0_128"),
     ("dispatch_gpu_q4_0", "dispatch_gpu_q4_0_1024", "dispatch_gpu_q4_0_1024"),
+    // dispatch_gpu_q4km group (M2.6)
+    ("dispatch_gpu_q4km", "dispatch_q4km_128", "dispatch_q4km_128"),
+    ("dispatch_gpu_q4km", "dispatch_q4km_512", "dispatch_q4km_512"),
 ];
 
 // ── Helper: probe git SHA ──────────────────────────────────────────────────────

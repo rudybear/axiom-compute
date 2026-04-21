@@ -332,6 +332,192 @@ fn q4_0_cpu_reference_layout_discriminating_fixture() {
     );
 }
 
+// ── Q4_K_M CPU reference (M2.6) ──────────────────────────────────────────────
+//
+// Q4_K_M block layout (matches ggml block_q4_K struct):
+//   144 bytes per superblock, 256 f32 elements per superblock
+//   bytes [0..2]   : f16 super-scale d (little-endian IEEE 754 half-precision)
+//   bytes [2..4]   : f16 super-min dmin (little-endian IEEE 754 half-precision)
+//   bytes [4..16]  : 12-byte packed scales region:
+//                    encodes 8 × (6-bit scale + 6-bit min) = 96 bits
+//                    decoded by get_scale_min_k4 below (canonical ggml bit-spread)
+//   bytes [16..144]: 128-byte packed 4-bit weights (256 weights, 2 nibbles per byte)
+//
+// Dequant formula per element (NO -8 offset, unlike Q4_0):
+//   y = d * sc * nibble - dmin * m
+// where nibble ∈ [0,15], sc and m are unsigned 6-bit integers in [0,63].
+//
+// Canonical ggml reference: ggml-quants.c `dequantize_row_q4_K`.
+
+/// Decode one (scale, min) pair at index j ∈ [0,8) from a 12-byte Q4_K_M
+/// scales region.  Matches ggml's `get_scale_min_k4(j, q, &d, &m)` exactly.
+///
+/// The bit-spread layout encodes:
+///   j < 4: sc = scales[j] & 63; m = scales[j+4] & 63.
+///   j >= 4: sc = (scales[j+4] & 0x0F) | ((scales[j-4] >> 6) << 4)
+///            m  = (scales[j+4] >> 4)   | ((scales[j]   >> 6) << 4)
+///
+/// CRITICAL: the `scales[j]` (NOT `scales[j-4]`) in the m-high branch is
+/// canonical ggml bit-aliasing — q[4..7]'s upper 2 bits store m's high-2 for
+/// j in {4,5,6,7}.  Do NOT change this to `j-4`.
+///
+/// Returns `(sc, m)` both in [0, 63].
+pub fn unpack_scale_min_k4_cpu(scales: &[u8; 12], j: usize) -> (u8, u8) {
+    if j < 4 {
+        let sc: u8 = scales[j] & 63;
+        let m: u8  = scales[j + 4] & 63;
+        (sc, m)
+    } else {
+        let sc_lo: u8 = scales[j + 4] & 0x0F;
+        let sc_hi: u8 = (scales[j - 4] >> 6) & 0x03;
+        let sc: u8 = sc_lo | (sc_hi << 4);
+        let m_lo: u8 = (scales[j + 4] >> 4) & 0x0F;
+        // CRITICAL: m uses scales[j] (q[j]) NOT scales[j-4] (q[j-4]) for the high 2 bits.
+        // This is the canonical ggml form: `(q[j+4] >> 4) | ((q[j-0] >> 6) << 4)`.
+        let m_hi: u8 = (scales[j] >> 6) & 0x03;
+        let m: u8 = m_lo | (m_hi << 4);
+        (sc, m)
+    }
+}
+
+/// Bytes per Q4_K_M superblock.
+pub const Q4KM_SUPERBLOCK_BYTES: usize = 144;
+
+/// Elements per Q4_K_M superblock.
+pub const Q4KM_SUPERBLOCK_ELEMS: usize = 256;
+
+/// CPU reference for Q4_K_M dequantize + matrix-vector multiply.
+///
+/// Bit-equivalent to the GPU kernel modulo IEEE-754 f16 rounding (handled by the
+/// `half` crate).  The GPU path widens via OpBitcast + OpFConvert; the CPU path
+/// widens via `half::f16::from_bits().to_f32()` — both produce the same f32 bit
+/// pattern for every legal f16 input.
+///
+/// Iteration order is identical to the GPU kernel:
+///   sb outer → chunk [0..4) → is0 then is1 sub-block → inner l in [0..32) →
+///   lo nibbles (sub-block is0) then hi nibbles (sub-block is1) accumulated.
+///
+/// # Parameters
+/// - `q`: packed Q4_K_M superblocks; length must be `n_superblocks * 144` bytes.
+/// - `x`: input f32 vector; length must be at least `n_superblocks * 256`.
+/// - `n_superblocks`: number of Q4_K_M superblocks.
+///
+/// # Returns
+/// The single f32 output element y[0] = accumulated dot-product sum over all
+/// superblocks and all 256 elements per superblock.
+///
+/// # Panics
+/// Panics if `q.len() != n_superblocks * 144` or `x.len() < n_superblocks * 256`.
+pub fn q4km_dequant_matvec_cpu(q: &[u8], x: &[f32], n_superblocks: usize) -> f32 {
+    assert_eq!(
+        q.len(), n_superblocks * Q4KM_SUPERBLOCK_BYTES,
+        "q4km_dequant_matvec_cpu: q length mismatch: expected {}, got {}",
+        n_superblocks * Q4KM_SUPERBLOCK_BYTES, q.len()
+    );
+    assert!(
+        x.len() >= n_superblocks * Q4KM_SUPERBLOCK_ELEMS,
+        "q4km_dequant_matvec_cpu: x length too short: expected >= {}, got {}",
+        n_superblocks * Q4KM_SUPERBLOCK_ELEMS, x.len()
+    );
+
+    let mut sum: f32 = 0.0_f32;
+    for sb in 0..n_superblocks {
+        let base: usize = sb * Q4KM_SUPERBLOCK_BYTES;
+        // Decode f16 super-scale d and super-min dmin (little-endian, 2 bytes each).
+        let d: f32 = half::f16::from_bits(
+            u16::from_le_bytes([q[base], q[base + 1]])
+        ).to_f32();
+        let dmin: f32 = half::f16::from_bits(
+            u16::from_le_bytes([q[base + 2], q[base + 3]])
+        ).to_f32();
+        // 12-byte scales region at bytes [base+4..base+16].
+        let scales: [u8; 12] = q[base + 4..base + 16].try_into()
+            .expect("q4km_dequant_matvec_cpu: scales slice must be 12 bytes");
+        // Four chunks of 64 elements each.
+        for chunk in 0..4_usize {
+            let is0: usize = chunk * 2;
+            let is1: usize = is0 + 1;
+            let (sc0, m0) = unpack_scale_min_k4_cpu(&scales, is0);
+            let (sc1, m1) = unpack_scale_min_k4_cpu(&scales, is1);
+            let d1:  f32 = d    * sc0 as f32;
+            let m1f: f32 = dmin * m0 as f32;
+            let d2:  f32 = d    * sc1 as f32;
+            let m2f: f32 = dmin * m1 as f32;
+            // 32 bytes of packed nibbles at qs_base + chunk*32.
+            let qs_base: usize = base + 16 + chunk * 32;
+            for l in 0..32_usize {
+                let byte: u8 = q[qs_base + l];
+                let lo: f32 = (byte & 0x0F) as f32;
+                let hi: f32 = ((byte >> 4) & 0x0F) as f32;
+                // NO -8 offset: Q4_K_M uses unsigned nibbles unlike Q4_0.
+                let lo_f: f32 = d1 * lo - m1f;
+                let hi_f: f32 = d2 * hi - m2f;
+                sum += lo_f * x[sb * Q4KM_SUPERBLOCK_ELEMS + chunk * 64 + l];
+                sum += hi_f * x[sb * Q4KM_SUPERBLOCK_ELEMS + chunk * 64 + 32 + l];
+            }
+        }
+    }
+    sum
+}
+
+/// Generate a deterministic Q4_K_M test fixture using a linear congruential generator.
+///
+/// Returns `(q_bytes, x_vec)` where:
+///   - `q_bytes` is `n_superblocks * 144` bytes of synthetic Q4_K_M data.
+///   - `x_vec` is `n_superblocks * 256` f32 values in `[-1.0, 1.0]`.
+///
+/// The f16 super-scales and super-mins are chosen as small positive f32 values that
+/// round-trip cleanly through f16 (generated in [0.1, 2.0] range).
+/// The scale bytes are full-range random u8; the nibble bytes are full-range random u8.
+/// The x-values are in [-1.0, 1.0] mapped from the LCG output.
+///
+/// Uses a simple LCG so no external `rand` dep is needed in integration tests that
+/// include this module directly.  The bench binary may prefer `StdRng` — see dispatch_q4km.rs.
+pub fn generate_q4km_test_data(n_superblocks: u32, seed: u64) -> (Vec<u8>, Vec<f32>) {
+    let n: usize = n_superblocks as usize;
+    let mut q_bytes: Vec<u8> = Vec::with_capacity(n * Q4KM_SUPERBLOCK_BYTES);
+    let mut x_vec:   Vec<f32> = Vec::with_capacity(n * Q4KM_SUPERBLOCK_ELEMS);
+
+    // LCG parameters (Knuth MMIX).
+    let mut state: u64 = seed ^ 0x9E37_79B9_7F4A_7C15_u64;
+    let lcg_next = |s: &mut u64| -> u64 {
+        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *s
+    };
+
+    for _ in 0..n {
+        // Super-scale d: f32 in [0.1, 2.0] → half::f16 → 2 LE bytes.
+        let d_raw: f32 = 0.1_f32 + (lcg_next(&mut state) as f32 / u64::MAX as f32) * 1.9_f32;
+        let d_f16: u16 = half::f16::from_f32(d_raw).to_bits();
+        q_bytes.push((d_f16 & 0xFF) as u8);
+        q_bytes.push((d_f16 >> 8) as u8);
+
+        // Super-min dmin: f32 in [0.0, 0.5] → half::f16 → 2 LE bytes.
+        let dmin_raw: f32 = (lcg_next(&mut state) as f32 / u64::MAX as f32) * 0.5_f32;
+        let dmin_f16: u16 = half::f16::from_f32(dmin_raw).to_bits();
+        q_bytes.push((dmin_f16 & 0xFF) as u8);
+        q_bytes.push((dmin_f16 >> 8) as u8);
+
+        // 12 scale bytes (random u8, all bits used for bit-spread packing).
+        for _ in 0..12_usize {
+            q_bytes.push((lcg_next(&mut state) & 0xFF) as u8);
+        }
+
+        // 128 nibble bytes (random packed 4-bit pairs).
+        for _ in 0..128_usize {
+            q_bytes.push((lcg_next(&mut state) & 0xFF) as u8);
+        }
+    }
+
+    // x-vector: n * 256 f32 values in [-1.0, 1.0].
+    for _ in 0..(n * Q4KM_SUPERBLOCK_ELEMS) {
+        let raw: f32 = (lcg_next(&mut state) as f32 / u64::MAX as f32) * 2.0_f32 - 1.0_f32;
+        x_vec.push(raw);
+    }
+
+    (q_bytes, x_vec)
+}
+
 // ── CPU model probe platform contract (AT-709b) ────────────────────────────────
 
 /// AT-709b: cpu_model_probe returns a String (never panics; possibly empty).
