@@ -125,6 +125,25 @@ pub struct Annotation {
 /// A single argument inside an annotation argument list.
 ///
 /// `Call` is used for compound forms like `O(1)` inside `@complexity(O(1))`.
+///
+/// # M2.3 additions
+///
+/// `Hole` and `HoleRef` are the two strategy-hole AST nodes:
+///
+/// - `Hole { name, candidates }`: declared in `@strategy { k: ?[v1, v2, ...] }`.
+///   The `name` field is set by the parser from the surrounding `Call` name when
+///   lowering the curly-brace sugar `{ k: ?[...] }` → `(k(?[...]))`.
+///
+/// - `HoleRef(name)`: reference site `?ident` — appears wherever an integer literal
+///   is accepted inside an annotation arg list (e.g. `@workgroup(?workgroup_x, 1, 1)`).
+///   The enumerator resolves HoleRefs during source-text substitution; codegen rejects
+///   any HIR module that still contains an unresolved HoleRef.
+///
+/// Grammar:
+/// - After `?`: peek the next token.
+///   - `[` → parse a `Hole` candidate list (declaration site).
+///   - Ident → produce `HoleRef(ident_name)` (reference site via `OptHole` token).
+///   - Anything else → `ParseError::QuestionMarkExpectsBracketOrIdent`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AnnotationArg {
     Int(i64),
@@ -132,6 +151,18 @@ pub enum AnnotationArg {
     Bool(bool),
     Ident(String),
     Call { name: String, args: Vec<Spanned<AnnotationArg>> },
+    /// `?[v1, v2, ...]` — strategy-hole declaration site inside `@strategy`.
+    ///
+    /// `name` is the hole's identifier (taken from the enclosing Call's name when
+    /// the curly-brace sugar `{ k: ?[...] }` is lowered).
+    /// `candidates` preserves user-source order (first element = ordinal-0 baseline).
+    Hole { name: String, candidates: Vec<i64> },
+    /// `?ident` — strategy-hole reference site.
+    ///
+    /// May appear anywhere an integer literal is accepted inside an annotation arg list.
+    /// Must reference a hole declared in `@strategy { ident: ?[...] }` on the same kernel;
+    /// the HIR validator rejects dangling references with `UndefinedStrategyHole`.
+    HoleRef(String),
 }
 
 /// The body of a function: a braced list of statements.
