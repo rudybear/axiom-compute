@@ -433,6 +433,94 @@ RFC 3339 UTC with millisecond resolution: `YYYY-MM-DDTHH:MM:SS.NNNZ` (always 24 
 
 AT-1101 through AT-1132 in `crates/axc-driver/tests/mcp_roundtrip.rs`. GPU-execution tests (AT-1114 through AT-1117) are gated behind `AXC_ENABLE_GPU_TESTS=1`.
 
+### 3.1.11 Q4_K_M superblock layout and dequant kernel (M2.6)
+
+Q4_K_M is the production quantization scheme for mainstream LLM deployments (Meta Llama-3-70B,
+Mistral-7B-v0.3, Qwen2-72B, Phi-4, and most GGUF checkpoints distributed at "Q4" precision).
+M2.6 ships the first AXIOM-Compute kernel matching this format.
+
+#### Block byte layout (144 bytes per 256 output elements)
+
+```c
+struct block_q4_K {
+    ggml_half d;           // super-scale,  bytes [0..2]  (IEEE-754 binary16 LE)
+    ggml_half dmin;        // super-min,    bytes [2..4]  (IEEE-754 binary16 LE)
+    uint8_t   scales[12];  // packed scales, bytes [4..16]  (96 bits = 8 × 12-bit (sc,m) pairs)
+    uint8_t   qs[128];     // 4-bit weights, bytes [16..144] (256 weights, 2 nibbles per byte)
+};  // total: 2 + 2 + 12 + 128 = 144 bytes per 256 elements
+```
+
+#### Bit-spread unpacking of the 12-byte scales region
+
+The 12 bytes encode 8 × (6-bit scale + 6-bit min) = 96 bits.  The canonical ggml
+`get_scale_min_k4(j, scales, &sc, &m)` decoding for j ∈ [0, 8):
+
+```c
+if (j < 4) {
+    sc = scales[j]     & 63;   // low 6 bits of scales[j]
+    m  = scales[j + 4] & 63;   // low 6 bits of scales[j+4]
+} else {
+    sc = (scales[j+4] & 0x0F) | ((scales[j-4] >> 6) << 4);  // 4-bit lo from scales[j+4], 2-bit hi from scales[j-4]
+    m  = (scales[j+4] >> 4)   | ((scales[j]   >> 6) << 4);  // 4-bit lo from scales[j+4], 2-bit hi from scales[j]
+    //                            ^^^^^^^^^^^^^^^^
+    //   CRITICAL: m-high uses scales[j] (q[j-0]), NOT scales[j-4] (q[j-4]).
+    //   q[4..7]'s UPPER 2 bits alias to m's high-2 for j ∈ {4,5,6,7}.
+    //   This is canonical ggml bit-spread packing, not a typo.
+}
+```
+
+The AXIOM-Compute kernel inlines this as an imperative `if j < 4u32 { ... } else { ... }` block
+using `band` / `lshr` / `bor` / `shl` builtins from M2.5.
+
+#### Dequantization formula (four-chunk iteration)
+
+```c
+// Four chunks of 64 elements each (4 × 64 = 256 per superblock).
+// Each chunk processes sub-blocks [is, is+1] where is = chunk * 2.
+for chunk in 0..4 {
+    get_scale_min_k4(is,   scales, &sc0, &m0); d1 = d * sc0; m1f = dmin * m0;
+    get_scale_min_k4(is+1, scales, &sc1, &m1); d2 = d * sc1; m2f = dmin * m1;
+    for l in 0..32 {
+        byte = qs[chunk*32 + l];
+        lo_nibble = byte & 0x0F;        hi_nibble = byte >> 4;
+        // NO -8 offset (unlike Q4_0): Q4_K_M uses unsigned 4-bit nibbles.
+        y[chunk*64 + l]      = d1 * lo_nibble - m1f;
+        y[chunk*64 + 32 + l] = d2 * hi_nibble - m2f;
+    }
+}
+```
+
+x-vector indexing: `x[sb*256 + chunk*64 + l]` for lo-nibble outputs (offset 0..32),
+`x[sb*256 + chunk*64 + 32 + l]` for hi-nibble outputs (offset 32..64).
+
+#### SPIR-V capabilities (same as M2.5 Q4_0, zero additions)
+
+| Capability | Value | Reason |
+|---|---|---|
+| Int8 | 39 | u8 SSBO access for scales/qs bytes |
+| Int16 | 22 | intermediate u16 in f16_bits_to_f32 |
+| Float16 | 9 | OpBitcast u16→f16 + OpFConvert f16→f32 |
+| StorageBuffer8BitAccess | 4448 | u8 SSBO loads (SPV_KHR_8bit_storage) |
+
+StorageBuffer16BitAccess is **NOT** required: d and dmin are loaded as two u8 loads
+via ptr_read_u16_zext, never as native f16 SSBO loads.
+
+#### Tolerance
+
+`@equiv_fp_tol(1e-3)` relative tolerance, matching two f16 roundings (d and dmin,
+each ~2^-11 relative error) plus FMA divergence across vendors.  If Lavapipe runs
+prove marginal, widen to 2e-3 with documented rationale (advisory, not blocking per
+M2.6-design-review.json §advisory_notes).
+
+#### Integration tests (M2.6)
+
+AT-1301..AT-1331 in `crates/axc-driver/tests/compile_q4km_dequant_matvec.rs`.
+GPU dispatch tests (AT-1324 Lavapipe, AT-1331 NVIDIA) are gated on `AXC_ENABLE_GPU_TESTS=1`.
+Bench group `dispatch_gpu_q4km` in `crates/axc-driver/benches/dispatch_q4km.rs`
+(dispatch_q4km_128 + dispatch_q4km_512).
+
+---
+
 ### 3.1 Types
 
 ```
@@ -603,3 +691,4 @@ trigger UB) may be rejected at HIR typecheck in a future milestone.
 - **2026-04-18:** M2.2 revision — added §3.1.7 Benchmark harness: Criterion bench groups (compile_pipeline, cpu_reference, dispatch_gpu), regression gate (11-sample median, 15% threshold), baselines.json schema v1, BENCHMARKS.md forward reference.
 - **2026-04-18:** M2.5 revision — added §3.1.8 Q4_0 dequantization builtins: Q4_0 block layout (18 bytes/block, 32 f32 elements), four new builtins (ptr_read_u8_zext, ptr_read_u16_zext, f16_bits_to_f32, f32_from_u32), capability side-effects (Int8=39, Int16=22, Float16=9, StorageBuffer8BitAccess=4448), integration tests AT-901..AT-918, dispatch_gpu_q4_0 bench group (n_blocks=128 and 1024).
 - **2026-04-18:** M2.4 revision — added §3.1.10 MCP server: JSON-RPC 2.0 stdio bridge exposing 6 tools (initialize, load_source, enumerate_variants, compile_variant, bench_variant, grid_search, optimization_history); NDJSON framing; 8 MiB inbound cap; RFC 4648 §4 STANDARD base64; RFC 3339 UTC millisecond timestamps; POSIX flock(LOCK_EX) history append; lazy Vulkan init (OnceVulkan); tri-state CorrectnessStatus; seeded deterministic inputs; AXC_MCP_HISTORY_DIR env override; 10 error codes (-32700 through -32006); acceptance tests AT-1101 through AT-1132.
+- **2026-04-18:** M2.6 revision — added §3.1.11 Q4_K_M superblock layout and dequant kernel: 144-byte block format (2-byte f16 d + 2-byte f16 dmin + 12-byte packed scales + 128-byte packed weights), bit-spread unpacking via inlined get_scale_min_k4 with canonical q[j] (NOT q[j-4]) m-high idiom, four-chunk two-sub-block-per-chunk iteration, dequant formula y=d*sc*nibble-dmin*m (NO -8 offset unlike Q4_0), @equiv_fp_tol(1e-3) tolerance, same M2.5 capability set (zero additions), integration tests AT-1301..AT-1331, bench group dispatch_gpu_q4km (dispatch_q4km_128 + dispatch_q4km_512).
