@@ -110,6 +110,11 @@ const KNOWN_BENCHES: &[(&str, &str, &str)] = &[
     ("dispatch_gpu", "dispatch_saxpy_1m", "dispatch_saxpy_1m"),
     ("dispatch_gpu", "dispatch_vector_add_1024", "dispatch_vector_add_1024"),
     ("dispatch_gpu", "dispatch_vector_add_1m", "dispatch_vector_add_1m"),
+    // dispatch_gpu_amortized group (M2.3a)
+    ("dispatch_gpu_amortized", "dispatch_handle_saxpy_1m", "dispatch_handle_saxpy_1m"),
+    // dispatch_gpu_q4_0 group (M2.5)
+    ("dispatch_gpu_q4_0", "dispatch_gpu_q4_0_128", "dispatch_gpu_q4_0_128"),
+    ("dispatch_gpu_q4_0", "dispatch_gpu_q4_0_1024", "dispatch_gpu_q4_0_1024"),
 ];
 
 // ── Helper: probe git SHA ──────────────────────────────────────────────────────
