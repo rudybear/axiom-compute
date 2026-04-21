@@ -1,0 +1,54 @@
+{
+  "id": "M2.3-strategy-holes",
+  "title": "@strategy holes + grid-search autotuner",
+  "phase": "M2",
+  "goal": "Add @strategy annotation with ? holes that external agents (LLM or grid search) fill with candidate values. Ship a grid-search autotuner that generates variants, benches each on the GPU, and picks the winner. This is the central AXIOM-Compute thesis — LLMs can enumerate strategies because the surface language makes them explicit.",
+  "scope_in": [
+    "@strategy annotation parsing: `@strategy { workgroup_x: ?[16, 32, 64, 128], workgroup_y: ?[1], workgroup_z: ?[1] }` — key: name, value: either literal or ?[<candidate, ...>] hole",
+    "Hole values restricted to positive integer literals for M2.3 (tile sizes, workgroup dims). Float/bool candidates deferred to M3.",
+    "HIR parses @strategy into `StrategyHoles` structure: `BTreeMap<String, Vec<i64>>` (hole_name → candidate values)",
+    "HIR validation: every ? referenced by other annotations must be declared in @strategy. E.g., `@workgroup(?workgroup_x, ?workgroup_y, 1)` requires `workgroup_x` and `workgroup_y` in @strategy.",
+    "Currently @workgroup args are literals; extend parser to accept `?ident` forms that reference strategy-hole names. Same for @vectorizable(width=?n) etc.",
+    "axc-optimize crate gains real content (was placeholder): StrategyEnumerator that produces the Cartesian product of candidate values, compiles each variant, returns list of variants with identifiers.",
+    "axc-optimize: `pub fn grid_search(source: &str, bench_fn: F) -> GridSearchResult` where F: FnMut(&KernelHandle) -> Result<Duration>. Benches each variant, returns ranking.",
+    "`axc optimize` CLI subcommand: `axc optimize <file> --bench-on-gpu` — enumerates all @strategy variants, benches each on GPU, prints table ranked by median time, emits the winning .spv",
+    "Integration test `axc-driver/tests/strategy_saxpy_autotune.rs`: saxpy.axc with @strategy { workgroup_x: ?[32, 64, 128, 256] }, runs grid search, asserts a winner was chosen + winner is reproducible + all variants had correct output (equiv_fp_tol 1e-6)",
+    "Documentation: DESIGN.md §3.1.9 documents @strategy semantics with saxpy tuning example"
+  ],
+  "scope_out": [
+    "LLM bridge (separate — this milestone is grid search only; LLM MCP server is M2.4)",
+    "Continuous/non-enumerable hole values (float candidates, auto-generated ranges)",
+    "Cross-kernel @strategy (holes that span kernels)",
+    "Pre-compilation hole resolution (compile-time folding of fixed choices — optimization for M3)",
+    "Multi-objective search (perf vs memory vs accuracy trade-off)",
+    "Persistent strategy cache / @optimization_log {} block (M3)",
+    "Bayesian / MCMC / genetic tuners (M3)"
+  ],
+  "acceptance_criteria": [
+    "cargo test --workspace passes (≥565 tests after M2.3)",
+    "cargo clippy --workspace --all-targets -- -D warnings clean",
+    "Parser accepts @strategy { name: ?[v1, v2, ...] } syntax with positive integer candidates",
+    "Parser accepts `?ident` reference in @workgroup args and resolves via HIR",
+    "Strategy enumerator produces correct Cartesian product of candidate values",
+    "saxpy.axc + 4 workgroup-size candidates: all 4 variants compile + pass in-process spirv-val + produce bit-exact output on GPU",
+    "Grid search picks a winner (lowest median dispatch time from 11-sample runs)",
+    "`axc optimize examples/saxpy.axc --holes workgroup_x=32,64,128,256` CLI invocation produces ranked output",
+    "Regression: 538 tests from prior milestones preserved"
+  ],
+  "memory_limit_gb": 50,
+  "dependencies": ["M2.5-q4_0-matmul"],
+  "blocks": ["M2.4-mcp-server", "M3.1-flash-attention"],
+  "estimated_loc": "1500-2500",
+  "estimated_tests_added": "20-30",
+  "open_questions_for_architect": [
+    "Hole value grammar: `?[32, 64, 128, 256]` or `?{32, 64, 128, 256}` or `?(32..=256 step 32)`? Pick `?[...]` (list syntax, simplest).",
+    "Hole references in other annotations: `@workgroup(?workgroup_x, 1, 1)` — how does the parser distinguish `?ident` from `?` prefix operator? Make `?` + ident mean hole reference; no other prefix operator uses `?`. Safe.",
+    "What happens if an unresolved `?ident` appears with no @strategy declaration? HIR error UndefinedStrategyHole.",
+    "Cartesian product explosion: 3 holes × 8 candidates each = 512 variants. No limit in M2.3 but document as caveat; M3 adds MAX_STRATEGY_VARIANTS ceiling.",
+    "Grid search is BLOCKING (runs each variant sequentially). Async / parallel compile is M3.",
+    "Winner selection: pure lowest-median? Or confidence interval non-overlapping? Simple median for M2.3.",
+    "CLI output format: human-readable table by default; JSON with `--json` flag.",
+    "Does the hole substitution happen at PARSE time (producing N AST clones), HIR time (N HIR modules), or codegen time (N SPIR-V outputs)? Recommend parse-time for determinism and simplicity.",
+    "Reproducibility: the winning variant needs to survive compilation deterministically. Document that `axc compile --strategy-value workgroup_x=64` produces exactly the same SPIR-V as was benched."
+  ]
+}
