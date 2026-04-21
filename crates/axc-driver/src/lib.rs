@@ -167,26 +167,97 @@ pub fn compile_source_with_assignments(
     compile_source_with_meta(&substituted)
 }
 
-/// M2.3: Substitute strategy hole references in source text.
+/// M2.3: Substitute strategy hole references in source text and strip @strategy block.
 ///
-/// For each `(name, value)` in `assignments`, replaces all occurrences of
-/// `?name` in the source with the decimal representation of `value`.
+/// Performs two passes:
 ///
-/// This is a simple text substitution (not lexer-aware) and relies on the
-/// invariant that hole names are valid identifiers (no regex special chars).
-/// The order of substitution is alphabetical (BTreeMap iteration order) to
-/// ensure determinism.
+/// 1. For each `(name, value)` in `assignments`, replaces all occurrences of
+///    `?name` in the source with the decimal representation of `value`.
+///    (Alphabetical BTreeMap order for determinism.)
+///
+/// 2. Strips the entire `@strategy { ... }` annotation block from the result.
+///    This is necessary because after hole-ref substitution, the @strategy block
+///    would still contain `?[...]` candidate lists that HIR would lower to
+///    StrategyHoles — triggering the codegen UnresolvedStrategyHole backstop.
+///    Stripping it signals that the holes are fully resolved.
+///
+/// The strip is simple-text-level: finds the first `@strategy` followed by
+/// whitespace and `{`, then removes through the matching `}`.  This handles
+/// the common single-level case.  Nested braces are not supported (M2.3 scope).
 pub(crate) fn substitute_strategy_holes(
     source: &str,
     assignments: &std::collections::BTreeMap<String, i64>,
 ) -> String {
+    // Pass 1: substitute ?name references.
     let mut result: String = source.to_string();
     for (name, value) in assignments {
         let hole_ref: String = format!("?{name}");
         let replacement: String = value.to_string();
         result = result.replace(&hole_ref, &replacement);
     }
+
+    // Pass 2: strip @strategy { ... } block.
+    // After Pass 1 the hole refs in @workgroup are integers, but @strategy still
+    // has ?[...] candidate lists. Removing the block prevents HIR from lowering
+    // the residual candidates into StrategyHoles (which would trip the backstop).
+    result = strip_strategy_annotation_block(&result);
+
     result
+}
+
+/// Strip the first `@strategy { ... }` annotation block from source text.
+///
+/// Finds `@strategy` followed by optional whitespace and `{`, then removes
+/// the entire span including the closing `}`.  Content between the braces is
+/// discarded.  Only single-level brace nesting is handled (sufficient for M2.3).
+///
+/// If no `@strategy {` is found, the source is returned unchanged.
+pub(crate) fn strip_strategy_annotation_block(source: &str) -> String {
+    // Find `@strategy` in the text.
+    let Some(at_pos) = source.find("@strategy") else {
+        return source.to_string();
+    };
+
+    // After `@strategy`, skip whitespace and look for `{`.
+    let after_keyword: &str = &source[at_pos + "@strategy".len()..];
+    let trimmed: &str = after_keyword.trim_start_matches(|c: char| c == ' ' || c == '\t' || c == '\r' || c == '\n');
+    if !trimmed.starts_with('{') {
+        // Not the curly-brace form; leave unchanged (e.g. @strategy(...) call form).
+        return source.to_string();
+    }
+
+    // Find the opening brace position in the original source.
+    let open_brace_offset: usize = at_pos
+        + "@strategy".len()
+        + (after_keyword.len() - trimmed.len());
+
+    // Scan forward to find the matching closing brace (depth tracking).
+    let bytes: &[u8] = source.as_bytes();
+    let mut depth: usize = 0;
+    let mut close_pos: Option<usize> = None;
+    for i in open_brace_offset..bytes.len() {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    close_pos = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let close_pos: usize = match close_pos {
+        Some(p) => p,
+        None => return source.to_string(), // Unmatched brace — leave unchanged.
+    };
+
+    // Build the stripped source: everything before `@strategy` + everything after `}`.
+    let before: &str = &source[..at_pos];
+    let after: &str = &source[close_pos + 1..];
+    format!("{before}{after}")
 }
 
 /// Compute the metadata sidecar path from an output path.
