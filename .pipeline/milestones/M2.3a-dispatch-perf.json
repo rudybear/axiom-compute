@@ -1,0 +1,52 @@
+{
+  "id": "M2.3a-dispatch-perf",
+  "title": "Dispatch perf rework: pipeline cache + device-local buffers + staging",
+  "phase": "M2",
+  "goal": "Rework VulkanContext::dispatch so real-GPU numbers reflect kernel math, not M1.5 per-call setup overhead. Currently saxpy_1m on RTX PRO 6000 takes 34 ms (should be ~50 µs) due to per-call pipeline compilation + host-visible buffers going through PCIe BAR. This milestone cuts that to sub-ms.",
+  "scope_in": [
+    "Persistent pipeline cache on VulkanContext: keyed by (spirv_hash, binding_plan_hash, push_constant_size); reuses OpModule + descriptor_set_layout + pipeline_layout + compute_pipeline across dispatches with same kernel",
+    "New API `VulkanContext::prepare_kernel(spirv, binding_plan) -> KernelHandle` — compile once, dispatch many. Existing `dispatch()` keeps one-shot compatibility but internally routes through prepare_kernel.",
+    "Device-local buffers with staging: compute SSBOs allocated DEVICE_LOCAL; HOST_VISIBLE staging buffer for upload; readback via HOST_VISIBLE staging + vkCmdCopyBuffer; pipeline barriers between COPY→COMPUTE and COMPUTE→COPY",
+    "Buffer reuse: staging and device-local buffers cached by size class within the KernelHandle; subsequent dispatches with same shape reuse allocations",
+    "Pipeline cache on disk (optional): vk::PipelineCache created with `vkCreatePipelineCache(.., data_from_file)` at context init, serialized to `~/.cache/axc/pipeline.cache` at context drop. Accelerates repeated cold starts.",
+    "New bench baselines on the reworked path: both Lavapipe and real GPU should show dramatic speedup on the 1M benches",
+    "Regression gate auto-reblessed on M2.3a merge (the old baselines are intentionally invalidated)",
+    "Correctness preserved: saxpy + vector_add still produce bit-exact CPU-reference output",
+    "Semantics preserved: no change to emitted SPIR-V, no change to HIR, no change to driver API surface",
+    "DispatchError gains 2 new variants: PipelineCacheLoadFailed, StagingCopyFailed"
+  ],
+  "scope_out": [
+    "Async dispatch / multi-queue (M3)",
+    "Dispatch batching (M3 — multiple kernels per command buffer)",
+    "Timeline semaphores (M3)",
+    "Profile-guided pipeline cache pre-warm (future)",
+    "Pipeline cache cross-machine sharing (vendor-locked format anyway)",
+    "NVIDIA fast-path extensions (VK_NV_*) — stay portable",
+    "GPU-side timing via VkQueryPool (would need a separate milestone for perf profiling primitives)"
+  ],
+  "acceptance_criteria": [
+    "cargo test --workspace: ≥492 preserved + new tests for KernelHandle + pipeline cache",
+    "cargo clippy --workspace --all-targets -- -D warnings clean",
+    "saxpy_1m dispatch on NVIDIA RTX PRO 6000 Blackwell drops from 34 ms to &lt; 2 ms (>17× speedup)",
+    "saxpy_1m dispatch on Lavapipe drops from 4.2 ms to &lt; 1 ms",
+    "Repeated dispatch of same kernel: second and subsequent calls at least 100× faster than cold start (proves cache works)",
+    "All 6 existing GPU tests still pass bit-exact",
+    "New baselines blessed in .pipeline/benchmarks/baselines.json; machine metadata distinguishes NVIDIA vs Lavapipe",
+    "No new SPIR-V or HIR changes (pure runtime rework)"
+  ],
+  "memory_limit_gb": 50,
+  "dependencies": ["M2.2-bench-harness"],
+  "blocks": ["M2.5-matmul-q4km", "M3.1-flash-attention"],
+  "estimated_loc": "1000-1800",
+  "estimated_tests_added": "15-25",
+  "open_questions_for_architect": [
+    "KernelHandle identity: opaque struct with Arc<Device>? Or token that indexes VulkanContext's cache? Arc-based is more idiomatic Rust.",
+    "Pipeline cache path: ~/.cache/axc/pipeline.cache or env override? XDG_CACHE_HOME. Disable-able via env for CI reproducibility.",
+    "Buffer pool vs per-KernelHandle buffers: M2.3a uses per-KernelHandle (simpler). Shared pool is M3.",
+    "Copy barriers: src_stage COPY + src_access TRANSFER_WRITE → dst_stage COMPUTE_SHADER + dst_access SHADER_READ. Symmetric for readback.",
+    "Staging buffer size: exactly input size, or rounded up to power of 2 for reuse? Round up.",
+    "How does the correctness oracle (bit-exact check) interact with device-local? Still readback to host via staging, compare. Same as before just with extra copy.",
+    "Baseline re-bless: automated via `cargo bench -- --bless-m23a` or manual? Manual — AXC_BLESS_BASELINES=1 already exists.",
+    "Is pipeline cache disk load/save safe in concurrent test runs? File lock? Probably use a temp file + atomic rename; or disable in tests."
+  ]
+}
