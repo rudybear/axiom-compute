@@ -12,6 +12,7 @@
 
 pub mod cli;
 pub mod optimize;
+pub mod mcp;
 
 pub use cli::{Command, Cli};
 
