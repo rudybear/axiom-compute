@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "CLI driver for the AXIOM-Compute compiler"
+description = "CLI driver for the AXIOM-Compute compiler (M2.4: MCP stdio server)"
 
 [[bin]]
 name = "axc"
@@ -50,17 +50,27 @@ axc-runtime  = { path = "../axc-runtime" }
 clap = { workspace = true }
 miette = { workspace = true }
 thiserror = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+xxhash-rust = { workspace = true }
+# M2.4: Deterministic seeded input generation for bench_variant.
+rand = { workspace = true }
+# M2.4: POSIX flock(LOCK_EX) for atomic history file append.
+libc = "0.2"
+# M2.4: In-process SPIR-V validation for compile_variant + bench_variant.
+spirv-tools = "0.13"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# M2.4: SPIR-V capability name mapping.
+spirv = { workspace = true }
 
 [dev-dependencies]
 rspirv = { workspace = true }
 spirv = { workspace = true }
-spirv-tools = "0.13"
 # M2.2: Criterion bench framework (cargo_bench_support only — no HTML reports dep).
 criterion = { workspace = true }
-# M2.2: Deterministic PRNG for reproducible bench inputs (StdRng::seed_from_u64).
-rand = { workspace = true }
 # M2.2: Serde for baselines.json and candidate-baselines.json serialization.
-serde = { workspace = true }
 # M2.5: half crate for bit-exact f16 → f32 conversion in Q4_0 CPU reference.
 half = "2"
+# M2.4: Temp file creation for history append tests.
+tempfile = { workspace = true }

@@ -379,6 +379,60 @@ before body emission begins (same pattern as `StorageBuffer16BitAccess`).
 AT-918 (17 compile-time + 1 GPU dispatch test).  AT-918 is `#[ignore]`-gated and
 requires `AXC_ENABLE_GPU_TESTS=1`.
 
+### 3.1.10 MCP server (M2.4)
+
+`crates/axc-driver/src/mcp/` implements a JSON-RPC 2.0 stdio bridge exposing 6 tools to LLM agents via `axc mcp [--log stderr|null]`.
+
+#### Protocol
+
+- **Framing:** NDJSON (one JSON object per line).
+- **Inbound cap:** 8 MiB per line; oversize lines return `PARSE_ERROR (-32700)` and the server continues.
+- **Notifications (§4.1):** requests with no `id` key produce no stdout output. Requests with `"id": null` respond with `"id": null`.
+- **B-5 validation:** `jsonrpc != "2.0"` → `INVALID_REQUEST (-32600)`; empty `method` → `METHOD_NOT_FOUND (-32601)`.
+
+#### Tools
+
+| Tool | Code | Description |
+|---|---|---|
+| `initialize` | — | Returns `server`, `version`, `tools` list |
+| `load_source` | — | Parse + HIR-lower; return kernel metadata, strategy_holes |
+| `enumerate_variants` | — | Cartesian-product enumeration of `@strategy` holes |
+| `compile_variant` | -32001 | Compile one variant to SPIR-V; return base64 + capabilities |
+| `bench_variant` | -32004 | GPU dispatch + correctness check; return median_ns + samples |
+| `grid_search` | -32003 | Run all variants, rank by median_ns, persist winner to history |
+| `optimization_history` | — | Read JSONL history for a source file |
+
+#### History file format
+
+Each `grid_search` call appends one JSONL entry to `.pipeline/history/<xxh3_hex16(source)>.jsonl`. Concurrent writers are serialized via `flock(LOCK_EX)` (POSIX advisory lock, B-1 fix). History directory is overridden by `AXC_MCP_HISTORY_DIR` env var.
+
+#### Base64 encoding (B-2 fix)
+
+RFC 4648 §4 STANDARD alphabet (`A-Za-z0-9+/=`). Index 62 = `+`, index 63 = `/`. NOT URL-safe.
+
+#### Timestamps (N-1 fix)
+
+RFC 3339 UTC with millisecond resolution: `YYYY-MM-DDTHH:MM:SS.NNNZ` (always 24 chars). Uses Howard-Hinnant civil-time algorithm.
+
+#### Error codes
+
+| Constant | Code | Meaning |
+|---|---|---|
+| `PARSE_ERROR` | -32700 | Invalid JSON or line too long |
+| `INVALID_REQUEST` | -32600 | `jsonrpc != "2.0"` |
+| `METHOD_NOT_FOUND` | -32601 | Unknown or empty method |
+| `INVALID_PARAMS` | -32602 | Wrong types / missing required fields |
+| `COMPILE_ERROR` | -32001 | Lex/parse/HIR/codegen failure |
+| `ENUMERATE_ERROR` | -32002 | No `@strategy` block |
+| `GRID_SEARCH_ERROR` | -32003 | Grid search setup failure |
+| `VULKAN_UNAVAILABLE` | -32004 | No Vulkan ICD / device creation failed |
+| `IO_ERROR` | -32005 | History file or source file I/O |
+| `SPIRV_VAL_FAILED` | -32006 | In-process spirv-tools rejected SPIR-V |
+
+#### Acceptance tests
+
+AT-1101 through AT-1132 in `crates/axc-driver/tests/mcp_roundtrip.rs`. GPU-execution tests (AT-1114 through AT-1117) are gated behind `AXC_ENABLE_GPU_TESTS=1`.
+
 ### 3.1 Types
 
 ```
@@ -548,3 +602,4 @@ trigger UB) may be rejected at HIR typecheck in a future milestone.
 - **2026-04-18:** M1.5 revision — added §3.1.6 Runtime dispatch (M1.5): VulkanContext lifecycle + Drop ordering, DispatchRequest API + ownership model, metadata sidecar schema v1, host-visible memory simplification + M2 staging-buffer plan, fence timeout default, push-constant byte-assembly discipline, workgroup-count device-limit pre-validation, Vulkan 1.1 subgroup BASIC+VOTE guaranteed / ARITHMETIC+BALLOT+SHUFFLE+CLUSTERED+QUAD device-optional note.
 - **2026-04-18:** M2.2 revision — added §3.1.7 Benchmark harness: Criterion bench groups (compile_pipeline, cpu_reference, dispatch_gpu), regression gate (11-sample median, 15% threshold), baselines.json schema v1, BENCHMARKS.md forward reference.
 - **2026-04-18:** M2.5 revision — added §3.1.8 Q4_0 dequantization builtins: Q4_0 block layout (18 bytes/block, 32 f32 elements), four new builtins (ptr_read_u8_zext, ptr_read_u16_zext, f16_bits_to_f32, f32_from_u32), capability side-effects (Int8=39, Int16=22, Float16=9, StorageBuffer8BitAccess=4448), integration tests AT-901..AT-918, dispatch_gpu_q4_0 bench group (n_blocks=128 and 1024).
+- **2026-04-18:** M2.4 revision — added §3.1.10 MCP server: JSON-RPC 2.0 stdio bridge exposing 6 tools (initialize, load_source, enumerate_variants, compile_variant, bench_variant, grid_search, optimization_history); NDJSON framing; 8 MiB inbound cap; RFC 4648 §4 STANDARD base64; RFC 3339 UTC millisecond timestamps; POSIX flock(LOCK_EX) history append; lazy Vulkan init (OnceVulkan); tri-state CorrectnessStatus; seeded deterministic inputs; AXC_MCP_HISTORY_DIR env override; 10 error codes (-32700 through -32006); acceptance tests AT-1101 through AT-1132.

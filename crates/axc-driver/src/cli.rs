@@ -9,6 +9,9 @@
 //!   holes and emit the winning SPIR-V.
 //! - `--strategy-value name=value` on `compile`: compile with a specific hole
 //!   assignment (bypasses grid search, used by the optimizer internally).
+//!
+//! M2.4 adds:
+//! - `axc mcp [--log stderr|null]`: start a JSON-RPC 2.0 stdio MCP server.
 
 use std::path::PathBuf;
 
@@ -114,5 +117,19 @@ pub enum Command {
         /// Defaults to `none`.
         #[arg(long, default_value = "none")]
         correctness: String,
+    },
+    /// Start a JSON-RPC 2.0 stdio MCP server for LLM agent integration.
+    ///
+    /// Reads NDJSON requests from stdin and writes NDJSON responses to stdout.
+    /// Logging goes to stderr (or /dev/null with `--log null`).
+    ///
+    /// Tools exposed: initialize, load_source, enumerate_variants,
+    /// compile_variant, bench_variant, grid_search, optimization_history.
+    Mcp {
+        /// Log destination: `stderr` (default) or `null` (discard all logs).
+        ///
+        /// Unknown values fall back to `stderr` with a warning.
+        #[arg(long, default_value = "stderr")]
+        log: String,
     },
 }

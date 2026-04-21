@@ -2,10 +2,13 @@
 //!
 //! Parses the CLI, dispatches to `compile_file` or a debug lex dump,
 //! renders diagnostics via miette, and exits non-zero on error.
+//!
+//! M2.4 adds `axc mcp [--log stderr|null]` — a JSON-RPC 2.0 stdio MCP server.
 
 use clap::Parser as ClapParser;
 use axc_driver::{Cli, Command, compile_file};
 use axc_driver::optimize::run_optimize;
+use axc_driver::mcp::{run_mcp_server, LogTarget};
 
 fn main() -> miette::Result<()> {
     let cli: Cli = Cli::parse();
@@ -45,6 +48,22 @@ fn main() -> miette::Result<()> {
         Command::Optimize { input, output, correctness } => {
             run_optimize(&input, &output, &correctness)
                 .map_err(|e| miette::miette!("{}", e))
+        }
+        Command::Mcp { log } => {
+            // Parse log target; unknown values fall back to stderr with a warning.
+            let target: LogTarget = match log.as_str() {
+                "null" => LogTarget::Null,
+                "stderr" => LogTarget::Stderr,
+                other => {
+                    eprintln!("axc mcp: unknown --log value {:?}, defaulting to stderr", other);
+                    LogTarget::Stderr
+                }
+            };
+            run_mcp_server(
+                std::io::BufReader::new(std::io::stdin().lock()),
+                std::io::stdout().lock(),
+                target,
+            ).map_err(|e| miette::miette!("mcp server: {}", e))
         }
     }
 }
