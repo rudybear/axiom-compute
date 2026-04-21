@@ -116,9 +116,12 @@ impl KernelHandle {
 
     /// Return the current sizes of allocated buffer slots (device-local side).
     ///
-    /// Used for test introspection (AT-805: verify buffer grows once via `dispatch_handle`).
-    /// Not dead code: called by integration tests (kernel_handle_reuse.rs).
-    #[cfg(any(test, feature = "test-hooks"))]
+    /// Available unconditionally as a public method for test introspection.
+    /// Used by integration tests (AT-805: kernel_handle_reuse.rs) to verify
+    /// that buffer pool growth works correctly across dispatches with different N.
+    ///
+    /// On non-test builds this is available but not expected to be called from
+    /// non-test code.
     pub fn buffer_sizes(&self) -> Vec<u64> {
         let guard = self.inner.buffers.lock();
         guard.iter().map(|slot| slot.device_local.size).collect()
