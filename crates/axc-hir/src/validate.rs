@@ -55,7 +55,7 @@ pub enum HirError {
         #[label("duplicate here")]
         span: Span,
     },
-    #[error("unknown annotation `@{name}` (M0 allows: @kernel, @workgroup, @intent, @complexity, @precondition, @subgroup_uniform, @cooperative_matrix)")]
+    #[error("unknown annotation `@{name}` (M0 allows: @kernel, @workgroup, @intent, @complexity, @precondition, @strict, @subgroup_uniform, @cooperative_matrix)")]
     UnknownAnnotationInM0 {
         name: String,
         #[label("here")]

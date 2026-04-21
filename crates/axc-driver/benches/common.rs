@@ -132,6 +132,132 @@ pub fn vector_add_cpu_reference(a: &[f32], b: &[f32]) -> Vec<f32> {
     a.iter().zip(b.iter()).map(|(&ai, &bi)| ai + bi).collect()
 }
 
+// ── Q4_0 dequantization CPU reference (M2.5) ──────────────────────────────────
+//
+// Q4_0 block layout (matches llama.cpp gguf format):
+//   18 bytes per block, 32 f32 elements per block
+//   byte  0..1:  f16 scale (little-endian IEEE 754 half-precision)
+//   bytes 2..17: 16 packed nibble pairs
+//                byte k (k in 0..16):
+//                  low  4 bits = weight at index k
+//                  high 4 bits = weight at index k + 16
+//                (This is the canonical llama.cpp / GGUF Q4_0 convention, NOT
+//                the interleaved `[2*k, 2*k+1]` layout. See DESIGN.md §3.1.8
+//                and examples/q4_0_dequant_matvec.axc.)
+//
+// Dequant formula: value_i = (nibble_i - 8) * f16_to_f32(scale)
+// where nibble is unsigned 0..15 and the offset 8 centers it at zero.
+//
+// This is the canonical CPU reference for Q4_0 dequant+matvec used in
+// integration tests and benchmarks (AT-901..AT-918, acceptance criterion 7).
+
+/// Bytes per Q4_0 block.
+pub const Q4_0_BLOCK_BYTES: usize = 18;
+
+/// Elements per Q4_0 block.
+pub const Q4_0_BLOCK_ELEMS: usize = 32;
+
+/// Build random Q4_0 quantized weight data and a matching f32 x-vector.
+///
+/// Returns `(q_bytes, x_vec)` where:
+///   - `q_bytes` is `n_blocks * Q4_0_BLOCK_BYTES` bytes of synthetic Q4_0 data
+///   - `x_vec` is `n_blocks * Q4_0_BLOCK_ELEMS` f32 values in `[-1.0, 1.0]`
+///
+/// The f16 scales are chosen as small positive f32 values that round-trip cleanly
+/// through f16 (values in `[0.1, 1.0]` rounded to nearest f16).
+/// The nibble bytes are random `u8` values (0x00..0xFF packed nibble pairs).
+pub fn make_q4_0_inputs(n_blocks: usize, seed: u64) -> (Vec<u8>, Vec<f32>) {
+    let mut rng: StdRng = StdRng::seed_from_u64(seed);
+    let mut q_bytes: Vec<u8> = Vec::with_capacity(n_blocks * Q4_0_BLOCK_BYTES);
+    let mut x_vec: Vec<f32> = Vec::with_capacity(n_blocks * Q4_0_BLOCK_ELEMS);
+
+    for _ in 0..n_blocks {
+        // Scale: random f32 in (0.1, 1.0) → round to f16 → store as 2 LE bytes.
+        let scale_f32: f32 = rng.gen_range(0.1_f32..1.0_f32);
+        let scale_f16 = half::f16::from_f32(scale_f32);
+        let scale_bits: u16 = scale_f16.to_bits();
+        q_bytes.push((scale_bits & 0xFF) as u8);
+        q_bytes.push((scale_bits >> 8) as u8);
+
+        // 16 packed nibble bytes.
+        for _ in 0..16 {
+            q_bytes.push(rng.gen::<u8>());
+        }
+
+        // 32 x-values for this block.
+        for _ in 0..Q4_0_BLOCK_ELEMS {
+            x_vec.push(rng.gen_range(-1.0_f32..=1.0_f32));
+        }
+    }
+
+    (q_bytes, x_vec)
+}
+
+/// CPU reference for Q4_0 dequantize + matrix-vector multiply.
+///
+/// Computes the dot product of the single-invocation kernel:
+///   y = sum over all blocks and elements of dequant(weight_k) * x[k]
+///
+/// where `dequant(nibble) = (nibble - 8) * scale`.
+///
+/// # Parameters
+/// - `q`: raw Q4_0 bytes (must be `n_blocks * 18` bytes long)
+/// - `x`: input f32 vector (must be `n_blocks * 32` f32 values long)
+/// - `n_blocks`: number of Q4_0 blocks
+///
+/// Returns a single `f32` accumulator (the scalar output of the matvec).
+///
+/// # Panics
+/// Panics if `q.len() != n_blocks * 18` or `x.len() != n_blocks * 32`.
+pub fn q4_0_dequant_matvec_cpu(q: &[u8], x: &[f32], n_blocks: usize) -> f32 {
+    assert_eq!(
+        q.len(), n_blocks * Q4_0_BLOCK_BYTES,
+        "q4_0_dequant_matvec_cpu: q length mismatch: expected {}, got {}",
+        n_blocks * Q4_0_BLOCK_BYTES, q.len()
+    );
+    assert_eq!(
+        x.len(), n_blocks * Q4_0_BLOCK_ELEMS,
+        "q4_0_dequant_matvec_cpu: x length mismatch: expected {}, got {}",
+        n_blocks * Q4_0_BLOCK_ELEMS, x.len()
+    );
+
+    let mut acc: f32 = 0.0_f32;
+
+    for block_idx in 0..n_blocks {
+        let block_byte_offset: usize = block_idx * Q4_0_BLOCK_BYTES;
+
+        // Decode f16 scale from the first 2 bytes (little-endian).
+        let scale_lo: u8 = q[block_byte_offset];
+        let scale_hi: u8 = q[block_byte_offset + 1];
+        let scale_bits: u16 = (scale_lo as u16) | ((scale_hi as u16) << 8);
+        let scale: f32 = half::f16::from_bits(scale_bits).to_f32();
+
+        // 16 packed nibble bytes → 32 nibble values.
+        //
+        // GGUF Q4_0 layout: for k in 0..16, byte k encodes two weights:
+        //   lo nibble = weight at index k
+        //   hi nibble = weight at index k + 16
+        //
+        // This matches `examples/q4_0_dequant_matvec.axc` and DESIGN.md §3.1.8.
+        let x_base: usize = block_idx * Q4_0_BLOCK_ELEMS;
+        for byte_k in 0..16_usize {
+            let packed: u8 = q[block_byte_offset + 2 + byte_k];
+            let lo_nibble: u8 = packed & 0x0F;
+            let hi_nibble: u8 = (packed >> 4) & 0x0F;
+
+            // Element byte_k: low nibble.
+            let w_lo: f32 = (lo_nibble as f32 - 8.0_f32) * scale;
+            acc += w_lo * x[x_base + byte_k];
+
+            // Element byte_k + 16: high nibble.
+            let w_hi: f32 = (hi_nibble as f32 - 8.0_f32) * scale;
+            acc += w_hi * x[x_base + byte_k + 16];
+        }
+    }
+
+    acc
+}
+
 // ── Push-constant assembly (AT-514a discipline from M1.5) ─────────────────────
 //
 // Callers MUST iterate `plan.scalars` in stored order and dispatch on scalar.ty.

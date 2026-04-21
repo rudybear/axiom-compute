@@ -603,11 +603,14 @@ impl<'tok> Parser<'tok> {
     /// Parse `[scalar_type]` after a buffer keyword.
     ///
     /// M2.1: f16 is now accepted as a buffer element type.
+    /// M2.5: u8 is now accepted as a buffer element type (for Q4_0 packed byte buffers).
     fn parse_buffer_elem(&mut self) -> Option<ScalarTypeRef> {
         if !self.expect_token(TokenKind::LBracket, "[") {
             return None;
         }
         let elem: ScalarTypeRef = match self.peek_kind().clone() {
+            // M2.5: u8 buffer elements allowed (Q4_0 packed byte SSBO access).
+            TokenKind::U8  => { self.advance(); ScalarTypeRef::U8 }
             TokenKind::I32 => { self.advance(); ScalarTypeRef::I32 }
             TokenKind::U32 => { self.advance(); ScalarTypeRef::U32 }
             TokenKind::I64 => { self.advance(); ScalarTypeRef::I64 }
@@ -618,7 +621,7 @@ impl<'tok> Parser<'tok> {
             TokenKind::F64 => { self.advance(); ScalarTypeRef::F64 }
             other => {
                 self.errors.push(ParseError::Unexpected {
-                    expected: "buffer element type (i32, u32, i64, u64, f16, f32, f64)".into(),
+                    expected: "buffer element type (u8, i32, u32, i64, u64, f16, f32, f64)".into(),
                     found: format!("{:?}", other),
                     span: self.peek_span(),
                 });

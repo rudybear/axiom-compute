@@ -126,6 +126,7 @@ dependencies = [
  "axc-runtime",
  "clap",
  "criterion",
+ "half",
  "miette",
  "rand",
  "rspirv",

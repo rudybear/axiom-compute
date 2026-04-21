@@ -9,6 +9,7 @@
 //! M1.3 adds structured control flow: if/else, for-range, while, break, continue.
 //! M1.4 adds subgroup operations and workgroup barrier.
 //! M2.1 adds cooperative-matrix types, F16 primitive, and four coopmat builtins.
+//! M2.5 adds U8 buffer element type and four Q4_0-path builtins for LLM dequant.
 
 pub mod hir;
 pub mod lower;
@@ -22,6 +23,7 @@ pub mod loop_ctx;
 pub mod control_flow;
 pub mod subgroup;
 pub mod coopmat;
+pub mod q4_0;
 
 pub use hir::{
     Module as HirModule,
@@ -53,3 +55,4 @@ pub use control_flow::{HirIf, HirElse, HirForRange, HirWhile, ForStep};
 pub use loop_ctx::{HirLoopStack, ScopeStack};
 pub use subgroup::{SubgroupOp, SubgroupReduceKind, BarrierKind};
 pub use coopmat::{CoopMatUse, CoopMatBuiltin, CoopMatrixShapeKind, CoopMatKey, CoopMatrixShape};
+pub use q4_0::{Q4_0Builtin, RESERVED_Q4_0_BUILTIN_NAMES, is_reserved_q4_0_builtin};

@@ -1,4 +1,5 @@
-//! Criterion bench groups `dispatch_gpu` and `dispatch_gpu_amortized` (M2.2 / M2.3a).
+//! Criterion bench groups `dispatch_gpu`, `dispatch_gpu_amortized`, and
+//! `dispatch_gpu_q4_0` (M2.2 / M2.3a / M2.5).
 //!
 //! `dispatch_gpu`: Measures `VulkanContext::dispatch` end-to-end latency for
 //! saxpy and vector_add at N ∈ {1024, 1M}.
@@ -9,6 +10,12 @@
 //! `dispatch_handle` calls on the same handle.  Demonstrates that the
 //! per-dispatch cost is dominated by CB record + fence wait (not pipeline
 //! compilation or buffer allocation).
+//!
+//! `dispatch_gpu_q4_0` (M2.5): Measures end-to-end GPU dispatch latency for the
+//! Q4_0 dequant+matvec kernel at n_blocks ∈ {128, 1024}.  The kernel produces
+//! a single f32 output (single-invocation kernel with 64-wide workgroup).
+//! Pre-flight correctness is verified against `q4_0_dequant_matvec_cpu` within
+//! an absolute tolerance of 1e-3 (matches AT-918 tolerance for f16 scale values).
 //!
 //! # GPU availability gate
 //!
@@ -40,12 +47,15 @@
 //!   reduces pre-allocated batch size so setup-memory peaks stay bounded.
 //! - `dispatch_handle_saxpy_1m`: `BatchSize::PerIteration` — handle is pre-warmed,
 //!   each iteration calls `dispatch_handle` directly; buffer pool is already allocated.
+//! - `dispatch_gpu_q4_0_128` / `dispatch_gpu_q4_0_1024`: `BatchSize::PerIteration`
+//!   — single-invocation kernel, tiny output; per-iteration overhead is the
+//!   dominant cost (CB record + queue submit + fence wait + single f32 readback).
 
 #[path = "common.rs"]
 mod common;
 
 use axc_runtime::{VulkanContext, VulkanContextOptions, KernelHandle, DispatchRequest, probe_vulkan_available};
-use axc_hir::ParamBindingPlan;
+use axc_hir::{ParamBindingPlan, ScalarTy};
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use std::sync::OnceLock;
 
@@ -74,6 +84,9 @@ struct GpuState {
     vector_add_plan: ParamBindingPlan,
     /// Pre-compiled KernelHandle for the amortized dispatch bench (M2.3a).
     saxpy_handle: KernelHandle,
+    /// M2.5: Q4_0 dequant+matvec SPIR-V and binding plan.
+    q4_0_spirv: Vec<u32>,
+    q4_0_plan: ParamBindingPlan,
 }
 
 static GPU_STATE: OnceLock<GpuState> = OnceLock::new();
@@ -114,6 +127,14 @@ fn gpu_state() -> &'static GpuState {
         let vector_add_spirv: Vec<u32> = common::bytes_to_words(&va_bytes);
         let vector_add_plan: ParamBindingPlan = va_meta.binding_plan;
 
+        // M2.5: Compile q4_0_dequant_matvec kernel.
+        let q4_0_src: &str = include_str!("../../../examples/q4_0_dequant_matvec.axc");
+        let (q4_0_bytes, q4_0_meta) =
+            axc_driver::compile_source_with_meta(q4_0_src)
+                .expect("dispatch bench: q4_0_dequant_matvec.axc compile failed");
+        let q4_0_spirv: Vec<u32> = common::bytes_to_words(&q4_0_bytes);
+        let q4_0_plan: ParamBindingPlan = q4_0_meta.binding_plan;
+
         GpuState {
             ctx,
             saxpy_spirv,
@@ -121,6 +142,8 @@ fn gpu_state() -> &'static GpuState {
             vector_add_spirv,
             vector_add_plan,
             saxpy_handle,
+            q4_0_spirv,
+            q4_0_plan,
         }
     })
 }
@@ -481,6 +504,171 @@ fn dispatch_handle_saxpy_1m(c: &mut Criterion) {
     });
 }
 
+// ── Q4_0 dequant+matvec dispatch benches (M2.5) ───────────────────────────────
+
+/// Pre-flight correctness check for Q4_0 dispatch.
+///
+/// Dispatches the Q4_0 kernel once and verifies `y[0]` matches the CPU
+/// reference within `ABS_TOL_Q4_0 = 1e-3` (f16 scale precision limit).
+fn pre_flight_q4_0(state: &GpuState, n_blocks: usize) {
+    /// Absolute tolerance for Q4_0: f16 scale has ~3 decimal digits of precision.
+    const ABS_TOL_Q4_0: f32 = 1e-3;
+
+    let (q_bytes, x_vec) = common::make_q4_0_inputs(n_blocks, common::SEED);
+    let cpu_result: f32 = common::q4_0_dequant_matvec_cpu(&q_bytes, &x_vec, n_blocks);
+    let x_bytes: Vec<u8> = common::f32_slice_to_bytes(&x_vec);
+    let y_init: Vec<u8> = vec![0u8; 4];
+
+    // Build push-constant block for n_blocks.
+    let mut pc: Vec<u8> = vec![0u8; state.q4_0_plan.push_constant_total_bytes as usize];
+    let n_blocks_u32: u32 = n_blocks as u32;
+    for scalar in &state.q4_0_plan.scalars {
+        let start: usize = scalar.offset as usize;
+        if scalar.ty == ScalarTy::U32 {
+            pc[start..start + 4].copy_from_slice(&n_blocks_u32.to_le_bytes());
+        }
+    }
+
+    let q_len: usize = n_blocks * common::Q4_0_BLOCK_BYTES;
+    let x_len: usize = n_blocks * common::Q4_0_BLOCK_ELEMS * 4;
+
+    let req = DispatchRequest {
+        spirv: &state.q4_0_spirv,
+        binding_plan: &state.q4_0_plan,
+        workgroups: [1, 1, 1],
+        inputs: &[q_bytes.as_slice(), x_bytes.as_slice(), y_init.as_slice()],
+        output_sizes: &[q_len, x_len, 4],
+        push_constants: &pc,
+        entry_point: "q4_0_dequant_matvec",
+    };
+
+    let outputs: Vec<Vec<u8>> = state
+        .ctx
+        .dispatch(req)
+        .expect("pre_flight_q4_0: dispatch must succeed");
+
+    let y_bytes: &[u8] = &outputs[2];
+    assert!(y_bytes.len() >= 4, "pre_flight_q4_0: y output too short");
+    let gpu_result: f32 = f32::from_le_bytes([y_bytes[0], y_bytes[1], y_bytes[2], y_bytes[3]]);
+
+    let abs_err: f32 = (gpu_result - cpu_result).abs();
+    assert!(
+        abs_err < ABS_TOL_Q4_0,
+        "pre_flight_q4_0(n_blocks={n_blocks}): GPU={gpu_result:.6}, CPU={cpu_result:.6}, abs_err={abs_err:.2e} >= 1e-3"
+    );
+}
+
+/// Bench `dispatch_gpu_q4_0_128`: Q4_0 dequant+matvec dispatch, n_blocks=128 (128 * 18 = 2304 weight bytes).
+///
+/// BatchSize::PerIteration — full GPU round-trip per iteration.
+fn dispatch_gpu_q4_0_128(c: &mut Criterion) {
+    if !gpu_benches_enabled() {
+        eprintln!("skipping dispatch_gpu_q4_0_128: AXC_ENABLE_GPU_BENCHES != 1 or no Vulkan ICD");
+        c.bench_function("dispatch_gpu_q4_0_128", |b| {
+            b.iter(|| {});
+        });
+        return;
+    }
+
+    let state: &GpuState = gpu_state();
+    let n_blocks: usize = 128;
+    pre_flight_q4_0(state, n_blocks);
+
+    let (q_bytes, x_vec) = common::make_q4_0_inputs(n_blocks, common::SEED);
+    let x_bytes: Vec<u8> = common::f32_slice_to_bytes(&x_vec);
+    let y_init: Vec<u8> = vec![0u8; 4];
+
+    let mut pc: Vec<u8> = vec![0u8; state.q4_0_plan.push_constant_total_bytes as usize];
+    let n_blocks_u32: u32 = n_blocks as u32;
+    for scalar in &state.q4_0_plan.scalars {
+        let start: usize = scalar.offset as usize;
+        if scalar.ty == ScalarTy::U32 {
+            pc[start..start + 4].copy_from_slice(&n_blocks_u32.to_le_bytes());
+        }
+    }
+
+    let q_len: usize = n_blocks * common::Q4_0_BLOCK_BYTES;
+    let x_len: usize = n_blocks * common::Q4_0_BLOCK_ELEMS * 4;
+
+    c.bench_function("dispatch_gpu_q4_0_128", |b| {
+        b.iter_batched(
+            || {},
+            |()| {
+                let req = DispatchRequest {
+                    spirv: &state.q4_0_spirv,
+                    binding_plan: &state.q4_0_plan,
+                    workgroups: [1, 1, 1],
+                    inputs: &[q_bytes.as_slice(), x_bytes.as_slice(), y_init.as_slice()],
+                    output_sizes: &[q_len, x_len, 4],
+                    push_constants: &pc,
+                    entry_point: "q4_0_dequant_matvec",
+                };
+                let _outputs = state
+                    .ctx
+                    .dispatch(req)
+                    .expect("dispatch_gpu_q4_0_128: dispatch must succeed");
+            },
+            BatchSize::PerIteration,
+        );
+    });
+}
+
+/// Bench `dispatch_gpu_q4_0_1024`: Q4_0 dequant+matvec dispatch, n_blocks=1024.
+///
+/// BatchSize::PerIteration — single-output kernel; overhead is dominated by
+/// GPU round-trip latency (CB record + submit + fence wait), not data size.
+fn dispatch_gpu_q4_0_1024(c: &mut Criterion) {
+    if !gpu_benches_enabled() {
+        eprintln!("skipping dispatch_gpu_q4_0_1024: AXC_ENABLE_GPU_BENCHES != 1 or no Vulkan ICD");
+        c.bench_function("dispatch_gpu_q4_0_1024", |b| {
+            b.iter(|| {});
+        });
+        return;
+    }
+
+    let state: &GpuState = gpu_state();
+    let n_blocks: usize = 1024;
+    pre_flight_q4_0(state, n_blocks);
+
+    let (q_bytes, x_vec) = common::make_q4_0_inputs(n_blocks, common::SEED);
+    let x_bytes: Vec<u8> = common::f32_slice_to_bytes(&x_vec);
+    let y_init: Vec<u8> = vec![0u8; 4];
+
+    let mut pc: Vec<u8> = vec![0u8; state.q4_0_plan.push_constant_total_bytes as usize];
+    let n_blocks_u32: u32 = n_blocks as u32;
+    for scalar in &state.q4_0_plan.scalars {
+        let start: usize = scalar.offset as usize;
+        if scalar.ty == ScalarTy::U32 {
+            pc[start..start + 4].copy_from_slice(&n_blocks_u32.to_le_bytes());
+        }
+    }
+
+    let q_len: usize = n_blocks * common::Q4_0_BLOCK_BYTES;
+    let x_len: usize = n_blocks * common::Q4_0_BLOCK_ELEMS * 4;
+
+    c.bench_function("dispatch_gpu_q4_0_1024", |b| {
+        b.iter_batched(
+            || {},
+            |()| {
+                let req = DispatchRequest {
+                    spirv: &state.q4_0_spirv,
+                    binding_plan: &state.q4_0_plan,
+                    workgroups: [1, 1, 1],
+                    inputs: &[q_bytes.as_slice(), x_bytes.as_slice(), y_init.as_slice()],
+                    output_sizes: &[q_len, x_len, 4],
+                    push_constants: &pc,
+                    entry_point: "q4_0_dequant_matvec",
+                };
+                let _outputs = state
+                    .ctx
+                    .dispatch(req)
+                    .expect("dispatch_gpu_q4_0_1024: dispatch must succeed");
+            },
+            BatchSize::PerIteration,
+        );
+    });
+}
+
 criterion_group!(
     dispatch_benches,
     dispatch_saxpy_1024,
@@ -492,4 +680,9 @@ criterion_group!(
     dispatch_gpu_amortized,
     dispatch_handle_saxpy_1m,
 );
-criterion_main!(dispatch_benches, dispatch_gpu_amortized);
+criterion_group!(
+    dispatch_gpu_q4_0,
+    dispatch_gpu_q4_0_128,
+    dispatch_gpu_q4_0_1024,
+);
+criterion_main!(dispatch_benches, dispatch_gpu_amortized, dispatch_gpu_q4_0);

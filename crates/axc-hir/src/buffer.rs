@@ -72,9 +72,17 @@ impl BufferTy {
     /// capability and `SPV_KHR_16bit_storage` extension.
     ///
     /// M2.1: Only F16 SSBO elements trigger this. I8/U8 use the 8-bit storage
-    /// extension path (deferred to a later milestone).
+    /// extension path (see `needs_8bit_storage`).
     pub fn needs_16bit_storage(&self) -> bool {
         self.elem.bit_width() == 16
+    }
+
+    /// True if this buffer element type requires the `StorageBuffer8BitAccess`
+    /// capability and `SPV_KHR_8bit_storage` extension.
+    ///
+    /// M2.5: I8 and U8 SSBO elements trigger this capability path.
+    pub fn needs_8bit_storage(&self) -> bool {
+        self.elem.bit_width() == 8
     }
 }
 
