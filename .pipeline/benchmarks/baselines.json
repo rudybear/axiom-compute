@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
-  "generated": "2026-04-20T18:13:20Z",
-  "git_sha": "5644db4",
+  "generated": "2026-04-21T08:06:30Z",
+  "git_sha": "e98eabc",
   "machine": {
     "os": "linux",
     "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)",
-    "vulkan_icd": "/usr/share/vulkan/icd.d/lvp_icd.json",
-    "vulkan_device": "llvmpipe (LLVM 20.1.2, 256 bits)",
+    "vulkan_icd": "",
+    "vulkan_device": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
     "cpu_model": "Intel(R) Core(TM) i9-14900KF",
     "axc_version": "0.0.1"
   },
@@ -14,80 +14,72 @@
     {
       "group": "compile_pipeline",
       "bench": "compile_saxpy",
-      "median_ns": 11709,
-      "low_ns": 11464,
-      "high_ns": 11731
+      "median_ns": 11195,
+      "low_ns": 11177,
+      "high_ns": 11220
     },
     {
       "group": "compile_pipeline",
       "bench": "compile_vector_add",
-      "median_ns": 9359,
-      "low_ns": 9352,
-      "high_ns": 9377
+      "median_ns": 9046,
+      "low_ns": 8988,
+      "high_ns": 9103
     },
     {
       "group": "cpu_reference",
       "bench": "cpu_saxpy_1024",
-      "median_ns": 281,
-      "low_ns": 241,
-      "high_ns": 319
+      "median_ns": 203,
+      "low_ns": 182,
+      "high_ns": 244
     },
     {
       "group": "cpu_reference",
       "bench": "cpu_saxpy_1m",
-      "median_ns": 813454,
-      "low_ns": 803293,
-      "high_ns": 821952
+      "median_ns": 678596,
+      "low_ns": 672273,
+      "high_ns": 687228
     },
     {
       "group": "cpu_reference",
       "bench": "cpu_vector_add_1024",
-      "median_ns": 68,
-      "low_ns": 68,
-      "high_ns": 68
+      "median_ns": 65,
+      "low_ns": 65,
+      "high_ns": 66
     },
     {
       "group": "cpu_reference",
       "bench": "cpu_vector_add_1m",
-      "median_ns": 159519,
-      "low_ns": 156861,
-      "high_ns": 160424
+      "median_ns": 154591,
+      "low_ns": 153037,
+      "high_ns": 156787
     },
     {
       "group": "dispatch_gpu",
       "bench": "dispatch_saxpy_1024",
-      "median_ns": 288499,
-      "low_ns": 228017,
-      "high_ns": 359386
+      "median_ns": 38104,
+      "low_ns": 37962,
+      "high_ns": 38389
     },
     {
       "group": "dispatch_gpu",
       "bench": "dispatch_saxpy_1m",
-      "median_ns": 4200642,
-      "low_ns": 4175299,
-      "high_ns": 4228957
+      "median_ns": 26629203,
+      "low_ns": 26545877,
+      "high_ns": 26885743
     },
     {
       "group": "dispatch_gpu",
       "bench": "dispatch_vector_add_1024",
-      "median_ns": 225738,
-      "low_ns": 196821,
-      "high_ns": 256643
+      "median_ns": 979200,
+      "low_ns": 978163,
+      "high_ns": 980864
     },
     {
       "group": "dispatch_gpu",
       "bench": "dispatch_vector_add_1m",
-      "median_ns": 6526336,
-      "low_ns": 6494248,
-      "high_ns": 6582831
-    },
-    {
-      "group": "dispatch_gpu_amortized",
-      "bench": "dispatch_handle_saxpy_1m",
-      "median_ns": 0,
-      "low_ns": 0,
-      "high_ns": 0,
-      "_note": "FIXME W-7: baseline TBD after Lavapipe GPU bench run with M2.3a"
+      "median_ns": 42092256,
+      "low_ns": 40943141,
+      "high_ns": 43583778
     }
   ]
 }
