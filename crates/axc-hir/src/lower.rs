@@ -8,7 +8,7 @@ use axc_lexer::Span;
 use axc_parser::ast::{Module as AstModule, Item, AnnotationArg, Stmt, TypeRef, ScalarTypeRef};
 use crate::hir::{
     Module as HirModule, Kernel, KernelId, KernelAnnotations, WorkgroupDims,
-    KernelBody, ComplexityForm, ComplexityVar, PreconditionTrivial,
+    KernelBody, ComplexityForm, ComplexityVar, PreconditionTrivial, StrategyHoles,
 };
 use crate::validate::{HirError, HirWarning};
 use crate::typecheck::typecheck_kernel_body;
@@ -38,6 +38,8 @@ pub fn lower_module(ast: &AstModule) -> (HirModule, Vec<HirError>, Vec<HirWarnin
                 let mut cooperative_matrix: bool = false;
                 let mut seen_workgroup: bool = false;
                 let mut seen_kernel: bool = false;
+                // M2.3: strategy holes
+                let mut strategy_holes_opt: Option<StrategyHoles> = None;
 
                 for ann in &kd.annotations {
                     let name: &str = &ann.node.name.node;
@@ -70,6 +72,9 @@ pub fn lower_module(ast: &AstModule) -> (HirModule, Vec<HirError>, Vec<HirWarnin
                                     span: ann.span,
                                 });
                             } else {
+                                // M2.3: workgroup args may be HoleRefs; defer validation
+                                // (the HoleRef → integer resolution happens in axc-optimize).
+                                // Only attempt to extract as integer if they are Int args.
                                 let x_res: Result<u32, HirError> = extract_workgroup_dim(&args[0].node, ann.span);
                                 let y_res: Result<u32, HirError> = extract_workgroup_dim(&args[1].node, ann.span);
                                 let z_res: Result<u32, HirError> = extract_workgroup_dim(&args[2].node, ann.span);
@@ -126,6 +131,18 @@ pub fn lower_module(ast: &AstModule) -> (HirModule, Vec<HirError>, Vec<HirWarnin
                         // The HIR lowerer accepts and ignores it (validation of the
                         // strict discipline is done by the QA agent, not the compiler).
                         "strict" => {}
+                        // M2.3: @strategy { k: ?[v1, v2, ...] } — strategy holes.
+                        "strategy" => {
+                            let holes: StrategyHoles = lower_strategy_annotation(
+                                &ann.node.args,
+                                ann.span,
+                                &mut errors,
+                            );
+                            if ann.node.args.is_empty() {
+                                warnings.push(HirWarning::EmptyStrategyBlock { span: ann.span });
+                            }
+                            strategy_holes_opt = Some(holes);
+                        }
                         other => {
                             errors.push(HirError::UnknownAnnotationInM0 {
                                 name: other.to_owned(),
@@ -135,16 +152,39 @@ pub fn lower_module(ast: &AstModule) -> (HirModule, Vec<HirError>, Vec<HirWarnin
                     }
                 }
 
+                // M2.3: Validate HoleRefs across all annotations on this kernel.
+                validate_hole_refs(
+                    &kd.annotations,
+                    strategy_holes_opt.as_ref(),
+                    &kd.params,
+                    item.span,
+                    &mut errors,
+                    &mut warnings,
+                );
+
+                // M2.3: If @workgroup has HoleRefs, we cannot determine actual dims yet.
+                // Use placeholder dims (1,1,1) so the kernel can still be placed into HIR.
+                // The enumerator will produce concrete workgroup dims after substitution.
+                let wg_has_holes: bool = kd.annotations.iter().any(|a| {
+                    a.node.name.node == "workgroup"
+                        && a.node.args.iter().any(|arg| matches!(&arg.node, AnnotationArg::HoleRef(_)))
+                });
+
                 // Check that @workgroup was present
-                let wg: WorkgroupDims = match workgroup_opt {
-                    Some(w) => w,
-                    None => {
-                        errors.push(HirError::MissingWorkgroup {
-                            name: kd.name.node.clone(),
-                            span: item.span,
-                        });
-                        // Use a placeholder so we can still emit the kernel into HIR
-                        WorkgroupDims { x: 1, y: 1, z: 1 }
+                let wg: WorkgroupDims = if wg_has_holes {
+                    // Placeholder: actual dims come from the enumerator-resolved source.
+                    workgroup_opt.unwrap_or(WorkgroupDims { x: 1, y: 1, z: 1 })
+                } else {
+                    match workgroup_opt {
+                        Some(w) => w,
+                        None => {
+                            errors.push(HirError::MissingWorkgroup {
+                                name: kd.name.node.clone(),
+                                span: item.span,
+                            });
+                            // Use a placeholder so we can still emit the kernel into HIR
+                            WorkgroupDims { x: 1, y: 1, z: 1 }
+                        }
                     }
                 };
 
@@ -156,8 +196,11 @@ pub fn lower_module(ast: &AstModule) -> (HirModule, Vec<HirError>, Vec<HirWarnin
                     });
                 }
 
-                // Validate workgroup dimensions (zero check)
-                let _ = validate_workgroup_dims(&wg, workgroup_span, &kd.name.node, &mut errors, &mut warnings);
+                // Validate workgroup dimensions (zero check) — skip if holes are present
+                // since placeholder dims would spuriously trigger the zero-dim error.
+                if !wg_has_holes {
+                    let _ = validate_workgroup_dims(&wg, workgroup_span, &kd.name.node, &mut errors, &mut warnings);
+                }
 
                 let annotations: KernelAnnotations = KernelAnnotations {
                     workgroup: wg,
@@ -166,6 +209,7 @@ pub fn lower_module(ast: &AstModule) -> (HirModule, Vec<HirError>, Vec<HirWarnin
                     preconditions,
                     subgroup_uniform,
                     cooperative_matrix,
+                    strategy: strategy_holes_opt,
                 };
 
                 // Lower kernel parameters.
@@ -388,8 +432,14 @@ pub fn lower_params_for_test(
     params
 }
 
-/// Extract a single workgroup dimension from an `AnnotationArg::Int`.
-/// Validates that the value is in `[1, u32::MAX]` (zero is caught by workgroup
+/// Extract a single workgroup dimension from an `AnnotationArg::Int` or `HoleRef`.
+///
+/// `HoleRef` args produce a placeholder value of 1 so HIR construction succeeds;
+/// the actual value is resolved by the enumerator at axc-optimize time. The caller
+/// is responsible for not running the workgroup-dimension validator when holes are
+/// present.
+///
+/// Validates that integer values are in `[1, u32::MAX]` (zero is caught by workgroup
 /// validation; negative overflows u32).
 fn extract_workgroup_dim(arg: &AnnotationArg, span: Span) -> Result<u32, HirError> {
     match arg {
@@ -400,6 +450,8 @@ fn extract_workgroup_dim(arg: &AnnotationArg, span: Span) -> Result<u32, HirErro
                 Ok(*v as u32)
             }
         }
+        // M2.3: HoleRef — placeholder; actual value comes from enumerator.
+        AnnotationArg::HoleRef(_) => Ok(1),
         _ => Err(HirError::BadWorkgroupArity { got: 0, span }),
     }
 }
@@ -478,6 +530,191 @@ fn lower_complexity(arg: &AnnotationArg, span: Span) -> Result<ComplexityForm, H
             }
         }
         _ => Err(HirError::UnsupportedComplexityInM0 { span }),
+    }
+}
+
+/// M2.3: Lower `@strategy` annotation args to a `StrategyHoles` struct.
+///
+/// The args are in the uniform Call-wrapped form (whether the user wrote the
+/// sugar `{ k: ?[...] }` or the explicit `(k(?[...]))` form). Each arg is:
+///   `Call { name: "hole_name", args: [Hole { name: "hole_name", candidates }] }`
+///
+/// Validation:
+/// - Duplicate hole names → `HirError::DuplicateStrategyHoleName` (defense-in-depth)
+/// - Empty candidate list → `HirError::StrategyHoleEmptyCandidates`
+/// - Non-positive candidate → `HirError::StrategyHoleNonPositive`
+/// - HoleRef inside strategy block → `HirError::HoleRefInStrategyBlock`
+fn lower_strategy_annotation(
+    args: &[axc_lexer::Spanned<AnnotationArg>],
+    ann_span: Span,
+    errors: &mut Vec<HirError>,
+) -> StrategyHoles {
+    let mut holes: StrategyHoles = StrategyHoles::new();
+
+    for arg in args {
+        match &arg.node {
+            AnnotationArg::Call { name, args: inner_args } => {
+                // Duplicate check
+                if holes.map.contains_key(name.as_str()) {
+                    errors.push(HirError::DuplicateStrategyHoleName {
+                        name: name.clone(),
+                        span: arg.span,
+                    });
+                    continue;
+                }
+
+                // Inner arg should be a Hole
+                if inner_args.len() != 1 {
+                    errors.push(HirError::UnsupportedComplexityInM0 { span: arg.span });
+                    continue;
+                }
+
+                match &inner_args[0].node {
+                    AnnotationArg::Hole { candidates, .. } => {
+                        // Defense-in-depth: validate candidates
+                        if candidates.is_empty() {
+                            errors.push(HirError::StrategyHoleEmptyCandidates {
+                                name: name.clone(),
+                                span: arg.span,
+                            });
+                            continue;
+                        }
+                        for &v in candidates.iter() {
+                            if v < 1 {
+                                errors.push(HirError::StrategyHoleNonPositive {
+                                    name: name.clone(),
+                                    value: v,
+                                    span: arg.span,
+                                });
+                            }
+                        }
+                        holes.map.insert(name.clone(), candidates.clone());
+                    }
+                    AnnotationArg::HoleRef(ref_name) => {
+                        errors.push(HirError::HoleRefInStrategyBlock {
+                            name: ref_name.clone(),
+                            span: inner_args[0].span,
+                        });
+                    }
+                    other => {
+                        errors.push(HirError::UnsupportedComplexityInM0 { span: arg.span });
+                        let _ = other;
+                    }
+                }
+            }
+            AnnotationArg::HoleRef(ref_name) => {
+                errors.push(HirError::HoleRefInStrategyBlock {
+                    name: ref_name.clone(),
+                    span: arg.span,
+                });
+            }
+            _ => {
+                // Unknown arg shape inside @strategy — skip with a noop.
+                // Parser should have caught malformed strategy blocks.
+                let _ = ann_span;
+            }
+        }
+    }
+
+    holes
+}
+
+/// M2.3: Validate that every HoleRef across all annotations refers to a declared hole,
+/// and emit UnusedStrategyHole warnings for holes never referenced.
+fn validate_hole_refs(
+    annotations: &[axc_lexer::Spanned<axc_parser::ast::Annotation>],
+    strategy: Option<&StrategyHoles>,
+    params: &[axc_lexer::Spanned<axc_parser::ast::Param>],
+    kernel_span: Span,
+    errors: &mut Vec<HirError>,
+    warnings: &mut Vec<HirWarning>,
+) {
+    let _ = kernel_span; // currently unused; may be needed for future diagnostics
+    // Collect all hole names referenced via HoleRef across non-strategy annotations.
+    let mut referenced_holes: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for ann in annotations {
+        if ann.node.name.node == "strategy" {
+            // Don't validate inside the @strategy block itself — only non-strategy annotations.
+            continue;
+        }
+        collect_hole_refs_in_args(&ann.node.args, &mut referenced_holes);
+    }
+
+    // For each referenced hole, check it is declared in @strategy.
+    for ann in annotations {
+        if ann.node.name.node == "strategy" {
+            continue;
+        }
+        validate_hole_refs_in_args(&ann.node.args, strategy, errors);
+    }
+
+    // UnusedStrategyHole: declared holes that were never referenced.
+    if let Some(holes) = strategy {
+        for (hole_name, _) in holes.map.iter() {
+            if !referenced_holes.contains(hole_name.as_str()) {
+                warnings.push(HirWarning::UnusedStrategyHole {
+                    name: hole_name.clone(),
+                    span: Span::new(0, 0), // exact span not tracked in HIR for unused holes
+                });
+            }
+        }
+
+        // StrategyHoleShadowsKernelParam: check if any hole name matches a kernel param.
+        for (hole_name, _) in holes.map.iter() {
+            let shadows = params.iter().any(|p| p.node.name.node == *hole_name);
+            if shadows {
+                warnings.push(HirWarning::StrategyHoleShadowsKernelParam {
+                    name: hole_name.clone(),
+                    span: Span::new(0, 0),
+                });
+            }
+        }
+    }
+}
+
+/// Recursively collect all HoleRef names from an annotation arg list.
+fn collect_hole_refs_in_args(
+    args: &[axc_lexer::Spanned<AnnotationArg>],
+    out: &mut std::collections::HashSet<String>,
+) {
+    for arg in args {
+        match &arg.node {
+            AnnotationArg::HoleRef(name) => {
+                out.insert(name.clone());
+            }
+            AnnotationArg::Call { args: inner, .. } => {
+                collect_hole_refs_in_args(inner, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Recursively validate that HoleRef names are all declared in `strategy`.
+fn validate_hole_refs_in_args(
+    args: &[axc_lexer::Spanned<AnnotationArg>],
+    strategy: Option<&StrategyHoles>,
+    errors: &mut Vec<HirError>,
+) {
+    for arg in args {
+        match &arg.node {
+            AnnotationArg::HoleRef(name) => {
+                let declared = strategy
+                    .map(|s| s.map.contains_key(name.as_str()))
+                    .unwrap_or(false);
+                if !declared {
+                    errors.push(HirError::UndefinedStrategyHole {
+                        name: name.clone(),
+                        span: arg.span,
+                    });
+                }
+            }
+            AnnotationArg::Call { args: inner, .. } => {
+                validate_hole_refs_in_args(inner, strategy, errors);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1058,6 +1295,113 @@ mod tests {
         assert!(
             matches!(&r_stmt.kind, HirExprKind::SubgroupBuiltin { op: SubgroupOp::Reduce(SubgroupReduceKind::Add), .. }),
             "expected SubgroupBuiltin::Reduce(Add); got {:?}", &r_stmt.kind
+        );
+    }
+
+    // ── M2.3: Strategy holes HIR tests (AT-1008..AT-1012, AT-1051) ────────────
+
+    /// AT-1008: HIR lowers @strategy into StrategyHoles with BTreeMap ordering
+    /// (alphabetical, not source order).
+    #[test]
+    fn at_1008_hir_lowers_strategy_to_btreemap() {
+        let src = "@strategy { b: ?[1], a: ?[2] } @kernel @workgroup(1, 1, 1) fn k() -> void { return; }";
+        let (hir, errors, _warns) = lower_src(src);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        let kernel = &hir.kernels[0];
+        let strat = kernel.annotations.strategy.as_ref().expect("strategy should be Some");
+        // Keys must be in alphabetical order (BTreeMap)
+        let keys: Vec<&String> = strat.map.keys().collect();
+        assert_eq!(keys, vec!["a", "b"], "BTreeMap must yield alphabetical order: {keys:?}");
+        assert_eq!(strat.map["a"], vec![2i64]);
+        assert_eq!(strat.map["b"], vec![1i64]);
+    }
+
+    /// AT-1009: HIR rejects undefined hole reference with UndefinedStrategyHole.
+    #[test]
+    fn at_1009_hir_rejects_undefined_strategy_hole() {
+        let src = "@kernel @workgroup(?missing_hole, 1, 1) fn k() -> void { return; }";
+        let (_, errors, _) = lower_src(src);
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                HirError::UndefinedStrategyHole { name, .. } if name == "missing_hole"
+            )),
+            "expected UndefinedStrategyHole {{ name: \"missing_hole\" }}: {errors:?}"
+        );
+    }
+
+    /// AT-1010: HIR rejects duplicate hole name in @strategy.
+    #[test]
+    fn at_1010_hir_rejects_duplicate_hole_name() {
+        // Use the explicit Call form where duplicates are expressible.
+        let src = "@strategy(x(?[1]), x(?[2])) @kernel @workgroup(1, 1, 1) fn k() -> void { return; }";
+        let (_, errors, _) = lower_src(src);
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                HirError::DuplicateStrategyHoleName { name, .. } if name == "x"
+            )),
+            "expected DuplicateStrategyHoleName {{ name: \"x\" }}: {errors:?}"
+        );
+    }
+
+    /// AT-1011: HIR emits UnusedStrategyHole warning for declared-but-unreferenced holes.
+    #[test]
+    fn at_1011_hir_warns_on_unused_strategy_hole() {
+        let src = "@strategy { x: ?[1], y: ?[2] } @kernel @workgroup(?x, 1, 1) fn k() -> void { return; }";
+        let (_, errors, warns) = lower_src(src);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        assert!(
+            warns.iter().any(|w| matches!(w, HirWarning::UnusedStrategyHole { name, .. } if name == "y")),
+            "expected UnusedStrategyHole {{ name: \"y\" }}: {warns:?}"
+        );
+        // x is referenced, so no warning for x
+        assert!(
+            !warns.iter().any(|w| matches!(w, HirWarning::UnusedStrategyHole { name, .. } if name == "x")),
+            "should NOT warn about x (it is referenced): {warns:?}"
+        );
+    }
+
+    /// AT-1012: HIR whitelist accepts 'strategy' annotation name.
+    #[test]
+    fn at_1012_hir_whitelist_accepts_strategy() {
+        let src = "@strategy { x: ?[1] } @kernel @workgroup(?x, 1, 1) fn k() -> void { return; }";
+        let (_, errors, _) = lower_src(src);
+        // Should NOT produce UnknownAnnotationInM0
+        assert!(
+            !errors.iter().any(|e| matches!(e, HirError::UnknownAnnotationInM0 { name, .. } if name == "strategy")),
+            "should NOT produce UnknownAnnotationInM0 for @strategy: {errors:?}"
+        );
+    }
+
+    /// AT-1051: HirWarning::StrategyHoleShadowsKernelParam fires when hole name
+    /// equals a kernel parameter name.
+    #[test]
+    fn at_1051_hir_warns_on_hole_shadows_param() {
+        // @strategy declares hole `n`, kernel has param `n: u32`.
+        let src = "@strategy { n: ?[1024] } @kernel @workgroup(?n, 1, 1) fn saxpy(n: u32) -> void { return; }";
+        let (_, errors, warns) = lower_src(src);
+        // Should produce the shadow warning (non-fatal)
+        assert!(
+            warns.iter().any(|w| matches!(w, HirWarning::StrategyHoleShadowsKernelParam { name, .. } if name == "n")),
+            "expected StrategyHoleShadowsKernelParam {{ name: \"n\" }}: {warns:?}"
+        );
+        // Should NOT produce an error (just a warning)
+        let _ = errors; // might have other errors; this test only checks the warning
+    }
+
+    // HIR defense-in-depth: empty strategy block emits EmptyStrategyBlock warning.
+    #[test]
+    fn hir_warning_empty_strategy_block() {
+        // Use call form for empty strategy: @strategy()
+        // Note: the sugar @strategy{} with no args requires a different parser path;
+        // we use the call form for simplicity.
+        let src = "@strategy() @kernel @workgroup(1, 1, 1) fn k() -> void { return; }";
+        let (_, errors, warns) = lower_src(src);
+        let _ = errors; // don't care about other errors
+        assert!(
+            warns.iter().any(|w| matches!(w, HirWarning::EmptyStrategyBlock { .. })),
+            "expected EmptyStrategyBlock warning: {warns:?}"
         );
     }
 }

@@ -8,6 +8,7 @@
 //! structured data).
 
 use axc_lexer::Span;
+use std::collections::BTreeMap;
 use crate::param::{KernelParam, ParamBindingPlan};
 
 /// Vulkan 1.1 guaranteed minimum `maxComputeWorkGroupInvocations`.
@@ -48,6 +49,37 @@ pub struct Kernel {
     pub span: Span,
 }
 
+/// M2.3: Strategy-hole declarations extracted from `@strategy { ... }`.
+///
+/// The `map` uses `BTreeMap` for deterministic iteration order (alphabetical
+/// by hole name). This is load-bearing for reproducibility: the Cartesian
+/// product traversal and `variant_id` hashing both depend on a stable key order
+/// that is independent of source-file declaration order and Rust hash randomization.
+///
+/// Candidate lists preserve user-source order (the first element is the ordinal-0
+/// baseline assignment for correctness checking).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StrategyHoles {
+    /// Hole name → ordered candidate list.
+    ///
+    /// Invariant: every `Vec<i64>` is non-empty and all candidates are positive (>= 1).
+    /// These invariants are enforced at parse time and re-validated by the HIR.
+    pub map: BTreeMap<String, Vec<i64>>,
+}
+
+impl StrategyHoles {
+    /// Create an empty `StrategyHoles` map.
+    pub fn new() -> Self {
+        Self { map: BTreeMap::new() }
+    }
+}
+
+impl Default for StrategyHoles {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Structured representation of the supported annotation set for a kernel.
 ///
 /// All fields are structured types — no `String` is used for data that has
@@ -67,6 +99,13 @@ pub struct KernelAnnotations {
     pub subgroup_uniform: bool,
     /// `@cooperative_matrix` flag — M2.1.
     pub cooperative_matrix: bool,
+    /// M2.3: Strategy-hole declarations from `@strategy { ... }`.
+    ///
+    /// `None` if the kernel has no `@strategy` annotation.
+    /// When `Some`, the enumerator resolves holes before codegen;
+    /// a kernel with unresolved `HoleRef`s that reaches codegen triggers
+    /// `CodegenError::UnresolvedStrategyHole` as a backstop.
+    pub strategy: Option<StrategyHoles>,
 }
 
 /// Complexity form: the outer function (`O`, `Theta`, `Omega`).

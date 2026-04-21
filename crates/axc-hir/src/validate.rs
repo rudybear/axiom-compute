@@ -107,6 +107,61 @@ pub enum HirError {
         #[label("here")]
         span: Span,
     },
+
+    // ── M2.3: strategy-hole HIR errors ──────────────────────────────────────
+
+    /// A `?name` HoleRef in an annotation references a hole name that was not
+    /// declared in `@strategy { name: ?[...] }` on this kernel.
+    #[error("unresolved strategy hole `?{name}`; declare it in `@strategy {{ {name}: ?[...] }}` on this kernel")]
+    UndefinedStrategyHole {
+        name: String,
+        #[label("referenced here")]
+        span: Span,
+    },
+
+    /// `@strategy` declares the same hole name twice.
+    ///
+    /// Duplicate detection is always active even though the curly-brace sugar
+    /// `{ k: ?[...], k: ?[...] }` cannot naturally express duplicates — the
+    /// explicit Call form `@strategy(k(?[1]), k(?[2]))` can.
+    #[error("strategy hole `{name}` is declared more than once in `@strategy`")]
+    DuplicateStrategyHoleName {
+        name: String,
+        #[label("duplicate declaration here")]
+        span: Span,
+    },
+
+    /// Defense-in-depth: a hole's candidate list is empty at HIR time.
+    ///
+    /// The parser already rejects this with `EmptyHoleCandidateList`; this HIR
+    /// error catches direct AST construction in tests and other code paths.
+    #[error("strategy hole `{name}` has an empty candidate list; provide at least one value")]
+    StrategyHoleEmptyCandidates {
+        name: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    /// Defense-in-depth: a hole candidate is non-positive.
+    ///
+    /// The parser already rejects this with `NonPositiveStrategyCandidate`; this
+    /// HIR error catches direct AST construction in tests.
+    #[error("strategy hole `{name}` candidate {value} is not positive (>= 1)")]
+    StrategyHoleNonPositive {
+        name: String,
+        value: i64,
+        #[label("here")]
+        span: Span,
+    },
+
+    /// A `?[...]` (HoleRef) appears inside a `@strategy { ... }` block itself —
+    /// recursive holes are not supported.
+    #[error("a HoleRef `?{name}` may not appear inside a @strategy block (recursive holes are not allowed)")]
+    HoleRefInStrategyBlock {
+        name: String,
+        #[label("here")]
+        span: Span,
+    },
 }
 
 /// Non-fatal diagnostic warning from HIR validation.
@@ -133,6 +188,30 @@ pub enum HirWarning {
     /// `workgroup_barrier` does NOT trigger this warning in M1.4 (CRITICAL-4 fix).
     SubgroupOpInDivergentContext {
         op_name: &'static str,
+        span: Span,
+    },
+
+    // ── M2.3: strategy-hole HIR warnings ─────────────────────────────────
+
+    /// A hole was declared in `@strategy` but never referenced via `?name` in
+    /// any other annotation on this kernel. Non-fatal — the user may be staging
+    /// an upcoming edit or reserving the name for a future annotation.
+    UnusedStrategyHole {
+        name: String,
+        span: Span,
+    },
+
+    /// `@strategy {}` with no hole declarations — the block is a no-op.
+    EmptyStrategyBlock {
+        span: Span,
+    },
+
+    /// A strategy hole name matches a kernel parameter name (e.g. `?n` and `n: u32`).
+    ///
+    /// The names live in disjoint namespaces (`?n` vs bare `n`), so this is not
+    /// an error. However, it can be confusing to readers.
+    StrategyHoleShadowsKernelParam {
+        name: String,
         span: Span,
     },
 }
@@ -208,6 +287,7 @@ mod tests {
                     preconditions: Vec::new(),
                     subgroup_uniform: false,
                     cooperative_matrix: false,
+                    strategy: None,
                 },
                 params: Vec::new(),
                 binding_plan: ParamBindingPlan {
