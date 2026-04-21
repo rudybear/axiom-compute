@@ -202,6 +202,8 @@ fn bench_regression_detects_over_threshold_slowdown() {
     for entry in &baselines.benchmarks {
         // Only gate on cpu_reference benches (AT-712 intentional scope).
         // dispatch_gpu is too variable on Lavapipe; compile_pipeline has OS-noise dominance.
+        // dispatch_gpu_amortized (M2.3a): skipped here — FIXME W-7: re-arm when Lavapipe
+        // GPU bench baseline is established for dispatch_handle_saxpy_1m.
         if entry.group != "cpu_reference" {
             continue;
         }

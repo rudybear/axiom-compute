@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 description = "AXIOM-Compute Vulkan 1.1 compute dispatcher — real GPU execution via ash 0.38"
 
+[features]
+# Expose test-introspection accessors (buffer sizes, etc.) for integration tests.
+test-hooks = []
+
 [dependencies]
 ash = { workspace = true }
 axc-hir = { path = "../axc-hir", features = ["serde"] }
@@ -13,8 +17,12 @@ thiserror = { workspace = true }
 miette = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+xxhash-rust = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 axc-driver = { path = "../axc-driver" }
 axc-lexer = { path = "../axc-lexer" }
 rspirv = { workspace = true }
+tempfile = { workspace = true }

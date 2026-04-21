@@ -4,7 +4,19 @@
 //! for structured diagnostic rendering. No `Box<dyn Error>` is used anywhere;
 //! all error context is encoded in typed fields (anti-pattern compliance).
 //!
-//! Variant count: 23 (rev 1, M1.5). The count is asserted in `at_502`.
+//! Variant count: 25 (rev 1, M2.3a). The count is asserted in `at_801`.
+
+/// Direction of a staging-buffer copy operation.
+///
+/// Used in `DispatchError::StagingCopyFailed` to distinguish host-to-device
+/// uploads from device-to-host readbacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyDirection {
+    /// Copying from host (CPU) memory to device (GPU) memory.
+    HostToDevice,
+    /// Copying from device (GPU) memory to host (CPU) memory.
+    DeviceToHost,
+}
 
 /// Typed error for all Vulkan dispatch failure modes.
 ///
@@ -152,6 +164,34 @@ pub enum DispatchError {
         /// The schema version this runtime understands.
         supported: u32,
     },
+
+    // ── M2.3a pipeline-cache and staging-copy errors ──────────────────────────
+    /// Failed to load the on-disk pipeline cache file.
+    ///
+    /// Non-fatal at context init: logged via `tracing::warn!` and the context
+    /// continues with an empty in-memory pipeline cache. Typed so tests can
+    /// inspect the explicit-fail path.
+    #[error("failed to load pipeline cache at '{}': {reason}", path.display())]
+    PipelineCacheLoadFailed {
+        /// The path of the cache file that could not be loaded.
+        path: std::path::PathBuf,
+        /// Human-readable reason (I/O error or Vulkan result code).
+        reason: String,
+    },
+
+    /// A staging-buffer copy (host↔device) failed.
+    ///
+    /// `vkMapMemory` or a `vkCmdCopyBuffer`-level error during the staging
+    /// upload or readback phase of `dispatch_handle`.
+    #[error("staging copy failed for binding #{binding} ({direction:?}): {reason}")]
+    StagingCopyFailed {
+        /// Descriptor binding index of the failed copy.
+        binding: u32,
+        /// Direction of the failed copy.
+        direction: CopyDirection,
+        /// Human-readable reason.
+        reason: String,
+    },
 }
 
 /// Convenience type alias for dispatch results.
@@ -161,12 +201,12 @@ pub type DispatchResult<T> = Result<T, DispatchError>;
 mod tests {
     use super::*;
 
-    /// AT-502: DispatchError has exactly 23 variants, all Display and Diagnostic.
+    /// AT-801: DispatchError has exactly 25 variants, all Display and Diagnostic.
     ///
-    /// The exhaustive match below ensures the compiler reminds us to update this
-    /// test whenever a variant is added or removed.
+    /// Supersedes AT-502 (23 variants). The exhaustive match below ensures the
+    /// compiler reminds us to update this test whenever a variant is added or removed.
     #[test]
-    fn at_502_dispatch_error_variants_are_display_miette() {
+    fn at_801_dispatch_error_variants_count_is_25() {
         // Construct one instance of each variant and verify non-empty Display.
         let variants: Vec<DispatchError> = vec![
             DispatchError::VulkanEntryFailed("test".to_owned()),
@@ -195,10 +235,19 @@ mod tests {
             DispatchError::MetadataIoError("test".to_owned()),
             DispatchError::MetadataParseError("test".to_owned()),
             DispatchError::MetadataSchemaMismatch { got: 2, supported: 1 },
+            DispatchError::PipelineCacheLoadFailed {
+                path: std::path::PathBuf::from("/tmp/test.cache"),
+                reason: "test".to_owned(),
+            },
+            DispatchError::StagingCopyFailed {
+                binding: 0,
+                direction: CopyDirection::HostToDevice,
+                reason: "test".to_owned(),
+            },
         ];
 
-        // Verify exactly 23 variants are covered.
-        assert_eq!(variants.len(), 23, "expected exactly 23 DispatchError variants");
+        // Verify exactly 25 variants are covered.
+        assert_eq!(variants.len(), 25, "expected exactly 25 DispatchError variants");
 
         for variant in &variants {
             let msg = variant.to_string();
@@ -228,5 +277,33 @@ mod tests {
             use miette::Diagnostic;
             let _ = variant.code();
         }
+    }
+
+    /// AT-802: CopyDirection enum has exactly two variants with Debug.
+    #[test]
+    fn at_802_copy_direction_two_variants_debug() {
+        let h2d: CopyDirection = CopyDirection::HostToDevice;
+        let d2h: CopyDirection = CopyDirection::DeviceToHost;
+
+        let h2d_str: String = format!("{h2d:?}");
+        let d2h_str: String = format!("{d2h:?}");
+
+        assert!(!h2d_str.is_empty(), "HostToDevice debug must be non-empty");
+        assert!(!d2h_str.is_empty(), "DeviceToHost debug must be non-empty");
+        assert_ne!(h2d_str, d2h_str, "HostToDevice and DeviceToHost must have distinct debug strings");
+
+        // Exhaustive match to ensure exactly two variants exist.
+        let _covered: () = match h2d {
+            CopyDirection::HostToDevice => {}
+            CopyDirection::DeviceToHost => {}
+        };
+    }
+
+    /// AT-502 (legacy test preserved as alias): verifies the new 25-count.
+    #[test]
+    fn at_502_dispatch_error_variants_are_display_miette() {
+        // This test delegates to the more complete at_801 test above.
+        // Preserved for backward-compatibility with any test-name grepping.
+        at_801_dispatch_error_variants_count_is_25();
     }
 }
