@@ -3,26 +3,101 @@
 //! `VulkanContext::new()` initializes the full Vulkan stack:
 //! - Entry (loads the Vulkan shared library)
 //! - Instance (Vulkan API 1.1, no validation layers by default)
-//! - Physical device selection (first device with a compute queue, or env override)
+//! - Physical device selection (first device with a compute queue family, or env override)
 //! - Logical device + queue
 //! - Command pool with `RESET_COMMAND_BUFFER`
 //! - Cached device limits (`max_compute_work_group_count`) for pre-validation
 //! - Cached memory properties for buffer allocation
 //!
+//! ## M2.3a additions
+//!
+//! - `Arc<DeviceOwner>` for shared device lifetime between context and `KernelHandle`s.
+//! - `PipelineCache` for Vulkan pipeline caching (disk-backed via options).
+//! - `parking_lot::Mutex<BTreeMap<KernelCacheKey, Weak<KernelHandleInner>>>` in-process
+//!   kernel cache (no HashMap — anti-pattern #14).
+//! - `prepare_kernel` / `dispatch_handle` prepare-once/dispatch-many API.
+//!
 //! ## Drop behavior
 //!
-//! `VulkanContext::drop` calls `vkDeviceWaitIdle` before destroying the device.
-//! This is critical on Lavapipe to avoid a `VK_ERROR_DEVICE_LOST` shutdown race
-//! when previously-submitted commands have not yet completed.
+//! `VulkanContext::drop` sequence:
+//! 1. `device_wait_idle()` (blocks until all submitted commands complete)
+//! 2. `pipeline_cache.save()` (non-fatal, logs via `tracing::warn!` on error)
+//! 3. Destroy `vk::PipelineCache` handle
+//! 4. Destroy command pool
+//! 5. Drop `in_mem_kernel_cache` (releases all Weak refs)
+//! 6. Drop `Arc<DeviceOwner>` (calls `vkDestroyDevice` iff strong_count was 1)
+//! 7. Destroy instance
+//!
+//! If a `KernelHandle` outlives the context, step 6 does NOT destroy the device.
+//! The device is destroyed when the last `KernelHandle` drops its `Arc<DeviceOwner>`.
 //!
 //! ## Device selection
 //!
-//! 1. If `AXC_PHYSICAL_DEVICE_INDEX` is set and in range, use that index.
-//! 2. Otherwise, iterate physical devices in enumeration order and pick the first
+//! 1. If `VulkanContextOptions::physical_device_index` is set and in range, use that.
+//! 2. If `AXC_PHYSICAL_DEVICE_INDEX` is set and in range (via `from_env()`), use that.
+//! 3. Otherwise, iterate physical devices in enumeration order and pick the first
 //!    that has a compute queue family.
 
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Weak};
+
 use ash::vk;
+use axc_hir::ParamBindingPlan;
+use parking_lot::Mutex;
+
+use crate::device_owner::DeviceOwner;
 use crate::error::DispatchError;
+use crate::pipeline_cache::{PipelineCache, resolve_pipeline_cache_path_from_env};
+use crate::pipeline::build_compute_pipeline;
+use crate::kernel_handle::{
+    KernelHandle, KernelHandleInner, KernelCacheKey,
+    make_cache_key, allocate_descriptor_pool_and_set,
+    ensure_buffers_fit_with_mem_props, record_and_submit_dispatch,
+    DispatchQueueCtx,
+};
+use crate::dispatch::validate_request;
+use crate::dispatch::DispatchRequest;
+
+/// Configuration for `VulkanContext::new_with_options`.
+///
+/// `VulkanContext::new()` delegates to `new_with_options(VulkanContextOptions::from_env())`.
+/// Tests use `new_with_options` directly to supply explicit paths and indices without
+/// mutating the process environment.
+pub struct VulkanContextOptions {
+    /// Path to the on-disk pipeline cache file.
+    ///
+    /// `None` disables the pipeline cache. Tests pass an explicit tempdir path.
+    /// `VulkanContext::new()` resolves this via `resolve_pipeline_cache_path_from_env()`.
+    pub pipeline_cache_path: Option<PathBuf>,
+    /// Physical device index override.
+    ///
+    /// `None` falls back to the first compute-capable device. Tests may pass an
+    /// explicit index to select a specific device.
+    pub physical_device_index: Option<usize>,
+    /// Fence timeout in milliseconds for `dispatch_handle`.
+    ///
+    /// `None` reads `AXC_FENCE_TIMEOUT_MS` from the environment, defaulting to 10,000 ms.
+    pub fence_timeout_ms: Option<u64>,
+}
+
+impl VulkanContextOptions {
+    /// Build options from environment variables.
+    ///
+    /// Reads `AXC_PHYSICAL_DEVICE_INDEX`, `AXC_FENCE_TIMEOUT_MS`, and
+    /// `resolve_pipeline_cache_path_from_env()`.
+    pub fn from_env() -> Self {
+        Self {
+            pipeline_cache_path: resolve_pipeline_cache_path_from_env(),
+            physical_device_index: std::env::var("AXC_PHYSICAL_DEVICE_INDEX")
+                .ok()
+                .and_then(|v: String| v.parse::<usize>().ok()),
+            fence_timeout_ms: std::env::var("AXC_FENCE_TIMEOUT_MS")
+                .ok()
+                .and_then(|v: String| v.parse::<u64>().ok()),
+        }
+    }
+}
 
 /// Initialized Vulkan context for compute dispatch.
 ///
@@ -37,8 +112,8 @@ pub struct VulkanContext {
     /// Selected physical device.
     #[allow(dead_code)]
     pub(crate) physical_device: vk::PhysicalDevice,
-    /// Logical device.
-    pub(crate) device: ash::Device,
+    /// Arc-wrapped device owner — shared with any KernelHandles created from this context.
+    pub(crate) device_owner: Arc<DeviceOwner>,
     /// Compute queue handle.
     pub(crate) queue: vk::Queue,
     /// Queue family index used for the command pool and queue.
@@ -52,14 +127,35 @@ pub struct VulkanContext {
     pub(crate) max_compute_work_group_count: [u32; 3],
     /// Human-readable device name for diagnostics.
     device_name: String,
+    /// On-disk and in-memory Vulkan pipeline cache.
+    pipeline_cache: PipelineCache,
+    /// Process-local kernel cache: maps KernelCacheKey → weak ref to KernelHandleInner.
+    ///
+    /// Weak refs allow handles to be freed normally; the cache simply doesn't serve
+    /// stale entries. BTreeMap enforces no-HashMap invariant (#14).
+    in_mem_kernel_cache: Mutex<BTreeMap<KernelCacheKey, Weak<KernelHandleInner>>>,
+    /// Fence timeout in milliseconds, resolved at context creation time.
+    /// Stored for use in `dispatch_handle`; shadowed by env var if set after context init.
+    #[allow(dead_code)]
+    fence_timeout_ms: u64,
 }
 
 impl VulkanContext {
     /// Initialize Vulkan and create a compute-capable device context.
     ///
+    /// Equivalent to `new_with_options(VulkanContextOptions::from_env())`.
+    ///
     /// Returns `Err(DispatchError::NoSupportedDevice)` if no physical device
     /// with a compute queue family is found.
     pub fn new() -> Result<Self, DispatchError> {
+        Self::new_with_options(VulkanContextOptions::from_env())
+    }
+
+    /// Initialize Vulkan with explicit options (M2.3a).
+    ///
+    /// Preferred over `new()` in tests: pass an explicit `pipeline_cache_path`
+    /// (e.g., a tempdir) to avoid env-based path resolution and serial_test.
+    pub fn new_with_options(opts: VulkanContextOptions) -> Result<Self, DispatchError> {
         // ── Step 1: Entry (load Vulkan library) ───────────────────────────────
         // SAFETY: Entry::load() loads the Vulkan shared library via the platform
         // search path. The returned Entry holds function pointers valid for the
@@ -104,11 +200,14 @@ impl VulkanContext {
         }
 
         // Determine which physical device to use.
-        let device_index_override: Option<usize> =
-            std::env::var("AXC_PHYSICAL_DEVICE_INDEX")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .filter(|&i| i < physical_devices.len());
+        let device_index_override: Option<usize> = opts.physical_device_index
+            .filter(|&i| i < physical_devices.len())
+            .or_else(|| {
+                std::env::var("AXC_PHYSICAL_DEVICE_INDEX")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .filter(|&i| i < physical_devices.len())
+            });
 
         let (physical_device, queue_family_index): (vk::PhysicalDevice, u32) =
             match device_index_override {
@@ -162,7 +261,7 @@ impl VulkanContext {
 
         // SAFETY: device_create_info is valid; no extensions or features that require
         // runtime checks are enabled (M1.5 only uses f32 arithmetic which is core 1.1).
-        let device: ash::Device =
+        let raw_device: ash::Device =
             unsafe { instance.create_device(physical_device, &device_create_info, None) }
                 .map_err(|e| {
                     // SAFETY: destroy instance on device creation failure.
@@ -170,8 +269,11 @@ impl VulkanContext {
                     DispatchError::DeviceCreationFailed(e.to_string())
                 })?;
 
-        // SAFETY: device is valid; queue was created with queue_family_index and index 0.
-        let queue: vk::Queue = unsafe { device.get_device_queue(queue_family_index, 0) };
+        // SAFETY: raw_device is valid; queue was created with queue_family_index and index 0.
+        let queue: vk::Queue = unsafe { raw_device.get_device_queue(queue_family_index, 0) };
+
+        // Wrap device in Arc<DeviceOwner> — vkDestroyDevice fires when the last Arc drops.
+        let device_owner: Arc<DeviceOwner> = Arc::new(DeviceOwner { device: raw_device });
 
         // ── Step 6: Command pool ──────────────────────────────────────────────
         let cp_info = vk::CommandPoolCreateInfo::default()
@@ -180,13 +282,15 @@ impl VulkanContext {
 
         // SAFETY: cp_info is valid; device is alive for the lifetime of the pool.
         let command_pool: vk::CommandPool =
-            unsafe { device.create_command_pool(&cp_info, None) }
+            unsafe { device_owner.create_command_pool(&cp_info, None) }
                 .map_err(|e| {
-                    // SAFETY: destroy device + instance on command pool creation failure.
-                    unsafe {
-                        device.destroy_device(None);
-                        instance.destroy_instance(None);
-                    }
+                    // Clone the Arc so the closure captures by value; when the closure
+                    // returns the cloned Arc drops → triggers DeviceOwner::drop → vkDestroyDevice.
+                    let _owner_ref: Arc<DeviceOwner> = Arc::clone(&device_owner);
+                    drop(_owner_ref);
+                    // SAFETY: instance was created above; the device using it has been
+                    // destroyed via DeviceOwner::drop triggered by the Arc drop above.
+                    unsafe { instance.destroy_instance(None); }
                     DispatchError::DeviceCreationFailed(format!("create_command_pool: {e}"))
                 })?;
 
@@ -200,17 +304,42 @@ impl VulkanContext {
         let limits: vk::PhysicalDeviceLimits = props.limits;
         let max_compute_work_group_count: [u32; 3] = limits.max_compute_work_group_count;
 
+        // ── Step 9: Pipeline cache ────────────────────────────────────────────
+        let pipeline_cache: PipelineCache =
+            PipelineCache::new(&device_owner.device, opts.pipeline_cache_path)
+                .unwrap_or_else(|e| {
+                    tracing::warn!(reason = %e, "pipeline cache init failed — using disabled cache");
+                    // Fallback: create with None (disabled). Should not fail since it just
+                    // calls vkCreatePipelineCache with 0 initial data — but if it does,
+                    // we cannot recover here. The unwrap below is intentional in that
+                    // catastrophic case; in practice Vulkan always allows empty cache creation.
+                    PipelineCache::new(&device_owner.device, None)
+                        .expect("empty pipeline cache creation must not fail")
+                });
+
+        // ── Step 10: Fence timeout ────────────────────────────────────────────
+        let fence_timeout_ms: u64 = opts.fence_timeout_ms
+            .or_else(|| {
+                std::env::var("AXC_FENCE_TIMEOUT_MS")
+                    .ok()
+                    .and_then(|v: String| v.parse::<u64>().ok())
+            })
+            .unwrap_or(crate::dispatch::DEFAULT_FENCE_TIMEOUT_MS);
+
         Ok(Self {
             entry,
             instance,
             physical_device,
-            device,
+            device_owner,
             queue,
             queue_family_index,
             command_pool,
             memory_properties,
             max_compute_work_group_count,
             device_name,
+            pipeline_cache,
+            in_mem_kernel_cache: Mutex::new(BTreeMap::new()),
+            fence_timeout_ms,
         })
     }
 
@@ -227,6 +356,179 @@ impl VulkanContext {
     /// Vulkan resource allocation.
     pub fn max_compute_work_group_count(&self) -> [u32; 3] {
         self.max_compute_work_group_count
+    }
+
+    /// Prepare (compile) a kernel and return a reusable `KernelHandle`.
+    ///
+    /// The handle caches: shader module, DSL (optional for 0-buffer kernels),
+    /// pipeline layout, pipeline, descriptor pool+set (optional), and a reusable
+    /// fence. Subsequent `dispatch_handle` calls reuse all of these.
+    ///
+    /// ## Double-checked locking (W-3)
+    ///
+    /// 1. Lock the kernel cache and look up `key`.
+    /// 2. If a live `Arc` is found, return it immediately.
+    /// 3. **Drop the lock** before calling `build_compute_pipeline` (may take 5–20 ms).
+    /// 4. Re-lock and re-check: another thread may have inserted while we compiled.
+    /// 5. If still absent, insert the freshly compiled handle.
+    ///
+    /// If another thread won the race, the freshly-built `KernelHandleInner` is
+    /// dropped (its Drop cleans up all Vulkan objects). Wasted compile work is
+    /// bounded to one per cold-miss race.
+    pub fn prepare_kernel(
+        &self,
+        spirv: &[u32],
+        binding_plan: &ParamBindingPlan,
+        push_constant_total_bytes: u32,
+        entry_point: &str,
+    ) -> Result<KernelHandle, DispatchError> {
+        let key: KernelCacheKey = make_cache_key(spirv, binding_plan, push_constant_total_bytes);
+
+        // Phase 1: check cache under lock.
+        {
+            let guard = self.in_mem_kernel_cache.lock();
+            if let Some(weak) = guard.get(&key) {
+                if let Some(arc) = weak.upgrade() {
+                    return Ok(KernelHandle { inner: arc });
+                }
+                // Stale entry (KernelHandle was dropped); fall through.
+            }
+        } // Guard released here — compile outside the lock (W-3).
+
+        // Phase 2: compile pipeline OUTSIDE the lock.
+        let compiled = build_compute_pipeline(
+            &self.device_owner.device,
+            spirv,
+            binding_plan,
+            entry_point,
+            self.pipeline_cache.vk(),
+        )?;
+
+        // P-5: allocate descriptor pool + set only for kernels with buffer bindings.
+        let (descriptor_pool, descriptor_set): (Option<vk::DescriptorPool>, Option<vk::DescriptorSet>) =
+            if binding_plan.buffers.is_empty() {
+                (None, None)
+            } else {
+                let dsl: vk::DescriptorSetLayout = compiled.descriptor_set_layout
+                    .expect("non-empty buffers must produce a DSL");
+                let (pool, set) = allocate_descriptor_pool_and_set(
+                    &self.device_owner.device,
+                    dsl,
+                    binding_plan.buffers.len(),
+                )?;
+                (Some(pool), Some(set))
+            };
+
+        // Create the reusable fence (P-2).
+        let fence_info = vk::FenceCreateInfo::default();
+        let fence: vk::Fence =
+            // SAFETY: fence_info is valid; the fence will be destroyed in KernelHandleInner::drop.
+            unsafe { self.device_owner.create_fence(&fence_info, None) }
+                .map_err(|e| {
+                    // SAFETY: clean up compiled pipeline resources on fence creation failure.
+                    unsafe {
+                        if let Some(pool) = descriptor_pool {
+                            self.device_owner.destroy_descriptor_pool(pool, None);
+                        }
+                        self.device_owner.destroy_pipeline(compiled.pipeline, None);
+                        self.device_owner.destroy_pipeline_layout(compiled.pipeline_layout, None);
+                        if let Some(dsl) = compiled.descriptor_set_layout {
+                            self.device_owner.destroy_descriptor_set_layout(dsl, None);
+                        }
+                        self.device_owner.destroy_shader_module(compiled.shader_module, None);
+                    }
+                    DispatchError::CommandBufferRecordFailed(format!("create_fence: {e}"))
+                })?;
+
+        let inner_fresh: Arc<KernelHandleInner> = Arc::new(KernelHandleInner {
+            device: Arc::clone(&self.device_owner),
+            shader_module: compiled.shader_module,
+            descriptor_set_layout: compiled.descriptor_set_layout,
+            pipeline_layout: compiled.pipeline_layout,
+            pipeline: compiled.pipeline,
+            descriptor_pool,
+            descriptor_set,
+            fence,
+            _entry_point_cstr: compiled.entry_point_cstr,
+            binding_plan: binding_plan.clone(),
+            buffers: Mutex::new(Vec::new()),
+            cache_key: key.clone(),
+            spirv_word_count: spirv.len(),
+        });
+
+        // Phase 3: re-lock and re-check (lost-race detection, W-3).
+        let mut guard = self.in_mem_kernel_cache.lock();
+        if let Some(weak) = guard.get(&key) {
+            if let Some(arc) = weak.upgrade() {
+                // Another thread compiled and inserted while we held the lock.
+                // Discard our fresh build (its Drop cleans up Vulkan objects).
+                drop(inner_fresh);
+                return Ok(KernelHandle { inner: arc });
+            }
+        }
+        guard.insert(key, Arc::downgrade(&inner_fresh));
+        Ok(KernelHandle { inner: inner_fresh })
+    }
+
+    /// Execute a prepared kernel and return output buffer bytes.
+    ///
+    /// Acquires the per-handle buffer mutex, grows buffers if needed,
+    /// uploads inputs, records + submits a command buffer, waits on the
+    /// reusable fence, and reads back outputs.
+    ///
+    /// ## Concurrency
+    ///
+    /// Concurrent `dispatch_handle` calls on the SAME handle serialize at the
+    /// `parking_lot::Mutex` (P-4). Calls on DIFFERENT handles run in parallel.
+    pub fn dispatch_handle(
+        &self,
+        handle: &KernelHandle,
+        workgroups: (u32, u32, u32),
+        inputs: &[&[u8]],
+        output_sizes: &[usize],
+        push_constants: &[u8],
+    ) -> Result<Vec<Vec<u8>>, DispatchError> {
+        // Validate arguments before acquiring the buffer mutex.
+        let dummy_req = DispatchRequest {
+            spirv: &[],
+            binding_plan: &handle.inner.binding_plan,
+            workgroups: [workgroups.0, workgroups.1, workgroups.2],
+            inputs,
+            output_sizes,
+            push_constants,
+            entry_point: "",
+        };
+        validate_request(&dummy_req, self.max_compute_work_group_count)?;
+
+        // Acquire the per-handle buffer mutex for the entire grow→submit→readback sequence (P-4).
+        let mut buffers_guard = handle.inner.buffers.lock();
+
+        // Grow buffers if needed (ensure_buffers_fit_with_mem_props).
+        ensure_buffers_fit_with_mem_props(
+            &mut buffers_guard,
+            &handle.inner,
+            inputs,
+            output_sizes,
+            &self.memory_properties,
+        )?;
+
+        // Record, submit, wait, readback.
+        let queue_ctx = DispatchQueueCtx {
+            command_pool: self.command_pool,
+            queue: self.queue,
+        };
+        let outputs = record_and_submit_dispatch(
+            &handle.inner,
+            &queue_ctx,
+            &buffers_guard,
+            inputs,
+            output_sizes,
+            push_constants,
+            workgroups,
+        )?;
+
+        drop(buffers_guard);
+        Ok(outputs)
     }
 }
 
@@ -251,20 +553,38 @@ fn find_compute_queue_family(
 
 impl Drop for VulkanContext {
     fn drop(&mut self) {
+        // Step 1: wait for all GPU work to complete.
         // SAFETY: device is valid; device_wait_idle blocks until all submitted
-        // commands complete — required before destroying the device on Lavapipe
+        // commands complete — required before destroying resources on Lavapipe
         // to avoid VK_ERROR_DEVICE_LOST shutdown races.
-        let _ = unsafe { self.device.device_wait_idle() };
+        let _ = unsafe { self.device_owner.device_wait_idle() };
 
+        // Step 2: save pipeline cache to disk (non-fatal).
+        if let Err(e) = self.pipeline_cache.save(&self.device_owner.device) {
+            tracing::warn!(reason = %e, "pipeline cache save failed on context drop");
+        }
+
+        // Step 3: destroy the vk::PipelineCache handle.
+        // SAFETY: pipeline_cache.vk_handle was created from this device.
+        unsafe {
+            self.device_owner
+                .destroy_pipeline_cache(self.pipeline_cache.vk_handle, None);
+        }
+
+        // Step 4: destroy command pool.
         // SAFETY: command_pool was created from this device; it is valid.
-        unsafe { self.device.destroy_command_pool(self.command_pool, None); }
+        unsafe { self.device_owner.destroy_command_pool(self.command_pool, None); }
 
-        // SAFETY: device was created from this instance; no outstanding objects remain
-        // (device_wait_idle ensured command completion; DispatchResources RAII cleaned
-        // up per-dispatch handles before returning to callers).
-        unsafe { self.device.destroy_device(None); }
+        // Step 5: drop in_mem_kernel_cache (releases all Weak refs).
+        // (Automatic via field drop order — Mutex<BTreeMap<…, Weak<…>>>)
 
-        // SAFETY: instance was created in new(); the device using it has been destroyed.
+        // Step 6: Arc<DeviceOwner> drops here (end of Drop body).
+        // If this is the last Arc ref, DeviceOwner::drop fires → vkDestroyDevice.
+        // If KernelHandles still hold Arcs, device survives until those drop.
+
+        // Step 7: destroy instance.
+        // SAFETY: instance was created in new_with_options(); device has been
+        // destroyed (or will be when last KernelHandle drops).
         unsafe { self.instance.destroy_instance(None); }
     }
 }

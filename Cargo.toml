@@ -35,3 +35,8 @@ half = { version = "2.4", default-features = false }
 # M2.2: Benchmark harness and deterministic PRNG.
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 rand = "0.8"
+# M2.3a: Hashing and synchronization primitives.
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+parking_lot = "0.12"
+# M2.3a: Temp file creation for pipeline cache tests.
+tempfile = "3"

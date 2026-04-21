@@ -5,6 +5,14 @@
 //! dependency-correct order (dependents before dependencies), ensuring that
 //! resources are freed on both success paths, `?`-early-returns, and panics.
 //!
+//! ## M2.3a note
+//!
+//! `DeviceOwner` lifetime contract: `VulkanContext` holds `Arc<DeviceOwner>`;
+//! `KernelHandleInner` clones it. `vkDestroyDevice` fires only when the last
+//! Arc drops. `DispatchResources` holds a plain reference `&'dev ash::Device`,
+//! which is borrowed from the `DeviceOwner` via Deref — safe because
+//! `DispatchResources` is always dropped before the context that created it.
+//!
 //! ## Dependency-correct destruction order
 //!
 //! This is NOT strictly reverse-of-creation — it is the order Vulkan requires
@@ -23,6 +31,9 @@
 use ash::vk;
 
 /// One Vulkan resource handle, tagged by kind for type-safe destruction.
+///
+/// Retained for the legacy one-shot dispatch path and future use.
+#[allow(dead_code)]
 pub(crate) enum ResourceHandle {
     Fence(vk::Fence),
     CommandBuffer {
@@ -45,6 +56,9 @@ pub(crate) enum ResourceHandle {
 ///
 /// On error paths, handles pushed before the failing step are still cleaned up
 /// by Drop when the local variable goes out of scope (via `?` or early return).
+///
+/// Retained for legacy compatibility and potential future use in M3+.
+#[allow(dead_code)]
 pub(crate) struct DispatchResources<'dev> {
     /// Reference to the logical device used for destruction.
     device: &'dev ash::Device,
@@ -54,6 +68,7 @@ pub(crate) struct DispatchResources<'dev> {
 
 impl<'dev> DispatchResources<'dev> {
     /// Create an empty resource holder for the given logical device.
+    #[allow(dead_code)]
     pub(crate) fn new(device: &'dev ash::Device) -> Self {
         Self {
             device,
@@ -62,6 +77,7 @@ impl<'dev> DispatchResources<'dev> {
     }
 
     /// Record a new handle. The handle will be destroyed in `Drop`.
+    #[allow(dead_code)]
     pub(crate) fn push(&mut self, h: ResourceHandle) {
         self.handles.push(h);
     }
