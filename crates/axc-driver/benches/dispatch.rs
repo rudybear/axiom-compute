@@ -1,7 +1,14 @@
-//! Criterion bench group `dispatch_gpu` (M2.2).
+//! Criterion bench groups `dispatch_gpu` and `dispatch_gpu_amortized` (M2.2 / M2.3a).
 //!
-//! Measures `VulkanContext::dispatch` end-to-end latency for saxpy and
-//! vector_add at N ∈ {1024, 1M}.
+//! `dispatch_gpu`: Measures `VulkanContext::dispatch` end-to-end latency for
+//! saxpy and vector_add at N ∈ {1024, 1M}.
+//!
+//! `dispatch_gpu_amortized`: Measures `VulkanContext::dispatch_handle` latency
+//! for a pre-compiled `KernelHandle` (prepare-once/dispatch-many path).
+//! Added in M2.3a. Benches one warm-up dispatch, then measures single
+//! `dispatch_handle` calls on the same handle.  Demonstrates that the
+//! per-dispatch cost is dominated by CB record + fence wait (not pipeline
+//! compilation or buffer allocation).
 //!
 //! # GPU availability gate
 //!
@@ -13,7 +20,7 @@
 //! # VulkanContext lifetime
 //!
 //! One `VulkanContext` is constructed once (expensive) and shared across all
-//! four benches via a lazy static.  Device/queue/command-pool creation is NOT
+//! benches via a lazy static.  Device/queue/command-pool creation is NOT
 //! in the measured region.
 //!
 //! # Pre-flight correctness (AT-705)
@@ -31,11 +38,13 @@
 //! - `dispatch_saxpy_1m` / `dispatch_vector_add_1m`: `BatchSize::LargeInput`
 //!   — each iteration's setup builds a fresh output Vec of 4 MB; LargeInput
 //!   reduces pre-allocated batch size so setup-memory peaks stay bounded.
+//! - `dispatch_handle_saxpy_1m`: `BatchSize::PerIteration` — handle is pre-warmed,
+//!   each iteration calls `dispatch_handle` directly; buffer pool is already allocated.
 
 #[path = "common.rs"]
 mod common;
 
-use axc_runtime::{VulkanContext, DispatchRequest, probe_vulkan_available};
+use axc_runtime::{VulkanContext, VulkanContextOptions, KernelHandle, DispatchRequest, probe_vulkan_available};
 use axc_hir::ParamBindingPlan;
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use std::sync::OnceLock;
@@ -63,6 +72,8 @@ struct GpuState {
     saxpy_plan: ParamBindingPlan,
     vector_add_spirv: Vec<u32>,
     vector_add_plan: ParamBindingPlan,
+    /// Pre-compiled KernelHandle for the amortized dispatch bench (M2.3a).
+    saxpy_handle: KernelHandle,
 }
 
 static GPU_STATE: OnceLock<GpuState> = OnceLock::new();
@@ -70,8 +81,12 @@ static GPU_STATE: OnceLock<GpuState> = OnceLock::new();
 /// Initialize GPU state once; panics if Vulkan setup or compilation fails.
 fn gpu_state() -> &'static GpuState {
     GPU_STATE.get_or_init(|| {
-        let ctx: VulkanContext = VulkanContext::new()
-            .expect("dispatch bench: VulkanContext::new() must succeed");
+        let ctx: VulkanContext = VulkanContext::new_with_options(VulkanContextOptions {
+            pipeline_cache_path: None,
+            physical_device_index: None,
+            fence_timeout_ms: None,
+        })
+        .expect("dispatch bench: VulkanContext::new_with_options must succeed");
 
         eprintln!(
             "dispatch_gpu: using device '{}'",
@@ -82,7 +97,16 @@ fn gpu_state() -> &'static GpuState {
             axc_driver::compile_source_with_meta(common::SAXPY_SRC)
                 .expect("dispatch bench: saxpy.axc compile failed");
         let saxpy_spirv: Vec<u32> = common::bytes_to_words(&saxpy_bytes);
-        let saxpy_plan: ParamBindingPlan = saxpy_meta.binding_plan;
+        let saxpy_plan: ParamBindingPlan = saxpy_meta.binding_plan.clone();
+
+        // Pre-compile KernelHandle for the amortized bench (M2.3a).
+        let saxpy_handle: KernelHandle = ctx.prepare_kernel(
+            &saxpy_spirv,
+            &saxpy_plan,
+            saxpy_meta.binding_plan.push_constant_total_bytes,
+            &saxpy_meta.entry_point,
+        )
+        .expect("dispatch bench: prepare_kernel for saxpy must succeed");
 
         let (va_bytes, va_meta) =
             axc_driver::compile_source_with_meta(common::VECTOR_ADD_SRC)
@@ -96,6 +120,7 @@ fn gpu_state() -> &'static GpuState {
             saxpy_plan,
             vector_add_spirv,
             vector_add_plan,
+            saxpy_handle,
         }
     })
 }
@@ -382,6 +407,80 @@ fn dispatch_vector_add_1m(c: &mut Criterion) {
     });
 }
 
+// ── Amortized dispatch_handle bench (M2.3a) ────────────────────────────────────
+
+/// Bench `dispatch_handle_saxpy_1m`: amortized `dispatch_handle` on a
+/// pre-compiled `KernelHandle`, saxpy N=1M.
+///
+/// The handle is prepared once in `gpu_state()` (pipeline compile + buffer
+/// alloc happen during first `dispatch_handle` call, outside the measured
+/// region).  Each Criterion iteration calls `dispatch_handle` directly:
+/// fence reset, CB record, queue submit, fence wait, readback.
+///
+/// BatchSize::PerIteration — each iteration is a complete GPU round-trip.
+fn dispatch_handle_saxpy_1m(c: &mut Criterion) {
+    if !gpu_benches_enabled() {
+        eprintln!(
+            "skipping dispatch_handle_saxpy_1m: AXC_ENABLE_GPU_BENCHES != 1 or no Vulkan ICD"
+        );
+        c.bench_function("dispatch_handle_saxpy_1m", |b| {
+            b.iter(|| {});
+        });
+        return;
+    }
+
+    let state: &GpuState = gpu_state();
+
+    let n: u32 = N_LARGE;
+    let buf_size: usize = n as usize * 4;
+    let workgroups: (u32, u32, u32) = (n.div_ceil(WG_SIZE_X), 1, 1);
+
+    let (x, y, alpha) = common::make_saxpy_inputs(n as usize, common::SEED);
+    let x_bytes: Vec<u8> = common::f32_slice_to_bytes(&x);
+    let y_bytes: Vec<u8> = common::f32_slice_to_bytes(&y);
+    let pc: Vec<u8> = common::assemble_saxpy_push_constants(&state.saxpy_plan, n, alpha);
+
+    // Warm-up dispatch: allocates buffers and verifies correctness.
+    // This first call is NOT in the measured region.
+    {
+        let outputs: Vec<Vec<u8>> = state.ctx.dispatch_handle(
+            &state.saxpy_handle,
+            workgroups,
+            &[&x_bytes, &y_bytes],
+            &[buf_size, buf_size],
+            &pc,
+        )
+        .expect("dispatch_handle_saxpy_1m: warm-up dispatch must succeed");
+        let y_out: Vec<f32> = common::bytes_to_f32_vec(&outputs[1]);
+        let cpu_ref: Vec<f32> = common::saxpy_cpu_reference(&x, &y, alpha);
+        for i in 0..n as usize {
+            let err: f32 = (y_out[i] - cpu_ref[i]).abs();
+            assert!(
+                err < common::ABS_TOL,
+                "dispatch_handle_saxpy_1m warm-up: GPU[{i}]={:.8}, CPU[{i}]={:.8}, err={:.2e}",
+                y_out[i], cpu_ref[i], err
+            );
+        }
+    }
+
+    c.bench_function("dispatch_handle_saxpy_1m", |b| {
+        b.iter_batched(
+            || {},
+            |()| {
+                let _outputs = state.ctx.dispatch_handle(
+                    &state.saxpy_handle,
+                    workgroups,
+                    &[&x_bytes, &y_bytes],
+                    &[buf_size, buf_size],
+                    &pc,
+                )
+                .expect("dispatch_handle_saxpy_1m: dispatch must succeed");
+            },
+            BatchSize::PerIteration,
+        );
+    });
+}
+
 criterion_group!(
     dispatch_benches,
     dispatch_saxpy_1024,
@@ -389,4 +488,8 @@ criterion_group!(
     dispatch_vector_add_1024,
     dispatch_vector_add_1m
 );
-criterion_main!(dispatch_benches);
+criterion_group!(
+    dispatch_gpu_amortized,
+    dispatch_handle_saxpy_1m,
+);
+criterion_main!(dispatch_benches, dispatch_gpu_amortized);

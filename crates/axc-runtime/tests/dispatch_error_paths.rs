@@ -4,9 +4,10 @@
 //! path (not just the pure `validate_request` function).
 //! AT-506a tests the device-limit workgroup count check via the actual device.
 //! AT-519 (Display smoke) does NOT require GPU — it only checks error messages.
+//! AT-519b covers M2.3a variants: PipelineCacheLoadFailed and StagingCopyFailed.
 
 use axc_runtime::{
-    VulkanContext, DispatchRequest, DispatchError,
+    VulkanContext, DispatchRequest, DispatchError, CopyDirection,
     probe_vulkan_available, gpu_tests_enabled,
 };
 use axc_hir::{ParamBindingPlan, BufferBindingSlot, BufferTy, ScalarTy};
@@ -235,6 +236,45 @@ fn dispatch_error_variants_are_display_miette() {
         assert!(has_keyword,
             "DispatchError::Display must contain a diagnostic keyword; msg='{msg}'");
     }
+}
+
+/// AT-519b: M2.3a variant Display smoke — PipelineCacheLoadFailed and StagingCopyFailed.
+///
+/// NOT GPU-gated — only tests error message formatting of the two new variants
+/// added in M2.3a: PipelineCacheLoadFailed and StagingCopyFailed (with CopyDirection).
+#[test]
+fn at_519b_m2_3a_error_variants_display() {
+    let pipeline_cache_err: DispatchError = DispatchError::PipelineCacheLoadFailed {
+        path: std::path::PathBuf::from("/tmp/at_519b.cache"),
+        reason: "I/O error: file not found".to_owned(),
+    };
+    let staging_h2d: DispatchError = DispatchError::StagingCopyFailed {
+        binding: 0,
+        direction: CopyDirection::HostToDevice,
+        reason: "vkMapMemory returned VK_ERROR_MEMORY_MAP_FAILED".to_owned(),
+    };
+    let staging_d2h: DispatchError = DispatchError::StagingCopyFailed {
+        binding: 1,
+        direction: CopyDirection::DeviceToHost,
+        reason: "readback map failed".to_owned(),
+    };
+
+    for err in &[pipeline_cache_err, staging_h2d, staging_d2h] {
+        let msg: String = err.to_string();
+        assert!(!msg.is_empty(),
+            "M2.3a error variant Display must be non-empty; variant: {err:?}");
+        let msg_lower: String = msg.to_lowercase();
+        let has_keyword: bool = msg_lower.contains("failed")
+            || msg_lower.contains("error");
+        assert!(has_keyword,
+            "M2.3a error variant Display must contain 'failed' or 'error'; msg='{msg}'");
+    }
+
+    // Verify CopyDirection::HostToDevice and DeviceToHost have distinct Debug output.
+    let h2d_debug: String = format!("{:?}", CopyDirection::HostToDevice);
+    let d2h_debug: String = format!("{:?}", CopyDirection::DeviceToHost);
+    assert_ne!(h2d_debug, d2h_debug,
+        "CopyDirection::HostToDevice and DeviceToHost must have distinct Debug strings");
 }
 
 /// Convert a `Vec<u8>` SPIR-V binary to a `Vec<u32>` word stream.

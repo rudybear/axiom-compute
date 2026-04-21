@@ -80,6 +80,14 @@
       "median_ns": 6526336,
       "low_ns": 6494248,
       "high_ns": 6582831
+    },
+    {
+      "group": "dispatch_gpu_amortized",
+      "bench": "dispatch_handle_saxpy_1m",
+      "median_ns": 0,
+      "low_ns": 0,
+      "high_ns": 0,
+      "_note": "FIXME W-7: baseline TBD after Lavapipe GPU bench run with M2.3a"
     }
   ]
 }
