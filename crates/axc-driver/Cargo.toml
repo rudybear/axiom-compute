@@ -41,11 +41,12 @@ harness = false
 bench_regression_fixture_slowdown = []
 
 [dependencies]
-axc-lexer = { path = "../axc-lexer" }
-axc-parser = { path = "../axc-parser" }
-axc-hir = { path = "../axc-hir" }
-axc-codegen = { path = "../axc-codegen" }
-axc-runtime = { path = "../axc-runtime" }
+axc-lexer    = { path = "../axc-lexer" }
+axc-parser   = { path = "../axc-parser" }
+axc-hir      = { path = "../axc-hir" }
+axc-codegen  = { path = "../axc-codegen" }
+axc-optimize = { path = "../axc-optimize" }
+axc-runtime  = { path = "../axc-runtime" }
 clap = { workspace = true }
 miette = { workspace = true }
 thiserror = { workspace = true }

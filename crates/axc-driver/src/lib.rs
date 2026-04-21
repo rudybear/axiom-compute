@@ -11,6 +11,7 @@
 //! Codegen runs ONLY when all three error lists are empty.
 
 pub mod cli;
+pub mod optimize;
 
 pub use cli::{Command, Cli};
 
@@ -138,6 +139,54 @@ pub fn compile_source_with_meta(source: &str) -> Result<(Vec<u8>, KernelMetadata
 pub fn compile_source_to_spirv(source: &str) -> Result<Vec<u8>, DriverError> {
     let (bytes, _meta) = compile_source_with_meta(source)?;
     Ok(bytes)
+}
+
+/// M2.3: Full pipeline with strategy hole pre-resolution.
+///
+/// Like `compile_source_with_meta` but accepts explicit hole assignments that
+/// substitute named `?hole` references with concrete integer values before
+/// HIR construction.
+///
+/// This is the per-variant compilation path called by `axc optimize` (and
+/// `axc compile --strategy-value`).  Each call compiles one strategy variant.
+///
+/// `assignments`: map of hole name → concrete value.  Holes not listed here
+/// retain whatever default the source provides (first candidate).
+///
+/// Returns `DriverError::Compile` if any pipeline phase fails after substitution.
+pub fn compile_source_with_assignments(
+    source: &str,
+    assignments: &std::collections::BTreeMap<String, i64>,
+) -> Result<(Vec<u8>, KernelMetadata), DriverError> {
+    // Strategy substitution: rewrite `?hole` references in the source text to
+    // their concrete integer values before lexing.  This is source-text
+    // substitution (NOT AST rewrite) for byte-identical SPIR-V reproducibility.
+    //
+    // The substituted source is fed to the normal pipeline.
+    let substituted: String = substitute_strategy_holes(source, assignments);
+    compile_source_with_meta(&substituted)
+}
+
+/// M2.3: Substitute strategy hole references in source text.
+///
+/// For each `(name, value)` in `assignments`, replaces all occurrences of
+/// `?name` in the source with the decimal representation of `value`.
+///
+/// This is a simple text substitution (not lexer-aware) and relies on the
+/// invariant that hole names are valid identifiers (no regex special chars).
+/// The order of substitution is alphabetical (BTreeMap iteration order) to
+/// ensure determinism.
+pub(crate) fn substitute_strategy_holes(
+    source: &str,
+    assignments: &std::collections::BTreeMap<String, i64>,
+) -> String {
+    let mut result: String = source.to_string();
+    for (name, value) in assignments {
+        let hole_ref: String = format!("?{name}");
+        let replacement: String = value.to_string();
+        result = result.replace(&hole_ref, &replacement);
+    }
+    result
 }
 
 /// Compute the metadata sidecar path from an output path.
