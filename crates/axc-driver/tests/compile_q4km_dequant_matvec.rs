@@ -28,11 +28,16 @@
 
 use std::path::PathBuf;
 
+// common.rs is included by multiple bench and test targets via #[path]; the
+// duplicate_mod lint fires when clippy checks all targets together.  This is the
+// established pattern in the axc-driver bench suite.
+#[allow(clippy::duplicate_mod)]
 #[path = "../benches/common.rs"]
 mod common;
 
 // Pull in Q4_K_M-specific helpers from common_helpers.rs directly.
-// We use a module alias to avoid conflicting with the `common` bench module.
+// Dead-code allow: common_helpers.rs has test-only helper functions unused here.
+#[allow(clippy::duplicate_mod, dead_code)]
 #[path = "common_helpers.rs"]
 mod helpers;
 
@@ -69,6 +74,7 @@ mod spv {
     pub const OP_CONVERT_U_TO_F:   u16 = 112; // OpConvertUToF (SPIR-V unified1 §3.42.12)
     pub const OP_BITWISE_XOR:      u16 = 166;
     pub const OP_DECORATE:         u16 = 71;
+    #[allow(dead_code)]
     pub const OP_MEMBER_DECORATE:  u16 = 72;
 
     /// Capability enum values.
@@ -84,11 +90,13 @@ mod spv {
     /// StorageClass enum values.
     pub mod sc {
         pub const STORAGE_BUFFER: u32 = 12;
+        #[allow(dead_code)]
         pub const PUSH_CONSTANT:  u32 = 9;
     }
 
     /// Decoration enum values.
     pub mod dec {
+        #[allow(dead_code)]
         pub const NON_WRITABLE:   u32 = 24;
         #[allow(dead_code)]
         pub const NON_READABLE:   u32 = 25;
@@ -156,7 +164,7 @@ fn decode_spirv_string(words: &[u32]) -> String {
 /// Load words from a SPIR-V byte blob.
 fn load_words(bytes: &[u8]) -> Vec<u32> {
     assert!(
-        bytes.len() % 4 == 0,
+        bytes.len().is_multiple_of(4),
         "SPIR-V byte length must be divisible by 4"
     );
     let n: usize = bytes.len() / 4;
@@ -301,6 +309,7 @@ fn at_1305_storage_buffer_8bit_access_capability_emitted_exactly_once() {
 /// Q4_K_M loads f16 values via ptr_read_u16_zext (u8 SSBO loads, no f16 SSBOs).
 /// This is the same invariant as M2.5 Q4_0 (AT-917).
 #[test]
+#[allow(non_snake_case)]
 fn at_1306_storage_buffer_16bit_access_capability_NOT_emitted() {
     let words: Vec<u32> = compile_q4km();
     let insts: Vec<RawInst> = parse_raw(&words);
@@ -335,6 +344,7 @@ fn at_1307_extension_spv_khr_8bit_storage_emitted_exactly_once() {
 
 /// AT-1308: OpExtension "SPV_KHR_16bit_storage" must NOT be emitted.
 #[test]
+#[allow(non_snake_case)]
 fn at_1308_extension_spv_khr_16bit_storage_NOT_emitted() {
     let words: Vec<u32> = compile_q4km();
     let insts: Vec<RawInst> = parse_raw(&words);
@@ -552,8 +562,9 @@ fn at_1312_get_scale_min_k4_cpu_reference_matches_ggml_for_8_hand_verified_pairs
         scales[3]  = 0xFF;  // hi2_sc = (0xFF>>6)&3 = 3
         scales[7]  = 0xFF;  // hi2_m  = (0xFF>>6)&3 = 3
         let (sc, m) = helpers::unpack_scale_min_k4_cpu(&scales, 7);
-        let expected_sc: u8 = (0xFF & 0x0F) | (((0xFFu8 >> 6) & 0x03) << 4);
-        let expected_m:  u8 = ((0xFF >> 4) & 0x0F) | (((0xFFu8 >> 6) & 0x03) << 4);
+        // 0xFF & 0x0F = 0x0F; (0xFF >> 6) & 0x03 = 3; (0xFF >> 4) & 0x0F = 0x0F.
+        let expected_sc: u8 = 0x0Fu8 | (3u8 << 4); // = 0x3F = 63
+        let expected_m:  u8 = 0x0Fu8 | (3u8 << 4); // = 0x3F = 63
         assert_eq!(sc, expected_sc, "j=7: sc mismatch");
         assert_eq!(m,  expected_m,  "j=7: m mismatch");
     }
