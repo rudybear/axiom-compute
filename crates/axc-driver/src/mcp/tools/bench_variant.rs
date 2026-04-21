@@ -85,7 +85,7 @@ pub(crate) fn pick_cpu_reference(
 ///
 /// Each binding `i` uses `StdRng::seed_from_u64(variant_id ^ (i as u64))`.
 /// Identical `(input_sizes, variant_id)` → identical bytes across runs.
-pub(crate) fn seeded_inputs(input_sizes: &[usize], variant_id: u64) -> Vec<Vec<u8>> {
+pub fn seeded_inputs(input_sizes: &[usize], variant_id: u64) -> Vec<Vec<u8>> {
     input_sizes
         .iter()
         .enumerate()
@@ -108,7 +108,7 @@ pub(crate) fn seeded_inputs(input_sizes: &[usize], variant_id: u64) -> Vec<Vec<u
 /// (assuming f32 element size, 4 bytes per element); axes 1 and 2 default to 1.
 ///
 /// Returns `[1, 1, 1]` as a safe fallback if `input_sizes` is empty.
-pub(crate) fn derive_workgroups(
+pub fn derive_workgroups(
     input_sizes: &[usize],
     workgroup_size: [u32; 3],
     override_: Option<[u32; 3]>,

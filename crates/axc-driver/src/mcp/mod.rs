@@ -32,10 +32,21 @@ pub use tools::load_source::{
     BufferBindingSummary, ScalarBindingSummary,
 };
 pub use tools::enumerate_variants::{EnumerateVariantsRequest, EnumerateVariantsResponse, StrategyVariantSummary};
-pub use tools::compile_variant::{CompileVariantRequest, CompileVariantResponse};
-pub use tools::bench_variant::{BenchVariantRequest, BenchVariantResponse, MachineMetadata, CorrectnessStatus};
-pub use tools::grid_search::{GridSearchRequest, GridSearchResponse, RankedVariant};
+pub use tools::compile_variant::{
+    CompileVariantRequest, CompileVariantResponse,
+    BASE64_ALPHABET, base64_encode, base64_decode, scan_caps_and_exts,
+};
+pub use tools::bench_variant::{
+    BenchVariantRequest, BenchVariantResponse, MachineMetadata, CorrectnessStatus,
+    seeded_inputs, derive_workgroups,
+};
+pub use tools::grid_search::{
+    GridSearchRequest, GridSearchResponse, RankedVariant,
+    HistoryEntryRecord, GridSearchPersisted,
+    format_rfc3339_utc, history_path_for_source, append_history_entry,
+};
 pub use tools::optimization_history::{OptHistoryRequest, OptHistoryResponse, HistoryEntry};
+pub use dispatch::{McpToolError, OnceVulkan, resolve_source};
 
 /// Maximum inbound line size: 8 MiB.
 ///
@@ -249,6 +260,46 @@ fn resolve_history_dir() -> std::path::PathBuf {
 
     // 3. Fallback.
     std::path::PathBuf::from(".pipeline/history")
+}
+
+// ── Test helpers (pub for integration tests in tests/) ────────────────────────
+
+/// Create a minimal `HistoryEntryRecord` for testing.
+///
+/// The record has a synthetic `source_xxh3`, empty ranked list, and zeroed
+/// machine metadata. `label` is used as a tag in `source_xxh3`.
+pub fn make_test_history_record(label: &str) -> HistoryEntryRecord {
+    use std::collections::BTreeMap;
+    HistoryEntryRecord {
+        timestamp: format_rfc3339_utc(std::time::SystemTime::now()),
+        git_sha: None,
+        source_xxh3: format!("{label}_test_hash"),
+        grid_search: GridSearchPersisted {
+            winner_variant_id: 0,
+            winner_assignments: BTreeMap::new(),
+            winner_median_ns: 0,
+            ranked: Vec::new(),
+            machine: MachineMetadata {
+                device_name: "test_device".to_string(),
+                driver_version: 0,
+                api_version: 0,
+                physical_device_index: 0,
+                icd_path: None,
+                git_sha: None,
+            },
+        },
+    }
+}
+
+/// Thin wrapper around `append_history_entry` for integration tests.
+///
+/// Same semantics; exists to give tests a stable symbol without exposing
+/// the internal `HistoryEntryRecord` construction details.
+pub fn append_history_entry_for_test(
+    path: &std::path::Path,
+    record: &HistoryEntryRecord,
+) -> Result<(), std::io::Error> {
+    append_history_entry(path, record)
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────

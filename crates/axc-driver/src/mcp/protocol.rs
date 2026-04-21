@@ -11,10 +11,34 @@
 //! - `Some(Value::Null)` (key present, value `null`) → request with null id;
 //!   server MUST reply with `id: null` per §4.2.
 //!
-//! We rely on `#[serde(default)]` on `id` to distinguish the two cases:
-//! default is `None`, so a missing key deserialises to `None`.
+//! We rely on a custom deserializer for `id` to distinguish the two cases:
+//! - Key absent → `None` (notification)
+//! - Key present with `null` → `Some(Value::Null)` (request with null id)
+//!
+//! Plain `Option<Value>` with `#[serde(default)]` cannot distinguish these because
+//! serde deserializes JSON `null` into `Option::None` for `Option<T>`.
 
 use serde_json::Value;
+
+/// Deserializer for `id` that distinguishes absent key from explicit `null`.
+///
+/// Returns `None` only when the JSON key was absent entirely.
+/// Returns `Some(Value::Null)` when the key was present with value `null`.
+fn deserialize_id<'de, D>(de: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // `Option<Value>` with serde treats absent key via `#[serde(default)]`
+    // and present-null as `Some(Value::Null)` via `deserialize_option`.
+    // We use Value directly here to get the raw JSON value, including null.
+    let v: Value = serde::Deserialize::deserialize(de)?;
+    Ok(Some(v))
+}
+
+/// Default for absent `id` key: `None` → notification.
+fn id_default() -> Option<Value> {
+    None
+}
 
 /// Incoming request or notification envelope.
 ///
@@ -25,7 +49,12 @@ pub struct RpcEnvelope {
     /// Must equal `"2.0"` — validated in the server loop before dispatch.
     pub jsonrpc: String,
     /// Request id. `None` → notification (no reply). `Some(Null)` → reply with null id.
-    #[serde(default)]
+    ///
+    /// The custom deserializer `deserialize_id` ensures that:
+    /// - Absent key → `None` (via `default = "id_default"`)
+    /// - Present `null` → `Some(Value::Null)`
+    /// - Present value → `Some(value)`
+    #[serde(default = "id_default", deserialize_with = "deserialize_id")]
     pub id: Option<Value>,
     /// Method name. Validated to be non-empty before dispatch.
     #[serde(default)]

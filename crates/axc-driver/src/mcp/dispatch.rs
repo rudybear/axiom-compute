@@ -75,7 +75,7 @@ impl McpContext {
 /// - `NotTried` — first bench/grid call will attempt initialization.
 /// - `Available(ctx)` — Vulkan is usable.
 /// - `Unavailable(reason)` — probe failed; same reason returned on all subsequent calls.
-pub(crate) enum OnceVulkan {
+pub enum OnceVulkan {
     NotTried,
     /// Boxed to reduce enum size (VulkanContext is ~680 bytes).
     Available(Box<axc_runtime::VulkanContext>),
@@ -83,11 +83,16 @@ pub(crate) enum OnceVulkan {
 }
 
 impl OnceVulkan {
+    /// Create a pre-seeded `Unavailable` state (for tests and error injection).
+    pub fn new_unavailable(reason: String) -> OnceVulkan {
+        OnceVulkan::Unavailable(reason)
+    }
+
     /// Get or initialize the `VulkanContext`.
     ///
     /// On first call: probes `probe_vulkan_available()` then `VulkanContext::new()`.
     /// Caches the outcome (success or failure) for all subsequent calls.
-    pub(crate) fn get_or_init(&mut self) -> Result<&axc_runtime::VulkanContext, McpToolError> {
+    pub fn get_or_init(&mut self) -> Result<&axc_runtime::VulkanContext, McpToolError> {
         match self {
             OnceVulkan::Available(ctx) => Ok(ctx),
             OnceVulkan::Unavailable(reason) => {
@@ -130,7 +135,7 @@ impl OnceVulkan {
 /// Each variant maps to a specific `ErrorCode` constant.
 #[derive(Debug)]
 #[allow(dead_code)] // `Internal` reserved for future tool handlers
-pub(crate) enum McpToolError {
+pub enum McpToolError {
     /// Compilation phase failure (lex/parse/HIR/codegen).
     Compile(crate::DriverError),
     /// Strategy enumeration failure.
@@ -248,7 +253,7 @@ impl McpToolError {
 /// N-3: Does NOT enforce path-traversal policy (absolute paths and `..` are
 /// permitted under the stdio single-user trust boundary). Emits `tracing::warn!`
 /// on suspicious path shapes (leading `/` or containing `..`) for audit trail.
-pub(crate) fn resolve_source(
+pub fn resolve_source(
     source: &Option<String>,
     path: &Option<std::path::PathBuf>,
 ) -> Result<String, McpToolError> {

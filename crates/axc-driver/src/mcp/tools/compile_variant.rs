@@ -21,14 +21,14 @@ use crate::mcp::dispatch::McpToolError;
 ///
 /// Index 62 is `+` (0x2B), index 63 is `/` (0x2F).
 /// This is explicitly NOT the URL-safe §5 alphabet (which uses `-` and `_`).
-pub(crate) const BASE64_ALPHABET: &[u8; 64] =
+pub const BASE64_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Encode `bytes` using the RFC 4648 §4 STANDARD base64 alphabet with `=` padding.
 ///
 /// Output contains only characters in `[A-Za-z0-9+/=]`.
 /// No line breaks, no whitespace, no BOM.
-pub(crate) fn base64_encode(bytes: &[u8]) -> String {
+pub fn base64_encode(bytes: &[u8]) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len().div_ceil(3) * 4);
     let a: &[u8; 64] = BASE64_ALPHABET;
 
@@ -68,7 +68,7 @@ pub(crate) fn base64_encode(bytes: &[u8]) -> String {
 /// Accepts only the standard alphabet (`[A-Za-z0-9+/=]`).
 /// URL-safe input (containing `-` or `_`) returns `Err`.
 /// Incorrect padding or invalid characters return `Err` with a description.
-pub(crate) fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
+pub fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
     // Decode table: 0xFF = invalid.
     let mut table: [u8; 256] = [0xFF_u8; 256];
     for (i, &b) in BASE64_ALPHABET.iter().enumerate() {
@@ -141,7 +141,7 @@ const OP_EXT_INST_IMPORT: u16 = 11;
 /// Returns `(capabilities, extensions)` in encounter order.
 /// The first 5 words are the SPIR-V header (magic, version, generator, bound, schema)
 /// and are skipped.
-pub(crate) fn scan_caps_and_exts(words: &[u32]) -> (Vec<String>, Vec<String>) {
+pub fn scan_caps_and_exts(words: &[u32]) -> (Vec<String>, Vec<String>) {
     let mut caps: Vec<String> = Vec::new();
     let mut exts: Vec<String> = Vec::new();
 
@@ -376,7 +376,7 @@ mod tests {
     #[test]
     fn at_1126_scan_caps_and_exts_order() {
         // Build a synthetic SPIR-V word stream:
-        // Header (5 words) + OpCapability Shader (cap 1) + OpCapability StorageUniformBufferBlock16 (cap 4427)
+        // Header (5 words) + OpCapability Shader (cap 1) + OpCapability StorageBuffer16BitAccess (cap 4433)
         // + OpExtension "SPV_KHR_16bit_storage"
         let mut words: Vec<u32> = vec![
             0x07230203, // magic
@@ -386,9 +386,9 @@ mod tests {
         // OpCapability Shader (opcode 17, wc 2) | capability 1 (Shader)
         words.push((2 << 16) | 17);
         words.push(1); // Shader
-        // OpCapability StorageUniformBufferBlock16 (capability 4427)
+        // OpCapability StorageBuffer16BitAccess / StorageUniformBufferBlock16 (capability 4433)
         words.push((2 << 16) | 17);
-        words.push(4427);
+        words.push(4433);
         // OpExtension "SPV_KHR_16bit_storage"
         let ext_str: &str = "SPV_KHR_16bit_storage";
         let ext_bytes: Vec<u8> = {

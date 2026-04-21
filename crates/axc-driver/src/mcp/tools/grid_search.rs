@@ -39,11 +39,12 @@ use crate::mcp::tools::enumerate_variants::StrategyVariantSummary;
 /// # Examples
 ///
 /// ```
-/// # use std::time::{UNIX_EPOCH, Duration};
+/// # use axc_driver::mcp::format_rfc3339_utc;
+/// # use std::time::UNIX_EPOCH;
 /// // epoch
 /// assert_eq!(format_rfc3339_utc(UNIX_EPOCH), "1970-01-01T00:00:00.000Z");
 /// ```
-pub(crate) fn format_rfc3339_utc(t: SystemTime) -> String {
+pub fn format_rfc3339_utc(t: SystemTime) -> String {
     let dur: Duration = t.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
     let total_secs: u64 = dur.as_secs();
     let millis: u32 = dur.subsec_millis();
@@ -85,7 +86,7 @@ pub(crate) fn hex16(h: u64) -> String {
 /// Compute the history file path for a given source string.
 ///
 /// Returns `<history_dir>/<xxh3_hex16(source.as_bytes())>.jsonl`.
-pub(crate) fn history_path_for_source(history_dir: &Path, source: &str) -> PathBuf {
+pub fn history_path_for_source(history_dir: &Path, source: &str) -> PathBuf {
     let hash: u64 = xxh3_64(source.as_bytes());
     history_dir.join(format!("{}.jsonl", hex16(hash)))
 }
@@ -137,7 +138,7 @@ pub struct RankedVariant {
 /// Distinct from the on-wire `HistoryEntry` (which is a superset used by
 /// `optimization_history`) — keeps the on-disk format stable.
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
-pub(crate) struct HistoryEntryRecord {
+pub struct HistoryEntryRecord {
     /// RFC3339 UTC timestamp with millisecond resolution.
     pub timestamp: String,
     /// Best-effort git HEAD SHA (7 chars), or `None`.
@@ -150,7 +151,7 @@ pub(crate) struct HistoryEntryRecord {
 
 /// Persistent grid-search sub-record.
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
-pub(crate) struct GridSearchPersisted {
+pub struct GridSearchPersisted {
     /// Winner's variant_id.
     pub winner_variant_id: u64,
     /// Winner's assignments (BTreeMap for determinism).
@@ -171,7 +172,7 @@ pub(crate) struct GridSearchPersisted {
 /// On NFS or FUSE filesystems where `flock` is advisory-only, the lock may be a
 /// no-op; the fallback is `O_APPEND` atomicity (Linux guarantees this up to one
 /// page, ~4 KiB). Documented in DESIGN.md §3.1.10.
-pub(crate) fn append_history_entry(
+pub fn append_history_entry(
     path: &Path,
     entry: &HistoryEntryRecord,
 ) -> Result<(), std::io::Error> {
