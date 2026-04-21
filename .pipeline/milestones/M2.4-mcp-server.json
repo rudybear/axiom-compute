@@ -1,0 +1,56 @@
+{
+  "id": "M2.4-mcp-server",
+  "title": "MCP server — JSON-RPC agent bridge",
+  "phase": "M2",
+  "goal": "Expose AXIOM-Compute's core capabilities (load source, enumerate @strategy holes, propose values, compile, dispatch+bench, record history) over JSON-RPC stdio, following Anthropic's Model Context Protocol. Closes the LLM-driven optimization loop — external agents can iteratively explore the design space via a stable tool interface instead of shelling out to the CLI.",
+  "scope_in": [
+    "`axc mcp` CLI subcommand — spawns a JSON-RPC stdio server",
+    "Tool: `load_source({path})` → returns kernel metadata (kernel_name, strategy_holes, binding_plan summary, workgroup_dims, complexity_annotation)",
+    "Tool: `enumerate_variants({source})` → returns array of StrategyVariant {variant_id, assignments}",
+    "Tool: `compile_variant({source, assignments})` → returns {spirv_base64, metadata_json, caps, exts}",
+    "Tool: `bench_variant({source, assignments, input_sizes, workgroups})` → returns {median_ns, samples, correctness_ok} — synchronous dispatch on local GPU",
+    "Tool: `grid_search({source, [holes_override]})` → runs grid_search() and returns ranked GridSearchResult",
+    "Tool: `optimization_history({source_path})` → returns JSONL history of prior grid_search results keyed by source hash (stored in .pipeline/history/)",
+    "JSON-RPC protocol: id-based request/response, standard MCP shapes, stdin/stdout, no network sockets",
+    "Error taxonomy: `McpError { code, message, data }` for each tool; wrap existing DriverError/EnumerateError/GridSearchError",
+    "`axc mcp --log stderr` to trace requests",
+    "History persistence: `.pipeline/history/<source_xxh3>.jsonl` with append-only grid search results",
+    "Integration test: spawn `axc mcp`, send load_source + enumerate_variants + compile_variant over stdio, assert responses match CLI output",
+    "Documentation: DESIGN.md §3.1.10 MCP tool schemas + example LLM session transcript"
+  ],
+  "scope_out": [
+    "Streaming tool responses (M3)",
+    "Actual LLM agent implementation — the server exposes tools; a separate agent script is user-side",
+    "Multi-client connection routing (stdio is single-client by design)",
+    "TLS / authentication (stdio is process-local; user's trust boundary)",
+    "Persistent session state beyond history file",
+    "Tool: fine-grained SPIR-V manipulation (rewrite passes) — M3",
+    "Schema validation via formal MCP package — hand-roll JSON-RPC for M2.4 to minimize deps"
+  ],
+  "acceptance_criteria": [
+    "cargo test --workspace passes (≥620 after M2.4)",
+    "cargo clippy --workspace --all-targets -- -D warnings clean",
+    "`axc mcp` starts and accepts JSON-RPC on stdin",
+    "Integration test spawns mcp subprocess, round-trips load_source for saxpy, asserts strategy_holes contains workgroup_x if example has it",
+    "Integration test round-trips enumerate_variants → compile_variant, asserts SPIR-V magic word 0x07230203 in returned base64",
+    "Integration test round-trips grid_search on a 4-variant saxpy, asserts winner_id present in response",
+    "History file `.pipeline/history/<hash>.jsonl` appends on each grid_search invocation (testable via mcp call)",
+    "Protocol errors return well-formed JSON-RPC error objects (code in range -32603..-32000)",
+    "Regression: 598 tests from prior milestones preserved"
+  ],
+  "memory_limit_gb": 50,
+  "dependencies": ["M2.3-strategy-holes"],
+  "blocks": ["M3.1-flash-attention"],
+  "estimated_loc": "1500-2500",
+  "estimated_tests_added": "20-35",
+  "open_questions_for_architect": [
+    "JSON-RPC library: hand-roll (simple, no deps) OR use `jsonrpc-v2` / `jsonrpsee`? Hand-roll for M2.4 minimalism — it's a stdio server with ~6 methods, serde_json already in workspace.",
+    "Tool parameter/return schemas: plain serde_json::Value OR typed structs (Request/Response per tool)? Typed structs with #[derive(Deserialize)] for clarity + compile-time checks.",
+    "Async vs sync: stdio IO is inherently serial; sync is fine. No tokio dep.",
+    "bench_variant workgroups: user-supplied? Or inferred from kernel annotations? Inferred from the @workgroup; user only supplies input sizes.",
+    "Protocol version negotiation: include `{server: 'axc-mcp', version: '0.1', capabilities: [...]}` in an initialize handshake? MCP spec expects this. Keep minimal: single initialize method returning capabilities.",
+    "History file format: one JSON object per line (JSONL)? Or single JSON array? JSONL for append-safety.",
+    "Error code allocation: follow MCP/JSON-RPC convention (parse error -32700, invalid request -32600, method not found -32601, invalid params -32602, internal -32603; server-defined errors -32000..-32099).",
+    "Compile and bench expect the source in full; do we also support `source_path` variants that read from disk? YES — add path-accepting sibling for each source-accepting tool."
+  ]
+}
