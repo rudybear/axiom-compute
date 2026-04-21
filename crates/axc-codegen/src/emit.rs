@@ -114,6 +114,10 @@ pub fn emit_module(hir: &HirModule, opts: &CodegenOptions) -> Result<Vec<u32>, C
     let uses_f16_ssbo = kernel.binding_plan.buffers.iter()
         .any(|b| b.ty.needs_16bit_storage());
 
+    // M2.5: Detect U8 SSBO buffers for StorageBuffer8BitAccess + Int8 capabilities.
+    let uses_u8_ssbo = kernel.binding_plan.buffers.iter()
+        .any(|b| b.ty.needs_8bit_storage());
+
     // ── Step 1: Capabilities ─────────────────────────────────────────────────
     b.capability(Capability::Shader);
 
@@ -229,6 +233,9 @@ pub fn emit_module(hir: &HirModule, opts: &CodegenOptions) -> Result<Vec<u32>, C
             let mut caps = CapabilitiesRequired {
                 // M2.1: Set storage_16bit flag from binding plan (F16 SSBO buffers).
                 storage_16bit: uses_f16_ssbo,
+                // M2.5: Set storage_8bit / int8 flags from binding plan (U8 SSBO buffers).
+                storage_8bit: uses_u8_ssbo,
+                int8: uses_u8_ssbo,
                 ..Default::default()
             };
 
@@ -305,6 +312,23 @@ pub fn emit_module(hir: &HirModule, opts: &CodegenOptions) -> Result<Vec<u32>, C
             if caps.storage_16bit {
                 b.capability(Capability::StorageBuffer16BitAccess);
                 b.extension("SPV_KHR_16bit_storage");
+            }
+
+            // M2.5: 8-bit integer and 8-bit storage capabilities for U8 SSBO buffers
+            // and ptr_read_u8_zext / ptr_read_u16_zext builtins (AT-901..AT-906).
+            // `caps.int8` and `caps.storage_8bit` are set either from the binding plan
+            // (uses_u8_ssbo) or from the body emitter (ptr_read_* builtins used).
+            if caps.int8 {
+                b.capability(Capability::Int8);
+            }
+            if caps.storage_8bit {
+                b.capability(Capability::StorageBuffer8BitAccess);
+                b.extension("SPV_KHR_8bit_storage");
+            }
+            // M2.5: Int16 capability for f16_bits_to_f32 builtin (intermediate u16).
+            // caps.int16 is set by the body emitter when f16_bits_to_f32 is used.
+            if caps.int16 {
+                b.capability(Capability::Int16);
             }
 
             // Save for entry_point call below.
@@ -437,6 +461,8 @@ fn expr_uses_gid(expr: &axc_hir::expr::HirExpr) -> bool {
         HirExprKind::BitwiseBuiltin { args, .. } => args.iter().any(expr_uses_gid),
         HirExprKind::SubgroupBuiltin { args, .. } => args.iter().any(expr_uses_gid),
         HirExprKind::CoopMatBuiltin { args, .. } => args.iter().any(expr_uses_gid),
+        // M2.5: Q4_0 builtins may nest gid-using offset args; recurse into args.
+        HirExprKind::Q4_0Builtin { args, .. } => args.iter().any(expr_uses_gid),
         HirExprKind::IntLit { .. }
         | HirExprKind::FloatLit { .. }
         | HirExprKind::BoolLit(_)
@@ -524,6 +550,10 @@ fn expr_uses_subgroup_op(expr: &axc_hir::expr::HirExpr, target: SubgroupOp) -> b
         HirExprKind::CoopMatBuiltin { args, .. } => {
             args.iter().any(|a| expr_uses_subgroup_op(a, target))
         }
+        // M2.5: Q4_0 builtins may nest subgroup-using offset args; recurse.
+        HirExprKind::Q4_0Builtin { args, .. } => {
+            args.iter().any(|a| expr_uses_subgroup_op(a, target))
+        }
         HirExprKind::GidBuiltin { .. }
         | HirExprKind::IntLit { .. }
         | HirExprKind::FloatLit { .. }
@@ -598,6 +628,8 @@ fn expr_uses_coopmat(expr: &axc_hir::expr::HirExpr) -> bool {
         HirExprKind::BitwiseBuiltin { args, .. } | HirExprKind::SubgroupBuiltin { args, .. } => {
             args.iter().any(expr_uses_coopmat)
         }
+        // M2.5: Q4_0 builtins are not coopmat; no cooperative-matrix ops inside.
+        HirExprKind::Q4_0Builtin { .. } => false,
         HirExprKind::GidBuiltin { .. }
         | HirExprKind::IntLit { .. }
         | HirExprKind::FloatLit { .. }

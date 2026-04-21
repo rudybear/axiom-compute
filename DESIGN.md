@@ -319,6 +319,66 @@ A regression gate (`crates/axc-driver/tests/bench_regression.rs`) compares
 threshold.  See `BENCHMARKS.md` for the blessed command, blessing workflow,
 regression gate invocation, and CI matrix.
 
+### 3.1.8 Q4_0 dequantization builtins (M2.5)
+
+AXIOM-Compute adds four intrinsic builtins for efficient Q4_0 (4-bit GGUF)
+weight dequantization from `buffer[u8]` SSOBs:
+
+#### Q4_0 block layout
+
+Each Q4_0 block is 18 bytes encoding 32 f32 elements:
+
+```
+byte 0..1:  f16 scale (little-endian IEEE 754 half-precision)
+bytes 2..17: 16 packed nibble pairs
+             byte k → lo nibble = weight at index k
+                      hi nibble = weight at index k+16
+```
+
+Dequantization: `weight_i = (nibble_i - 8) * scale`
+
+The bias of 8 centers the unsigned nibble range [0,15] at zero (effective signed
+range [-8, 7]).
+
+#### Four Q4_0 builtins
+
+| Builtin | SPIR-V emission | Capabilities set |
+|---|---|---|
+| `ptr_read_u8_zext(buf, offset)` | OpAccessChain + OpLoad(u8) + OpUConvert(u32) | `Int8`, `StorageBuffer8BitAccess` |
+| `ptr_read_u16_zext(buf, offset)` | Two u8 loads + shift + BitwiseOr into u32 | `Int8`, `StorageBuffer8BitAccess` |
+| `f16_bits_to_f32(bits_u32)` | OpUConvert(u32→u16) + OpBitcast(u16→f16) + OpFConvert(f16→f32) | `Int16`, `Float16` |
+| `f32_from_u32(n_u32)` | OpConvertUToF(u32→f32) | (none new) |
+
+All four builtins are only valid for `buffer[u8]` SSBO arguments and are
+lowered by `crates/axc-codegen/src/q4_0.rs`.
+
+#### Capability side-effects
+
+Capabilities are lazily accumulated via `CapabilitiesRequired` (the same
+pattern as M2.1 cooperative-matrix caps):
+
+- `ptr_read_u8_zext` / `ptr_read_u16_zext`: set `caps.int8` + `caps.storage_8bit`
+  → emit `OpCapability Int8` + `OpCapability StorageBuffer8BitAccess` + `OpExtension "SPV_KHR_8bit_storage"`
+- `f16_bits_to_f32`: set `caps.int16` + `caps.float16`
+  → emit `OpCapability Int16` + `OpCapability Float16`
+
+Additionally, if the kernel binding plan contains a `buffer[u8]` SSBO,
+`StorageBuffer8BitAccess` and `Int8` are pre-enabled from the binding plan
+before body emission begins (same pattern as `StorageBuffer16BitAccess`).
+
+**SPIR-V capability numeric values** (spirv-0.3.0+sdk-1.3.268.0):
+- `Int8 = 39` (NOT 40 — common off-by-one from older spec drafts)
+- `Int16 = 22`
+- `Float16 = 9`
+- `StorageBuffer8BitAccess = 4448`
+- `StorageBuffer16BitAccess = 4433`
+
+#### Integration tests
+
+`crates/axc-driver/tests/compile_q4_0_dequant_matvec.rs` provides AT-901 through
+AT-918 (17 compile-time + 1 GPU dispatch test).  AT-918 is `#[ignore]`-gated and
+requires `AXC_ENABLE_GPU_TESTS=1`.
+
 ### 3.1 Types
 
 ```
@@ -487,3 +547,4 @@ trigger UB) may be rejected at HIR typecheck in a future milestone.
 - **2026-04-18:** M1.3 revision — added §3.1.4 Control flow (M1.3): OpLoopMerge, continue_target, structured CFG for if/for/while/break/continue.
 - **2026-04-18:** M1.5 revision — added §3.1.6 Runtime dispatch (M1.5): VulkanContext lifecycle + Drop ordering, DispatchRequest API + ownership model, metadata sidecar schema v1, host-visible memory simplification + M2 staging-buffer plan, fence timeout default, push-constant byte-assembly discipline, workgroup-count device-limit pre-validation, Vulkan 1.1 subgroup BASIC+VOTE guaranteed / ARITHMETIC+BALLOT+SHUFFLE+CLUSTERED+QUAD device-optional note.
 - **2026-04-18:** M2.2 revision — added §3.1.7 Benchmark harness: Criterion bench groups (compile_pipeline, cpu_reference, dispatch_gpu), regression gate (11-sample median, 15% threshold), baselines.json schema v1, BENCHMARKS.md forward reference.
+- **2026-04-18:** M2.5 revision — added §3.1.8 Q4_0 dequantization builtins: Q4_0 block layout (18 bytes/block, 32 f32 elements), four new builtins (ptr_read_u8_zext, ptr_read_u16_zext, f16_bits_to_f32, f32_from_u32), capability side-effects (Int8=39, Int16=22, Float16=9, StorageBuffer8BitAccess=4448), integration tests AT-901..AT-918, dispatch_gpu_q4_0 bench group (n_blocks=128 and 1024).

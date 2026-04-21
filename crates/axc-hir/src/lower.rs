@@ -121,6 +121,11 @@ pub fn lower_module(ast: &AstModule) -> (HirModule, Vec<HirError>, Vec<HirWarnin
                         "cooperative_matrix" => {
                             cooperative_matrix = true;
                         }
+                        // M2.5: @strict is a documentation/lint annotation that
+                        // enforces @intent + @complexity + @precondition are all present.
+                        // The HIR lowerer accepts and ignores it (validation of the
+                        // strict discipline is done by the QA agent, not the compiler).
+                        "strict" => {}
                         other => {
                             errors.push(HirError::UnknownAnnotationInM0 {
                                 name: other.to_owned(),

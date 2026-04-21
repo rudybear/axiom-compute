@@ -461,6 +461,54 @@ pub enum TypecheckError {
         span: Span,
     },
 
+    // ── M2.5 Q4_0-path builtin errors ─────────────────────────────────────────
+
+    #[error("Q4_0 builtin `{name}` requires {expected} argument(s); got {found}")]
+    Q4_0BuiltinWrongArity {
+        name: &'static str,
+        expected: usize,
+        found: usize,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("`ptr_read_u8_zext` / `ptr_read_u16_zext` first argument must be a kernel buffer parameter identifier (readonly_buffer[u8] or buffer[u8]); got `{found_kind}`")]
+    PtrReadArgMustBeBufferParam {
+        found_kind: &'static str,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("`ptr_read_u8_zext` / `ptr_read_u16_zext` requires a `readonly_buffer[u8]` or `buffer[u8]` parameter; got buffer with element type `{elem_ty}`")]
+    PtrReadBufferElemMustBeU8 {
+        elem_ty: &'static str,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("`f16_bits_to_f32` requires a `u32` argument; got `{got_ty}`")]
+    F16BitsToF32ArgMustBeU32 {
+        got_ty: &'static str,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("`f32_from_u32` requires a `u32` argument; got `{got_ty}`")]
+    Q4_0BuiltinArgTypeMismatch {
+        name: &'static str,
+        expected_ty: &'static str,
+        got_ty: &'static str,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("`{name}` is a reserved Q4_0-path builtin identifier and cannot be used as a variable name")]
+    ReservedQ4_0BuiltinName {
+        name: String,
+        #[label("here")]
+        span: Span,
+    },
+
     #[error("f16 literal out of range for bin16 (value {value} overflows to infinity)")]
     F16LiteralOutOfRange {
         value: f64,
@@ -564,6 +612,14 @@ impl<'p> TypeChecker<'p> {
         // type-constructor keyword at expression scope. Reject it as a variable name.
         if name == "matrix" {
             self.errors.push(TypecheckError::ReservedKeyword {
+                name: name.to_owned(),
+                span,
+            });
+            return None;
+        }
+        // M2.5: Q4_0-path builtin names are reserved and cannot be used as variable names.
+        if crate::q4_0::is_reserved_q4_0_builtin(name) {
+            self.errors.push(TypecheckError::ReservedQ4_0BuiltinName {
                 name: name.to_owned(),
                 span,
             });
@@ -2664,6 +2720,184 @@ fn check_coopmat_store_stmt(
     })
 }
 
+// ── Q4_0-path builtin calls (M2.5) ───────────────────────────────────────────
+
+/// Typecheck a Q4_0-path builtin expression call.
+///
+/// Dispatched from `check_call` when the call name is in `RESERVED_Q4_0_BUILTIN_NAMES`.
+fn check_q4_0_call(
+    tc: &mut TypeChecker<'_>,
+    op: crate::q4_0::Q4_0Builtin,
+    _name_span: Span,
+    args: &[axc_lexer::Spanned<past::Expr>],
+    call_span: Span,
+    _expected: Option<ScalarTy>,
+) -> Option<HirExpr> {
+    use crate::q4_0::Q4_0Builtin;
+
+    // Arity check.
+    let expected_arity = op.arity();
+    if args.len() != expected_arity {
+        tc.errors.push(TypecheckError::Q4_0BuiltinWrongArity {
+            name: op.source_name(),
+            expected: expected_arity,
+            found: args.len(),
+            span: call_span,
+        });
+        return None;
+    }
+
+    match op {
+        Q4_0Builtin::PtrReadU8Zext | Q4_0Builtin::PtrReadU16Zext => {
+            // arg0: must be a kernel buffer parameter identifier with elem type U8.
+            // arg1: byte_offset — must be a u32 expression.
+            let buf_arg = &args[0];
+            let offset_arg = &args[1];
+
+            // Verify that arg0 is a plain identifier referring to a buffer param.
+            let buf_name: &str = match &buf_arg.node {
+                axc_parser::ast::Expr::Ident(n) => n.as_str(),
+                _ => {
+                    tc.errors.push(TypecheckError::PtrReadArgMustBeBufferParam {
+                        found_kind: "non-identifier expression",
+                        span: buf_arg.span,
+                    });
+                    return None;
+                }
+            };
+            let param_info = tc.find_param(buf_name);
+            let (param_position, buf_ty) = match param_info {
+                Some(p) => {
+                    match &p.ty {
+                        ParamTy::Buffer(bt) => (p.position, *bt),
+                        ParamTy::Scalar(_) => {
+                            tc.errors.push(TypecheckError::PtrReadArgMustBeBufferParam {
+                                found_kind: "scalar parameter",
+                                span: buf_arg.span,
+                            });
+                            return None;
+                        }
+                    }
+                }
+                None => {
+                    // Could be a local binding (not allowed).
+                    if tc.find_binding(buf_name).is_some() {
+                        tc.errors.push(TypecheckError::PtrReadArgMustBeBufferParam {
+                            found_kind: "local binding (not a kernel parameter)",
+                            span: buf_arg.span,
+                        });
+                    } else {
+                        tc.errors.push(TypecheckError::UnknownBinding {
+                            name: buf_name.to_owned(),
+                            span: buf_arg.span,
+                        });
+                    }
+                    return None;
+                }
+            };
+            // The buffer element type MUST be U8.
+            if buf_ty.elem != ScalarTy::U8 {
+                tc.errors.push(TypecheckError::PtrReadBufferElemMustBeU8 {
+                    elem_ty: buf_ty.elem.display_name(),
+                    span: buf_arg.span,
+                });
+                return None;
+            }
+            // Compute the buffer-only binding slot index.
+            let buf_param_index = count_buffer_position(tc.params, param_position);
+
+            // arg1: byte_offset must be u32.
+            let offset_hir = check_expr(tc, &offset_arg.node, offset_arg.span, Some(ScalarTy::U32))?;
+            if offset_hir.ty != ScalarTy::U32 {
+                tc.errors.push(TypecheckError::Q4_0BuiltinArgTypeMismatch {
+                    name: op.source_name(),
+                    expected_ty: "u32",
+                    got_ty: offset_hir.ty.display_name(),
+                    span: offset_arg.span,
+                });
+                return None;
+            }
+
+            // Synthesize a placeholder U32 node for the buffer argument
+            // (the buf arg is a kernel param identifier, not a scalar value;
+            //  the codegen uses buf_param_index to look up the SSBO var id).
+            let buf_hir = axc_hir_buf_arg_placeholder(buf_arg.span);
+
+            let return_ty = op.return_ty();
+            Some(HirExpr {
+                kind: crate::expr::HirExprKind::Q4_0Builtin {
+                    op,
+                    args: vec![buf_hir, offset_hir],
+                    buf_param_index: Some(buf_param_index),
+                },
+                ty: return_ty,
+                span: call_span,
+            })
+        }
+
+        Q4_0Builtin::F16BitsToF32 => {
+            // arg0: bits — must be u32.
+            let bits_arg = &args[0];
+            let bits_hir = check_expr(tc, &bits_arg.node, bits_arg.span, Some(ScalarTy::U32))?;
+            if bits_hir.ty != ScalarTy::U32 {
+                tc.errors.push(TypecheckError::F16BitsToF32ArgMustBeU32 {
+                    got_ty: bits_hir.ty.display_name(),
+                    span: bits_arg.span,
+                });
+                return None;
+            }
+            Some(HirExpr {
+                kind: crate::expr::HirExprKind::Q4_0Builtin {
+                    op,
+                    args: vec![bits_hir],
+                    buf_param_index: None,
+                },
+                ty: ScalarTy::F32,
+                span: call_span,
+            })
+        }
+
+        Q4_0Builtin::F32FromU32 => {
+            // arg0: u — must be u32.
+            let u_arg = &args[0];
+            let u_hir = check_expr(tc, &u_arg.node, u_arg.span, Some(ScalarTy::U32))?;
+            if u_hir.ty != ScalarTy::U32 {
+                tc.errors.push(TypecheckError::Q4_0BuiltinArgTypeMismatch {
+                    name: op.source_name(),
+                    expected_ty: "u32",
+                    got_ty: u_hir.ty.display_name(),
+                    span: u_arg.span,
+                });
+                return None;
+            }
+            Some(HirExpr {
+                kind: crate::expr::HirExprKind::Q4_0Builtin {
+                    op,
+                    args: vec![u_hir],
+                    buf_param_index: None,
+                },
+                ty: ScalarTy::F32,
+                span: call_span,
+            })
+        }
+    }
+}
+
+/// Build a placeholder U32 HIR expression for the buffer-parameter argument of
+/// `ptr_read_u8_zext` / `ptr_read_u16_zext`.
+///
+/// The codegen uses `buf_param_index` (not the expression itself) to look up the
+/// SSBO variable id. The expression is a BoolLit placeholder that the body emitter
+/// never evaluates. Using a dedicated sentinel avoids introducing a new HIR variant
+/// solely for "this argument is a kernel parameter name, not a value".
+fn axc_hir_buf_arg_placeholder(span: Span) -> HirExpr {
+    HirExpr {
+        kind: crate::expr::HirExprKind::BoolLit(false), // placeholder — never evaluated by codegen
+        ty: ScalarTy::U32,
+        span,
+    }
+}
+
 // ── Bitwise builtin calls ─────────────────────────────────────────────────────
 
 fn check_call(
@@ -2674,6 +2908,11 @@ fn check_call(
     call_span: Span,
     expected: Option<ScalarTy>,
 ) -> Option<HirExpr> {
+    // M2.5: dispatch Q4_0-path builtins FIRST (before coopmat and subgroup).
+    if let Some(q4_op) = crate::q4_0::Q4_0Builtin::from_source_name(name) {
+        return check_q4_0_call(tc, q4_op, name_span, args, call_span, expected);
+    }
+
     // M2.1: dispatch cooperative-matrix expression builtins (Zero, Load, MulAdd).
     // Store is a statement (void return) — handled in check_builtin_call_stmt.
     use crate::coopmat::CoopMatBuiltin;

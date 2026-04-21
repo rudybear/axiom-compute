@@ -190,6 +190,23 @@ pub struct CapabilitiesRequired {
     /// Without this, `OpConstantNull` and `OpConstant` on F16-element coopmat types
     /// are rejected by spirv-val ("Cannot form constants of 8- or 16-bit types").
     pub float16: bool,
+    /// M2.5: True if any ptr_read_u8_zext or ptr_read_u16_zext builtin was used,
+    /// OR if any buffer[u8]/readonly_buffer[u8] is in the binding plan.
+    ///
+    /// Requires `OpCapability Int8`, `OpCapability StorageBuffer8BitAccess`,
+    /// and `OpExtension "SPV_KHR_8bit_storage"`.
+    pub int8: bool,
+    /// M2.5: True if the `storage_8bit` capability must be emitted.
+    ///
+    /// Set when any U8 SSBO appears in the binding plan OR when ptr_read_u8/u16
+    /// builtins are used. Always co-set with `int8`.
+    pub storage_8bit: bool,
+    /// M2.5: True if `f16_bits_to_f32` was used — requires `OpCapability Int16`.
+    ///
+    /// The intermediate `u16` type in `OpUConvert u32→u16` requires `Int16`.
+    /// Note: `storage_16bit` is NOT required for this path because the f16
+    /// value never crosses a buffer boundary as a native f16 scalar.
+    pub int16: bool,
 }
 
 impl CapabilitiesRequired {
@@ -197,6 +214,10 @@ impl CapabilitiesRequired {
         match ty {
             ScalarTy::I64 | ScalarTy::U64 => { self.int64 = true; }
             ScalarTy::F64 => { self.float64 = true; }
+            // M2.5: I8/U8 types in SPIR-V body require Int8 capability.
+            ScalarTy::I8 | ScalarTy::U8 => { self.int8 = true; }
+            // M2.5: I16/U16 types in SPIR-V body require Int16 capability.
+            ScalarTy::I16 | ScalarTy::U16 => { self.int16 = true; }
             _ => {}
         }
     }
@@ -940,6 +961,71 @@ fn emit_expr(em: &mut BodyEmitter<'_>, expr: &HirExpr) -> Result<Word, BodyCodeg
                     Err(BodyCodegenError::UnexpectedHir(
                         "coopmat_store used in expression position (must be a statement)"
                     ))
+                }
+            }
+        }
+        HirExprKind::Q4_0Builtin { op, args, buf_param_index } => {
+            // M2.5: Dispatch to q4_0 module.
+            use crate::q4_0 as q;
+            use axc_hir::q4_0::Q4_0Builtin;
+            match op {
+                Q4_0Builtin::PtrReadU8Zext | Q4_0Builtin::PtrReadU16Zext => {
+                    // args[0] is the buffer-param placeholder (BoolLit, never evaluated).
+                    // args[1] is the byte_offset expression.
+                    if args.len() != 2 {
+                        return Err(BodyCodegenError::UnexpectedHir(
+                            "ptr_read_u8/u16_zext: expected 2 args"
+                        ));
+                    }
+                    let buf_slot = buf_param_index.ok_or(BodyCodegenError::UnexpectedHir(
+                        "ptr_read_u8/u16_zext: buf_param_index is None"
+                    ))?;
+                    let byte_offset_id = emit_expr(em, &args[1])?;
+                    let bindings = em.res.buffer_bindings
+                        .ok_or(BodyCodegenError::UnexpectedHir(
+                            "ptr_read_u8/u16_zext: no BufferBindings in resources"
+                        ))?;
+                    let buf_var_id = *bindings.var_ids.get(&buf_slot)
+                        .ok_or(BodyCodegenError::UnexpectedHir(
+                            "ptr_read_u8/u16_zext: buffer_binding not in var_ids"
+                        ))?;
+                    let elem_ptr_ty = *bindings.elem_ptr_ids.get(&buf_slot)
+                        .ok_or(BodyCodegenError::UnexpectedHir(
+                            "ptr_read_u8/u16_zext: buffer_binding not in elem_ptr_ids"
+                        ))?;
+                    match op {
+                        Q4_0Builtin::PtrReadU8Zext => {
+                            q::emit_ptr_read_u8_zext(
+                                em.b, em.type_cache, em.caps,
+                                buf_var_id, elem_ptr_ty, byte_offset_id,
+                            )
+                        }
+                        Q4_0Builtin::PtrReadU16Zext => {
+                            q::emit_ptr_read_u16_zext(
+                                em.b, em.type_cache, em.caps,
+                                buf_var_id, elem_ptr_ty, byte_offset_id,
+                            )
+                        }
+                        _ => unreachable!("inner match covers only U8/U16 variants"),
+                    }
+                }
+                Q4_0Builtin::F16BitsToF32 => {
+                    if args.len() != 1 {
+                        return Err(BodyCodegenError::UnexpectedHir(
+                            "f16_bits_to_f32: expected 1 arg"
+                        ));
+                    }
+                    let bits_id = emit_expr(em, &args[0])?;
+                    q::emit_f16_bits_to_f32(em.b, em.type_cache, em.caps, bits_id)
+                }
+                Q4_0Builtin::F32FromU32 => {
+                    if args.len() != 1 {
+                        return Err(BodyCodegenError::UnexpectedHir(
+                            "f32_from_u32: expected 1 arg"
+                        ));
+                    }
+                    let u_id = emit_expr(em, &args[0])?;
+                    q::emit_f32_from_u32(em.b, em.type_cache, u_id)
                 }
             }
         }
@@ -1980,5 +2066,27 @@ fn reduce_sum(n: u32, src: readonly_buffer[f32], dst: buffer[f32]) -> void {\n\
         assert!(has_op(&words, Op::ControlBarrier), "expected OpControlBarrier");
         assert!(has_op(&words, Op::Return), "expected OpReturn after barrier");
     }
-}
 
+    // ── M2.5: Q4_0 diagnostic test — check capability emission ───────────────
+
+    // debug_q4_0_check_capabilities: ptr_read_u8_zext on readonly_buffer[u8] emits Int8 cap
+    #[test]
+    fn debug_q4_0_check_capabilities() {
+        // Minimal Q4_0 kernel with ptr_read_u8_zext to check Int8 capability emission.
+        let src = concat!(
+            "@kernel @workgroup(64,1,1) ",
+            "@intent(\"test\") @complexity(O(n)) @precondition(true)\n",
+            "fn q4_0_test(q: readonly_buffer[u8], n_blocks: u32) -> void {\n",
+            "    let b: u32 = ptr_read_u8_zext(q, 0u32);\n",
+            "    return;\n",
+            "}\n",
+        );
+        let words = compile_to_words(src);
+        // INT8 capability = 39 (spirv-0.3.0+sdk-1.3.268.0: Capability::Int8 = 39u32)
+        assert!(has_capability(&words, 39),
+            "ptr_read_u8_zext on readonly_buffer[u8] must emit OpCapability Int8 (39)");
+        // StorageBuffer8BitAccess capability = 4448
+        assert!(has_capability(&words, 4448),
+            "ptr_read_u8_zext on readonly_buffer[u8] must emit OpCapability StorageBuffer8BitAccess (4448)");
+    }
+}

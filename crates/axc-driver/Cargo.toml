@@ -61,3 +61,5 @@ criterion = { workspace = true }
 rand = { workspace = true }
 # M2.2: Serde for baselines.json and candidate-baselines.json serialization.
 serde = { workspace = true }
+# M2.5: half crate for bit-exact f16 → f32 conversion in Q4_0 CPU reference.
+half = "2"

@@ -10,6 +10,7 @@
 //! M1.4 adds `SubgroupBuiltin` expression kind and `Barrier` statement kind.
 //! M2.1 adds `CoopMatBuiltin` expression kind and `CoopMatStore` statement kind for
 //!       cooperative-matrix operations.
+//! M2.5 adds `Q4_0Builtin` expression kind for byte-level access and f16 conversion.
 
 use axc_lexer::Span;
 use crate::ty::{ScalarTy, IntLiteralValue, FloatLiteralValue};
@@ -153,6 +154,23 @@ pub enum HirExprKind {
         args: Vec<HirExpr>,
         result_ty: CoopMatKey,
         /// Buffer-parameter binding slot (0-based) used by Load to synthesize OpAccessChain.
+        buf_param_index: Option<u32>,
+    },
+    /// Q4_0-path builtin call (M2.5).
+    ///
+    /// Covers the four byte-access and conversion primitives:
+    /// - `ptr_read_u8_zext(buf, byte_offset) -> u32`
+    /// - `ptr_read_u16_zext(buf, byte_offset) -> u32`
+    /// - `f16_bits_to_f32(bits: u32) -> f32`
+    /// - `f32_from_u32(u: u32) -> f32`
+    ///
+    /// For the `ptr_read_*` variants, `buf_param_index` is the 0-based buffer-only
+    /// binding slot used by the SPIR-V emitter to look up the SSBO variable id.
+    /// For the conversion variants (`F16BitsToF32`, `F32FromU32`), `buf_param_index` is `None`.
+    Q4_0Builtin {
+        op: crate::q4_0::Q4_0Builtin,
+        args: Vec<HirExpr>,
+        /// Buffer-parameter binding slot (0-based); `Some` for ptr_read_* builtins.
         buf_param_index: Option<u32>,
     },
 }

@@ -80,6 +80,22 @@
       "median_ns": 42092256,
       "low_ns": 40943141,
       "high_ns": 43583778
+    },
+    {
+      "group": "dispatch_gpu_q4_0",
+      "bench": "dispatch_gpu_q4_0_128",
+      "median_ns": null,
+      "low_ns": null,
+      "high_ns": null,
+      "note": "M2.5: baseline not yet measured on target hardware; null until first GPU bench run"
+    },
+    {
+      "group": "dispatch_gpu_q4_0",
+      "bench": "dispatch_gpu_q4_0_1024",
+      "median_ns": null,
+      "low_ns": null,
+      "high_ns": null,
+      "note": "M2.5: baseline not yet measured on target hardware; null until first GPU bench run"
     }
   ]
 }
