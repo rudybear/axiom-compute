@@ -1,0 +1,50 @@
+{
+  "id": "M2.5-q4_0-matmul",
+  "title": "Q4_0 quantized matmul — llama.cpp-style dequant + matmul beachhead",
+  "phase": "M2",
+  "goal": "Ship a Q4_0 dequantize + matmul compute kernel matching the llama.cpp ggml quantization scheme. Smaller, simpler analog of full Q4_K_M (deferred). Proves AXIOM-Compute can express real LLM inference kernels and establishes a baseline against llama.cpp Vulkan for the beachhead claim from DESIGN.md §5. This is the first non-toy kernel in the project.",
+  "scope_in": [
+    "Q4_0 block structure: 32 f32 elements per block = 1 f16 scale (2 B) + 16 signed 4-bit weights packed in 16 bytes. Block size = 18 bytes. Dequant: value_i = (nibble_i - 8) * f16_to_f32(scale).",
+    "SPIR-V: OpCapability Int8 + Int16 + SPV_KHR_8bit_storage + SPV_KHR_16bit_storage (for f16 scale)",
+    "AXIOM surface: new type alias not needed — use buffer[u8] with ptr_read_u8 semantics. Document the block layout in comments and DESIGN.md.",
+    "Kernel: `q4_0_dequant_matvec(q: readonly_buffer[u8], x: readonly_buffer[f32], y: buffer[f32], n_blocks: u32)` — for each f32 output element, dequantize the 32-element block of weights, multiply by x[k..k+32], accumulate into y[i]. Single-kernel per-output-element for M2.5 simplicity; tiled/vectorized version is M3.",
+    "Bitwise builtins already in place: `band(byte, 0x0F)` extracts low nibble, `lshr(byte, 4u32)` + `band(_, 0x0F)` extracts high nibble. Nibble is 0..15 unsigned; subtract 8 and cast to signed: `(nibble as i32) - 8`",
+    "f16 -> f32 conversion: new builtin `f16_to_f32(u16_bits) -> f32` that emits OpFConvert from an OpCapability Float16 u16 load. Or use the cooperative-matrix crate's existing mechanism. Pick: dedicated builtin, OpConvertFToF from OpBitcast u16->f16.",
+    "Example: `examples/q4_0_dequant_matvec.axc` — one kernel, ~30 lines, fully annotated with @strict + @equiv_fp_tol",
+    "Integration test: `crates/axc-driver/tests/compile_q4_0_dequant_matvec.rs` — compile + spirv-val + dispatch (N=128 blocks, random weights, random x), assert fp32 output matches a CPU reference within 1e-3 relative tolerance (fp16 scale introduces rounding)",
+    "Bench: new group `dispatch_gpu_q4_0` timing the full dequant+matvec for two sizes (128 blocks, 1024 blocks)",
+    "CPU reference implementation in Rust (in tests/common.rs) that matches llama.cpp's Q4_0 semantics"
+  ],
+  "scope_out": [
+    "Q4_K_M (superblock with minimum-max scales, 256-element blocks) — M2.6 or later",
+    "Q5_0 / Q8_0 (future quantization schemes)",
+    "Full matmul (matrix x matrix, not matvec) — M3 with cooperative_matrix",
+    "Tiled / subgroup-optimized variants — M3",
+    "Autotuner (M2.3 @strategy holes)",
+    "llama.cpp production integration / GGUF file parsing — separate integration project",
+    "Direct comparison against llama.cpp Vulkan baseline — parity claim requires its own milestone with per-op timing at workload scale (pre-M3)"
+  ],
+  "acceptance_criteria": [
+    "cargo test --workspace passes (≥520 after M2.5)",
+    "cargo clippy --workspace --all-targets -- -D warnings clean",
+    "q4_0_dequant_matvec compiles to valid SPIR-V (in-process spirv-tools)",
+    "Dispatch on NVIDIA RTX PRO 6000 produces output matching CPU reference within 1e-3 relative tolerance for 128-block matvec",
+    "Same dispatch on Lavapipe (CI) within same tolerance",
+    "Q4_0 block layout documented in DESIGN.md §3.1.8",
+    "New bench entries for dispatch_gpu_q4_0_128 and dispatch_gpu_q4_0_1024 in baselines.json (blessed on merge)",
+    "CPU reference exposed via pub fn q4_0_dequant_matvec_cpu for bench reuse"
+  ],
+  "memory_limit_gb": 50,
+  "dependencies": ["M2.3a-dispatch-perf"],
+  "blocks": ["M3.1-flash-attention"],
+  "estimated_loc": "800-1500",
+  "estimated_tests_added": "12-20",
+  "open_questions_for_architect": [
+    "f16_to_f32 builtin: dedicated op or reinterpret via OpBitcast + OpFConvert? Recommend dedicated to avoid exposing bitcast surface.",
+    "i16 reinterpret of u16 bits for sign-extension: Vulkan's OpBitcast handles this, but our language needs a builtin. Recommend `u16_bits_to_f16(u: u32) -> f32` via u16 load + bitcast + FConvert.",
+    "Signed 4-bit arithmetic: store nibble as u32 in [0,15], subtract 8, cast to signed. No native i4 type.",
+    "Memory layout for the buffer[u8] Q4_0 blob: packed tightly, 18 bytes per block, block_idx × 18 computes byte offset? Spec exactly.",
+    "Workgroup size for matvec: one invocation per output element OR one subgroup per block? Start simple: one invocation per output, each iterating over all blocks. O(n_blocks) per thread; brute-force for M2.5.",
+    "Correctness tolerance: 1e-3 relative is generous (matches llama.cpp's own tolerance). Spec explicit in tests."
+  ]
+}
