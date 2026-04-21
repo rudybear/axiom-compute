@@ -250,17 +250,15 @@ fn bytes_to_words_roundtrip_length_invariant() {
 /// A single Q4_0 block where:
 ///   - scale = 1.0 (f16 0x3C00, bytes 0x00, 0x3C)
 ///   - every data byte = 0x80  →  lo_nibble=0, hi_nibble=8
-///   → dequantized weight at index k (0..16) = (0 - 8) * 1.0 = -8.0
-///   → dequantized weight at index k+16 (16..32) = (8 - 8) * 1.0 = 0.0
+///     → dequantized weight at index k (0..16) = (0 - 8) * 1.0 = -8.0
+///     → dequantized weight at index k+16 (16..32) = (8 - 8) * 1.0 = 0.0
 fn fixture_single_block_scale_one_half_weights() -> Vec<u8> {
     let mut q: Vec<u8> = Vec::with_capacity(18);
     // f16 scale 1.0 bits = 0x3C00, little-endian.
     q.push(0x00);
     q.push(0x3C);
     // 16 data bytes each 0x80 → low nibble=0x0, high nibble=0x8.
-    for _ in 0..16 {
-        q.push(0x80);
-    }
+    q.extend(std::iter::repeat_n(0x80u8, 16));
     q
 }
 
@@ -315,9 +313,7 @@ fn q4_0_cpu_reference_layout_discriminating_fixture() {
     q.push(0x00);
     q.push(0x3C);
     // All data bytes = 0x12 → lo=0x2, hi=0x1.
-    for _ in 0..16 {
-        q.push(0x12);
-    }
+    q.extend(std::iter::repeat_n(0x12u8, 16));
 
     let mut x: Vec<f32> = vec![0.0_f32; 32];
     for xk in x.iter_mut().take(16) {

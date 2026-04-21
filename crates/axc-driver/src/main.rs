@@ -5,15 +5,32 @@
 
 use clap::Parser as ClapParser;
 use axc_driver::{Cli, Command, compile_file};
+use axc_driver::optimize::run_optimize;
 
 fn main() -> miette::Result<()> {
     let cli: Cli = Cli::parse();
 
     match cli.command {
-        Command::Compile { input, output } => {
-            compile_file(&input, &output).map_err(|e| {
-                miette::miette!("{}", e)
-            })
+        Command::Compile { input, output, strategy_values } => {
+            if strategy_values.is_empty() {
+                compile_file(&input, &output).map_err(|e| {
+                    miette::miette!("{}", e)
+                })
+            } else {
+                // M2.3: per-variant compilation with explicit hole assignments.
+                let mut assignments: std::collections::BTreeMap<String, i64> =
+                    std::collections::BTreeMap::new();
+                for sv in strategy_values {
+                    assignments.insert(sv.name, sv.value);
+                }
+                let source: String = std::fs::read_to_string(&input)
+                    .map_err(|e| miette::miette!("io error reading {:?}: {}", input, e))?;
+                let (bytes, _meta) = axc_driver::compile_source_with_assignments(&source, &assignments)
+                    .map_err(|e| miette::miette!("{}", e))?;
+                std::fs::write(&output, &bytes)
+                    .map_err(|e| miette::miette!("io error writing {:?}: {}", output, e))?;
+                Ok(())
+            }
         }
         Command::Lex { input } => {
             let source: String = std::fs::read_to_string(&input).map_err(|e| {
@@ -24,6 +41,10 @@ fn main() -> miette::Result<()> {
                 println!("{:?}", tok.kind);
             }
             Ok(())
+        }
+        Command::Optimize { input, output, correctness } => {
+            run_optimize(&input, &output, &correctness)
+                .map_err(|e| miette::miette!("{}", e))
         }
     }
 }

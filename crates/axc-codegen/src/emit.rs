@@ -77,6 +77,18 @@ pub enum CodegenError {
     TooManyKernelsInM0 { got: usize },
     #[error("internal rspirv assembly error: {0}")]
     Rspirv(String),
+    /// M2.3: Backstop guard — strategy holes must be resolved by the enumerator
+    /// before codegen. If a kernel with `@strategy` holes reaches `emit_module`
+    /// without resolution, codegen must refuse rather than emit SPIR-V with
+    /// placeholder workgroup dimensions (1×1×1), which would be silently wrong.
+    #[error(
+        "kernel `{kernel_name}` has unresolved @strategy holes `{holes:?}`; \
+         resolve via axc-optimize before calling emit_module"
+    )]
+    UnresolvedStrategyHole {
+        kernel_name: String,
+        holes: Vec<String>,
+    },
 }
 
 /// Emit a SPIR-V word stream (`Vec<u32>`) from a validated HIR module.
@@ -92,6 +104,18 @@ pub fn emit_module(hir: &HirModule, opts: &CodegenOptions) -> Result<Vec<u32>, C
     }
 
     let kernel = &hir.kernels[0];
+
+    // M2.3: Backstop guard — refuse to emit SPIR-V if strategy holes are unresolved.
+    // The enumerator in axc-optimize must call `resolve_single_variant` first, which
+    // replaces `annotations.strategy` with `None` and rewrites workgroup dims.
+    if let Some(ref strategy) = kernel.annotations.strategy {
+        let hole_names: Vec<String> = strategy.map.keys().cloned().collect();
+        return Err(CodegenError::UnresolvedStrategyHole {
+            kernel_name: kernel.name.clone(),
+            holes: hole_names,
+        });
+    }
+
     let wg = &kernel.annotations.workgroup;
 
     // ── Step 0: Create builder and set version FIRST ─────────────────────────
@@ -820,6 +844,7 @@ mod tests {
                 preconditions: Vec::new(),
                 subgroup_uniform: false,
                 cooperative_matrix: false,
+                strategy: None,
             },
             params: Vec::new(),
             binding_plan: ParamBindingPlan {
@@ -1539,5 +1564,44 @@ mod tests {
             !caps.contains(&Capability::GroupNonUniformBallot),
             "GroupNonUniformBallot must NOT be present for subgroup_all; caps: {caps:?}"
         );
+    }
+
+    // ── M2.3: AT-1013 — codegen backstop for unresolved strategy holes ────────
+
+    /// AT-1013: emit_module must return UnresolvedStrategyHole when a kernel
+    /// carries an unresolved @strategy annotation (holes not resolved by optimizer).
+    ///
+    /// This is the backstop guard: the enumerator in axc-optimize calls
+    /// `resolve_single_variant` before codegen, but if it is somehow skipped,
+    /// codegen must refuse rather than silently emit a 1×1×1 kernel.
+    #[test]
+    fn at_1013_codegen_rejects_unresolved_strategy_holes() {
+        use axc_hir::hir::StrategyHoles;
+        use std::collections::BTreeMap;
+
+        // Build a valid HIR first (no strategy) and then manually inject strategy
+        // holes to simulate the forbidden state that should never reach codegen.
+        let src = "@kernel @workgroup(64,1,1) fn mykern() -> void { return; }";
+        let (ast, lex_errs, parse_errs) = parse(src);
+        assert!(lex_errs.is_empty());
+        assert!(parse_errs.is_empty());
+        let (mut hir, hir_errs, _warns) = lower_module(&ast);
+        assert!(hir_errs.is_empty());
+
+        // Inject unresolved strategy holes directly into the HIR (simulate missing resolution).
+        let mut map: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+        map.insert("workgroup_x".to_string(), vec![32, 64, 128]);
+        hir.kernels[0].annotations.strategy = Some(StrategyHoles { map });
+
+        let result = emit_module(&hir, &CodegenOptions::default());
+        match result {
+            Err(CodegenError::UnresolvedStrategyHole { ref kernel_name, ref holes }) => {
+                assert_eq!(kernel_name, "mykern",
+                    "kernel_name should be 'mykern'; got {kernel_name:?}");
+                assert_eq!(holes, &["workgroup_x"],
+                    "holes should list 'workgroup_x'; got {holes:?}");
+            }
+            other => panic!("expected UnresolvedStrategyHole, got {other:?}"),
+        }
     }
 }

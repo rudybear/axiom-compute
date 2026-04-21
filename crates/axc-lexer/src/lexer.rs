@@ -232,6 +232,16 @@ impl<'src> Lexer<'src> {
     }
 
     fn lex_opt_hole(&mut self, start: u32) -> (Token, Option<LexError>) {
+        // M2.3: `?` followed by `[` → emit Question token so the parser can
+        // construct an AnnotationArg::Hole from the bracket-delimited list.
+        // `?` followed by an identifier → emit OptHole(name) as before.
+        // `?` followed by anything else (including EOF) → emit Question and let
+        // the parser produce ParseError::QuestionMarkExpectsBracketOrIdent.
+        if !self.is_at_end() && self.peek() == b'[' {
+            // Leave `[` for the parser to consume as LBracket.
+            return (Token::new(TokenKind::Question, Span::new(start, self.pos)), None);
+        }
+
         let name_start: u32 = self.pos;
         while !self.is_at_end() && (self.peek().is_ascii_alphanumeric() || self.peek() == b'_') {
             self.advance();
@@ -240,9 +250,10 @@ impl<'src> Lexer<'src> {
             &self.source[name_start as usize..self.pos as usize],
         ).into_owned();
         if name.is_empty() {
+            // `?` at EOF or before a non-identifier, non-`[` token.
+            // Emit Question so the parser can produce a structured error.
             let span: Span = Span::new(start, self.pos);
-            let err: LexError = LexError::UnexpectedChar { ch: '?', span };
-            (Token::new(TokenKind::Error("expected name after '?'".into()), span), Some(err))
+            (Token::new(TokenKind::Question, span), None)
         } else {
             (Token::new(TokenKind::OptHole(name), Span::new(start, self.pos)), None)
         }

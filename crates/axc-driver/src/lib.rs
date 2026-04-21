@@ -11,6 +11,7 @@
 //! Codegen runs ONLY when all three error lists are empty.
 
 pub mod cli;
+pub mod optimize;
 
 pub use cli::{Command, Cli};
 
@@ -138,6 +139,125 @@ pub fn compile_source_with_meta(source: &str) -> Result<(Vec<u8>, KernelMetadata
 pub fn compile_source_to_spirv(source: &str) -> Result<Vec<u8>, DriverError> {
     let (bytes, _meta) = compile_source_with_meta(source)?;
     Ok(bytes)
+}
+
+/// M2.3: Full pipeline with strategy hole pre-resolution.
+///
+/// Like `compile_source_with_meta` but accepts explicit hole assignments that
+/// substitute named `?hole` references with concrete integer values before
+/// HIR construction.
+///
+/// This is the per-variant compilation path called by `axc optimize` (and
+/// `axc compile --strategy-value`).  Each call compiles one strategy variant.
+///
+/// `assignments`: map of hole name → concrete value.  Holes not listed here
+/// retain whatever default the source provides (first candidate).
+///
+/// Returns `DriverError::Compile` if any pipeline phase fails after substitution.
+pub fn compile_source_with_assignments(
+    source: &str,
+    assignments: &std::collections::BTreeMap<String, i64>,
+) -> Result<(Vec<u8>, KernelMetadata), DriverError> {
+    // Strategy substitution: rewrite `?hole` references in the source text to
+    // their concrete integer values before lexing.  This is source-text
+    // substitution (NOT AST rewrite) for byte-identical SPIR-V reproducibility.
+    //
+    // The substituted source is fed to the normal pipeline.
+    let substituted: String = substitute_strategy_holes(source, assignments);
+    compile_source_with_meta(&substituted)
+}
+
+/// M2.3: Substitute strategy hole references in source text and strip @strategy block.
+///
+/// Performs two passes:
+///
+/// 1. For each `(name, value)` in `assignments`, replaces all occurrences of
+///    `?name` in the source with the decimal representation of `value`.
+///    (Alphabetical BTreeMap order for determinism.)
+///
+/// 2. Strips the entire `@strategy { ... }` annotation block from the result.
+///    This is necessary because after hole-ref substitution, the @strategy block
+///    would still contain `?[...]` candidate lists that HIR would lower to
+///    StrategyHoles — triggering the codegen UnresolvedStrategyHole backstop.
+///    Stripping it signals that the holes are fully resolved.
+///
+/// The strip is simple-text-level: finds the first `@strategy` followed by
+/// whitespace and `{`, then removes through the matching `}`.  This handles
+/// the common single-level case.  Nested braces are not supported (M2.3 scope).
+pub(crate) fn substitute_strategy_holes(
+    source: &str,
+    assignments: &std::collections::BTreeMap<String, i64>,
+) -> String {
+    // Pass 1: substitute ?name references.
+    let mut result: String = source.to_string();
+    for (name, value) in assignments {
+        let hole_ref: String = format!("?{name}");
+        let replacement: String = value.to_string();
+        result = result.replace(&hole_ref, &replacement);
+    }
+
+    // Pass 2: strip @strategy { ... } block.
+    // After Pass 1 the hole refs in @workgroup are integers, but @strategy still
+    // has ?[...] candidate lists. Removing the block prevents HIR from lowering
+    // the residual candidates into StrategyHoles (which would trip the backstop).
+    result = strip_strategy_annotation_block(&result);
+
+    result
+}
+
+/// Strip the first `@strategy { ... }` annotation block from source text.
+///
+/// Finds `@strategy` followed by optional whitespace and `{`, then removes
+/// the entire span including the closing `}`.  Content between the braces is
+/// discarded.  Only single-level brace nesting is handled (sufficient for M2.3).
+///
+/// If no `@strategy {` is found, the source is returned unchanged.
+pub(crate) fn strip_strategy_annotation_block(source: &str) -> String {
+    // Find `@strategy` in the text.
+    let Some(at_pos) = source.find("@strategy") else {
+        return source.to_string();
+    };
+
+    // After `@strategy`, skip whitespace and look for `{`.
+    let after_keyword: &str = &source[at_pos + "@strategy".len()..];
+    let trimmed: &str = after_keyword.trim_start_matches([' ', '\t', '\r', '\n']);
+    if !trimmed.starts_with('{') {
+        // Not the curly-brace form; leave unchanged (e.g. @strategy(...) call form).
+        return source.to_string();
+    }
+
+    // Find the opening brace position in the original source.
+    let open_brace_offset: usize = at_pos
+        + "@strategy".len()
+        + (after_keyword.len() - trimmed.len());
+
+    // Scan forward to find the matching closing brace (depth tracking).
+    let bytes: &[u8] = source.as_bytes();
+    let mut depth: usize = 0;
+    let mut close_pos: Option<usize> = None;
+    for (i, &byte) in bytes.iter().enumerate().skip(open_brace_offset) {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    close_pos = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let close_pos: usize = match close_pos {
+        Some(p) => p,
+        None => return source.to_string(), // Unmatched brace — leave unchanged.
+    };
+
+    // Build the stripped source: everything before `@strategy` + everything after `}`.
+    let before: &str = &source[..at_pos];
+    let after: &str = &source[close_pos + 1..];
+    format!("{before}{after}")
 }
 
 /// Compute the metadata sidecar path from an output path.
@@ -436,5 +556,62 @@ mod tests {
                 "expected DriverError::Compile with all three phases non-empty; got: {other:?}"
             ),
         }
+    }
+
+    // ── AT-1043..AT-1045: Strategy hole source-text substitution tests ────────
+
+    /// AT-1043: substitute_strategy_holes replaces ?name with integer value.
+    #[test]
+    fn at_1043_substitute_strategy_holes_basic() {
+        let mut assignments: std::collections::BTreeMap<String, i64> =
+            std::collections::BTreeMap::new();
+        assignments.insert("wg".to_string(), 64);
+
+        let src = "@workgroup(?wg, 1, 1)";
+        let result = substitute_strategy_holes(src, &assignments);
+        // After substitution, ?wg → 64; @strategy block stripped (none present here).
+        assert_eq!(result, "@workgroup(64, 1, 1)",
+            "substitute_strategy_holes must replace ?wg with 64");
+    }
+
+    /// AT-1044: strip_strategy_annotation_block removes @strategy { ... } from source.
+    #[test]
+    fn at_1044_strip_strategy_block_removes_annotation() {
+        let src = "@kernel @workgroup(64,1,1) @strategy { x: ?[32, 64] } fn k() -> void { return; }";
+        let result = strip_strategy_annotation_block(src);
+        assert!(
+            !result.contains("@strategy"),
+            "strip_strategy_annotation_block must remove @strategy block; got {result:?}"
+        );
+        assert!(
+            result.contains("@kernel"),
+            "rest of source must be preserved; got {result:?}"
+        );
+        assert!(
+            result.contains("fn k()"),
+            "kernel declaration must be preserved; got {result:?}"
+        );
+    }
+
+    /// AT-1045: compile_source_with_assignments + strategy strips correctly produce valid SPIR-V.
+    #[test]
+    fn at_1045_compile_with_assignments_end_to_end() {
+        let src = concat!(
+            "@kernel @workgroup(?wg_x, 1, 1)\n",
+            "@strategy { wg_x: ?[32, 64, 128] }\n",
+            "fn tune() -> void { return; }\n",
+        );
+
+        let mut assignments: std::collections::BTreeMap<String, i64> =
+            std::collections::BTreeMap::new();
+        assignments.insert("wg_x".to_string(), 128);
+
+        let (bytes, meta) = compile_source_with_assignments(src, &assignments)
+            .expect("compile must succeed with wg_x=128");
+
+        assert_eq!(&bytes[0..4], &[0x03, 0x02, 0x23, 0x07],
+            "SPIR-V magic must be correct");
+        assert_eq!(meta.workgroup_size, [128, 1, 1],
+            "workgroup_size must reflect resolved wg_x=128");
     }
 }

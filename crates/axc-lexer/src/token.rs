@@ -219,6 +219,12 @@ pub enum TokenKind {
     Eof,
     /// Error token — lexer recovered and continued. The string is the error message.
     Error(String),
+    /// `?` — M2.3 strategy-hole sigil (bare question mark, before `[` or at EOF).
+    ///
+    /// Emitted by the lexer when `?` is followed by `[` (declaration site) so that
+    /// the parser can handle `?[...]` as a hole-candidate list. `?ident` is still
+    /// lexed as `OptHole(String)` for the reference-site form.
+    Question,
 }
 
 impl TokenKind {
@@ -360,7 +366,8 @@ impl TokenKind {
             | TokenKind::LBrace
             | TokenKind::RBrace
             | TokenKind::Eof
-            | TokenKind::Error(_) => None,
+            | TokenKind::Error(_)
+            | TokenKind::Question => None,
         }
     }
 }
