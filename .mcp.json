@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "axc": {
+      "command": "cargo",
+      "args": ["run", "--quiet", "--release", "-p", "axc-driver", "--", "mcp"],
+      "env": {
+        "AXC_ENABLE_GPU_TESTS": "1"
+      }
+    }
+  }
+}
