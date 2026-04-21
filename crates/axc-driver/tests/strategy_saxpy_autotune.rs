@@ -169,3 +169,113 @@ fn at_1031f_substitute_strategy_holes_replaces_all_refs() {
         .expect("compilation with assignments must succeed");
     assert!(!bytes.is_empty(), "bytes must be non-empty after substitution");
 }
+
+// ── AT-1046..AT-1050: Additional integration tests ────────────────────────────
+
+/// AT-1046: All three SAXPY strategy variants (workgroup_x ∈ {32,64,128}) compile ok.
+#[test]
+fn at_1046_all_three_variants_compile_to_valid_spirv() {
+    for wg_x in [32i64, 64, 128] {
+        let mut assignments: BTreeMap<String, i64> = BTreeMap::new();
+        assignments.insert("workgroup_x".to_string(), wg_x);
+
+        let (bytes, meta) = compile_source_with_assignments(SAXPY_STRATEGY_SRC, &assignments)
+            .unwrap_or_else(|e| panic!("compile failed for wg_x={wg_x}: {e}"));
+
+        assert_eq!(&bytes[0..4], &[0x03, 0x02, 0x23, 0x07],
+            "SPIR-V magic must be correct for wg_x={wg_x}");
+        assert_eq!(meta.workgroup_size[0], wg_x as u32,
+            "workgroup_size[0] must be {wg_x}");
+    }
+}
+
+/// AT-1047: HIR for SAXPY strategy kernel reports UnusedStrategyHole warning for unused hole.
+///
+/// If the source has `@strategy { workgroup_x: ?[...] }` but `?workgroup_x` is NOT
+/// referenced in any other annotation, the HIR validator emits UnusedStrategyHole.
+/// Here we use a source where the @workgroup uses a literal, not a HoleRef, so the
+/// hole is unused.
+#[test]
+fn at_1047_hir_warns_unused_strategy_hole() {
+    use axc_hir::lower_module;
+    use axc_hir::validate::HirWarning;
+    use axc_parser::parse;
+
+    let src = concat!(
+        "@kernel @workgroup(64, 1, 1)\n",
+        "@strategy { workgroup_x: ?[32, 64, 128] }\n",
+        "fn unused_hole_test() -> void { return; }\n",
+    );
+
+    let (ast, _, _) = parse(src);
+    let (_hir, _errs, warns) = lower_module(&ast);
+
+    assert!(
+        warns.iter().any(|w| matches!(w, HirWarning::UnusedStrategyHole { .. })),
+        "expected UnusedStrategyHole warning; got: {warns:?}"
+    );
+}
+
+/// AT-1048: enumerate_strategy ordinals are exactly 0, 1, 2 for 3-candidate hole.
+#[test]
+fn at_1048_ordinals_are_sequential() {
+    use axc_hir::lower_module;
+    use axc_parser::parse;
+    use axc_optimize::enumerator::enumerate_strategy;
+
+    let (ast, _, _) = parse(SAXPY_STRATEGY_SRC);
+    let (hir, errs, _) = lower_module(&ast);
+    assert!(errs.is_empty(), "hir errors: {errs:?}");
+
+    let kernel = hir.kernels.first().unwrap();
+    let strategy = kernel.annotations.strategy.as_ref().unwrap();
+    let variants = enumerate_strategy(strategy).unwrap();
+
+    let ordinals: Vec<u64> = variants.iter().map(|v| v.ordinal).collect();
+    assert_eq!(ordinals, vec![0, 1, 2],
+        "ordinals must be exactly [0, 1, 2] for 3 candidates");
+}
+
+/// AT-1049: variant_id for different ordinals are unique across all 3 SAXPY candidates.
+#[test]
+fn at_1049_variant_ids_unique_for_all_saxpy_candidates() {
+    use axc_hir::lower_module;
+    use axc_parser::parse;
+    use axc_optimize::enumerator::enumerate_strategy;
+
+    let (ast, _, _) = parse(SAXPY_STRATEGY_SRC);
+    let (hir, _, _) = lower_module(&ast);
+    let kernel = hir.kernels.first().unwrap();
+    let strategy = kernel.annotations.strategy.as_ref().unwrap();
+    let variants = enumerate_strategy(strategy).unwrap();
+
+    let ids: Vec<u64> = variants.iter().map(|v| v.variant_id).collect();
+    // All three must be distinct.
+    let unique_count = {
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        sorted.len()
+    };
+    assert_eq!(unique_count, 3,
+        "all 3 variant_ids must be distinct; got {ids:?}");
+}
+
+/// AT-1050: codegen backstop fires for SAXPY kernel with unresolved strategy.
+#[test]
+fn at_1050_codegen_backstop_fires_for_unresolved_saxpy() {
+    use axc_hir::lower_module;
+    use axc_parser::parse;
+    use axc_codegen::emit::{emit_module, CodegenOptions, CodegenError};
+
+    let (ast, _, _) = parse(SAXPY_STRATEGY_SRC);
+    let (hir, errs, _) = lower_module(&ast);
+    assert!(errs.is_empty(), "hir errors: {errs:?}");
+
+    // Don't resolve the strategy — pass the HIR directly to emit_module.
+    let result = emit_module(&hir, &CodegenOptions::default());
+    assert!(
+        matches!(result, Err(CodegenError::UnresolvedStrategyHole { .. })),
+        "emit_module must return UnresolvedStrategyHole for unresolved strategy; got {result:?}"
+    );
+}

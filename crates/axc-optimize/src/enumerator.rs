@@ -413,4 +413,81 @@ mod tests {
         let holes = StrategyHoles { map };
         assert_eq!(cartesian_product_size(&holes), 6);
     }
+
+    // ── AT-1036..AT-1039: Additional enumerator tests ─────────────────────────
+
+    /// AT-1036: CARTESIAN_WARN_THRESHOLD is 100.
+    #[test]
+    fn at_1036_cartesian_warn_threshold_is_100() {
+        assert_eq!(CARTESIAN_WARN_THRESHOLD, 100);
+    }
+
+    /// AT-1037: variant_id encoding is xxh3_64 of canonical bytes.
+    ///
+    /// Manually compute expected bytes for workgroup_x=64 and verify.
+    #[test]
+    fn at_1037_variant_id_canonical_encoding() {
+        use xxhash_rust::xxh3::xxh3_64;
+
+        // Single hole: workgroup_x=64.
+        // Canonical encoding: u32-LE name_len + UTF-8 name + i64-LE value.
+        let name = b"workgroup_x";
+        let value: i64 = 64;
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        buf.extend_from_slice(name);
+        buf.extend_from_slice(&value.to_le_bytes());
+        let expected_id: u64 = xxh3_64(&buf);
+
+        let mut map: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+        map.insert("workgroup_x".to_string(), vec![32, 64, 128]);
+        let holes = StrategyHoles { map };
+        let variants = enumerate_strategy(&holes).unwrap();
+
+        // ordinal 1 = workgroup_x=64
+        assert_eq!(variants[1].variant_id, expected_id,
+            "variant_id must match manual xxh3_64 computation");
+    }
+
+    /// AT-1038: resolve_single_variant with unknown hole returns UnknownHole error.
+    #[test]
+    fn at_1038_resolve_rejects_unknown_hole_name() {
+        let mut holes_map: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+        holes_map.insert("workgroup_x".to_string(), vec![64]);
+        let kernel = make_kernel_with_strategy(1, holes_map);
+
+        let mut assignment_values: BTreeMap<String, i64> = BTreeMap::new();
+        assignment_values.insert("nonexistent_hole".to_string(), 64);
+        let assignments = StrategyAssignments { values: assignment_values };
+
+        let result = resolve_single_variant(&kernel, &assignments);
+        assert!(
+            matches!(result, Err(crate::EnumerateError::UnknownHole { ref name }) if name == "nonexistent_hole"),
+            "expected UnknownHole for unknown name; got {result:?}"
+        );
+    }
+
+    /// AT-1039: enumerate_strategy with three holes produces correct total variant count.
+    #[test]
+    fn at_1039_three_holes_cartesian_product_count() {
+        let mut map: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+        map.insert("a".to_string(), vec![1, 2]);
+        map.insert("b".to_string(), vec![10, 20, 30]);
+        map.insert("c".to_string(), vec![100, 200]);
+        let holes = StrategyHoles { map };
+
+        let variants = enumerate_strategy(&holes).unwrap();
+        // 2 × 3 × 2 = 12
+        assert_eq!(variants.len(), 12, "2×3×2 should produce 12 variants");
+
+        // Verify alphabetical key ordering: a < b < c
+        assert_eq!(variants[0].assignments.values["a"], 1);
+        assert_eq!(variants[0].assignments.values["b"], 10);
+        assert_eq!(variants[0].assignments.values["c"], 100);
+
+        // Last variant: a=2, b=30, c=200
+        assert_eq!(variants[11].assignments.values["a"], 2);
+        assert_eq!(variants[11].assignments.values["b"], 30);
+        assert_eq!(variants[11].assignments.values["c"], 200);
+    }
 }

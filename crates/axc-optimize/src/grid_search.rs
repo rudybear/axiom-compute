@@ -452,4 +452,75 @@ mod tests {
         assert_eq!(CARTESIAN_WARN_THRESHOLD, 100,
             "CARTESIAN_WARN_THRESHOLD must be 100 per spec");
     }
+
+    // ── AT-1040..AT-1042: Additional grid search tests ────────────────────────
+
+    /// AT-1040: grid_search winner_variant_id matches the variant_id from enumerate_strategy.
+    #[test]
+    fn at_1040_winner_variant_id_matches_enumerator() {
+        use crate::enumerator::enumerate_strategy;
+
+        let kernel = make_strategy_kernel(1, vec![32, 64, 128]);
+        let strategy = kernel.annotations.strategy.as_ref().unwrap();
+        let variants = enumerate_strategy(strategy).unwrap();
+
+        // Use atomic counter so first call wins (ordinal 0 = fastest).
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let bench_fn: BenchFn<'_> = &|_spv: &[u32]| {
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            // First call (ordinal 0) returns 10ns; rest return 100ns.
+            let t = if n == 0 { 10 } else { 100 };
+            Ok(SampleStats { median_ns: t, min_ns: t, max_ns: t, n_samples: 1 })
+        };
+
+        let result = grid_search(
+            &kernel,
+            &CorrectnessPolicy::None,
+            None,
+            bench_fn,
+            &CodegenOptions::default(),
+        ).unwrap();
+
+        // Winner must be ordinal 0; its variant_id must match what enumerate gives.
+        assert_eq!(result.winner_variant_id, variants[0].variant_id,
+            "winner_variant_id must match enumerator variant_id for ordinal 0");
+    }
+
+    /// AT-1041: grid_search returns fallback_used=false when winner benchmarks ok.
+    #[test]
+    fn at_1041_fallback_used_false_when_bench_succeeds() {
+        let kernel = make_strategy_kernel(1, vec![64, 128]);
+
+        let result = grid_search(
+            &kernel,
+            &CorrectnessPolicy::None,
+            None,
+            &|_| Ok(SampleStats { median_ns: 50, min_ns: 40, max_ns: 60, n_samples: 3 }),
+            &CodegenOptions::default(),
+        ).unwrap();
+
+        assert!(!result.fallback_used,
+            "fallback_used must be false when benchmarks succeed");
+    }
+
+    /// AT-1042: grid_search results vec contains all enumerated variants.
+    #[test]
+    fn at_1042_results_vec_contains_all_variants() {
+        let kernel = make_strategy_kernel(1, vec![32, 64, 128, 256]);
+
+        let result = grid_search(
+            &kernel,
+            &CorrectnessPolicy::None,
+            None,
+            &|_| Ok(SampleStats { median_ns: 100, min_ns: 90, max_ns: 110, n_samples: 5 }),
+            &CodegenOptions::default(),
+        ).unwrap();
+
+        assert_eq!(result.results.len(), 4,
+            "results must contain all 4 enumerated variants");
+        // All ordinals 0..3 present
+        let ordinals: Vec<u64> = result.results.iter().map(|r| r.ordinal).collect();
+        assert_eq!(ordinals, vec![0, 1, 2, 3], "ordinals must be 0..3 in order");
+    }
 }

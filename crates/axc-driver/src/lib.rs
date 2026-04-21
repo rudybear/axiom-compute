@@ -220,7 +220,7 @@ pub(crate) fn strip_strategy_annotation_block(source: &str) -> String {
 
     // After `@strategy`, skip whitespace and look for `{`.
     let after_keyword: &str = &source[at_pos + "@strategy".len()..];
-    let trimmed: &str = after_keyword.trim_start_matches(|c: char| c == ' ' || c == '\t' || c == '\r' || c == '\n');
+    let trimmed: &str = after_keyword.trim_start_matches([' ', '\t', '\r', '\n']);
     if !trimmed.starts_with('{') {
         // Not the curly-brace form; leave unchanged (e.g. @strategy(...) call form).
         return source.to_string();
@@ -235,8 +235,8 @@ pub(crate) fn strip_strategy_annotation_block(source: &str) -> String {
     let bytes: &[u8] = source.as_bytes();
     let mut depth: usize = 0;
     let mut close_pos: Option<usize> = None;
-    for i in open_brace_offset..bytes.len() {
-        match bytes[i] {
+    for (i, &byte) in bytes.iter().enumerate().skip(open_brace_offset) {
+        match byte {
             b'{' => depth += 1,
             b'}' => {
                 depth -= 1;
@@ -556,5 +556,62 @@ mod tests {
                 "expected DriverError::Compile with all three phases non-empty; got: {other:?}"
             ),
         }
+    }
+
+    // ── AT-1043..AT-1045: Strategy hole source-text substitution tests ────────
+
+    /// AT-1043: substitute_strategy_holes replaces ?name with integer value.
+    #[test]
+    fn at_1043_substitute_strategy_holes_basic() {
+        let mut assignments: std::collections::BTreeMap<String, i64> =
+            std::collections::BTreeMap::new();
+        assignments.insert("wg".to_string(), 64);
+
+        let src = "@workgroup(?wg, 1, 1)";
+        let result = substitute_strategy_holes(src, &assignments);
+        // After substitution, ?wg → 64; @strategy block stripped (none present here).
+        assert_eq!(result, "@workgroup(64, 1, 1)",
+            "substitute_strategy_holes must replace ?wg with 64");
+    }
+
+    /// AT-1044: strip_strategy_annotation_block removes @strategy { ... } from source.
+    #[test]
+    fn at_1044_strip_strategy_block_removes_annotation() {
+        let src = "@kernel @workgroup(64,1,1) @strategy { x: ?[32, 64] } fn k() -> void { return; }";
+        let result = strip_strategy_annotation_block(src);
+        assert!(
+            !result.contains("@strategy"),
+            "strip_strategy_annotation_block must remove @strategy block; got {result:?}"
+        );
+        assert!(
+            result.contains("@kernel"),
+            "rest of source must be preserved; got {result:?}"
+        );
+        assert!(
+            result.contains("fn k()"),
+            "kernel declaration must be preserved; got {result:?}"
+        );
+    }
+
+    /// AT-1045: compile_source_with_assignments + strategy strips correctly produce valid SPIR-V.
+    #[test]
+    fn at_1045_compile_with_assignments_end_to_end() {
+        let src = concat!(
+            "@kernel @workgroup(?wg_x, 1, 1)\n",
+            "@strategy { wg_x: ?[32, 64, 128] }\n",
+            "fn tune() -> void { return; }\n",
+        );
+
+        let mut assignments: std::collections::BTreeMap<String, i64> =
+            std::collections::BTreeMap::new();
+        assignments.insert("wg_x".to_string(), 128);
+
+        let (bytes, meta) = compile_source_with_assignments(src, &assignments)
+            .expect("compile must succeed with wg_x=128");
+
+        assert_eq!(&bytes[0..4], &[0x03, 0x02, 0x23, 0x07],
+            "SPIR-V magic must be correct");
+        assert_eq!(meta.workgroup_size, [128, 1, 1],
+            "workgroup_size must reflect resolved wg_x=128");
     }
 }

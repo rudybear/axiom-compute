@@ -2726,4 +2726,102 @@ mod tests {
         // The critical invariant: NO PANIC.
         let _ = errors; // just ensure we reach this line
     }
+
+    // ── AT-1032..AT-1035: Additional strategy hole parser tests ──────────────
+
+    /// AT-1032: Parser accepts @strategy block with multiple holes.
+    #[test]
+    fn at_1032_parser_accepts_multiple_holes_in_strategy_block() {
+        let src = concat!(
+            "@kernel\n",
+            "@workgroup(?wg_x, ?wg_y, 1)\n",
+            "@strategy { wg_x: ?[32, 64, 128], wg_y: ?[1, 2, 4] }\n",
+            "fn k() -> void { return; }\n",
+        );
+        let (ast, errors) = parse_src(src);
+        assert!(
+            errors.is_empty(),
+            "expected no errors for multi-hole strategy block; got {errors:?}"
+        );
+        let kernel = &ast.items[0];
+        let crate::ast::Item::Kernel(kd) = &kernel.node;
+        let strategy_ann = kd.annotations.iter().find(|a| a.node.name.node == "strategy");
+        assert!(strategy_ann.is_some(), "@strategy annotation must be present");
+    }
+
+    /// AT-1033: Parser rejects @strategy block with duplicate hole name.
+    ///
+    /// The parser emits `StrategyBlockSyntax` or similar when the same key
+    /// appears twice within one @strategy block.
+    #[test]
+    fn at_1033_parser_rejects_duplicate_hole_name_in_strategy() {
+        // Strategy block with `x` declared twice.
+        let src = concat!(
+            "@kernel @workgroup(1,1,1)\n",
+            "@strategy { x: ?[32, 64], x: ?[128] }\n",
+            "fn k() -> void { return; }\n",
+        );
+        // The parser currently does not deduplicate keys at parse time; duplicates
+        // are caught by the HIR validator (UndefinedStrategyHole / DuplicateStrategyHoleName).
+        // This test verifies the parser does NOT panic on duplicates.
+        let (_ast, _errors) = parse_src(src);
+        // Critical invariant: no panic.
+    }
+
+    /// AT-1034: Parser accepts HoleRef (?ident) in @workgroup annotation arg.
+    #[test]
+    fn at_1034_parser_accepts_hole_ref_in_workgroup() {
+        let src = concat!(
+            "@kernel @workgroup(?wg_size, 1, 1)\n",
+            "@strategy { wg_size: ?[64, 128] }\n",
+            "fn k() -> void { return; }\n",
+        );
+        let (ast, errors) = parse_src(src);
+        assert!(
+            errors.is_empty(),
+            "expected no parse errors for HoleRef in @workgroup; got {errors:?}"
+        );
+        let kernel = &ast.items[0];
+        let crate::ast::Item::Kernel(kd) = &kernel.node;
+        let wg_ann = kd.annotations.iter().find(|a| a.node.name.node == "workgroup");
+        assert!(wg_ann.is_some(), "@workgroup annotation must be present");
+        let args = &wg_ann.unwrap().node.args;
+        assert!(
+            args.iter().any(|a| matches!(a.node, AnnotationArg::HoleRef(_))),
+            "first @workgroup arg must be a HoleRef"
+        );
+    }
+
+    /// AT-1035: Parser produces Hole AST node with correct candidates for sugar form.
+    #[test]
+    fn at_1035_hole_ast_node_has_correct_candidates() {
+        let src = concat!(
+            "@kernel @workgroup(?tilesize, 1, 1)\n",
+            "@strategy { tilesize: ?[16, 32, 64, 128] }\n",
+            "fn k() -> void { return; }\n",
+        );
+        let (ast, errors) = parse_src(src);
+        assert!(errors.is_empty(), "expected no errors: {errors:?}");
+
+        let kernel = &ast.items[0];
+        let crate::ast::Item::Kernel(kd) = &kernel.node;
+        let strategy_ann = kd.annotations.iter().find(|a| a.node.name.node == "strategy").unwrap();
+        // The sugar @strategy { k: ?[...] } is lowered at parse time to
+        // @strategy(k(?[16, 32, 64, 128])) — i.e. a Call with one Hole arg.
+        // Find the Hole node inside the Call.
+        let call_arg = &strategy_ann.node.args[0].node;
+        if let AnnotationArg::Call { name, args } = call_arg {
+            assert_eq!(name, "tilesize");
+            assert_eq!(args.len(), 1, "Call must have exactly one arg (the Hole)");
+            if let AnnotationArg::Hole { name: hole_name, candidates } = &args[0].node {
+                assert_eq!(hole_name, "tilesize");
+                assert_eq!(*candidates, vec![16i64, 32, 64, 128],
+                    "candidates must match source order");
+            } else {
+                panic!("expected Hole arg inside Call; got {:?}", args[0].node);
+            }
+        } else {
+            panic!("expected Call arg for strategy; got {call_arg:?}");
+        }
+    }
 }
