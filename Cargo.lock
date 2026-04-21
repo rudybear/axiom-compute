@@ -122,6 +122,7 @@ dependencies = [
  "axc-codegen",
  "axc-hir",
  "axc-lexer",
+ "axc-optimize",
  "axc-parser",
  "axc-runtime",
  "clap",
@@ -162,6 +163,17 @@ dependencies = [
 [[package]]
 name = "axc-optimize"
 version = "0.0.1"
+dependencies = [
+ "axc-codegen",
+ "axc-hir",
+ "axc-lexer",
+ "axc-parser",
+ "miette",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "xxhash-rust",
+]
 
 [[package]]
 name = "axc-parser"
