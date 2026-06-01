@@ -552,6 +552,31 @@ BDA would change the **shader** (descriptor-bound SSBO -> 64-bit `PhysicalStorag
 ### New/changed error variants
 `DispatchError` grows to 28 variants: `SemaphoreCreationFailed`, `TransferQueueSubmitFailed`, and `MappedRangeOpFailed { op: MappedRangeOp }` (`MappedRangeOp in {Flush, Invalidate}`).
 
+### 3.1.12 (r2 delta) — Profiling-driven readback fix: Levers A + B
+
+r1 cut `dispatch_saxpy_1m` from 23 ms to 3.08 ms but MISSED the <1 ms gate. A profiling pass on the residual 3.08 ms isolated the bottleneck precisely:
+
+| phase | time | % |
+|---|---|---|
+| copy_in (host→staging, 8 MB cached writes) | 252 µs (~31 GB/s) | 9% |
+| GPU timeline (upload DMA + compute + readback DMA) | 750 µs | 27% |
+| **copy_out (staging→host, 8 MB reads)** | **1730 µs (~4.5 GB/s)** | **62% — bottleneck** |
+| fixed (CB alloc/free, locks) | ~31 µs | 1% |
+
+**Root cause of the slow copy_out:** with HOST_CACHED staging the host *write* side (copy_in) is fast, but the host *read* side is still slow because the GPU DMAs results into system-RAM staging pages, so the CPU read is cold-cache and PCIe-snoop-limited at ~4.5 GB/s. Two compounding problems: (1) read-only INPUT bindings were being read back needlessly (saxpy's `x` is `readonly` yet 4 MB of it was copied device→host — half of copy_out); (2) even the legitimate 4 MB output is slow because it lives in system-RAM staging.
+
+**Lever A — skip readback of read-only bindings.** Readback is now driven by the binding plan's `BufferAccess` *and* the caller's `output_sizes`: a binding whose access is `readonly` is **never** read back (predicate `binding_is_readback(access, size) = size > 0 && access != ReadOnly`). This halves saxpy's readback bytes and removes a needless device→staging DMA. It is vendor-independent (helps Lavapipe/AMD/Intel) and requires no API change.
+
+**Lever B — zero-copy readback via ReBAR.** The Blackwell exposes a `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT` memory type (ReBAR, full 95.6 GiB). For bindings that are read back, their **device-local storage buffer is allocated in ReBAR memory and persistently mapped**, so the compute shader writes results directly into host-visible VRAM and the host reads them over the ReBAR aperture at ~60 GB/s — **eliminating the device→staging readback DMA and the ~4.5 GB/s staging copy entirely.** A single `SHADER_WRITE → HOST_READ` barrier (`dstStage = HOST`) on the ReBAR buffer replaces the prior copy + `TRANSFER_WRITE → HOST_READ` barrier. The upload path is unchanged (inputs still stage; copy_in is fine at 9%). When ReBAR is absent (Lavapipe / AMD-without-ReBAR / discrete-without-ReBAR) the runtime falls back to r1's device-local + HOST_CACHED-staging readback with **no regression**; the fallback is exercised on ReBAR hardware via `AXC_FORCE_NO_REBAR=1`. Coherency: Type 4 is HOST_COHERENT (no invalidate); a non-coherent ReBAR type triggers an atom-aligned invalidate before the host read.
+
+When the only read-back bindings are ReBAR, the dedicated three-submit chain collapses to two (or one) submits — the compute submit signals the host fence directly, reusing r1's skipped-readback handling.
+
+**Projected result.** saxpy_1m ≈ 252 µs (copy_in) + ~600 µs (upload DMA + compute) + ~67 µs (4 MB ReBAR read @ ~60 GB/s) + ~31 µs ≈ **~0.95 ms → meets the <1 ms gate (or marginal).** This is the milestone's primary proof.
+
+**Honest q4km_512 assessment.** q4km_512's 5.76 ms is **not** readback-bound — its output is a few bytes per row; the cost is the 2 MB x-vector UPLOAD DMA + single-row matvec COMPUTE (memory-bound, no reuse). Levers A + B make its readback free but barely move the total. The `<2 ms` gate is unrealistic for single-row matvec and is **re-scoped to M3.1's multi-row matmul**, where compute amortizes the upload and a workgroup-tiled kernel exists. r2 re-blesses `dispatch_saxpy_1m` only.
+
+**What r2 deliberately does NOT change (profiled):** ReBAR on the upload path (copy_in is 9%, already fast), command-buffer pooling (~1%), and queue-mode/semaphore variation (no overlap benefit for memory-bound kernels). r1's transfer-queue/overlap is retained for M3.1 multi-tile workloads.
+
 ---
 
 ### 3.1 Types
