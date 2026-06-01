@@ -214,6 +214,13 @@ pub enum HirWarning {
         name: String,
         span: Span,
     },
+
+    /// M3.1: `@cooperative_matrix` flag is set but the kernel body contains no
+    /// `coopmat_mul_add` op. The `coop_matrix` field in `KernelAnnotations` will be
+    /// `None`; the kernel is treated as non-coopmat at runtime.
+    CoopMatFlagWithoutOps {
+        kernel_name: String,
+    },
 }
 
 /// Run post-lowering validation rules on a `HirModule`.
@@ -287,6 +294,7 @@ mod tests {
                     preconditions: Vec::new(),
                     subgroup_uniform: false,
                     cooperative_matrix: false,
+                    coop_matrix: None,
                     strategy: None,
                 },
                 params: Vec::new(),

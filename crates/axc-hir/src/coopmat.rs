@@ -19,6 +19,24 @@
 
 use crate::ty::ScalarTy;
 
+// ── CoopMatScopeHir ───────────────────────────────────────────────────────────
+
+/// The scope of a cooperative-matrix operation (HIR level).
+///
+/// M3.1 adds this to `CoopMatrixShape` and the metadata sidecar so the runtime
+/// can verify the device supports the required scope at preflight time.
+///
+/// Only `Subgroup` is emitted by M3.1 codegen (Scope = 3 in SPIR-V).
+/// `Workgroup` is reserved for future milestones.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CoopMatScopeHir {
+    /// Subgroup scope (SPIR-V Scope = 3). M3.1 kernels always use this.
+    Subgroup,
+    /// Workgroup scope (SPIR-V Scope = 2). Reserved for future milestones.
+    Workgroup,
+}
+
 // ── CoopMatUse ────────────────────────────────────────────────────────────────
 
 /// The `use` tag carried on every cooperative-matrix value.
@@ -201,20 +219,38 @@ pub fn is_allowed_coopmat_element(ty: ScalarTy) -> bool {
 ///
 /// `PartialOrd + Ord` are required by `BTreeMap<CoopMatKey, Word>` (determinism
 /// invariant: no HashMap-driven emission order — M1.3 precedent).
+///
+/// M3.1 adds `k` (the contraction dimension) and `result_type` (the accumulator
+/// element type). These are internal-cache-key fields only; the EMITTED SPIR-V
+/// `OpTypeCooperativeMatrixKHR` operands are (elem, scope, m, n, use_) — unchanged.
+/// The new fields make the key self-describing for the driver/metadata path without
+/// altering the emitted module (AT-1508).
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CoopMatKey {
     pub elem: ScalarTy,
     pub m: u32,
     pub n: u32,
+    /// Contraction dimension K (a.n == b.m, guaranteed by KDimMismatch typecheck). M3.1.
+    pub k: u32,
     pub use_: CoopMatUse,
+    /// Accumulator result element type (== elem for all-f16 case). M3.1.
+    pub result_type: ScalarTy,
 }
 
 // ── CoopMatrixShape ───────────────────────────────────────────────────────────
 
-/// Annotation shape advertised by `@cooperative_matrix(M, N, K, A_type, B_type, C_type)`.
+/// Full cooperative-matrix shape derived from the kernel body (M3.1).
 ///
-/// Used in `CooperativeMatrixAnnotationMismatch` diagnostic.
+/// Stored in `KernelAnnotations.coop_matrix` and serialized into the metadata
+/// sidecar so the runtime can build `CoopMatRequiredShape` without hardcoding
+/// any dimension or type. Derived during HIR lowering from the `coopmat_mul_add`
+/// operand types (see `derive_coopmat_shape` in `lower.rs`).
+///
+/// Previously: annotation shape from `@cooperative_matrix(M, N, K, ...)`.
+/// M3.1 extends it with `result_type` and `scope` and sources the values from
+/// the TYPECHECKED body (so K = a.n = b.m is guaranteed by the existing
+/// `KDimMismatch` typecheck — no new validation needed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoopMatrixShape {
     pub m: u32,
@@ -223,6 +259,11 @@ pub struct CoopMatrixShape {
     pub a_elem: ScalarTy,
     pub b_elem: ScalarTy,
     pub c_elem: ScalarTy,
+    /// Accumulator result element type (== c_elem for all-f16 case). M3.1.
+    pub result_type: ScalarTy,
+    /// SPIR-V scope used for all cooperative-matrix ops in this kernel. M3.1.
+    /// M3.1 codegen always emits Subgroup (scope = 3).
+    pub scope: CoopMatScopeHir,
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
