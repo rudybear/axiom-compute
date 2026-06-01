@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "generated": "2026-04-21T23:21:45Z",
-  "git_sha": "6944359",
+  "generated": "2026-06-01T20:44:52Z",
+  "git_sha": "d434feb",
   "machine": {
     "os": "linux",
     "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)",
@@ -14,107 +14,107 @@
     {
       "group": "compile_pipeline",
       "bench": "compile_saxpy",
-      "median_ns": 11837,
-      "low_ns": 11828,
-      "high_ns": 11851
+      "median_ns": 11593,
+      "low_ns": 11528,
+      "high_ns": 11664
     },
     {
       "group": "compile_pipeline",
       "bench": "compile_vector_add",
-      "median_ns": 9076,
-      "low_ns": 9073,
-      "high_ns": 9078
+      "median_ns": 9670,
+      "low_ns": 9632,
+      "high_ns": 9694
     },
     {
       "group": "cpu_reference",
       "bench": "cpu_saxpy_1024",
-      "median_ns": 265,
-      "low_ns": 231,
-      "high_ns": 302
+      "median_ns": 210,
+      "low_ns": 194,
+      "high_ns": 245
     },
     {
       "group": "cpu_reference",
       "bench": "cpu_saxpy_1m",
-      "median_ns": 721485,
-      "low_ns": 713120,
-      "high_ns": 734248
+      "median_ns": 654714,
+      "low_ns": 649807,
+      "high_ns": 660390
     },
     {
       "group": "cpu_reference",
       "bench": "cpu_vector_add_1024",
-      "median_ns": 63,
-      "low_ns": 61,
-      "high_ns": 63
+      "median_ns": 64,
+      "low_ns": 64,
+      "high_ns": 64
     },
     {
       "group": "cpu_reference",
       "bench": "cpu_vector_add_1m",
-      "median_ns": 211032,
-      "low_ns": 209173,
-      "high_ns": 211678
+      "median_ns": 151750,
+      "low_ns": 150862,
+      "high_ns": 153023
     },
     {
       "group": "dispatch_gpu",
       "bench": "dispatch_saxpy_1024",
-      "median_ns": 1221667,
-      "low_ns": 756421,
-      "high_ns": 1499827
+      "median_ns": 31565,
+      "low_ns": 31185,
+      "high_ns": 31780
     },
     {
       "group": "dispatch_gpu",
       "bench": "dispatch_saxpy_1m",
-      "median_ns": 23047104,
-      "low_ns": 22749601,
-      "high_ns": 23341983
+      "median_ns": 3219017,
+      "low_ns": 3203119,
+      "high_ns": 3231790
     },
     {
       "group": "dispatch_gpu",
       "bench": "dispatch_vector_add_1024",
-      "median_ns": 2575112,
-      "low_ns": 2495674,
-      "high_ns": 2602558
+      "median_ns": 1133524,
+      "low_ns": 1128837,
+      "high_ns": 1143283
     },
     {
       "group": "dispatch_gpu",
       "bench": "dispatch_vector_add_1m",
-      "median_ns": 52110861,
-      "low_ns": 51459715,
-      "high_ns": 64515850
+      "median_ns": 9941574,
+      "low_ns": 9904838,
+      "high_ns": 9993295
     },
     {
       "group": "dispatch_gpu_amortized",
       "bench": "dispatch_handle_saxpy_1m",
-      "median_ns": 22247633,
-      "low_ns": 21979548,
-      "high_ns": 22465355
+      "median_ns": 3169279,
+      "low_ns": 3150457,
+      "high_ns": 3181693
     },
     {
       "group": "dispatch_gpu_q4_0",
       "bench": "dispatch_gpu_q4_0_1024",
-      "median_ns": 3255213,
-      "low_ns": 3188545,
-      "high_ns": 3278820
+      "median_ns": 1709351,
+      "low_ns": 1701715,
+      "high_ns": 1720783
     },
     {
       "group": "dispatch_gpu_q4_0",
       "bench": "dispatch_gpu_q4_0_128",
-      "median_ns": 2555453,
-      "low_ns": 2503897,
-      "high_ns": 2591243
+      "median_ns": 1209143,
+      "low_ns": 1203519,
+      "high_ns": 1216455
     },
     {
       "group": "dispatch_gpu_q4km",
       "bench": "dispatch_q4km_128",
-      "median_ns": 3380241,
-      "low_ns": 3306786,
-      "high_ns": 3443232
+      "median_ns": 1832268,
+      "low_ns": 1824685,
+      "high_ns": 1844525
     },
     {
       "group": "dispatch_gpu_q4km",
       "bench": "dispatch_q4km_512",
-      "median_ns": 8836038,
-      "low_ns": 8575548,
-      "high_ns": 9201722
+      "median_ns": 5322206,
+      "low_ns": 5255519,
+      "high_ns": 5407011
     }
   ]
 }

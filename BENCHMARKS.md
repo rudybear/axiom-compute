@@ -21,23 +21,23 @@ Intel i9-14900KF host, driver 580.126.09 / CUDA 13.0, 96 GB VRAM.
 | `compile_vector_add` | — | **9.1 μs** | |
 | `cpu_saxpy` | 1 K / 1 M | 265 ns / 721 μs | Rust reference |
 | `cpu_vector_add` | 1 K / 1 M | 63 ns / 211 μs | Rust reference |
-| `dispatch_saxpy` | 1 K | **1.22 ms** | One-shot: includes pipeline compile + staging |
-| `dispatch_saxpy` | 1 M | **23.0 ms** | Staging-bound |
-| `dispatch_vector_add` | 1 K | 2.58 ms | |
-| `dispatch_vector_add` | 1 M | 52.1 ms | |
-| `dispatch_handle_saxpy_1m` (amortized) | 1 M | **22.2 ms** | Pipeline cache reused |
-| `dispatch_gpu_q4_0_128` | 128 blocks (4 K elem) | **2.56 ms** | Q4_0 dequant + matvec |
-| `dispatch_gpu_q4_0_1024` | 1024 blocks (32 K elem) | **3.26 ms** | |
-| `dispatch_gpu_q4km_128` | 128 SB (32 K elem) | **3.38 ms** | Q4_K_M — llama.cpp beachhead |
-| `dispatch_gpu_q4km_512` | 512 SB (131 K elem) | **8.84 ms** | Bandwidth-bound |
+| `dispatch_saxpy` | 1 K | **31.7 µs** | One-shot (was 1.22 ms pre-M3.0 — **39×**) |
+| `dispatch_saxpy` | 1 M | **3.22 ms** | host round-trip (was 23.0 ms pre-M3.0 — **7.5×**) |
+| `dispatch_vector_add` | 1 K | 1.14 ms | (was 2.58 ms) |
+| `dispatch_vector_add` | 1 M | 9.95 ms | (was 52.1 ms — **5.2×**) |
+| `dispatch_handle_saxpy_1m` (amortized) | 1 M | **3.18 ms** | Pipeline cache reused (was 22.2 ms) |
+| `dispatch_gpu_q4_0_128` | 128 blocks (4 K elem) | **1.22 ms** | Q4_0 dequant + matvec (was 2.56 ms) |
+| `dispatch_gpu_q4_0_1024` | 1024 blocks (32 K elem) | **1.72 ms** | (was 3.26 ms) |
+| `dispatch_gpu_q4km_128` | 128 SB (32 K elem) | **1.86 ms** | Q4_K_M — llama.cpp beachhead (was 3.38 ms) |
+| `dispatch_gpu_q4km_512` | 512 SB (131 K elem) | **5.47 ms** | host round-trip (was 8.84 ms) |
 
-All numbers include the full host-round-trip: `memcpy` → staging → device-local copy → compute → device-local → staging → memcpy + fence wait.
+All numbers include the full host-round-trip: `memcpy` → staging → device-local copy → compute → device-local → staging → memcpy + fence wait. **M3.0** (persistent-mapped HOST_CACHED staging + dedicated transfer queue + timeline-semaphore overlap) cut these 1.5–39× across the board.
 
-**Correctness**: every GPU kernel produces bit-exact output vs CPU reference within its declared FP tolerance. `AT-1331_gpu_dispatch_nvidia_matches_cpu_reference_within_1e_3` is green for Q4_K_M.
+**Correctness**: every GPU kernel produces bit-exact output vs CPU reference within its declared FP tolerance. `AT-1331_gpu_dispatch_nvidia_matches_cpu_reference_within_1e_3` is green for Q4_K_M; M3.0's `AT-1418` four-config oracle proves single-queue / dedicated-queue / forced-non-coherent / forced-binary-semaphore paths are all byte-identical.
 
-**Ceiling at 1M elements**: ~23 ms is ~100× off theoretical PCIe peak — the staging-buffer copy path dominates. Pinned memory + concurrent transfer (deferred to M3) closes this gap.
+**Ceiling at 1M elements (post-M3.0)**: ~3.2 ms for `saxpy_1m` is now dominated by **host-round-trip PCIe transfer + readback**, not the kernel — moving ~12 MB host→device→host every call. This is a property of the *benchmark*, not kernel quality: real LLM inference keeps weights resident in VRAM. The `<1 ms` ambition is re-scoped to a **GPU-resident benchmark** (M3.1/M3.4). A ReBAR zero-copy-readback attempt (M3.0 r2) was empirically reverted — CPU reads from the BAR aperture are ~60× *slower* (see DESIGN.md §3.1.12).
 
-**Pipeline cache impact**: `dispatch_saxpy_1m` one-shot (23.0 ms) → amortized (22.2 ms) saves ~800 μs per call on NVIDIA; expected to be much larger on AMD/Intel where shader compile is slower.
+**Pipeline cache impact**: `dispatch_saxpy_1m` one-shot (3.22 ms) ≈ amortized (3.18 ms) — post-M3.0 the two converge because data movement, not pipeline setup, dominates; the staging overhead that made them both ~22 ms is gone.
 
 ### Lavapipe (software Vulkan, CI)
 
