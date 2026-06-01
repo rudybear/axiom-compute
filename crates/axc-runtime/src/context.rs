@@ -67,12 +67,23 @@ use crate::kernel_handle::{
 };
 use crate::dispatch::validate_request;
 use crate::dispatch::DispatchRequest;
+use crate::transfer_queue::{
+    select_queue_families, queue_mode, build_device_queue_create_infos,
+    concurrent_family_indices, QueueMode, QueueFamilySelection, TransferQueueInfo,
+};
+use crate::sync::{detect_sync_mode, create_handoff, SyncMode};
 
 /// Configuration for `VulkanContext::new_with_options`.
 ///
 /// `VulkanContext::new()` delegates to `new_with_options(VulkanContextOptions::from_env())`.
 /// Tests use `new_with_options` directly to supply explicit paths and indices without
 /// mutating the process environment.
+///
+/// ## Backward compatibility
+///
+/// Use `VulkanContextOptions { ..Default::default() }` to add only the fields you care
+/// about without breaking when new fields are added.
+#[derive(Default)]
 pub struct VulkanContextOptions {
     /// Path to the on-disk pipeline cache file.
     ///
@@ -88,14 +99,34 @@ pub struct VulkanContextOptions {
     ///
     /// `None` reads `AXC_FENCE_TIMEOUT_MS` from the environment, defaulting to 10,000 ms.
     pub fence_timeout_ms: Option<u64>,
+    // ── M3.0 force options (AT-1409, AT-1418) ─────────────────────────────────
+    /// Force single-queue mode regardless of hardware capabilities.
+    ///
+    /// `None` = auto-detect. `Some(true)` = always single-queue.
+    /// Reads `AXC_FORCE_SINGLE_QUEUE=1` from env in `from_env()`.
+    pub force_single_queue: Option<bool>,
+    /// Force binary semaphores even on Vulkan 1.2 / timeline-capable devices.
+    ///
+    /// `None` = auto-detect. `Some(true)` = always binary.
+    /// Reads `AXC_FORCE_BINARY_SEMAPHORES=1` from env in `from_env()`.
+    pub force_binary_semaphores: Option<bool>,
+    /// Force NonCoherent flush/invalidate even on coherent staging memory.
+    ///
+    /// `None` = auto. `Some(true)` = treat all staging as NonCoherent for CI coverage.
+    /// Reads `AXC_FORCE_NONCOHERENT_STAGING=1` from env in `from_env()`.
+    pub force_noncoherent_staging: Option<bool>,
 }
 
 impl VulkanContextOptions {
     /// Build options from environment variables.
     ///
-    /// Reads `AXC_PHYSICAL_DEVICE_INDEX`, `AXC_FENCE_TIMEOUT_MS`, and
-    /// `resolve_pipeline_cache_path_from_env()`.
+    /// Reads `AXC_PHYSICAL_DEVICE_INDEX`, `AXC_FENCE_TIMEOUT_MS`,
+    /// `AXC_FORCE_SINGLE_QUEUE`, `AXC_FORCE_BINARY_SEMAPHORES`,
+    /// `AXC_FORCE_NONCOHERENT_STAGING`, and `resolve_pipeline_cache_path_from_env()`.
     pub fn from_env() -> Self {
+        let read_bool_flag = |var: &str| -> Option<bool> {
+            std::env::var(var).ok().map(|v| v == "1")
+        };
         Self {
             pipeline_cache_path: resolve_pipeline_cache_path_from_env(),
             physical_device_index: std::env::var("AXC_PHYSICAL_DEVICE_INDEX")
@@ -104,6 +135,9 @@ impl VulkanContextOptions {
             fence_timeout_ms: std::env::var("AXC_FENCE_TIMEOUT_MS")
                 .ok()
                 .and_then(|v: String| v.parse::<u64>().ok()),
+            force_single_queue: read_bool_flag("AXC_FORCE_SINGLE_QUEUE"),
+            force_binary_semaphores: read_bool_flag("AXC_FORCE_BINARY_SEMAPHORES"),
+            force_noncoherent_staging: read_bool_flag("AXC_FORCE_NONCOHERENT_STAGING"),
         }
     }
 }
@@ -155,6 +189,25 @@ pub struct VulkanContext {
     /// Stored for use in `dispatch_handle`; shadowed by env var if set after context init.
     #[allow(dead_code)]
     fence_timeout_ms: u64,
+    // ── M3.0 fields ───────────────────────────────────────────────────────────
+    /// Optional dedicated transfer queue + command pool (DedicatedTransfer mode).
+    transfer: Option<TransferQueueInfo>,
+    /// Queue mode resolved at init time.
+    queue_mode: QueueMode,
+    /// Semaphore synchronization mode resolved at init time.
+    sync_mode: SyncMode,
+    /// `nonCoherentAtomSize` from device limits (WARNING-1: never hardcoded).
+    non_coherent_atom_size: u64,
+    /// Whether `force_noncoherent_staging` was set (AT-1409 / AT-1418).
+    force_noncoherent_staging: bool,
+    /// Context-level queue-submit lock (CRITICAL-5: atomic-group serialization).
+    queue_submit_lock: Arc<Mutex<()>>,
+    /// Per-pool lock for the compute command pool (WARNING-5).
+    compute_pool_lock: Arc<Mutex<()>>,
+    /// Per-pool lock for the transfer command pool (WARNING-5); `None` in SingleQueue.
+    transfer_pool_lock: Option<Arc<Mutex<()>>>,
+    /// Resolved queue family selection (stored for concurrent_families).
+    queue_family_sel: QueueFamilySelection,
 }
 
 impl VulkanContext {
@@ -168,7 +221,7 @@ impl VulkanContext {
         Self::new_with_options(VulkanContextOptions::from_env())
     }
 
-    /// Initialize Vulkan with explicit options (M2.3a).
+    /// Initialize Vulkan with explicit options (M3.0).
     ///
     /// Preferred over `new()` in tests: pass an explicit `pipeline_cache_path`
     /// (e.g., a tempdir) to avoid env-based path resolution and serial_test.
@@ -180,53 +233,60 @@ impl VulkanContext {
         let entry: ash::Entry = unsafe { ash::Entry::load() }
             .map_err(|e| DispatchError::VulkanEntryFailed(e.to_string()))?;
 
-        // ── Step 2: Instance ──────────────────────────────────────────────────
+        // ── Step 2: Instance (M3.0: request Vulkan 1.2 if available) ─────────
         let app_name = std::ffi::CString::new("axc-runtime").unwrap();
         let engine_name = std::ffi::CString::new("axc-compute").unwrap();
+
+        // Bump API version to min(reported, 1.2) so timeline semaphores are reachable.
+        // We NEVER fail on 1.1 — binary semaphore fallback handles 1.1-only ICDs.
+        // Use try_enumerate_instance_version (available in ash 0.38) which returns None
+        // on Vulkan 1.0 implementations that do not support the call.
+        // SAFETY: try_enumerate_instance_version is a read-only query on the entry.
+        let instance_api_version: u32 = unsafe {
+            entry.try_enumerate_instance_version()
+                .ok()
+                .flatten()
+                .unwrap_or(vk::API_VERSION_1_1)
+        };
+        let requested_api_version: u32 = if instance_api_version >= vk::API_VERSION_1_2 {
+            vk::API_VERSION_1_2
+        } else {
+            vk::API_VERSION_1_1
+        };
 
         let app_info = vk::ApplicationInfo::default()
             .application_name(&app_name)
             .application_version(0)
             .engine_name(&engine_name)
             .engine_version(0)
-            .api_version(vk::API_VERSION_1_1);
+            .api_version(requested_api_version);
 
         let instance_info = vk::InstanceCreateInfo::default()
             .application_info(&app_info);
 
-        // SAFETY: instance_info is valid for the duration of this call. No validation
-        // layers are enabled by default (opt-in via AXC_VULKAN_VALIDATION in M2+).
+        // SAFETY: instance_info is valid for the duration of this call.
         let raw_instance: ash::Instance =
             unsafe { entry.create_instance(&instance_info, None) }
                 .map_err(|e| DispatchError::NoVulkanInstance(e.to_string()))?;
 
-        // Wrap entry + instance in Arc<InstanceOwner> so they can be shared with
-        // KernelHandles that outlive this VulkanContext (AT-827). vkDestroyInstance
-        // fires when the last Arc<InstanceOwner> drops.
         let instance_owner: Arc<InstanceOwner> = Arc::new(InstanceOwner {
             instance: raw_instance,
             entry,
         });
-
-        // Alias for brevity in the remainder of this function.
         let instance: &ash::Instance = &instance_owner.instance;
 
         // ── Step 3: Physical device selection ─────────────────────────────────
-        // SAFETY: instance is valid; enumerate_physical_devices is a read-only query.
+        // SAFETY: instance is valid.
         let physical_devices: Vec<vk::PhysicalDevice> =
             unsafe { instance.enumerate_physical_devices() }
                 .map_err(|e| {
-                    // Drop Arc<InstanceOwner> — fires vkDestroyInstance.
-                    drop(Arc::clone(&instance_owner));
                     DispatchError::NoVulkanInstance(format!("enumerate_physical_devices: {e}"))
                 })?;
 
         if physical_devices.is_empty() {
-            // InstanceOwner drops here → vkDestroyInstance.
             return Err(DispatchError::NoSupportedDevice);
         }
 
-        // Determine which physical device to use.
         let device_index_override: Option<usize> = opts.physical_device_index
             .filter(|&i| i < physical_devices.len())
             .or_else(|| {
@@ -236,21 +296,20 @@ impl VulkanContext {
                     .filter(|&i| i < physical_devices.len())
             });
 
-        let (physical_device, queue_family_index): (vk::PhysicalDevice, u32) =
+        // Select physical device + queue family selection (M3.0: uses transfer_queue::select).
+        let force_single_queue: bool = opts.force_single_queue.unwrap_or(false);
+        let (physical_device, queue_family_sel): (vk::PhysicalDevice, QueueFamilySelection) =
             match device_index_override {
                 Some(idx) => {
-                    let pd: vk::PhysicalDevice = physical_devices[idx];
-                    // SAFETY: pd is a valid physical device.
-                    let qf_idx = find_compute_queue_family(instance, pd)
-                        .ok_or(DispatchError::NoComputeQueue)?;
-                    (pd, qf_idx)
+                    let pd = physical_devices[idx];
+                    let sel = select_queue_families(instance, pd, force_single_queue)?;
+                    (pd, sel)
                 }
                 None => {
-                    let mut found: Option<(vk::PhysicalDevice, u32)> = None;
+                    let mut found: Option<(vk::PhysicalDevice, QueueFamilySelection)> = None;
                     for &pd in &physical_devices {
-                        // SAFETY: pd is a valid physical device.
-                        if let Some(qf) = find_compute_queue_family(instance, pd) {
-                            found = Some((pd, qf));
+                        if let Ok(sel) = select_queue_families(instance, pd, force_single_queue) {
+                            found = Some((pd, sel));
                             break;
                         }
                     }
@@ -258,76 +317,101 @@ impl VulkanContext {
                 }
             };
 
-        // ── Step 4: Device name (for diagnostics) ─────────────────────────────
-        // SAFETY: physical_device is valid; get_physical_device_properties is read-only.
+        let queue_family_index: u32 = queue_family_sel.compute_family;
+        let q_mode: QueueMode = queue_mode(&queue_family_sel);
+
+        // ── Step 4: Device name + properties ──────────────────────────────────
+        // SAFETY: physical_device is valid.
         let props = unsafe { instance.get_physical_device_properties(physical_device) };
-        // SAFETY: props.device_name is a null-terminated C string guaranteed by the
-        // Vulkan spec (VkPhysicalDeviceProperties::deviceName is a char[256] with a NUL).
+        // SAFETY: props.device_name is a null-terminated C string per Vulkan spec
+        // (VkPhysicalDeviceProperties::deviceName is char[256] with a NUL terminator).
         let device_name: String = unsafe {
             std::ffi::CStr::from_ptr(props.device_name.as_ptr())
                 .to_string_lossy()
                 .into_owned()
         };
 
-        // ── Step 5: Logical device + queue ────────────────────────────────────
+        // ── Step 4b: Detect sync mode ─────────────────────────────────────────
+        let force_binary: bool = opts.force_binary_semaphores.unwrap_or(false);
+        let s_mode: SyncMode = detect_sync_mode(
+            instance, physical_device, requested_api_version, force_binary,
+        );
+
+        // ── Step 5: Logical device + queues ───────────────────────────────────
         let queue_priorities: [f32; 1] = [1.0f32];
-        let queue_create_info = vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(queue_family_index)
-            .queue_priorities(&queue_priorities);
+        let queue_create_infos = build_device_queue_create_infos(&queue_family_sel, &queue_priorities);
 
-        let device_create_info = vk::DeviceCreateInfo::default()
-            .queue_create_infos(std::slice::from_ref(&queue_create_info));
+        // Chain Vulkan12Features for timelineSemaphore when applicable (WARNING-4).
+        // The local binding MUST outlive the DeviceCreateInfo used in create_device.
+        let mut vk12_features = vk::PhysicalDeviceVulkan12Features::default();
+        let device_create_info: vk::DeviceCreateInfo<'_> =
+            if s_mode == SyncMode::Timeline && requested_api_version >= vk::API_VERSION_1_2 {
+                vk12_features.timeline_semaphore = vk::TRUE;
+                vk::DeviceCreateInfo::default()
+                    .queue_create_infos(&queue_create_infos)
+                    .push_next(&mut vk12_features)
+            } else {
+                vk::DeviceCreateInfo::default()
+                    .queue_create_infos(&queue_create_infos)
+            };
 
-        // SAFETY: device_create_info is valid; no extensions or features that require
-        // runtime checks are enabled (M1.5 only uses f32 arithmetic which is core 1.1).
+        // SAFETY: device_create_info is valid; vk12_features outlives this call.
         let raw_device: ash::Device =
             unsafe { instance.create_device(physical_device, &device_create_info, None) }
                 .map_err(|e| DispatchError::DeviceCreationFailed(e.to_string()))?;
 
-        // SAFETY: raw_device is valid; queue was created with queue_family_index and index 0.
+        // SAFETY: queue was requested at index 0 of the compute family.
         let queue: vk::Queue = unsafe { raw_device.get_device_queue(queue_family_index, 0) };
 
-        // Wrap device in Arc<DeviceOwner> inside ManuallyDrop — vkDestroyDevice fires
-        // when the last Arc drops. ManuallyDrop allows VulkanContext::drop to explicitly
-        // take ownership and drop the Arc before instance_owner (Vulkan spec §3.3.3).
         let device_owner: ManuallyDrop<Arc<DeviceOwner>> =
             ManuallyDrop::new(Arc::new(DeviceOwner { device: raw_device }));
-
-        // Wrap instance_owner in ManuallyDrop so Drop can explicitly take it AFTER
-        // device_owner has been dropped, satisfying VkDevice-before-VkInstance ordering.
         let instance_owner: ManuallyDrop<Arc<InstanceOwner>> = ManuallyDrop::new(instance_owner);
 
-        // ── Step 6: Command pool ──────────────────────────────────────────────
+        // ── Step 6: Compute command pool ──────────────────────────────────────
         let cp_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(queue_family_index)
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-
-        // SAFETY: cp_info is valid; device is alive for the lifetime of the pool.
+        // SAFETY: cp_info is valid.
         let command_pool: vk::CommandPool =
             unsafe { device_owner.create_command_pool(&cp_info, None) }
                 .map_err(|e| {
                     DispatchError::DeviceCreationFailed(format!("create_command_pool: {e}"))
                 })?;
 
+        // ── Step 6b: Transfer command pool + queue (DedicatedTransfer mode) ───
+        let transfer: Option<TransferQueueInfo> = if let Some(tf) = queue_family_sel.transfer_family {
+            let tf_pool_info = vk::CommandPoolCreateInfo::default()
+                .queue_family_index(tf)
+                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+            // SAFETY: tf_pool_info is valid.
+            let tf_pool = unsafe { device_owner.create_command_pool(&tf_pool_info, None) }
+                .map_err(|e| {
+                    // SAFETY: compute pool was created above; destroy on error.
+                    unsafe { device_owner.destroy_command_pool(command_pool, None); }
+                    DispatchError::DeviceCreationFailed(format!("create_transfer_command_pool: {e}"))
+                })?;
+            // SAFETY: queue was requested at index 0 of the transfer family.
+            let tf_queue = unsafe { device_owner.get_device_queue(tf, 0) };
+            Some(TransferQueueInfo { family: tf, queue: tf_queue, command_pool: tf_pool })
+        } else {
+            None
+        };
+
         // ── Step 7: Cache memory properties ──────────────────────────────────
-        // SAFETY: physical_device is valid; this is a read-only query.
+        // SAFETY: physical_device is valid.
         let memory_properties: vk::PhysicalDeviceMemoryProperties =
             unsafe { instance_owner.instance.get_physical_device_memory_properties(physical_device) };
 
         // ── Step 8: Cache device limits ───────────────────────────────────────
-        // SAFETY: physical_device is valid; this is a read-only query.
         let limits: vk::PhysicalDeviceLimits = props.limits;
         let max_compute_work_group_count: [u32; 3] = limits.max_compute_work_group_count;
+        let non_coherent_atom_size: u64 = limits.non_coherent_atom_size;
 
         // ── Step 9: Pipeline cache ────────────────────────────────────────────
         let pipeline_cache: PipelineCache =
             PipelineCache::new(&device_owner.device, opts.pipeline_cache_path)
                 .unwrap_or_else(|e| {
                     tracing::warn!(reason = %e, "pipeline cache init failed — using disabled cache");
-                    // Fallback: create with None (disabled). Should not fail since it just
-                    // calls vkCreatePipelineCache with 0 initial data — but if it does,
-                    // we cannot recover here. The unwrap below is intentional in that
-                    // catastrophic case; in practice Vulkan always allows empty cache creation.
                     PipelineCache::new(&device_owner.device, None)
                         .expect("empty pipeline cache creation must not fail")
                 });
@@ -340,6 +424,10 @@ impl VulkanContext {
                     .and_then(|v: String| v.parse::<u64>().ok())
             })
             .unwrap_or(crate::dispatch::DEFAULT_FENCE_TIMEOUT_MS);
+
+        let force_noncoherent: bool = opts.force_noncoherent_staging.unwrap_or(false);
+        let transfer_pool_lock: Option<Arc<Mutex<()>>> =
+            if transfer.is_some() { Some(Arc::new(Mutex::new(()))) } else { None };
 
         Ok(Self {
             instance_owner,
@@ -354,6 +442,15 @@ impl VulkanContext {
             pipeline_cache,
             in_mem_kernel_cache: Mutex::new(BTreeMap::new()),
             fence_timeout_ms,
+            transfer,
+            queue_mode: q_mode,
+            sync_mode: s_mode,
+            non_coherent_atom_size,
+            force_noncoherent_staging: force_noncoherent,
+            queue_submit_lock: Arc::new(Mutex::new(())),
+            compute_pool_lock: Arc::new(Mutex::new(())),
+            transfer_pool_lock,
+            queue_family_sel,
         })
     }
 
@@ -454,6 +551,33 @@ impl VulkanContext {
                     DispatchError::CommandBufferRecordFailed(format!("create_fence: {e}"))
                 })?;
 
+        // Create handoff semaphores for the dedicated-transfer path (M3.0).
+        // In SingleQueue mode, handoff = None (only the fence is used).
+        let handoff = match self.queue_mode {
+            crate::transfer_queue::QueueMode::DedicatedTransfer => {
+                Some(
+                    create_handoff(&self.device_owner.device, self.sync_mode)
+                        .inspect_err(|_| {
+                            // SAFETY: all of these handles were successfully created above;
+                            // clean up on semaphore creation failure.
+                            unsafe {
+                                if let Some(pool) = descriptor_pool {
+                                    self.device_owner.destroy_descriptor_pool(pool, None);
+                                }
+                                self.device_owner.destroy_fence(fence, None);
+                                self.device_owner.destroy_pipeline(compiled.pipeline, None);
+                                self.device_owner.destroy_pipeline_layout(compiled.pipeline_layout, None);
+                                if let Some(dsl) = compiled.descriptor_set_layout {
+                                    self.device_owner.destroy_descriptor_set_layout(dsl, None);
+                                }
+                                self.device_owner.destroy_shader_module(compiled.shader_module, None);
+                            }
+                        })?,
+                )
+            }
+            crate::transfer_queue::QueueMode::SingleQueue => None,
+        };
+
         let inner_fresh: Arc<KernelHandleInner> = Arc::new(KernelHandleInner {
             _instance_owner: Arc::clone(&self.instance_owner),
             device: Arc::clone(&self.device_owner),
@@ -469,6 +593,12 @@ impl VulkanContext {
             buffers: Mutex::new(Vec::new()),
             cache_key: key.clone(),
             spirv_word_count: spirv.len(),
+            // M3.0 fields:
+            queue_mode: self.queue_mode,
+            sync_mode: self.sync_mode,
+            handoff,
+            non_coherent_atom_size: self.non_coherent_atom_size,
+            concurrent_families: concurrent_family_indices(&self.queue_family_sel),
         });
 
         // Phase 3: re-lock and re-check (lost-race detection, W-3).
@@ -527,10 +657,21 @@ impl VulkanContext {
             &self.memory_properties,
         )?;
 
-        // Record, submit, wait, readback.
+        // Build the extended DispatchQueueCtx (M3.0).
+        let (transfer_queue, transfer_command_pool) = match &self.transfer {
+            Some(ti) => (ti.queue, ti.command_pool),
+            None => (self.queue, self.command_pool), // SingleQueue: reuse compute handles
+        };
         let queue_ctx = DispatchQueueCtx {
             command_pool: self.command_pool,
             queue: self.queue,
+            transfer_queue,
+            transfer_command_pool,
+            non_coherent_atom_size: self.non_coherent_atom_size,
+            queue_submit_lock: Arc::clone(&self.queue_submit_lock),
+            compute_pool_lock: Arc::clone(&self.compute_pool_lock),
+            transfer_pool_lock: self.transfer_pool_lock.as_ref().map(Arc::clone),
+            force_noncoherent: self.force_noncoherent_staging,
         };
         let outputs = record_and_submit_dispatch(
             &handle.inner,
@@ -545,25 +686,6 @@ impl VulkanContext {
         drop(buffers_guard);
         Ok(outputs)
     }
-}
-
-/// Find the index of the first queue family with `COMPUTE` support.
-///
-/// Returns `None` if no such family exists.
-fn find_compute_queue_family(
-    instance: &ash::Instance,
-    physical_device: vk::PhysicalDevice,
-) -> Option<u32> {
-    // SAFETY: physical_device is valid; this is a read-only query.
-    let families =
-        unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
-
-    for (i, family) in families.iter().enumerate() {
-        if family.queue_flags.contains(vk::QueueFlags::COMPUTE) {
-            return Some(i as u32);
-        }
-    }
-    None
 }
 
 impl Drop for VulkanContext {
@@ -586,7 +708,14 @@ impl Drop for VulkanContext {
                 .destroy_pipeline_cache(self.pipeline_cache.vk_handle, None);
         }
 
-        // Step 4: destroy command pool.
+        // Step 4a: destroy transfer command pool if it exists (M3.0).
+        if let Some(ref ti) = self.transfer {
+            // SAFETY: transfer pool was created from this device; device_wait_idle
+            // ensures no commands are in-flight using this pool.
+            unsafe { self.device_owner.destroy_command_pool(ti.command_pool, None); }
+        }
+
+        // Step 4b: destroy compute command pool.
         // SAFETY: command_pool was created from this device; it is valid.
         unsafe { self.device_owner.destroy_command_pool(self.command_pool, None); }
 
