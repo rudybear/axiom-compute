@@ -139,6 +139,7 @@ pub struct CoopMatRequiredShape {
 /// The context probes device support for each feature and enables only the
 /// device-supported subset; a kernel that needs a feature the device lacks
 /// returns `DispatchError::DeviceFeatureUnsupported` at dispatch time.
+#[allow(dead_code)] // Used in AT-1504 tests and future dispatch-time preflight
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct RequiredDeviceFeatures {
     /// `VkPhysicalDevice16BitStorageFeatures.storageBuffer16BitAccess` —
@@ -358,6 +359,7 @@ pub fn coopmat_shape_supported(
 /// | CooperativeMatrixKHR     | coopmat op used                  | cooperativeMatrix                 |
 ///
 /// See the capability→feature table in M3.1-architect.json for the full mapping.
+#[allow(dead_code)] // Used in AT-1504 tests and future dispatch-time preflight
 pub(crate) fn required_device_features(
     binding_plan: &ParamBindingPlan,
     uses_coopmat: bool,
@@ -423,7 +425,7 @@ fn coopmat_scalar_meta_to_component_type(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axc_hir::{ParamBindingPlan, BufferBindingSlot, ScalarPushConstantSlot};
+    use axc_hir::{ParamBindingPlan, BufferBindingSlot};
     use axc_hir::buffer::{BufferTy, BufferAccess};
     use axc_hir::ty::ScalarTy;
     use axc_lexer::Span;

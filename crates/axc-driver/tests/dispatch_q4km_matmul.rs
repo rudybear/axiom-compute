@@ -9,7 +9,7 @@
 mod common_matmul;
 
 use axc_driver::compile_source_with_meta;
-use axc_runtime::{VulkanContext, VulkanContextOptions, DispatchError};
+use axc_runtime::{VulkanContext, DispatchError};
 
 const Q4KM_MATMUL_SRC: &str = include_str!("../../../examples/q4km_dequant_matmul.axc");
 const Q4KM_COOPMAT_SRC: &str = include_str!("../../../examples/q4km_dequant_matmul_coopmat.axc");
@@ -146,8 +146,8 @@ fn at_1520_q4km_matmul_256x256_bit_exact() {
 
     let output_y_size = (n_rows * n_cols) as usize * 4; // f32 elements
     let workgroups = (
-        ((n_rows * n_cols + 63) / 64),
-        1, 1
+        (n_rows * n_cols).div_ceil(64),
+        1_u32, 1_u32,
     );
 
     let outputs = match ctx.dispatch_handle(

@@ -1459,6 +1459,7 @@ fn submit_readback(
 /// On NonCoherent memory: calls `vkInvalidateMappedMemoryRanges` BEFORE `copy_out`
 /// for EACH readback slot (CRITICAL-1, WARNING-6).
 #[allow(clippy::undocumented_unsafe_blocks)]
+#[allow(clippy::too_many_arguments)]
 fn readback_from_persistent_mapping(
     buffers: &[BufferSlot],
     output_sizes: &[usize],

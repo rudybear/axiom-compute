@@ -6,9 +6,9 @@
 // Used for:
 //   - matmul_tflops_4096 resident bench (4096x4096 effective TFLOPS, runs on ALL vendors)
 //   - AT-1532: effective_tflops() finite > 0 assertion
-//   - D: @strategy tile holes (tile_m, tile_n) enumerate via axc-optimize
+//   - D: tile holes (tile_m, tile_n) from the strategy annotation enumerate via axc-optimize
 //
-// @strategy declares tile_m and tile_n holes for M3.1's tile-dimension autotuning.
+// The strategy annotation declares tile_m and tile_n holes for M3.1's autotuning.
 // The enumerator produces the Cartesian product; each variant is a separate compile.
 // For the bench we use the default (first candidate): tile_m=1, tile_n=1 (one element
 // per invocation — simple but correct; M3.4 will add workgroup-level tiling).
@@ -19,7 +19,7 @@
 @strategy { tile_m: ?[1, 2, 4], tile_n: ?[1, 2, 4] }
 @kernel
 @workgroup(64, 1, 1)
-@intent("F32 tiled matmul C = A * B; one (row,col) per invocation; tile dims from @strategy holes")
+@intent("F32 tiled matmul C = A * B; one (row,col) per invocation; tile dims from tile holes")
 @complexity(O(n))
 @precondition(true)
 fn matmul_f32_tiled(

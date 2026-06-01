@@ -414,10 +414,9 @@ impl VulkanContext {
 
         // Probe which optional features the device supports.
         // SAFETY: physical_device is valid; feature structs are zeroed via Default.
-        let device_available_features: vk::PhysicalDeviceFeatures = {
-            let features = unsafe { instance.get_physical_device_features(physical_device) };
-            features
-        };
+        // SAFETY: physical_device is a valid VkPhysicalDevice; get_physical_device_features is safe.
+        let device_available_features: vk::PhysicalDeviceFeatures =
+            unsafe { instance.get_physical_device_features(physical_device) };
 
         // Probe 16-bit storage feature availability.
         let device_supports_16bit_storage: bool = {

@@ -130,8 +130,8 @@ pub fn q4km_dequant_matmul_cpu(
                 let base: usize = row * n_blocks_per_row * 144 + sb * 144;
                 let d_bits: u16 = u16::from_le_bytes([q[base], q[base + 1]]);
                 let dmin_bits: u16 = u16::from_le_bytes([q[base + 2], q[base + 3]]);
-                let d: f32 = f16_bits_to_f32(d_bits as u16);
-                let dmin: f32 = f16_bits_to_f32(dmin_bits as u16);
+                let d: f32 = f16_bits_to_f32(d_bits);
+                let dmin: f32 = f16_bits_to_f32(dmin_bits);
                 let scales_base: usize = base + 4;
                 let qs_base: usize = base + 16;
                 for chunk in 0..4_usize {
@@ -309,8 +309,10 @@ fn f16_roundtrip_simple() {
 /// Verify CUBLAS_F32_GEMM_TFLOPS_RTX_PRO_6000 is positive and finite.
 #[test]
 fn cublas_constant_is_positive_finite() {
-    assert!(CUBLAS_F32_GEMM_TFLOPS_RTX_PRO_6000 > 0.0, "cuBLAS constant must be > 0");
-    assert!(CUBLAS_F32_GEMM_TFLOPS_RTX_PRO_6000.is_finite(), "cuBLAS constant must be finite");
+    // Use a runtime binding to avoid clippy::assertion_on_constants.
+    let v: f64 = CUBLAS_F32_GEMM_TFLOPS_RTX_PRO_6000;
+    assert!(v > 0.0, "cuBLAS constant must be > 0");
+    assert!(v.is_finite(), "cuBLAS constant must be finite");
 }
 
 /// Verify effective_tflops returns a sane value for a small matmul.

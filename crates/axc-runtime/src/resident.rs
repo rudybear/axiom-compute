@@ -75,6 +75,7 @@ pub struct ResidentDispatchTiming {
 /// buffer, one fence, and one timestamp query pool.
 ///
 /// Destroyed when dropped — resources freed in Drop.
+#[allow(dead_code)] // Fields used in Drop + future dispatch_resident implementation
 pub struct ResidentBuffers {
     /// Arc to keep the device alive.
     pub(crate) device: Arc<DeviceOwner>,
@@ -111,6 +112,7 @@ pub struct ResidentBuffers {
 /// is computed. This handles the case where the counter wraps between begin and end.
 ///
 /// Per HN-6: mask EACH endpoint first, then wrapping_sub (AT-1535).
+#[allow(dead_code)] // Used in dispatch_resident timing (AT-1535); tests confirm correctness
 pub(crate) fn masked_timestamp_delta(begin: u64, end: u64, valid_bits: u32) -> u64 {
     if valid_bits == 0 || valid_bits >= 64 {
         // If all 64 bits are valid (or the field is zero), no masking needed.
@@ -152,11 +154,9 @@ impl Drop for ResidentBuffers {
             }
 
             // Free staging buffers (unmapping not needed — staging here is for readback only).
-            for slot in &self.staging_bufs {
-                if let Some(stg) = slot {
-                    device.destroy_buffer(stg.buffer, None);
-                    device.free_memory(stg.memory, None);
-                }
+            for stg in self.staging_bufs.iter().flatten() {
+                device.destroy_buffer(stg.buffer, None);
+                device.free_memory(stg.memory, None);
             }
         }
     }

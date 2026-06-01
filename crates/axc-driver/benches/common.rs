@@ -258,6 +258,23 @@ pub fn q4_0_dequant_matvec_cpu(q: &[u8], x: &[f32], n_blocks: usize) -> f32 {
     acc
 }
 
+// ── M3.1: F16 byte helpers ────────────────────────────────────────────────────
+
+/// Convert a slice of f16 bit patterns (u16) to a byte Vec (little-endian per element).
+///
+/// Used by the coopmat dispatch tests to prepare f16 SSBO inputs.
+pub fn f16_slice_to_bytes(v: &[u16]) -> Vec<u8> {
+    v.iter().flat_map(|&b| b.to_le_bytes()).collect()
+}
+
+/// Convert a byte slice to a Vec<u16> of f16 bit patterns (little-endian).
+///
+/// Panics if `bytes.len()` is not a multiple of 2.
+pub fn bytes_to_f16_vec(bytes: &[u8]) -> Vec<u16> {
+    assert_eq!(bytes.len() % 2, 0, "f16 output must be 2-byte aligned");
+    bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
+}
+
 // ── Push-constant assembly (AT-514a discipline from M1.5) ─────────────────────
 //
 // Callers MUST iterate `plan.scalars` in stored order and dispatch on scalar.ty.

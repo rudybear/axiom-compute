@@ -17,6 +17,7 @@
 //!   a non-coopmat kernel.
 //! - Version 2 sidecars carry the optional `coopmat: Option<CoopMatShapeMeta>`
 //!   field populated by the driver from the HIR `CoopMatShape`.
+//!
 //! Versions >= 3 (or <= 0) are rejected with `MetadataSchemaMismatch`.
 //!
 //! ## Span fields
