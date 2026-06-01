@@ -1,25 +1,31 @@
-// matmul_f32_tiled.axc — M3.1: plain f32 tiled matmul (NO coopmat).
+// matmul_f32_tiled.axc — M3.1.5: NAIVE un-tiled scalar f32 GEMM (HARNESS VALIDATION ONLY).
 //
-// Computes C[row, col] = sum_k A[row, k] * B[k, col] for one (row, col) per invocation.
-// Row-major layout for all three matrices.
+// Computes C[row, col] = sum_k A[row, k] * B[k, col] for ONE (row, col) per invocation.
+// Row-major layout for all three matrices. Uncoalesced B access (B[ki*n+col] strides).
 //
-// Used for:
-//   - matmul_tflops_4096 resident bench (4096x4096 effective TFLOPS, runs on ALL vendors)
-//   - AT-1532: effective_tflops() finite > 0 assertion
-//   - D: tile holes (tile_m, tile_n) from the strategy annotation enumerate via axc-optimize
+// THIS IS NOT AN OPTIMIZED MATMUL. It is used only for harness validation:
+//   - naive_gemm_harness_validation bench: measures the resident-timing harness,
+//     labeled "NAIVE un-tiled scalar f32 GEMM — harness validation only, NOT an
+//     optimized matmul; expect low single-digit % of cuBLAS".
+//   - AT-1576: compile_source_with_meta works without @strategy holes.
+//   - AT-1581: the bench printed string MUST contain "NAIVE" and "harness validation".
 //
-// The strategy annotation declares tile_m and tile_n holes for M3.1's autotuning.
-// The enumerator produces the Cartesian product; each variant is a separate compile.
-// For the bench we use the default (first candidate): tile_m=1, tile_n=1 (one element
-// per invocation — simple but correct; M3.4 will add workgroup-level tiling).
+// The former @strategy { tile_m: ?[1,2,4], tile_n: ?[1,2,4] } holes were REMOVED
+// because they were INERT — never referenced in the kernel body. Pinning tile_m=1/2/4
+// produced byte-identical SPIR-V. The holes are now gone; this file compiles via
+// compile_source_with_meta with no assignments.
 //
-// Bit-exact vs matmul_f32_cpu (AT-1520 companion); relative tolerance 1e-3 is met
-// for the 4096x4096 case by f32 scalar accumulation.
+// Register/workgroup tiling (a real tile_m×tile_n block per invocation, using
+// shared[T,N] workgroup memory, FG.6) is DEFERRED TO M3.2. The former tile holes
+// would have needed to be wired into the body (separate accumulation loops, different
+// dispatch dimensions) to have any effect — that is M3.2 scope.
+//
+// Bit-exact vs matmul_f32_cpu for small cases; relative tolerance 1e-3 via f32
+// scalar accumulation holds for 4096x4096.
 
-@strategy { tile_m: ?[1, 2, 4], tile_n: ?[1, 2, 4] }
 @kernel
 @workgroup(64, 1, 1)
-@intent("F32 tiled matmul C = A * B; one (row,col) per invocation; tile dims from tile holes")
+@intent("NAIVE un-tiled scalar f32 GEMM C = A*B; one (row,col) per invocation; harness validation only — NOT an optimized matmul")
 @complexity(O(n))
 @precondition(true)
 fn matmul_f32_tiled(
