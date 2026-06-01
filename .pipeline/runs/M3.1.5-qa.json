@@ -1,0 +1,154 @@
+{
+  "verdict": "PASS",
+  "agent": "qa_agent",
+  "milestone_id": "M3.1.5-resident-bench",
+  "revision": "r1",
+  "date": "2026-06-01",
+
+  "requirements_total": 17,
+  "requirements_covered": 17,
+  "requirements_missing": [],
+
+  "test_results": {
+    "total_non_ignored": 785,
+    "passed": 785,
+    "failed": 0,
+    "ignored": 31,
+    "ignored_are_gpu_gated": true,
+    "ignored_tests_compile": "confirmed via cargo bench --no-run and cargo test output"
+  },
+
+  "verification_results": {
+    "clippy_check": "PASS — zero warnings with -D warnings across all targets",
+    "diff_check": "PASS — all 6 spec-mandated files present (resident.rs, context.rs, lib.rs, at1560_spirv_val_all_m31.rs, resident_matmul.rs, resident_timing.rs, matmul_f32_tiled.axc)",
+    "bench_build_check": "PASS — cargo bench --no-run -p axc-driver --bench resident_matmul succeeds",
+    "coder_self_report_matches_reality": true
+  },
+
+  "honesty_1_verification": {
+    "strategy_holes_removed": "CONFIRMED — @strategy { tile_m: ?[1,2,4], tile_n: ?[1,2,4] } line is GONE from matmul_f32_tiled.axc. Grep confirms tile_m/tile_n appear only in comments, not in live code.",
+    "header_documents_m32_deferral": "CONFIRMED — header comment states 'Register/workgroup tiling... DEFERRED TO M3.2' and explains the holes were inert.",
+    "at1560_fix": "CONFIRMED — at1560_spirv_val_all_m31.rs now uses compile_source_with_meta (no assignments); old compile_source_with_assignments path removed.",
+    "naive_gemm_label": "CONFIRMED — bench function 'naive_gemm_harness_validation' prints a string containing both 'NAIVE' and 'harness validation' (AT-1581 inline assert guards the label).",
+    "no_tflops_in_resident_timing_kernels": "CONFIRMED — resident_timing_kernels bench prints kernel_ns + timing_source only; asserts kernel_ns>0 && finite; no TFLOPS/cuBLAS line.",
+    "naive_gemm_asserts_only_tflops_gt0_finite": "CONFIRMED — bench only asserts tflops>0 && tflops.is_finite(); no competitive ratio assertion."
+  },
+
+  "timing_honesty_verification": {
+    "module_header_reworded": "CONFIRMED — resident.rs lines 1-66 reword timing as 'GPU dispatch duration: TOP_OF_PIPE → BOTTOM_OF_PIPE timestamp span; EXCLUDES host upload/readback; INCLUDES dispatch launch + pipeline latency'. Explicitly says 'NOT isolated ALU time. Do NOT call it kernel-only ALU.'",
+    "GpuTimestamp_doc_reworded": "CONFIRMED — GpuTimestamp variant doc says 'GPU dispatch duration: the single-dispatch span from before bind/push/dispatch to after all operations have drained the pipeline. Excludes host upload (one-time, pre-loop) and readback (post-loop). Includes dispatch launch latency and pipeline drain.'",
+    "warmup_mandatory_enforced": "CONFIRMED — resident_min_of_n helper enforces N_WARMUP=2 before measured loop in bench; AT-1530 enforces N_WARMUP=2. dispatch_resident itself measures one dispatch per call (caller responsibility, correctly documented).",
+    "cpufencewall_never_quoted_as_kernel_time": "CONFIRMED — timing_source_label() returns 'CpuFenceWall — scheduling-inclusive, NOT a GPU kernel time' for CpuFenceWall path; AT-1530 skips smaller-than assertion on CpuFenceWall path.",
+    "query_pool_not_created_when_0_valid_bits": "CONFIRMED — upload_resident creates query pool ONLY when select_timing_source(valid_bits, period)==GpuTimestamp; on CpuFenceWall path query_pool=vk::QueryPool::null() and no vkCmdWriteTimestamp is recorded.",
+    "select_timing_source_pure_and_tested": "CONFIRMED — AT-1573 passes: select_timing_source(32,1.0)==GpuTimestamp; (0,1.0)==CpuFenceWall; (32,0.0)==CpuFenceWall."
+  },
+
+  "correctness_1_workgroup_guard": {
+    "status": "CONFIRMED",
+    "location": "dispatch_resident lines 816-823 — validates cfg.workgroups against self.max_compute_work_group_count BEFORE any GPU work, returns DispatchError::WorkgroupCountExceedsDeviceLimit on failure.",
+    "at_1579_coverage": "AT-1579 test exists in resident_timing.rs, #[ignore]-gated (needs upload_resident), confirmed compiling."
+  },
+
+  "correctness_2_partial_cleanup": {
+    "status": "CONFIRMED via diff read — AT-1580",
+    "early_return_paths": [
+      "Path 1 (size overflow in device_local alloc loop): calls cleanup_partial_resident(device, null_qp, None, None, None, &staging_refs, &device_local_bufs) before returning Err(BufferAllocationFailed).",
+      "Path 2 (allocate_device_local_buffer failure): map_err drains staging_bufs, calls cleanup_partial_resident(device, null_qp, None, None, None, &staging_refs, &device_local_bufs) before propagating Err.",
+      "Path 3 (allocate_staging_buffer_cached failure): map_err drains staging_bufs (including newly pushed dl_buf), calls cleanup_partial_resident before propagating Err.",
+      "Path 4 (upload_command_pool creation failure): calls cleanup_partial_resident(device, null_qp, None, None, None, &staging_bufs, &device_local_bufs) before returning Err.",
+      "Path 5 (transient_staging alloc failure): frees transient_staging allocated so far + destroys upload_command_pool + calls cleanup_partial_resident for persistent objects before propagating Err.",
+      "Path 6 (record_and_submit_upload failure): frees transient_staging + destroys upload_command_pool + calls cleanup_partial_resident before returning Err.",
+      "Path 7 (resident_command_pool creation failure): cleanup_partial_resident(device, null_qp, None, descriptor_pool_opt, None, &staging_bufs, &device_local_bufs).",
+      "Path 8 (allocate_command_buffers failure): cleanup_partial_resident with Some(resident_command_pool).",
+      "Path 9 (create_fence failure): cleanup_partial_resident with Some(resident_fence=None, Some(resident_command_pool)).",
+      "Path 10 (create_query_pool failure): cleanup_partial_resident(device, null_qp, Some(resident_fence), descriptor_pool_opt, Some(resident_command_pool), ...) — fence and command_pool both freed.",
+      "No double-free: ResidentBuffers constructed only when ALL objects exist; Drop never sees partially-built state."
+    ],
+    "transient_upload_staging_freed_on_own_paths": "CONFIRMED — transient upload staging freed explicitly in error paths before calling cleanup_partial_resident; also freed at success via destroy_command_pool + per-buffer unsafe blocks.",
+    "descriptor_set_no_null_leak": "CONFIRMED — dsl=None for n==0 path returns (None,None) before descriptor_pool creation; DSL missing returns cleanup before Err."
+  },
+
+  "independent_descriptor_set": {
+    "status": "CONFIRMED",
+    "evidence": "dispatch_resident line 866: 'if let Some(ds) = resident.descriptor_set { device.cmd_bind_descriptor_sets(..., &[ds], ...); }'. HANDOFF-9 comment present at line 863. AT-1570 guards regression.",
+    "handle_inner_descriptor_set_not_referenced": "grep confirms handle.inner.descriptor_set is NOT referenced in dispatch_resident's binding code."
+  },
+
+  "no_unwrap_expect_in_new_lib_code": {
+    "status": "CONFIRMED",
+    "findings": "No new unwrap/expect introduced in resident.rs or context.rs M3.1.5 additions. Pre-existing infallible CString::new(literal).unwrap() calls in context.rs are unchanged and not new. Pre-existing defensive .expect() in prepare_kernel() (non-empty DSL invariant) is pre-existing. All unsafe blocks in M3.1.5 additions carry // SAFETY: comments."
+  },
+
+  "panic_to_result_conversion": {
+    "status": "CONFIRMED",
+    "scalar_ty_to_coopmat_scalar_meta": "Now returns Result<CoopMatScalarMeta, DriverError> — Err(UnsupportedCoopmatScalar) instead of panic!. hir_coopmat_shape_to_meta now returns Result; propagates ? in compile_source_with_meta. AT-1575 passes.",
+    "no_panic_remaining_in_scalar_fn": "CONFIRMED — grep shows no panic! in the new scalar_ty_to_coopmat_scalar_meta implementation."
+  },
+
+  "allow_annotations_verification": {
+    "clippy_manual_inspect": "Rationale documented in resident.rs header lines 1-8: partial-failure cleanup closures require tracking owned Vecs across error paths; inspect_err alternative would obscure CORRECTNESS-2 audit. ACCEPTED.",
+    "clippy_drain_collect": "Same rationale — cleanup helper requires consuming the Vec to avoid borrow conflicts in the map_err closures. ACCEPTED.",
+    "clippy_needless_range_loop": "Rationale: indexed access synchronizes multiple parallel Vecs (transient_staging[i], device_local_bufs[i], inputs[i]); enumerate/zip chains would obscure the cleanup ordering QA must audit. ACCEPTED.",
+    "verdict": "All three #![allow] have documented why-comments and none is hiding a correctness bug."
+  },
+
+  "api_additive_check": {
+    "status": "CONFIRMED",
+    "new_public_api": [
+      "VulkanContext::upload_resident",
+      "VulkanContext::dispatch_resident",
+      "VulkanContext::readback_resident",
+      "VulkanContext::prepare_kernel_checked",
+      "DriverError::UnsupportedCoopmatScalar { ty: String }",
+      "ResidentBuffers::command_buffer_handle",
+      "ResidentBuffers::fence_handle",
+      "ResidentBuffers::query_pool_handle",
+      "ResidentBuffers::device_local_buf_handles"
+    ],
+    "existing_api_unchanged": "prepare_kernel signature unchanged; dispatch_handle signature unchanged; existing bench IDs in other bench files unchanged; no codegen change."
+  },
+
+  "bench_ids_honest_set": {
+    "resident_timing_kernels/saxpy": "present",
+    "resident_timing_kernels/q4km_matvec": "present",
+    "resident_timing_kernels/q4km_matmul": "present",
+    "resident_timing_kernels/matmul_tile_coopmat": "present",
+    "naive_gemm_harness_validation": "present",
+    "dispatch_resident_matmul_tile": "present",
+    "old_matmul_tflops_4096": "GONE — confirmed renamed"
+  },
+
+  "field_doc_fix": {
+    "uses_coopmat_doc": "CONFIRMED — resident.rs line 165-167: 'Diagnostic-only: whether these buffers back a coopmat kernel. Set false in M3.1.5 — the handle carries no coopmat flag in this milestone.'"
+  },
+
+  "hn6_query_reset_ordering": {
+    "status": "CONFIRMED",
+    "evidence": "dispatch_resident lines 853-860: cmd_reset_query_pool is the FIRST recorded command after begin_command_buffer (before any cmd_write_timestamp), ONLY on the GpuTimestamp path."
+  },
+
+  "at_coverage_summary": {
+    "AT-1530": "Test exists in resident_timing.rs (#ignore), warmup mandatory, CpuFenceWall graceful fallback coded and labeled.",
+    "AT-1531": "Test exists (#ignore), coopmat typed-skip coded.",
+    "AT-1570": "Test exists (#ignore), includes ReadOnly binding (Lever A). Would detect descriptor_set regression.",
+    "AT-1571": "Test exists (#ignore), handle invariance across N=4 dispatches.",
+    "AT-1572": "Test exists (#ignore), also covered in AT-1570 inline.",
+    "AT-1573": "PASSES (non-ignored, pure unit test).",
+    "AT-1574": "Covered via AT-1578/1578b (pure preflight isolation tests). Full integration path exercised in AT-1531.",
+    "AT-1575": "PASSES (non-ignored, no-panic test).",
+    "AT-1576": "PASSES (non-ignored, matmul_f32_tiled compiles without strategy holes).",
+    "AT-1577": "PASSES — full workspace test + clippy clean + bench builds.",
+    "AT-1578": "PASSES (non-ignored, preflight isolation, deterministic first-missing-feature).",
+    "AT-1578b": "PASSES (non-ignored, coopmat preflight path).",
+    "AT-1579": "Test exists (#ignore, needs upload_resident), guard coded in dispatch_resident.",
+    "AT-1580": "QA diff-read verified — all 5+ early-return paths confirmed above.",
+    "AT-1581": "Inline assert guards 'NAIVE' and 'harness validation' substrings in bench.",
+    "AT-1582": "timing_source_label() appends CpuFenceWall qualifier; AT-1530 skips smaller-than on CpuFenceWall."
+  },
+
+  "memory_footprint_ok": true,
+
+  "summary": "All M3.1.5 spec requirements are implemented and verified. The three resident methods (upload/dispatch/readback_resident) are fully implemented (not stubs). HONESTY-1 is clean: @strategy holes are gone, naive_gemm_harness_validation is labeled, no competitive TFLOPS misrepresented. Timing honesty is complete: module header reworded to 'GPU dispatch duration' (not ALU), CpuFenceWall labeled everywhere, query pool not created on 0-valid-bits path. CORRECTNESS-1 (workgroup guard in dispatch_resident) and CORRECTNESS-2 (partial cleanup on all 10 early-return paths in upload_resident) are both verified by direct diff read. The independent descriptor set (AT-1570 guard) is confirmed in code. No unwrap/expect in new lib code. panic→DriverError::UnsupportedCoopmatScalar complete. Clippy clean. 785 non-ignored tests pass; 31 GPU-gated tests compile and are correctly #[ignore]-gated. Bench builds. API is additive only.",
+
+  "coder_self_report_accuracy": "Accurate with one qualification: the coder correctly noted warmup-discard is a caller responsibility (resident_min_of_n + AT-1530 enforce it), not baked into dispatch_resident itself — this matches the spec intent and is not a deviation."
+}

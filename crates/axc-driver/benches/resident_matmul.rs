@@ -139,7 +139,7 @@ fn bench_resident_timing_kernels(c: &mut Criterion) {
     };
 
     let mut group = c.benchmark_group("resident_matmul");
-    group.sample_size(3);
+    group.sample_size(10);
 
     // ── saxpy ──────────────────────────────────────────────────────────────
     {
@@ -441,7 +441,7 @@ fn bench_naive_gemm_harness_validation(c: &mut Criterion) {
     let workgroups = (wg_x, 1, 1);
 
     let mut group = c.benchmark_group("resident_matmul");
-    group.sample_size(3);
+    group.sample_size(10);
 
     group.bench_function("naive_gemm_harness_validation", |b| {
         b.iter_custom(|iters| {
@@ -550,7 +550,7 @@ fn bench_dispatch_resident_matmul_tile(c: &mut Criterion) {
     let workgroups = (1, 1, 1);
 
     let mut group = c.benchmark_group("resident_matmul");
-    group.sample_size(3);
+    group.sample_size(10);
 
     group.bench_function("dispatch_resident_matmul_tile", |b| {
         b.iter_custom(|iters| {
