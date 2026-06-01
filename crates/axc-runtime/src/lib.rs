@@ -77,6 +77,9 @@ pub mod kernel_handle;
 pub(crate) mod persistent_map;
 pub(crate) mod sync;
 pub(crate) mod transfer_queue;
+// M3.1 new modules
+pub mod coopmat;
+pub(crate) mod resident;
 
 pub use error::{DispatchError, DispatchResult, CopyDirection};
 pub use context::{VulkanContext, VulkanContextOptions};
@@ -85,3 +88,8 @@ pub use metadata::{KernelMetadata, load_kernel_metadata, CURRENT_SCHEMA_VERSION,
                    CoopMatShapeMeta, CoopMatScalarMeta, CoopMatScopeMeta};
 pub use icd::{probe_vulkan_available, gpu_tests_enabled, captured_icd_path};
 pub use kernel_handle::{KernelHandle, KernelCacheKey};
+pub use coopmat::{
+    CoopMatSupport, CoopMatShapeSupport, CoopMatComponentType, CoopMatScope,
+    CoopMatRequiredShape, coopmat_shape_supported, EnabledDeviceFeatures,
+};
+pub use resident::{ResidentBuffers, ResidentDispatchTiming, ResidentTimingSource, ResidentBenchConfig};
