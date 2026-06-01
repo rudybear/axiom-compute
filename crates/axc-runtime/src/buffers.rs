@@ -177,9 +177,8 @@ fn align_up(value: u64, alignment: u64) -> u64 {
 
 /// A DEVICE_LOCAL Vulkan buffer and its backing device memory.
 ///
-/// Created by `allocate_device_local_buffer` (plain) or `allocate_device_local_buffer_rebar`
-/// (r2 Lever B: ReBAR-backed, persistently mapped); destroyed by `KernelHandleInner::drop`
-/// (which unmaps any mapping BEFORE `destroy_buffer` then `free_memory`).
+/// Created by `allocate_device_local_buffer`; destroyed by `KernelHandleInner::drop`
+/// (which calls `destroy_buffer` then `free_memory` in dependency-correct order).
 pub(crate) struct DeviceLocalBuffer {
     /// The Vulkan buffer handle.
     pub(crate) buffer: vk::Buffer,
@@ -187,20 +186,6 @@ pub(crate) struct DeviceLocalBuffer {
     pub(crate) memory: vk::DeviceMemory,
     /// Actual allocated size in bytes.
     pub(crate) size: u64,
-    /// r2 Lever B: persistent host-side mapping into ReBAR (DEVICE_LOCAL|HOST_VISIBLE) memory.
-    ///
-    /// `Some` ONLY for a ReBAR-backed OUTPUT buffer allocated by `allocate_device_local_buffer_rebar`.
-    /// `None` for all plain device-local buffers (non-output or no-ReBAR fallback).
-    ///
-    /// If `Some`, MUST be unmapped (consuming the `PersistentMapping`) BEFORE
-    /// `destroy_buffer` / `free_memory` — same ordering as staging.
-    pub(crate) mapping: Option<PersistentMapping>,
-    /// r2 Lever B: coherency of the ReBAR mapping.
-    ///
-    /// Meaningful only when `mapping.is_some()`. For plain device-local buffers this is
-    /// set to `Coherency::Coherent` as a placeholder (it is never read when mapping is None).
-    #[allow(dead_code)]
-    pub(crate) coherency: Coherency,
 }
 
 /// A HOST_VISIBLE staging Vulkan buffer and its backing memory.
@@ -358,9 +343,6 @@ pub(crate) fn allocate_device_local_buffer(
         buffer,
         memory,
         size: aligned_size,
-        // Plain device-local: no ReBAR mapping. Coherency field is a placeholder (never read).
-        mapping: None,
-        coherency: Coherency::Coherent,
     })
 }
 
@@ -565,193 +547,6 @@ pub(crate) fn find_host_cached_memory_type_index(
     }
 
     None
-}
-
-/// Find a DEVICE_LOCAL | HOST_VISIBLE (ReBAR) memory type index for zero-copy output readback.
-///
-/// r2 Lever B: for OUTPUT bindings that are read back, the device-local storage buffer is
-/// allocated in ReBAR memory and persistently mapped, so the host reads results at ~60 GB/s
-/// directly from device-visible VRAM — eliminating the device→staging readback DMA and the
-/// slow staging copy_out (~4.5 GB/s on cold-cache system-RAM staging pages).
-///
-/// ## Search strategy (two passes — prefer COHERENT ReBAR)
-///
-/// Pass 1: DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT → `Coherency::Coherent`.
-///   (No invalidate needed; the Blackwell's Type 4 is this.)
-/// Pass 2: DEVICE_LOCAL | HOST_VISIBLE (without HOST_COHERENT) → `Coherency::NonCoherent{atom_size}`.
-///   (Requires atom-aligned invalidate before host read.)
-///
-/// Returns `None` if no DEVICE_LOCAL | HOST_VISIBLE type is compatible (Lavapipe /
-/// AMD-without-ReBAR / discrete-without-ReBAR). Callers fall back to the r1 staging-readback path.
-///
-/// `type_bits`: pass `mem_reqs.memory_type_bits` for an actual allocation, or `!0u32`
-/// (all types compatible) for the ReBAR-availability probe in context init.
-pub(crate) fn find_rebar_memory_type_index(
-    mem_props: &vk::PhysicalDeviceMemoryProperties,
-    type_bits: u32,
-    non_coherent_atom_size: u64,
-) -> Option<(u32, Coherency)> {
-    let local_vis = vk::MemoryPropertyFlags::DEVICE_LOCAL | vk::MemoryPropertyFlags::HOST_VISIBLE;
-    let coherent = vk::MemoryPropertyFlags::HOST_COHERENT;
-
-    // Pass 1: prefer DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT (no invalidate cost).
-    for i in 0..mem_props.memory_type_count {
-        if (type_bits >> i) & 1 != 1 {
-            continue;
-        }
-        let flags = mem_props.memory_types[i as usize].property_flags;
-        if flags.contains(local_vis | coherent) {
-            return Some((i, Coherency::Coherent));
-        }
-    }
-
-    // Pass 2: fall back to DEVICE_LOCAL | HOST_VISIBLE without HOST_COHERENT (non-coherent ReBAR).
-    for i in 0..mem_props.memory_type_count {
-        if (type_bits >> i) & 1 != 1 {
-            continue;
-        }
-        let flags = mem_props.memory_types[i as usize].property_flags;
-        if flags.contains(local_vis) && !flags.contains(coherent) {
-            return Some((i, Coherency::NonCoherent { atom_size: non_coherent_atom_size }));
-        }
-    }
-
-    None
-}
-
-/// Allocate a DEVICE_LOCAL buffer in ReBAR (DEVICE_LOCAL | HOST_VISIBLE) memory and
-/// persistently map it for zero-copy output readback.
-///
-/// r2 Lever B: for output bindings, the device-local storage buffer lives in ReBAR memory
-/// so the compute shader writes results directly into host-visible VRAM. After the fence
-/// the host reads via `device_local.mapping.copy_out()` at ~60 GB/s, eliminating the
-/// device→staging readback DMA and the cold-cache staging copy_out.
-///
-/// ## Buffer usage
-///
-/// Usage flags are STORAGE_BUFFER | TRANSFER_SRC | TRANSFER_DST — identical to the plain
-/// device-local path. STORAGE_BUFFER is mandatory (the shader binds the ReBAR buffer as
-/// the SSBO). TRANSFER_* flags are retained so the buffer can participate in mixed cases.
-///
-/// ## Mapping
-///
-/// `map_persistent` is called after `vkBindBufferMemory`. On map failure, both the
-/// buffer and memory are destroyed before returning `MemoryMapFailed` (no leak).
-///
-/// ## Sharing mode (CRITICAL-2)
-///
-/// CONCURRENT / EXCLUSIVE sharing via `concurrent_families`, identical to
-/// `allocate_device_local_buffer`. Composition with the iGPU-unified path is
-/// natural: on an iGPU the only DEVICE_LOCAL type is already HOST_VISIBLE, so
-/// `find_rebar_memory_type_index` will find it and this function will map it.
-pub(crate) fn allocate_device_local_buffer_rebar(
-    device: &ash::Device,
-    mem_props: &vk::PhysicalDeviceMemoryProperties,
-    non_coherent_atom_size: u64,
-    size: u64,
-    binding: u32,
-    concurrent_families: Option<[u32; 2]>,
-) -> Result<DeviceLocalBuffer, DispatchError> {
-    let requested_size: u64 = size.max(4);
-
-    let concurrent_families_storage: [u32; 2] = concurrent_families.unwrap_or([0, 0]);
-
-    let buffer_info: vk::BufferCreateInfo<'_> = if concurrent_families.is_some() {
-        vk::BufferCreateInfo::default()
-            .size(requested_size)
-            .usage(
-                vk::BufferUsageFlags::STORAGE_BUFFER
-                    | vk::BufferUsageFlags::TRANSFER_SRC
-                    | vk::BufferUsageFlags::TRANSFER_DST,
-            )
-            .sharing_mode(vk::SharingMode::CONCURRENT)
-            .queue_family_indices(&concurrent_families_storage)
-    } else {
-        vk::BufferCreateInfo::default()
-            .size(requested_size)
-            .usage(
-                vk::BufferUsageFlags::STORAGE_BUFFER
-                    | vk::BufferUsageFlags::TRANSFER_SRC
-                    | vk::BufferUsageFlags::TRANSFER_DST,
-            )
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-    };
-
-    // SAFETY: device is valid; buffer_info is correctly populated.
-    let buffer: vk::Buffer = unsafe { device.create_buffer(&buffer_info, None) }
-        .map_err(|e| DispatchError::BufferAllocationFailed {
-            binding,
-            size: requested_size as usize,
-            reason: e.to_string(),
-        })?;
-
-    // SAFETY: buffer was just created successfully.
-    let mem_reqs: vk::MemoryRequirements =
-        unsafe { device.get_buffer_memory_requirements(buffer) };
-
-    let (memory_type_index, coherency): (u32, Coherency) =
-        find_rebar_memory_type_index(mem_props, mem_reqs.memory_type_bits, non_coherent_atom_size)
-            .ok_or_else(|| {
-                // SAFETY: buffer was created above; destroy on error to avoid leak.
-                unsafe { device.destroy_buffer(buffer, None); }
-                DispatchError::NoCompatibleMemoryType
-            })?;
-
-    let aligned_size: u64 = align_up(requested_size, mem_reqs.alignment);
-
-    let alloc_info: vk::MemoryAllocateInfo<'_> = vk::MemoryAllocateInfo::default()
-        .allocation_size(aligned_size)
-        .memory_type_index(memory_type_index);
-
-    // SAFETY: alloc_info is valid; we destroy this memory in KernelHandleInner::drop
-    // (after unmapping the ReBAR persistent mapping first — same ordering as staging).
-    let memory: vk::DeviceMemory = unsafe { device.allocate_memory(&alloc_info, None) }
-        .map_err(|e| {
-            // SAFETY: buffer was created above; destroy on error to avoid leak.
-            unsafe { device.destroy_buffer(buffer, None); }
-            DispatchError::BufferAllocationFailed {
-                binding,
-                size: aligned_size as usize,
-                reason: format!("allocate_memory (rebar): {e}"),
-            }
-        })?;
-
-    // SAFETY: memory and buffer are valid. Offset 0 satisfies alignment.
-    unsafe { device.bind_buffer_memory(buffer, memory, 0) }
-        .map_err(|e| {
-            // SAFETY: clean up both handles on bind failure.
-            unsafe {
-                device.free_memory(memory, None);
-                device.destroy_buffer(buffer, None);
-            }
-            DispatchError::BufferAllocationFailed {
-                binding,
-                size: aligned_size as usize,
-                reason: format!("bind_buffer_memory (rebar): {e}"),
-            }
-        })?;
-
-    // Persistently map the ReBAR memory AFTER bind and BEFORE returning.
-    // On vkMapMemory failure: destroy buffer + free memory to avoid leak (same as staging).
-    // SAFETY: memory is DEVICE_LOCAL|HOST_VISIBLE (guaranteed by find_rebar_memory_type_index),
-    // not yet mapped, and aligned_size is the true allocation size.
-    let mapping: PersistentMapping = unsafe {
-        map_persistent(device, memory, aligned_size, coherency)
-    }.inspect_err(|_| {
-        // SAFETY: buffer and memory were successfully created above; destroy on map failure.
-        unsafe {
-            device.free_memory(memory, None);
-            device.destroy_buffer(buffer, None);
-        }
-    })?;
-
-    Ok(DeviceLocalBuffer {
-        buffer,
-        memory,
-        size: aligned_size,
-        mapping: Some(mapping),
-        coherency,
-    })
 }
 
 /// Find a DEVICE_LOCAL (optionally also HOST_VISIBLE, for iGPU) memory type index.
@@ -1020,108 +815,5 @@ mod tests {
         let total: u64 = round_up_pow2(saxpy_buf_size) * n_buffers;
         let cap_bytes: u64 = 50 * 1024 * 1024 * 1024; // 50 GB
         assert!(total < cap_bytes, "saxpy_1m total allocation must be < 50 GB; got {total}");
-    }
-
-    // ── r2 Lever B unit tests ──────────────────────────────────────────────────
-
-    /// AT-1424 (unit): find_rebar_memory_type_index prefers COHERENT ReBAR over non-coherent.
-    ///
-    /// Synthetic memory properties: type 0 = DEVICE_LOCAL (no HOST_VISIBLE),
-    /// type 1 = DEVICE_LOCAL|HOST_VISIBLE (non-coherent ReBAR),
-    /// type 2 = DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT (preferred coherent ReBAR).
-    /// Expects: type 2 returned, Coherency::Coherent.
-    #[test]
-    fn at_1424a_rebar_prefers_coherent() {
-        let mut memory_types = [vk::MemoryType::default(); vk::MAX_MEMORY_TYPES];
-        memory_types[0].property_flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
-        memory_types[1].property_flags =
-            vk::MemoryPropertyFlags::DEVICE_LOCAL | vk::MemoryPropertyFlags::HOST_VISIBLE;
-        memory_types[2].property_flags =
-            vk::MemoryPropertyFlags::DEVICE_LOCAL
-            | vk::MemoryPropertyFlags::HOST_VISIBLE
-            | vk::MemoryPropertyFlags::HOST_COHERENT;
-
-        let mem_props = vk::PhysicalDeviceMemoryProperties {
-            memory_type_count: 3,
-            memory_types,
-            ..Default::default()
-        };
-
-        let result = find_rebar_memory_type_index(&mem_props, 0b111, 64);
-        assert!(result.is_some(), "must find ReBAR type");
-        let (idx, coherency) = result.unwrap();
-        assert_eq!(idx, 2, "must prefer coherent ReBAR type at index 2");
-        assert_eq!(coherency, Coherency::Coherent, "coherent ReBAR must return Coherency::Coherent");
-    }
-
-    /// AT-1424b (unit): find_rebar_memory_type_index returns NonCoherent when only
-    /// a non-coherent DEVICE_LOCAL|HOST_VISIBLE type is present.
-    #[test]
-    fn at_1424b_rebar_noncoherent_fallback() {
-        let mut memory_types = [vk::MemoryType::default(); vk::MAX_MEMORY_TYPES];
-        memory_types[0].property_flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
-        memory_types[1].property_flags =
-            vk::MemoryPropertyFlags::DEVICE_LOCAL | vk::MemoryPropertyFlags::HOST_VISIBLE;
-
-        let mem_props = vk::PhysicalDeviceMemoryProperties {
-            memory_type_count: 2,
-            memory_types,
-            ..Default::default()
-        };
-
-        let atom_size: u64 = 128;
-        let result = find_rebar_memory_type_index(&mem_props, 0b11, atom_size);
-        assert!(result.is_some(), "must find non-coherent ReBAR type");
-        let (idx, coherency) = result.unwrap();
-        assert_eq!(idx, 1, "must pick DEVICE_LOCAL|HOST_VISIBLE at index 1");
-        match coherency {
-            Coherency::NonCoherent { atom_size: a } => {
-                assert_eq!(a, atom_size, "atom_size must match the plumbed non_coherent_atom_size");
-            }
-            Coherency::Coherent => panic!("non-coherent ReBAR must return NonCoherent"),
-        }
-    }
-
-    /// AT-1424c (unit): find_rebar_memory_type_index returns None on Lavapipe-like props
-    /// (no DEVICE_LOCAL|HOST_VISIBLE type). This covers the AT-1416 rebar_available=false case.
-    #[test]
-    fn at_1424c_rebar_absent_returns_none() {
-        let mut memory_types = [vk::MemoryType::default(); vk::MAX_MEMORY_TYPES];
-        // Only: DEVICE_LOCAL and HOST_VISIBLE|HOST_COHERENT (no combined type)
-        memory_types[0].property_flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
-        memory_types[1].property_flags =
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-
-        let mem_props = vk::PhysicalDeviceMemoryProperties {
-            memory_type_count: 2,
-            memory_types,
-            ..Default::default()
-        };
-
-        let result = find_rebar_memory_type_index(&mem_props, 0b11, 64);
-        assert!(result.is_none(), "Lavapipe-like props must return None for ReBAR finder");
-    }
-
-    /// AT-1416 (unit): rebar_available is false when find_rebar_memory_type_index returns None.
-    ///
-    /// On Lavapipe or discrete GPUs without ReBAR, the runtime sets rebar_available=false
-    /// and falls back to r1's staging-readback ladder. This unit asserts the probe is None.
-    #[test]
-    fn at_1416_rebar_available_false_for_lavapipe_like_props() {
-        let mut memory_types = [vk::MemoryType::default(); vk::MAX_MEMORY_TYPES];
-        // Lavapipe: HOST_VISIBLE|HOST_COHERENT only (no separate DEVICE_LOCAL type)
-        memory_types[0].property_flags =
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-
-        let mem_props = vk::PhysicalDeviceMemoryProperties {
-            memory_type_count: 1,
-            memory_types,
-            ..Default::default()
-        };
-
-        // probe with type_bits=!0 (all types compatible), as context init does.
-        let rebar_available: bool =
-            find_rebar_memory_type_index(&mem_props, !0u32, 64).is_some();
-        assert!(!rebar_available, "rebar_available must be false for Lavapipe-like memory props");
     }
 }

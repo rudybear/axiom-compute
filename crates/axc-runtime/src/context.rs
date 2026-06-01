@@ -59,7 +59,6 @@ use crate::instance_owner::InstanceOwner;
 use crate::error::DispatchError;
 use crate::pipeline_cache::{PipelineCache, resolve_pipeline_cache_path_from_env};
 use crate::pipeline::build_compute_pipeline;
-use crate::buffers::find_rebar_memory_type_index;
 use crate::kernel_handle::{
     KernelHandle, KernelHandleInner, KernelCacheKey,
     make_cache_key, allocate_descriptor_pool_and_set,
@@ -116,14 +115,6 @@ pub struct VulkanContextOptions {
     /// `None` = auto. `Some(true)` = treat all staging as NonCoherent for CI coverage.
     /// Reads `AXC_FORCE_NONCOHERENT_STAGING=1` from env in `from_env()`.
     pub force_noncoherent_staging: Option<bool>,
-    /// Force staging-readback fallback even on ReBAR-capable hardware (r2 Lever B).
-    ///
-    /// `None` = auto (use ReBAR when available). `Some(true)` = always use r1 staging-readback.
-    /// Reads `AXC_FORCE_NO_REBAR=1` from env in `from_env()`.
-    ///
-    /// Enables the ReBAR-absent fallback ladder to be exercised on ReBAR-capable hardware
-    /// for AT-1423 correctness and CI coverage, mirroring r1's force-option discipline.
-    pub force_no_rebar: Option<bool>,
 }
 
 impl VulkanContextOptions {
@@ -147,7 +138,6 @@ impl VulkanContextOptions {
             force_single_queue: read_bool_flag("AXC_FORCE_SINGLE_QUEUE"),
             force_binary_semaphores: read_bool_flag("AXC_FORCE_BINARY_SEMAPHORES"),
             force_noncoherent_staging: read_bool_flag("AXC_FORCE_NONCOHERENT_STAGING"),
-            force_no_rebar: read_bool_flag("AXC_FORCE_NO_REBAR"),
         }
     }
 }
@@ -210,17 +200,6 @@ pub struct VulkanContext {
     non_coherent_atom_size: u64,
     /// Whether `force_noncoherent_staging` was set (AT-1409 / AT-1418).
     force_noncoherent_staging: bool,
-    /// r2 Lever B: true if a DEVICE_LOCAL|HOST_VISIBLE (ReBAR) memory type is available.
-    ///
-    /// Probed once at context creation via `find_rebar_memory_type_index(&memory_properties, !0, ...)`.
-    /// When false (Lavapipe / AMD-without-ReBAR / discrete-without-ReBAR), every output
-    /// binding uses the r1 staging-readback path with no regression.
-    rebar_available: bool,
-    /// r2 Lever B: true if `force_no_rebar` was set (AXC_FORCE_NO_REBAR=1).
-    ///
-    /// Forces the staging-readback fallback even on ReBAR hardware, enabling AT-1423
-    /// correctness testing on the dev box. Mirrors r1's force-option discipline.
-    force_no_rebar: bool,
     /// Context-level queue-submit lock (CRITICAL-5: atomic-group serialization).
     queue_submit_lock: Arc<Mutex<()>>,
     /// Per-pool lock for the compute command pool (WARNING-5).
@@ -447,20 +426,8 @@ impl VulkanContext {
             .unwrap_or(crate::dispatch::DEFAULT_FENCE_TIMEOUT_MS);
 
         let force_noncoherent: bool = opts.force_noncoherent_staging.unwrap_or(false);
-        let force_no_rebar: bool = opts.force_no_rebar.unwrap_or(false);
         let transfer_pool_lock: Option<Arc<Mutex<()>>> =
             if transfer.is_some() { Some(Arc::new(Mutex::new(()))) } else { None };
-
-        // r2 Lever B: probe ReBAR availability ONCE at context creation.
-        // type_bits=!0u32 means "all types compatible" — we just need to know if
-        // any DEVICE_LOCAL|HOST_VISIBLE type exists on this physical device.
-        let rebar_available: bool =
-            find_rebar_memory_type_index(&memory_properties, !0u32, non_coherent_atom_size).is_some();
-        tracing::debug!(
-            rebar_available,
-            force_no_rebar,
-            "r2 ReBAR readback path probe"
-        );
 
         Ok(Self {
             instance_owner,
@@ -480,8 +447,6 @@ impl VulkanContext {
             sync_mode: s_mode,
             non_coherent_atom_size,
             force_noncoherent_staging: force_noncoherent,
-            rebar_available,
-            force_no_rebar,
             queue_submit_lock: Arc::new(Mutex::new(())),
             compute_pool_lock: Arc::new(Mutex::new(())),
             transfer_pool_lock,
@@ -634,10 +599,6 @@ impl VulkanContext {
             handoff,
             non_coherent_atom_size: self.non_coherent_atom_size,
             concurrent_families: concurrent_family_indices(&self.queue_family_sel),
-            // r2 Lever B: copied from context so ensure_buffers_fit_with_mem_props can decide
-            // per-binding whether to allocate via ReBAR or the r1 staging-readback path.
-            rebar_available: self.rebar_available && !self.force_no_rebar,
-            force_no_rebar: self.force_no_rebar,
         });
 
         // Phase 3: re-lock and re-check (lost-race detection, W-3).

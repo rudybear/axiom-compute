@@ -30,46 +30,14 @@ use parking_lot::Mutex;
 use crate::device_owner::DeviceOwner;
 use crate::instance_owner::InstanceOwner;
 use crate::error::DispatchError;
-use axc_hir::buffer::BufferAccess;
 use crate::buffers::{
-    allocate_device_local_buffer, allocate_device_local_buffer_rebar,
-    allocate_staging_buffer_cached,
+    allocate_device_local_buffer, allocate_staging_buffer_cached,
     DeviceLocalBuffer, StagingBuffer, round_up_pow2,
 };
 use crate::persistent_map::Coherency;
 use crate::sync::{HandoffSemaphores, SyncMode, destroy_handoff, recreate_binary_on_error};
 use crate::transfer_queue::QueueMode;
 use crate::dispatch::DEFAULT_FENCE_TIMEOUT_MS;
-
-/// r2 Lever A: determine whether a binding index should be read back from the device.
-///
-/// Returns `true` iff `output_size > 0` AND the binding's access mode is NOT `ReadOnly`.
-///
-/// A `ReadOnly` binding carries the SPIR-V `NonWritable` decoration, which proves the
-/// shader cannot write it — so there is nothing to read back, regardless of a non-zero
-/// `output_sizes[i]` supplied by the caller.
-///
-/// `WriteOnly` and `ReadWrite` bindings read back EXACTLY as in r1 (byte-exact preserved).
-/// For `ReadOnly` bindings the caller receives an empty `Vec<u8>` (byte-identical to the
-/// `output_size==0` case, which was already empty in r1).
-///
-/// This predicate replaces ALL five readback gates in:
-/// - `dispatch_single_queue`: compute→transfer barrier loop, device→staging copy loop.
-/// - `dispatch_dedicated`: compute→transfer barrier loop, readback copy loop.
-/// - `readback_from_persistent_mapping`: the per-slot gate.
-pub fn binding_is_readback(access: BufferAccess, output_size: usize) -> bool {
-    output_size > 0 && !matches!(access, BufferAccess::ReadOnly)
-}
-
-/// r2 Lever B: test whether a buffer slot has a ReBAR persistent mapping.
-///
-/// Returns `true` if the device-local buffer was allocated in ReBAR memory and
-/// persistently mapped via `allocate_device_local_buffer_rebar`. When true, the
-/// readback path reads directly from `slot.device_local.mapping` at ~60 GB/s
-/// instead of going through the staging DMA + copy_out.
-fn slot_is_rebar(slot: &BufferSlot) -> bool {
-    slot.device_local.mapping.is_some()
-}
 
 /// Cache key for the in-process kernel cache.
 ///
@@ -162,20 +130,6 @@ pub(crate) struct KernelHandleInner {
     /// Concurrent queue families for CONCURRENT device-local buffers.
     /// `None` in SingleQueue mode.
     pub(crate) concurrent_families: Option<[u32; 2]>,
-    // ── r2 Lever B additions ──────────────────────────────────────────────────
-    /// True when a DEVICE_LOCAL|HOST_VISIBLE (ReBAR) memory type is available AND
-    /// `force_no_rebar` is false. Copied from context at `prepare_kernel` time.
-    ///
-    /// When true, OUTPUT bindings (where `binding_is_readback` is true) are allocated
-    /// via `allocate_device_local_buffer_rebar` in `ensure_buffers_fit_with_mem_props`.
-    pub(crate) rebar_available: bool,
-    /// True if `AXC_FORCE_NO_REBAR=1` was set.
-    ///
-    /// Forces the r1 staging-readback fallback on ReBAR-capable hardware for AT-1423
-    /// correctness testing and CI coverage. Copied from context at `prepare_kernel` time.
-    /// Stored here for diagnostic introspection (see AT-1423 in m3_bandwidth.rs).
-    #[allow(dead_code)]
-    pub(crate) force_no_rebar: bool,
 }
 
 /// Public opaque handle to a compiled Vulkan kernel.
@@ -233,39 +187,24 @@ impl Drop for KernelHandleInner {
         {
             let mut guard = self.buffers.lock();
             for slot in guard.drain(..) {
-                // DROP ORDER (CRITICAL-6 / r2 Coder handoff):
-                //   1. slot.staging.mapping.unmap(device, memory)  ← CONSUMES PersistentMapping
-                //   2. device.destroy_buffer(slot.staging.buffer)
-                //   3. device.free_memory(slot.staging.memory)
-                //   4. IF slot.device_local.mapping is Some: unmap it (CONSUMES) BEFORE destroy
-                //   5. device.destroy_buffer(slot.device_local.buffer)
-                //   6. device.free_memory(slot.device_local.memory)
-                // Unmap MUST precede destroy_buffer to avoid a Vulkan validation error
-                // (vkDestroyBuffer while memory is mapped). For ReBAR outputs, step 4 is
-                // conditional but must precede step 5 — the Option is moved out by value so
-                // a forgotten unmap is structurally visible in review.
+                // Unmap staging BEFORE destroying buffer and freeing memory.
                 let staging_memory = slot.staging.memory;
                 let staging_buffer = slot.staging.buffer;
                 let device_local_buffer = slot.device_local.buffer;
                 let device_local_memory = slot.device_local.memory;
-                let rebar_mapping = slot.device_local.mapping; // Option<PersistentMapping>
                 // SAFETY: buffers are only destroyed after all fence waits complete (Drop
                 // runs after the last dispatch_handle returns). unmap-before-destroy order
                 // is mandatory; consuming PersistentMapping makes a forgotten unmap a compile error.
                 unsafe {
-                    // Step 1: unmap staging (consumes PersistentMapping).
+                    // Step 1: unmap (consumes PersistentMapping — compile error if forgotten).
                     slot.staging.mapping.unmap(device, staging_memory);
                     // Step 2: destroy staging buffer.
                     device.destroy_buffer(staging_buffer, None);
                     // Step 3: free staging memory.
                     device.free_memory(staging_memory, None);
-                    // Step 4: unmap ReBAR device-local mapping if present (r2 Lever B).
-                    if let Some(rebar_map) = rebar_mapping {
-                        rebar_map.unmap(device, device_local_memory);
-                    }
-                    // Step 5: destroy device-local buffer.
+                    // Step 4: destroy device-local buffer (never mapped).
                     device.destroy_buffer(device_local_buffer, None);
-                    // Step 6: free device-local memory.
+                    // Step 5: free device-local memory.
                     device.free_memory(device_local_memory, None);
                 }
             }
@@ -430,27 +369,21 @@ pub(crate) fn ensure_buffers_fit_with_mem_props(
         }
 
         // Destroy existing slot if present (and at index i).
-        // DROP ORDER (r2 Coder handoff): unmap staging BEFORE destroy, and unmap any ReBAR
-        // device-local mapping BEFORE destroy_buffer on the device-local buffer.
+        // DROP ORDER (Coder handoff note 1): unmap staging BEFORE destroy BEFORE free.
         if i < buffers.len() {
             let old_slot = buffers.remove(i);
             let staging_memory = old_slot.staging.memory;
             let staging_buffer = old_slot.staging.buffer;
             let device_local_buffer = old_slot.device_local.buffer;
             let device_local_memory = old_slot.device_local.memory;
-            let rebar_mapping = old_slot.device_local.mapping; // Option<PersistentMapping>
             // SAFETY: the old buffers are not in use (from a prior completed dispatch).
             unsafe {
-                // Step 1: unmap staging persistent mapping (BEFORE destroy).
+                // Step 1: unmap persistent mapping (BEFORE destroy).
                 old_slot.staging.mapping.unmap(device, staging_memory);
                 // Step 2: destroy and free staging.
                 device.destroy_buffer(staging_buffer, None);
                 device.free_memory(staging_memory, None);
-                // Step 3: unmap ReBAR device-local mapping if present (r2 Lever B).
-                if let Some(rebar_map) = rebar_mapping {
-                    rebar_map.unmap(device, device_local_memory);
-                }
-                // Step 4: destroy and free device-local.
+                // Step 3: destroy and free device-local.
                 device.destroy_buffer(device_local_buffer, None);
                 device.free_memory(device_local_memory, None);
             }
@@ -465,33 +398,13 @@ pub(crate) fn ensure_buffers_fit_with_mem_props(
             });
         }
 
-        // r2 Lever B: allocate the device-local buffer in ReBAR (DEVICE_LOCAL|HOST_VISIBLE)
-        // memory for output bindings when ReBAR is available and not suppressed.
-        // binding_is_readback checks BOTH the access mode (not ReadOnly) AND that a
-        // non-zero output_size was requested for this binding.
-        let is_output: bool = {
-            let access = inner.binding_plan.buffers[i].ty.access;
-            let out_len = if i < output_sizes.len() { output_sizes[i] } else { 0 };
-            binding_is_readback(access, out_len)
-        };
-        let device_local: DeviceLocalBuffer = if is_output && inner.rebar_available {
-            allocate_device_local_buffer_rebar(
-                device,
-                mem_props,
-                inner.non_coherent_atom_size,
-                new_size,
-                i as u32,
-                inner.concurrent_families,
-            )?
-        } else {
-            allocate_device_local_buffer(
-                device,
-                mem_props,
-                new_size,
-                i as u32,
-                inner.concurrent_families,
-            )?
-        };
+        let device_local: DeviceLocalBuffer = allocate_device_local_buffer(
+            device,
+            mem_props,
+            new_size,
+            i as u32,
+            inner.concurrent_families,
+        )?;
 
         let staging: StagingBuffer = allocate_staging_buffer_cached(
             device,
@@ -853,75 +766,41 @@ fn dispatch_single_queue(
     // SAFETY: workgroup counts were validated.
     unsafe { device.cmd_dispatch(cb, workgroups.0, workgroups.1, workgroups.2); }
 
-    // ── Compute→Transfer barriers (Lever A + Lever B) ────────────────────────
-    // r2 Lever A: only emit barriers for bindings that are actually read back
-    //   (binding_is_readback: output_size>0 AND access != ReadOnly).
-    // r2 Lever B: for ReBAR output bindings, emit SHADER_WRITE→HOST_READ (dstStage=HOST)
-    //   instead of SHADER_WRITE→TRANSFER_READ; no device→staging copy is recorded.
-    let mut compute_to_transfer_barriers: Vec<vk::BufferMemoryBarrier<'_>> = Vec::new();
-    let mut rebar_host_barriers: Vec<vk::BufferMemoryBarrier<'_>> = Vec::new();
+    // ── Compute→Transfer barriers ────────────────────────────────────────────
+    let mut compute_barriers: Vec<vk::BufferMemoryBarrier<'_>> = Vec::new();
     for i in 0..n {
-        let out_size = if i < output_sizes.len() { output_sizes[i] } else { 0 };
-        let access = inner.binding_plan.buffers[i].ty.access;
-        if !binding_is_readback(access, out_size) { continue; } // Lever A
+        if i >= output_sizes.len() || output_sizes[i] == 0 { continue; }
         let slot = &buffers[i];
-        if slot_is_rebar(slot) {
-            // Lever B: SHADER_WRITE → HOST_READ barrier on the ReBAR device-local buffer.
-            // dstStage=HOST: the host reads directly from the mapped ReBAR pointer after the fence.
-            let barrier = vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(slot.device_local.buffer).offset(0).size(vk::WHOLE_SIZE);
-            rebar_host_barriers.push(barrier);
-        } else {
-            // Staged readback: SHADER_WRITE → TRANSFER_READ (r1 path).
-            let barrier = vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(slot.device_local.buffer).offset(0).size(vk::WHOLE_SIZE);
-            compute_to_transfer_barriers.push(barrier);
-        }
+        let barrier = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(slot.device_local.buffer).offset(0).size(vk::WHOLE_SIZE);
+        compute_barriers.push(barrier);
     }
-    if !compute_to_transfer_barriers.is_empty() {
+    if !compute_barriers.is_empty() {
         // SAFETY: barriers correctly formed.
         unsafe {
             device.cmd_pipeline_barrier(cb,
                 vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(), &[], &compute_to_transfer_barriers, &[]);
-        }
-    }
-    if !rebar_host_barriers.is_empty() {
-        // Lever B: emit COMPUTE_SHADER→HOST barrier for all ReBAR outputs on the compute CB.
-        // SAFETY: barriers correctly formed.
-        unsafe {
-            device.cmd_pipeline_barrier(cb,
-                vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::HOST,
-                vk::DependencyFlags::empty(), &[], &rebar_host_barriers, &[]);
+                vk::DependencyFlags::empty(), &[], &compute_barriers, &[]);
         }
     }
 
     // ── Stage B: device→staging copies + TRANSFER_WRITE→HOST_READ barriers ───
-    // (CRITICAL-1: ALWAYS emit this barrier for staged outputs, both coherent and non-coherent paths)
-    // r2 Lever A: skip ReadOnly bindings (never read back).
-    // r2 Lever B: skip ReBAR output bindings (no copy needed; read from mapped pointer).
+    // (CRITICAL-1: ALWAYS emit this barrier, both coherent and non-coherent paths)
     let mut readback_barriers: Vec<vk::BufferMemoryBarrier<'_>> = Vec::new();
     for i in 0..n {
-        let out_size = if i < output_sizes.len() { output_sizes[i] } else { 0 };
-        let access = inner.binding_plan.buffers[i].ty.access;
-        if !binding_is_readback(access, out_size) { continue; } // Lever A
+        if i >= output_sizes.len() || output_sizes[i] == 0 { continue; }
         let slot = &buffers[i];
-        if slot_is_rebar(slot) { continue; } // Lever B: no copy for ReBAR outputs
         let copy_region = vk::BufferCopy::default()
-            .src_offset(0).dst_offset(0).size(out_size as u64);
+            .src_offset(0).dst_offset(0).size(output_sizes[i] as u64);
         // SAFETY: valid non-overlapping buffers.
         unsafe {
             device.cmd_copy_buffer(cb, slot.device_local.buffer, slot.staging.buffer, &[copy_region]);
         }
-        // CRITICAL-1: always emit TRANSFER_WRITE→HOST_READ barrier for staged outputs.
+        // CRITICAL-1: always emit TRANSFER_WRITE→HOST_READ barrier.
         let barrier = vk::BufferMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
             .dst_access_mask(vk::AccessFlags::HOST_READ)
@@ -975,9 +854,9 @@ fn dispatch_single_queue(
     }
     wait_result.map_err(|e| DispatchError::QueueSubmitFailed(e.to_string()))?;
 
-    // ── Readback via persistent mapping (Lever A + Lever B) ─────────────────
+    // ── Readback via persistent mapping ──────────────────────────────────────
     let outputs = readback_from_persistent_mapping(
-        inner, buffers, output_sizes, n, device, ctx.non_coherent_atom_size,
+        buffers, output_sizes, n, device, ctx.non_coherent_atom_size,
         &effective_coherency, ctx.force_noncoherent,
     );
 
@@ -1010,27 +889,7 @@ fn dispatch_dedicated(
         .expect("transfer_pool_lock must be Some in DedicatedTransfer mode");
 
     let has_uploads = (0..n).any(|i| i < inputs.len() && !inputs[i].is_empty());
-    // r2 Lever A + B: readback CB is only needed when at least one binding is read back
-    // via the staging path (non-ReBAR). ReBAR bindings read directly from the mapped pointer.
-    // Lever A: ReadOnly bindings are never read back.
-    // Lever B: ReBAR output bindings skip the readback CB entirely.
-    // NOTE: buffers may not be populated yet if this is the first call; we use a closure
-    // that checks the populated buffers slice (which ensure_buffers_fit populated above).
-    let has_staged_readback = {
-        let access_iter = (0..n).filter(|&i| {
-            let out_size = if i < output_sizes.len() { output_sizes[i] } else { 0 };
-            let access = inner.binding_plan.buffers[i].ty.access;
-            binding_is_readback(access, out_size)
-        });
-        access_iter.filter(|&i| !slot_is_rebar(&buffers[i])).count() > 0
-    };
-    // Legacy alias — used for timeline block reservation logic below.
-    let has_outputs = has_staged_readback
-        || (0..n).any(|i| {
-            let out_size = if i < output_sizes.len() { output_sizes[i] } else { 0 };
-            let access = inner.binding_plan.buffers[i].ty.access;
-            binding_is_readback(access, out_size) && slot_is_rebar(&buffers[i])
-        });
+    let has_outputs = (0..n).any(|i| i < output_sizes.len() && output_sizes[i] > 0);
 
     // ── Host-side upload: copy_in + flush (M3.0, WARNING-6) ──────────────────
     for i in 0..n {
@@ -1104,11 +963,8 @@ fn dispatch_dedicated(
         }
     };
 
-    // Readback CB from transfer pool (only if has_staged_readback).
-    // r2 Lever B: when all read-back bindings are ReBAR, has_staged_readback=false
-    // and the readback CB is SKIPPED — the compute submit signals readback_fence directly.
-    // This reuses r1's existing no-outputs branch without writing a new code path.
-    let readback_cb_opt: Option<vk::CommandBuffer> = if has_staged_readback {
+    // Readback CB from transfer pool (only if has_outputs).
+    let readback_cb_opt: Option<vk::CommandBuffer> = if has_outputs {
         let _pool_guard = transfer_pool_lock.lock();
         let cb_alloc = vk::CommandBufferAllocateInfo::default()
             .command_pool(ctx.transfer_command_pool)
@@ -1208,53 +1064,26 @@ fn dispatch_dedicated(
         }
         unsafe { device.cmd_dispatch(compute_cb, workgroups.0, workgroups.1, workgroups.2); }
 
-        // Compute→Transfer barriers for staged readback (SHADER_WRITE→TRANSFER_READ).
-        // r2 Lever A: skip ReadOnly bindings (never read back).
-        // r2 Lever B: skip ReBAR output bindings — they get a SHADER_WRITE→HOST_READ barrier
-        //   on this same compute CB (emitted below), not a TRANSFER_READ barrier.
+        // Compute→Transfer barriers for readback (SHADER_WRITE→TRANSFER_READ).
         if has_outputs {
-            let mut compute_to_transfer_barriers: Vec<vk::BufferMemoryBarrier<'_>> = Vec::new();
-            let mut rebar_host_barriers: Vec<vk::BufferMemoryBarrier<'_>> = Vec::new();
+            let mut compute_barriers: Vec<vk::BufferMemoryBarrier<'_>> = Vec::new();
             for i in 0..n {
-                let out_size = if i < output_sizes.len() { output_sizes[i] } else { 0 };
-                let access = inner.binding_plan.buffers[i].ty.access;
-                if !binding_is_readback(access, out_size) { continue; } // Lever A
+                if i >= output_sizes.len() || output_sizes[i] == 0 { continue; }
                 let slot = &buffers[i];
-                if slot_is_rebar(slot) {
-                    // Lever B: SHADER_WRITE → HOST_READ on the ReBAR device-local buffer.
-                    let barrier = vk::BufferMemoryBarrier::default()
-                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                        .dst_access_mask(vk::AccessFlags::HOST_READ)
-                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .buffer(slot.device_local.buffer).offset(0).size(vk::WHOLE_SIZE);
-                    rebar_host_barriers.push(barrier);
-                } else {
-                    // Staged readback: SHADER_WRITE → TRANSFER_READ (r1 path).
-                    let barrier = vk::BufferMemoryBarrier::default()
-                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .buffer(slot.device_local.buffer).offset(0).size(vk::WHOLE_SIZE);
-                    compute_to_transfer_barriers.push(barrier);
-                }
+                let barrier = vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(slot.device_local.buffer).offset(0).size(vk::WHOLE_SIZE);
+                compute_barriers.push(barrier);
             }
-            if !compute_to_transfer_barriers.is_empty() {
+            if !compute_barriers.is_empty() {
                 unsafe {
                     device.cmd_pipeline_barrier(compute_cb,
                         vk::PipelineStageFlags::COMPUTE_SHADER,
                         vk::PipelineStageFlags::TRANSFER,
-                        vk::DependencyFlags::empty(), &[], &compute_to_transfer_barriers, &[]);
-                }
-            }
-            if !rebar_host_barriers.is_empty() {
-                // Lever B: emit COMPUTE_SHADER→HOST barrier for all ReBAR outputs.
-                unsafe {
-                    device.cmd_pipeline_barrier(compute_cb,
-                        vk::PipelineStageFlags::COMPUTE_SHADER,
-                        vk::PipelineStageFlags::HOST,
-                        vk::DependencyFlags::empty(), &[], &rebar_host_barriers, &[]);
+                        vk::DependencyFlags::empty(), &[], &compute_barriers, &[]);
                 }
             }
         }
@@ -1262,30 +1091,25 @@ fn dispatch_dedicated(
             .map_err(|e| DispatchError::CommandBufferRecordFailed(e.to_string()))?;
     }
 
-    // ── Record readback CB (if has_staged_readback) ──────────────────────────
-    // r2 Lever A: skip ReadOnly bindings.
-    // r2 Lever B: skip ReBAR output bindings (no copy needed; host reads from mapped pointer).
+    // ── Record readback CB (if has_outputs) ───────────────────────────────────
     if let Some(readback_cb) = readback_cb_opt {
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe { device.begin_command_buffer(readback_cb, &begin_info) }
             .map_err(|e| DispatchError::CommandBufferRecordFailed(e.to_string()))?;
 
-        // Device→staging copies (staged outputs only — no ReBAR, no ReadOnly).
+        // Device→staging copies.
         let mut readback_barriers: Vec<vk::BufferMemoryBarrier<'_>> = Vec::new();
         for i in 0..n {
-            let out_size = if i < output_sizes.len() { output_sizes[i] } else { 0 };
-            let access = inner.binding_plan.buffers[i].ty.access;
-            if !binding_is_readback(access, out_size) { continue; } // Lever A
+            if i >= output_sizes.len() || output_sizes[i] == 0 { continue; }
             let slot = &buffers[i];
-            if slot_is_rebar(slot) { continue; } // Lever B: no copy for ReBAR outputs
             let copy_region = vk::BufferCopy::default()
-                .src_offset(0).dst_offset(0).size(out_size as u64);
+                .src_offset(0).dst_offset(0).size(output_sizes[i] as u64);
             unsafe {
                 device.cmd_copy_buffer(readback_cb, slot.device_local.buffer,
                     slot.staging.buffer, &[copy_region]);
             }
-            // CRITICAL-1: always emit TRANSFER_WRITE→HOST_READ barrier for staged outputs.
+            // CRITICAL-1: always emit TRANSFER_WRITE→HOST_READ barrier.
             let barrier = vk::BufferMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::HOST_READ)
@@ -1425,9 +1249,9 @@ fn dispatch_dedicated(
     }
     wait_result.map_err(|e| DispatchError::QueueSubmitFailed(e.to_string()))?;
 
-    // ── Readback: invalidate + copy_out via persistent mapping (Lever A + Lever B) ──
+    // ── Readback: invalidate + copy_out via persistent mapping ───────────────
     let outputs = readback_from_persistent_mapping(
-        inner, buffers, output_sizes, n, device, ctx.non_coherent_atom_size,
+        buffers, output_sizes, n, device, ctx.non_coherent_atom_size,
         &effective_coherency, ctx.force_noncoherent,
     );
 
@@ -1611,28 +1435,10 @@ fn submit_readback(
 
 /// Read back output buffers via persistent mapping after the fence has been waited.
 ///
-/// ## r2 Lever A
-///
-/// A binding whose `access == ReadOnly` is NEVER read back (the shader carries
-/// `NonWritable` decoration and provably cannot write it). The returned `Vec<u8>` is
-/// empty for such bindings — byte-identical to the `output_size==0` case.
-///
-/// ## r2 Lever B (ReBAR zero-copy)
-///
-/// For output bindings allocated in ReBAR memory (`slot.device_local.mapping.is_some()`),
-/// the host reads directly from the mapped device-local pointer at ~60 GB/s. An
-/// atom-aligned `invalidate` is called first on non-coherent ReBAR types; it is a no-op
-/// on the coherent Type 4 on the Blackwell. No staging copy_out is performed.
-///
-/// For non-ReBAR (staged) outputs the r1 staging path is used unchanged (invalidate +
-/// staging copy_out).
-///
-/// On NonCoherent staging memory: calls `vkInvalidateMappedMemoryRanges` BEFORE
-/// `copy_out` for EACH staged readback slot (CRITICAL-1, WARNING-6).
+/// On NonCoherent memory: calls `vkInvalidateMappedMemoryRanges` BEFORE `copy_out`
+/// for EACH readback slot (CRITICAL-1, WARNING-6).
 #[allow(clippy::undocumented_unsafe_blocks)]
-#[allow(clippy::too_many_arguments)]
 fn readback_from_persistent_mapping(
-    inner: &KernelHandleInner,
     buffers: &[BufferSlot],
     output_sizes: &[usize],
     n: usize,
@@ -1647,53 +1453,28 @@ fn readback_from_persistent_mapping(
     let mut outputs: Vec<Vec<u8>> = Vec::with_capacity(n);
     for i in 0..n {
         let out_size = if i < output_sizes.len() { output_sizes[i] } else { 0 };
-        let access = inner.binding_plan.buffers[i].ty.access;
-
-        // r2 Lever A: ReadOnly bindings are never read back regardless of out_size.
-        // Returns empty Vec (byte-identical to the out_size==0 case).
-        if !binding_is_readback(access, out_size) {
+        if out_size == 0 {
             outputs.push(Vec::new());
             continue;
         }
-
         let slot = &buffers[i];
-
-        if slot_is_rebar(slot) {
-            // r2 Lever B: read directly from the ReBAR device-local mapping at ~60 GB/s.
-            // invalidate first (no-op on coherent ReBAR; real on non-coherent ReBAR).
-            // SAFETY: fence has been waited; device/memory valid; buffers Mutex held (CRITICAL-6).
-            let _ = unsafe {
-                slot.device_local.mapping.as_ref()
-                    // SAFETY: slot_is_rebar guarantees mapping is Some.
-                    .expect("slot_is_rebar invariant: mapping must be Some")
-                    .invalidate(device, slot.device_local.memory, out_size as u64)
-            };
-            let mut out_bytes: Vec<u8> = vec![0u8; out_size];
-            // copy_out: reads from the ReBAR mapped pointer; buffers Mutex held (CRITICAL-6).
-            slot.device_local.mapping.as_ref()
-                .expect("slot_is_rebar invariant: mapping must be Some")
-                .copy_out(&mut out_bytes);
-            outputs.push(out_bytes);
-        } else {
-            // Staged readback (r1 path): invalidate staging + copy_out from staging mapping.
-            let coh = effective_coherency(slot);
-            // Invalidate on NonCoherent BEFORE copy_out (CRITICAL-1).
-            match coh {
-                Coherency::NonCoherent { .. } => {
-                    // SAFETY: fence has been waited; device/memory valid.
-                    // Ignore error: best-effort; if invalidate fails the data may be stale
-                    // but we still attempt the copy (error will surface as wrong output).
-                    let _ = unsafe {
-                        slot.staging.mapping.invalidate(device, slot.staging.memory, out_size as u64)
-                    };
-                }
-                Coherency::Coherent => {}
+        let coh = effective_coherency(slot);
+        // Invalidate on NonCoherent BEFORE copy_out (CRITICAL-1).
+        match coh {
+            Coherency::NonCoherent { .. } => {
+                // SAFETY: fence has been waited; device/memory valid.
+                // Ignore error: best-effort; if invalidate fails the data may be stale
+                // but we still attempt the copy (error will surface as wrong output).
+                let _ = unsafe {
+                    slot.staging.mapping.invalidate(device, slot.staging.memory, out_size as u64)
+                };
             }
-            let mut out_bytes: Vec<u8> = vec![0u8; out_size];
-            // copy_out: caller holds buffers Mutex (CRITICAL-6).
-            slot.staging.mapping.copy_out(&mut out_bytes);
-            outputs.push(out_bytes);
+            Coherency::Coherent => {}
         }
+        let mut out_bytes: Vec<u8> = vec![0u8; out_size];
+        // copy_out: caller holds buffers Mutex (CRITICAL-6).
+        slot.staging.mapping.copy_out(&mut out_bytes);
+        outputs.push(out_bytes);
     }
     outputs
 }
