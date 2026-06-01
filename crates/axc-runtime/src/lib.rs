@@ -83,4 +83,4 @@ pub use context::{VulkanContext, VulkanContextOptions};
 pub use dispatch::DispatchRequest;
 pub use metadata::{KernelMetadata, load_kernel_metadata, CURRENT_SCHEMA_VERSION};
 pub use icd::{probe_vulkan_available, gpu_tests_enabled, captured_icd_path};
-pub use kernel_handle::{KernelHandle, KernelCacheKey};
+pub use kernel_handle::{KernelHandle, KernelCacheKey, binding_is_readback};
