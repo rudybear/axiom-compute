@@ -96,8 +96,9 @@ fn at_1522_q4km_pipeline_create_succeeds_or_feature_skip() {
 ///
 /// NOT #[ignore] — runs on Lavapipe AND NVIDIA under AXC_ENABLE_GPU_TESTS=1.
 /// Uses a synthetic 256x256 Q4_K_M fixture (1 superblock per row).
+/// Self-skips when AXC_ENABLE_GPU_TESTS is unset, so the default `cargo test`
+/// (no GPU env) is unaffected; CI's GPU pass (env set) exercises it on Lavapipe.
 #[test]
-#[ignore]
 fn at_1520_q4km_matmul_256x256_bit_exact() {
     if !gpu_tests_enabled() {
         eprintln!("at_1520: AXC_ENABLE_GPU_TESTS not set; skipping");
