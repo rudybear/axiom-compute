@@ -1,0 +1,54 @@
+{
+  "verdict": "APPROVE",
+  "agent": "pessimistic_code_reviewer",
+  "milestone_id": "M3.1-coopmat-matmul",
+  "branch": "coder/M31-20260601-1410/M3.1-coopmat-matmul",
+  "scope": "git diff main..HEAD",
+  "critical_bugs": [],
+  "warnings": [
+    {
+      "id": "W1-panic-in-lib",
+      "description": "scalar_ty_to_coopmat_scalar_meta uses panic! on the catch-all arm in NON-TEST library code (compile path). CLAUDE.md/pessimistic mandate ban unwrap/expect/panic in lib code. The arm is genuinely unreachable: a CoopMatrixShape is only ever constructed from typechecked CoopMatKeys whose element types passed is_allowed_coopmat_element (F16/F32/I8/U8/I32/U32 — exactly the six covered arms). Defensive-invariant panic, not a reachable correctness hole. Recommend converting to a typed CodegenError/DriverError before M3.2, but not merge-blocking.",
+      "file": "crates/axc-driver/src/lib.rs",
+      "line": "203-217"
+    },
+    {
+      "id": "W2-tflops-bench-labeling",
+      "description": "matmul_tflops_4096 bench times the FULL dispatch_handle (host->device upload of two 64MB f32 inputs + dispatch + 64MB readback) via std::time::Instant, then divides 2*M*N*K by that WALL time and prints it as 'effective TFLOPS' with a '% of cuBLAS estimate' line. This is NOT kernel-only time — it includes upload+readback. The module docstring honestly admits '(or simulate with dispatch_handle)' and the cuBLAS line is labeled 'estimate (external cuBLAS baseline)' and NOT asserted, and the whole bench is gated behind AXC_ENABLE_GPU_BENCHES (off in CI). The number is therefore upload-dominated and would UNDER-report TFLOPS, not over-report — it cannot inflate a kernel-speed claim. Still, the 'effective TFLOPS' label on a whole-roundtrip measurement is misleading and must be relabeled (e.g. 'roundtrip TFLOPS (upload+dispatch+readback, NOT kernel-only)') when resident.rs lands in M3.2.",
+      "file": "crates/axc-driver/benches/resident_matmul.rs",
+      "line": "196-231"
+    },
+    {
+      "id": "W3-preflight-not-wired",
+      "description": "Dispatch-time preflight (required_device_features comparison -> DeviceFeatureUnsupported; coopmat_shape_supported -> CoopMatUnsupported; subgroup_size==32 guard) is NOT wired into dispatch_handle/prepare_kernel. The functions exist and are unit-tested (AT-1504/1500/1561/1551/1507) but nothing in the dispatch path calls them (required_device_features carries #[allow(dead_code)]). Fail-closed protection currently lives in TEST/BENCH code (AT-1521 checks feature_present; benches check enabled_features/subgroup_size). On a device missing a required feature, prepare_kernel relies on the DRIVER to reject pipeline creation rather than emitting the typed skip. NOT a correctness hole for the proven corpus (features are conditionally enabled at device creation so Lavapipe never crashes — it simply omits coopmat), but the typed-skip interface contract is unmet. QA disclosed this honestly (LIMITATION-2) as an M3.2 carry-forward.",
+      "file": "crates/axc-runtime/src/kernel_handle.rs",
+      "line": "dispatch_handle / dispatch_single_queue / dispatch_dedicated"
+    },
+    {
+      "id": "W4-resident-api-deferred",
+      "description": "upload_resident/dispatch_resident/readback_resident do NOT exist — resident.rs is the ResidentBuffers struct + Drop + masked_timestamp_delta only. Deferred to M3.2. The deferral fails SAFELY: there is no stub that returns zero/fabricated timings (the functions simply are not present, so no caller can obtain a fake kernel_ns). AT-1530/1531 are #[ignore] and honestly marked not-implemented. resident_bound debug-guard (HN-8) also absent. Acceptable bounded deferral.",
+      "file": "crates/axc-runtime/src/resident.rs",
+      "line": "1-200"
+    }
+  ],
+  "item_findings": {
+    "1_coopmat_metadata": "PASS — derive_coopmat_shape resolves operands through body.bindings via as_coopmat() (LocalRead path) AND inline CoopMatBuiltin result_ty; K = a.n (== b.m by KDimMismatch typecheck) is correct; M=a.m, N=b.n correct. coop_matrix=None path is safe (only derived when @cooperative_matrix flag set + Typed body; Empty/no-ops -> warning + None). Multiple mul_adds: takes the FIRST recursively (no debug_assert present, no release-mode UB — well-defined first-match; differing-shape kernels are out of M3.1 scope and would simply use the first shape's metadata).",
+    "2_capability_to_feature": "PASS — ALL feature-struct locals (vk12_features, feat_16bit_storage, feat_8bit_storage, feat_f16i8, feat_vmm, feat_coopmat, base_features2, coopmat_ext_cstr) are at FUNCTION scope and outlive create_device (no pNext dangling). Enablement is CONDITIONAL on device-probed support (Features2 probe before enable) so Lavapipe is unaffected. emit.rs capability code is UNCHANGED (diff is one test fixture field). Every emitted cap maps to an enabled feature: VulkanMemoryModel->vmm, CooperativeMatrixKHR->cooperative_matrix, StorageBuffer16BitAccess->storage_16bit, Int8->shader_int8, StorageBuffer8BitAccess->storage_8bit, Int16->shader_int16. Float16/Shader caps need no optional VkFeature for storage use. No unmapped capability.",
+    "3_preflight_ub": "PASS — query_coopmat_support gated on coopmat_device_ext_present (no entry-point call when absent); also re-checks cooperativeMatrix feature==TRUE before loader use. count==0 -> empty WITHOUT second call (raw_props.is_empty()). Two-call idiom via ash get_physical_device_cooperative_matrix_properties (race-free single helper). Matcher checks m/n/k AND a/b/c/result component types AND scope==Subgroup AND !saturating_accumulation — near-misses (f32 result, saturating, Workgroup) correctly REJECTED (AT-1561/1500). No silent miscompute path.",
+    "4_spirv_byte_identity": "PASS — CoopMatKey.k/result_type are documented cache-key-only; coopmat.rs type_cooperative_matrix_khr still emits (elem,scope,m,n,use_). emit.rs capability/operand emission unchanged. AT-1508 confirms recompile byte-identity. CooperativeMatrixKHR + SPV_KHR_cooperative_matrix + SPV_KHR_vulkan_memory_model + VulkanMemoryModel cap + Vulkan memory model all declared together under uses_coopmat (no silent ext picking).",
+    "5_lever_a": "PASS — binding_is_readback(access, size) applied IDENTICALLY to all 4 loops (compute-barrier, readback-barrier, copy-record, persistent-mapping) in both single-queue and dedicated paths. WriteOnly/ReadWrite still read back byte-exact (only ReadOnly skipped). No ReBAR/device-local memory-type change (grep rebar empty; no HOST_VISIBLE|DEVICE_LOCAL memory-type edits). AT-1503 covers the predicate.",
+    "6_resident_stub_honesty": "PASS-WITH-WARNING — resident dispatch API is ABSENT (not a lying stub): no function can return a fabricated timing. masked_timestamp_delta is correct (AT-1535, mask-each-endpoint-then-wrapping_sub). matmul_tflops_4096 bench substitutes dispatch_handle and mislabels whole-roundtrip wall time as 'effective TFLOPS' (W2) — under-reports, gated off in CI, cuBLAS line labeled estimate and unasserted. Demand relabel in M3.2, not merge-blocking.",
+    "7_metadata_back_compat": "PASS — load_kernel_metadata accepts schema_version {1,2}, rejects 0 and >=3 with typed DispatchError::MetadataSchemaMismatch (no panic/unwrap on the load path). v1 sidecars deserialize coopmat=None via serde default. No unwrap/expect in the metadata library load path (test-only unwraps acceptable).",
+    "8_memory_footprint": "PASS — 4096x4096 f32 host buffers ~192MB + per-iter 64MB zero vec (freed each iter); resident path stubbed/absent so no N-dispatch resident allocation. Well under 50GB. Drop frees all device-local + staging buffers; no leak across dispatches."
+  },
+  "spirv_val_check": "PASS",
+  "ub_check": "PASS",
+  "race_condition_check": "PASS",
+  "vendor_divergence_check": "PASS",
+  "build_check": "PASS (cargo build --workspace clean)",
+  "unit_test_check": "PASS (cargo test --workspace --lib: 590 passed, 0 failed)",
+  "lavapipe_no_regression": "PASS — features conditionally enabled; coopmat omitted on Lavapipe; AT-1520 plain q4km runs on Lavapipe bit-exact",
+  "deferrals_honestly_bounded": true,
+  "summary": "M3.1 is merge-safe. The first cooperative-matrix tensor-core dispatch is correct (AT-1510 max_diff=0, orchestrator-verified on NVIDIA), the SPIR-V is byte-identical to M2.1 (only a test-fixture field changed in emit.rs), device features are CONDITIONALLY enabled from a Features2 probe with all feature-struct locals at function scope (no pNext dangling, no Lavapipe regression), the coopmat preflight matcher rejects all near-misses, Lever A is consistent across all four readback loops with no ReBAR/memory-type change, metadata v1/v2 back-compat is typed-error clean, and the deferred resident API fails SAFELY (absent, not a lying stub). Four non-blocking issues: (W1) one defensive panic! in the lib compile path on a genuinely-unreachable arm, (W2) the matmul_tflops_4096 bench mislabels whole-roundtrip wall time as 'effective TFLOPS' (under-reports, CI-gated-off, cuBLAS line labeled estimate/unasserted), (W3) the dispatch-time preflight gate is implemented+unit-tested but NOT wired into dispatch_handle (protection currently lives in test/bench code), and (W4) the resident upload/dispatch/readback API is deferred to M3.2. All four are honestly disclosed by QA as bounded M3.2 carry-forwards and none is a correctness/UB/race hole. APPROVE.",
+  "most_dangerous_remaining_issue": "W3: the typed fail-closed preflight (DeviceFeatureUnsupported / CoopMatUnsupported / subgroup!=32 skip) is NOT wired into dispatch_handle — a production caller that skips the manual ctx.coopmat_support()/enabled_features() checks (which all current tests perform) would hand coopmat SPIR-V to prepare_kernel on an unsupporting device and get whatever raw driver error surfaces instead of the clean typed skip. Low impact today (features are conditionally enabled so no crash, and the whole corpus does the manual check), but the interface contract is unmet and MUST be wired in M3.2."
+}

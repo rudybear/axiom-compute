@@ -21,7 +21,7 @@ Last updated: 2026-04-28. Test count baseline: **713**.
 | **KernelBench-Vulkan public submission** | ❌ M3.2 |
 | **PyTorch frontend + upstream adoption** | ❌ M4 |
 | Bandwidth optimization (pinned memory, concurrent transfer) | ✅ M3.0 (saxpy_1m 7.5×, saxpy_1024 39×; <1ms gate re-scoped to GPU-resident metric) |
-| Multi-row tiled matmul (cooperative_matrix on real workloads) | ❌ M3.0 |
+| Multi-row tiled matmul (cooperative_matrix on real workloads) | ✅ M3.1 (first coopmat dispatch on Blackwell, bit-exact; resident-TFLOPS benchmark → M3.2) |
 | Cross-vendor real GPU CI (AMD RDNA3+, Intel Arc) | ❌ infra |
 | **llama.cpp Vulkan head-to-head A/B** | ❌ thesis-closing milestone |
 
@@ -55,7 +55,11 @@ Goal: prove the DESIGN.md §5 kill-criteria gates with publishable numbers, not 
 **Depends on:** M2.3a (already shipped pipeline cache + staging foundation).
 **Blocks:** all subsequent perf claims.
 
-### M3.1 — Multi-row tiled matmul + cooperative_matrix dispatch
+### M3.1 — Multi-row tiled matmul + cooperative_matrix dispatch ✅ DONE (core proven; perf-methodology carried to M3.2)
+
+**Status (2026-06-01):** Merged. **First-ever cooperative_matrix dispatch on real Blackwell tensor cores** — `matmul_tile.axc` (M2.1's compile-only SPIR-V, now executed) produces a 16×16 C=A·B tile **bit-exact (max_diff=0)** vs CPU reference on the NVIDIA RTX PRO 6000 (AT-1510). Required unlocking three device-feature classes never previously enabled: `VulkanMemoryModel` (the coopmat SPIR-V uses `OpMemoryModel Logical Vulkan`), `16BitStorage` (f16 SSBOs), `8BitStorage`+`shaderInt8/16` (q4km u8 weights) — all enabled **conditionally** (probe-then-enable, fail-closed `DeviceFeatureUnsupported`/`CoopMatUnsupported` skip), so Lavapipe and existing dispatch tests are unregressed. Multi-row `q4km_dequant_matmul` is **bit-exact 256×256** (AT-1520, runs on Lavapipe+NVIDIA); a pre-dequantized coopmat bridge proves coopmat-on-q4km (AT-1521, max_diff=0). Coopmat shape now flows HIR→metadata (schema v1→v2, back-compat). Lever A (skip `readonly` readback, deferred from M3.0 r2) landed cleanly without ReBAR. SPIR-V byte-identical to M2.1; spirv-val clean (AT-1560); a non-symmetric transpose fixture (AT-1512) guards against mis-strided loads. 780 tests.
+
+**Carried to M3.2 (honestly deferred):** the **GPU-resident benchmark** (`upload/dispatch/readback_resident` Vulkan command recording — types/Drop/timestamp-masking exist, recording stubbed) and therefore the clean **kernel-only TFLOPS / ≥50%-cuBLAS** number; the full **dequant→shared-f16-tile→coopmat fusion** (needs `shared[T,N]`, FG.6); wiring the typed dispatch-time preflight into `dispatch_handle` (currently in caller/test code); and `matmul_f32_tiled.axc` strategy-hole resolution in the TFLOPS bench. The `<2 ms` q4km gate from M3.0 also rides on this resident methodology. The cuBLAS comparison is reported as effective-TFLOPS only (no hard ratio assertion).
 
 **Why:** M2.6 Q4_K_M is single-row matvec (1 output per dispatch). Real LLM inference needs N-row matmul with tensor cores. M2.1 added cooperative_matrix codegen but it's compile-only — never dispatched on tensor-core hardware.
 
