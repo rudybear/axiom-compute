@@ -1,0 +1,43 @@
+{
+  "verdict": "APPROVE",
+  "agent": "pessimistic_design_reviewer",
+  "milestone_id": "M3.1.5-resident-bench",
+  "review_round": "r1",
+  "re_review_of": [
+    "HONESTY-1",
+    "TIMING-1",
+    "CORRECTNESS-1",
+    "CORRECTNESS-2",
+    "PREFLIGHT"
+  ],
+  "resolution_status": {
+    "HONESTY-1": "RESOLVED (verified against code)",
+    "TIMING-1": "RESOLVED (verified against code)",
+    "CORRECTNESS-1": "RESOLVED (verified against code)",
+    "CORRECTNESS-2": "RESOLVED (design-level; QA diff-read gate AT-1580)",
+    "PREFLIGHT": "RESOLVED — honestly documented as opt-in, not 'closed'"
+  },
+  "verification_detail": {
+    "HONESTY-1": "Genuinely reframed. Milestone deliverable is now the resident-timing METHODOLOGY (kernel-only ns over EXISTING real kernels), not a fabricated matmul TFLOPS. (a) The inert @strategy{tile_m,tile_n} line is scheduled for REMOVAL (not commenting-out) per HANDOFF-0/files_to_modify; verified in examples/matmul_f32_tiled.axc that the holes are TRULY dead — `?tile_m`/`?tile_n` appear ONLY in the @strategy block and @intent prose, never in the fn body (body computes one element per invocation; pinning 1/2/4 yields byte-identical SPIR-V). (b) The renamed naive_gemm_harness_validation bench's printed string MUST contain 'NAIVE' and 'harness validation' (AT-1581 substring guard); cannot be mistaken for optimized matmul perf. (c) Competitive matmul TFLOPS explicitly DEFERRED to M3.2 in design_md_additions §'Matmul TFLOPS is explicitly DEFERRED to M3.2'. (d) New headline bench resident_timing_kernels reports kernel_ns + timing_source, asserts only kernel_ns>0 && finite, NO TFLOPS/cuBLAS line.",
+    "TIMING-1": "Honestly relabeled. design_md_additions + spec prose now say 'GPU dispatch duration — TOP_OF_PIPE→BOTTOM_OF_PIPE timestamp span over the single dispatch; EXCLUDES host upload/readback, INCLUDES dispatch launch + pipeline latency'; explicitly NOT 'kernel-only ALU'. (The current resident.rs lines 3/16-20/57 STILL carry the old 'KERNEL-ONLY' prose and the wrong uses_coopmat doc (line 104 'shaderInt16'); HANDOFF-16/FIELD-DOC-FIX instruct the Coder to reword both — acceptable, this is a design doc.) Warmup-discard is MANDATORY (HANDOFF-12: 2 untimed warm-ups discarded, report MIN-of-N; N=10 bench, N>=3 AT-1530). CpuFenceWall flagged via timing_source, never quoted as a GPU kernel time (AT-1582; HANDOFF-13 appends 'scheduling-inclusive, NOT a GPU kernel time'). On valid_bits==0 OR period==0: NO query pool created and NO vkCmdWriteTimestamp recorded (edge_cases + HANDOFF-3; select_timing_source gates it, AT-1573).",
+    "CORRECTNESS-1": "Verified resolvable against real code. dispatch.rs validate_request (lines 84-92) already contains the workgroup-count branch returning WorkgroupCountExceedsDeviceLimit; context.rs max_compute_work_group_count() (line 731) exists. Spec puts the guard at the TOP of dispatch_resident (library method, not caller) before any submit (HANDOFF-7), AT-1579 covers it; bench's shrink-to-fit retained as a friendly pre-check only.",
+    "CORRECTNESS-2": "Resolved at design level. cleanup_partial_resident frees persistent objects in reverse creation order at EVERY early-return Err after the first allocation; transient upload staging/CB freed on their own error paths; ResidentBuffers built only when all objects exist so Drop never double-frees (verified Drop in resident.rs:127-163 destroys exactly these objects). Enforced by QA diff-read AT-1580 (no fault-injection seam exists, so this is a QA checklist item, not an automated test — acceptable and honestly stated).",
+    "PREFLIGHT": "Resolved and HONEST. Verified prepare_kernel signature in context.rs:752-758 is (spirv, binding_plan, push_constant_total_bytes, entry_point) — NO coopmat shape, NO kernel_name. Folding the preflight in WOULD require adding coopmat+kernel_name params, breaking every caller (the reviewer's option (a) was conditioned on 'if it doesn't break the API/signature' — it does). Additive prepare_kernel_checked is the correct call. The milestone summary no longer claims the gap is 'closed' — it states raw prepare_kernel callers remain unprotected by design ('closeable opt-in'), and SWITCHES driver/bench/test paths to the checked variant so the gap is exercised. Honest residual-gap statement present in technical_spec §B and design_md_additions."
+  },
+  "critical_issues": [],
+  "warnings": [
+    "WARNING (NEW, non-blocking): Removing the @strategy{tile_m,tile_n} line from examples/matmul_f32_tiled.axc leaves the EXISTING test crates/axc-driver/tests/at1560_spirv_val_all_m31.rs::at_1560_matmul_f32_tiled_spirv_val (lines 42-58) STALE. It calls compile_source_with_assignments(src, {tile_m:1, tile_n:1}) and its comment claims to 'Resolve strategy holes'. The spec's files_to_modify does NOT list this test; AT-1577 merely ASSERTS 'at1560 spirv-val tests still pass'. Verified behavior: substitute_strategy_holes does a text .replace('?tile_m', ...) (no-op when absent) and strip_strategy_annotation_block returns source unchanged when no @strategy block exists — so the test STILL PASSES (no build/runtime break, AT-1577 holds). BUT it becomes a self-contradicting dead test asserting resolution of holes that no longer exist, directly undercutting the milestone's HONESTY theme while AT-1576 adds a parallel compile_source_with_meta-based test. FIX (one line, Coder-absorbable under AT-1576 scope, no architect redesign): update at_1560_matmul_f32_tiled_spirv_val to use compile_source_with_meta (drop the assignments + the 'Resolve strategy holes' comment), OR delete it as redundant with the new AT-1576 test. Add this to the coder handoff.",
+    "WARNING (carry-forward, architect-disclosed): AT-1581 is only a SUBSTRING label guard ('NAIVE' + 'harness validation'). A Coder could satisfy it while ALSO printing a separate unqualified TFLOPS line elsewhere. Mitigated by AT-1581's second clause ('no bench prints a competitive matmul-TFLOPS claim without the naive/harness qualifier') and resident_timing_kernels asserting NO TFLOPS line — but final enforcement is QA's against the diff. Acceptable for a design; flagged for QA."
+  ],
+  "principle_violations": [],
+  "spirv_concerns": [],
+  "vendor_concerns": [
+    "Lavapipe (CI) path correctly exercises CpuFenceWall (valid_bits==0): NO query pool, NO timestamp write, kernel_ns>0 only, label printed, no smaller-than-host claim (AT-1530/AT-1582). NVIDIA RTX PRO 6000 exercises GpuTimestamp + smaller-than assertion. Subgroup!=32 / coopmat-absent paths typed-skip via CoopMatUnsupported (AT-1531/AT-1574). Heterogeneity handled."
+  ],
+  "missing_tests": [],
+  "questions_for_architect": [],
+  "new_holes_introduced": [
+    "ONE non-blocking new hole: stale at_1560_matmul_f32_tiled_spirv_val test referencing removed holes (see warnings). Does NOT break the build (verified) and does NOT regress any verdict gate; trivially fixed in the same diff. No architect redesign required."
+  ],
+  "summary": "RE-REVIEW r1: all five r0 NEEDS_REVISION items are GENUINELY resolved and HONEST, verified against the actual code (prepare_kernel signature context.rs:752, validate_request workgroup guard dispatch.rs:84-92, Drop teardown resident.rs:127-163, dead tile holes confirmed by grep). HONESTY-1: milestone reframed to resident-timing methodology; naive GEMM relabeled+AT-1581-guarded; inert tile holes scheduled for true removal; competitive TFLOPS deferred to M3.2. TIMING-1: 'GPU dispatch duration' (not 'kernel-only ALU'); mandatory warmup; CpuFenceWall flagged, never quoted as kernel time; no timestamp on 0-valid-bits. CORRECTNESS-1: library-side workgroup guard in dispatch_resident (AT-1579). CORRECTNESS-2: reverse-order cleanup_partial_resident at every early-return; QA diff gate AT-1580. PREFLIGHT: additive prepare_kernel_checked (fold-in genuinely breaks the signature), gap honestly documented as opt-in not closed. ONE new non-blocking hole found: the existing at_1560_matmul_f32_tiled_spirv_val test goes stale when the @strategy line is removed (still passes — no break — but asserts resolution of holes that no longer exist; one-line Coder fix to compile_source_with_meta). APPROVED with that fix added to the coder handoff and the AT-1581 substring-guard caveat flagged for QA."
+}
