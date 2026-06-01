@@ -61,6 +61,7 @@ fn at_805_kernel_handle_reuse_grows_buffers_once() {
         pipeline_cache_path: Some(tmp_dir.path().join("at_805.cache")),
         physical_device_index: None,
         fence_timeout_ms: None,
+        ..Default::default()
     })
     .expect("VulkanContext::new_with_options must succeed");
     eprintln!("AT-805: device = {}", ctx.physical_device_name());

@@ -50,6 +50,7 @@ fn at_816_dispatch_handle_saxpy_amortized_100x() {
         pipeline_cache_path: Some(tmp_dir.path().join("at_816.cache")),
         physical_device_index: None,
         fence_timeout_ms: None,
+        ..Default::default()
     })
     .expect("VulkanContext::new_with_options must succeed");
     eprintln!("AT-816: device = {}", ctx.physical_device_name());

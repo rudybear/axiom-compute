@@ -46,6 +46,7 @@ fn at_827_kernel_handle_outlives_context() {
             pipeline_cache_path: Some(cache_path.clone()),
             physical_device_index: None,
             fence_timeout_ms: None,
+            ..Default::default()
         })
         .expect("VulkanContext::new_with_options must succeed");
 

@@ -104,6 +104,7 @@ fn gpu_state() -> &'static GpuStateQ4KM {
             pipeline_cache_path: None,
             physical_device_index: None,
             fence_timeout_ms: None,
+            ..Default::default()
         })
         .expect("dispatch_q4km bench: VulkanContext::new_with_options must succeed");
 

@@ -1,8 +1,8 @@
-//! AXIOM-Compute Vulkan 1.1 runtime dispatcher — M2.3a.
+//! AXIOM-Compute Vulkan 1.2 runtime dispatcher — M3.0.
 //!
 //! This crate provides the real GPU execution layer for AXIOM-Compute kernels.
 //!
-//! # Pipeline (prepare-once / dispatch-many — M2.3a)
+//! # Pipeline (prepare-once / dispatch-many — M3.0)
 //!
 //! ```text
 //! .axc source ──► axc_driver::compile_source_with_meta
@@ -18,11 +18,21 @@
 //!                                                                               └─► Vec<Vec<u8>>
 //! ```
 //!
+//! # M3.0 dispatch bandwidth rework
+//!
+//! Four orthogonal levers:
+//! 1. Persistent-mapped staging (drop per-dispatch vkMapMemory/vkUnmapMemory).
+//! 2. HOST_CACHED staging + flush/invalidate on non-coherent memory.
+//! 3. Dedicated DMA transfer queue (CONCURRENT device-local buffers; no ownership barriers).
+//! 4. Timeline-semaphore (primary) / binary-semaphore (fallback) transfer/compute overlap.
+//!
 //! # Legacy (one-shot) API
 //!
 //! `VulkanContext::dispatch(DispatchRequest)` is preserved for backward compatibility.
 //! It now internally calls `prepare_kernel` + `dispatch_handle` and drops the handle
-//! on return, paying pipeline-compile cost on every call.
+//! on return, paying pipeline-compile cost on every call. The per-call handle drop
+//! unmaps its staging exactly once (consuming `PersistentMapping`), so there is no
+//! double-unmap.
 //!
 //! # GPU test gating
 //!
@@ -34,10 +44,20 @@
 //! CI sets `AXC_ENABLE_GPU_TESTS=1` and uses Lavapipe (Mesa software Vulkan)
 //! via `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json`.
 //!
+//! # Force options (M3.0)
+//!
+//! Three environment variables override auto-detection for CI coverage:
+//! - `AXC_FORCE_SINGLE_QUEUE=1` — disable dedicated transfer queue.
+//! - `AXC_FORCE_BINARY_SEMAPHORES=1` — use binary semaphores even on 1.2 devices.
+//! - `AXC_FORCE_NONCOHERENT_STAGING=1` — emit flush/invalidate on coherent memory.
+//!
 //! # Safety
 //!
 //! Every `unsafe` block has a `// SAFETY:` comment explaining the Vulkan spec
 //! invariants being honored. The crate-level lint below enforces this.
+//!
+//! `PersistentMapping` is `unsafe impl Send` ONLY (never `Sync`). See
+//! `persistent_map` module for the full safety argument (CRITICAL-6).
 
 #![warn(clippy::undocumented_unsafe_blocks)]
 
@@ -53,6 +73,10 @@ pub(crate) mod device_owner;
 pub(crate) mod instance_owner;
 pub(crate) mod pipeline_cache;
 pub mod kernel_handle;
+// M3.0 new modules (crate-private)
+pub(crate) mod persistent_map;
+pub(crate) mod sync;
+pub(crate) mod transfer_queue;
 
 pub use error::{DispatchError, DispatchResult, CopyDirection};
 pub use context::{VulkanContext, VulkanContextOptions};

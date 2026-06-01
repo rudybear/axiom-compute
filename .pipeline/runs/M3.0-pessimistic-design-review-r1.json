@@ -1,0 +1,74 @@
+{
+  "verdict": "APPROVE",
+  "agent": "pessimistic_design_reviewer",
+  "milestone_id": "M3.0-bandwidth",
+  "revision": "r1",
+  "re_review_of": ".pipeline/runs/M3.0-pessimistic-design-review.json",
+  "critical_issue_resolutions": [
+    {
+      "id": "CRITICAL-1",
+      "status": "RESOLVED",
+      "judgment": "Readback host-visibility is now genuinely uniform. technical_spec §1.A + coder_handoff_notes[READBACK BARRIER] mandate the in-command-stream TRANSFER_WRITE->HOST_READ barrier (srcStage=TRANSFER, dstStage=HOST, QUEUE_FAMILY_IGNORED, offset=0, size=WHOLE_SIZE) ALWAYS emitted on BOTH coherency states AND BOTH queue modes — replicated verbatim from the existing single-queue barrier. I verified that barrier against the real code at crates/axc-runtime/src/kernel_handle.rs lines 623-647; it matches byte-for-byte (the spec's line citation is accurate). The non-coherent vkInvalidateMappedMemoryRanges is ADDITIONAL to (not a substitute for) the barrier, placed after vkWaitForFences and before copy_out, coherency-gated. The spec explicitly states it does NOT rely on the Vulkan 7.5 fence-signal host-domain guarantee as a substitute for either. The muddle is gone; placement is correct."
+    },
+    {
+      "id": "CRITICAL-2",
+      "status": "RESOLVED",
+      "judgment": "The EXCLUSIVE ownership-transfer hazard is structurally ELIMINATED, not papered over. §3.B: device-local is VK_SHARING_MODE_CONCURRENT over {compute_family, transfer_family} ONLY in DedicatedTransfer mode (concurrent_family_indices() returns None in SingleQueue, so single-queue stays EXCLUSIVE + QUEUE_FAMILY_IGNORED — byte-identical to today, verified against the upload/compute/readback barriers at kernel_handle.rs 503-513 / 575-582 / 624-631, all already QUEUE_FAMILY_IGNORED). With CONCURRENT there is NO acquire/release pair anywhere, so the byte-identical-range failure class cannot occur; I confirmed no srcQF!=dstQF barrier survives (coder_handoff_notes[CONCURRENT SHARING] forbids it). Staging stays EXCLUSIVE and is correctly justified as touched by exactly one family in each mode (transfer in dedicated, compute in single-queue) so it needs no ownership transfer. The marginal CONCURRENT perf cost is stated and flagged in open_questions for M3.1 revisit. No correctness hole in mixing CONCURRENT device-local with EXCLUSIVE staging."
+    },
+    {
+      "id": "CRITICAL-3",
+      "status": "RESOLVED",
+      "judgment": "Timeline is primary; values are reserved atomically (reserve_timeline_block: base B, advance by 2) and monotonic/never-reset, so reuse across dispatches/errors/zero-buffer is sound — a skipped upload sets the compute wait to B (already passed), and the base still advances so the next dispatch never collides. The degenerate (zero-buffer) path reserves NO block and signals readback_fence from a single compute submit. The binary fallback state table (§4.B) is complete: happy / skip-upload / skip-readback / degenerate / mid-chain-error, and every signal is paired with exactly one wait in every case. The genuinely dangerous binary leftover (U-ok then C-fail leaving upload_done signaled) is handled by recreating the two binary semaphores during recovery (§4.B + §4.C), restoring a clean unsignaled pair before the next dispatch. One-signal-one-wait invariant holds across all skip cases."
+    },
+    {
+      "id": "CRITICAL-4",
+      "status": "RESOLVED",
+      "judgment": "§4.C specifies the full matrix: U-fail (free U CB, no fence wait), U-ok/C-fail (device_wait_idle, free U+C CBs from their own pools, recreate binaries, no readback_fence wait), U-ok/C-ok/R-fail (device_wait_idle, free U+R from transfer pool + C from compute pool, no fence wait), and all-ok-then-timeout (free all three from their pools). It never waits a never-submitted fence (kills the hang), frees every CB from its OWN pool under the matching pool lock (kills the leak), and calls device_wait_idle before freeing CBs referenced by an in-flight earlier submit. AT-1419 gives an injectable cfg(test) submit-failure hook asserting free-count==alloc-count and no spurious fence wait. No remaining hang/leak path."
+    },
+    {
+      "id": "CRITICAL-5",
+      "status": "RESOLVED",
+      "judgment": "The fix is atomic-group serialization: queue_submit_lock is held across ALL THREE vkQueueSubmit calls of one dispatch and released BEFORE any host fence wait (coder_handoff_notes[ATOMIC-GROUP SUBMIT] is explicit). The §4.D proof is sound: because the three submits of a dispatch are enqueued under one lock acquisition, two handles' chains cannot interleave on the shared FIFO queues T and C, so the wait-for graph is acyclic and no cross-queue head-of-line cycle can form. Critically, the lock guards SUBMIT ISSUE only — not GPU execution and not host waits — so (a) WITHIN-dispatch transfer/compute/readback overlap is preserved (sequenced by the timeline semaphore, not the lock), and (b) the single-handle perf path (saxpy_1m, the perf gate) is on an uncontended lock and is unaffected, so AT-1400/1401 remain reachable. It does serialize the submit-issue of DIFFERENT handles, which is an acceptable, bounded cost (submit calls are cheap; overlap and host-wait concurrency survive). Lock ordering is consistent (buffers Mutex outer, queue_submit_lock inner) so no lock-order deadlock is introduced."
+    },
+    {
+      "id": "CRITICAL-6",
+      "status": "RESOLVED",
+      "judgment": "PersistentMapping is `unsafe impl Send` ONLY, never Sync; the *mut u8 is private; there is no public host_ptr; access is exclusively through copy_in(&self,src)/copy_out(&self,dst) which memcpy internally and are called only by record_and_submit_dispatch under the per-handle buffers Mutex. I verified the soundness chain against the real code: kernel_handle.rs line 112 declares `buffers: parking_lot::Mutex<Vec<BufferSlot>>`. With PersistentMapping: Send (not Sync), BufferSlot/Vec<BufferSlot> are Send; parking_lot::Mutex<T>: Sync requires T: Send (satisfied) and Mutex<T>: Send requires T: Send (satisfied) — so KernelHandleInner remains Send+Sync WITHOUT requiring PersistentMapping: Sync. The spec's §1.C statement that `Mutex<T>: Sync` needs `T: Send` not `T: Sync` is correct. Since no &PersistentMapping is ever obtained outside the Mutex guard, the prior data-race (two threads calling host_ptr() and writing through the copied raw ptr) is eliminated by removing host_ptr entirely. Send is justified: the ptr moves with the BufferSlot, the underlying VkDeviceMemory is process-global, and the only deref is under the Mutex which supplies the happens-before edge."
+    }
+  ],
+  "acceptance_honesty_resolution": {
+    "status": "RESOLVED_WITH_BOUNDED_GAP",
+    "judgment": "The three force-options (force_single_queue, force_binary_semaphores, force_noncoherent_staging) are first-class on VulkanContextOptions + AXC_FORCE_* env (read in from_env()). force_noncoherent_staging genuinely EXECUTES vkFlush/vkInvalidate against coherent memory, so the flush/invalidate calls and their ORDERING relative to copy_in/copy_out are exercised on the dev box and on Lavapipe — a missing or mis-sequenced invalidate surfaces as output divergence via AT-1418's 4-config byte-exact oracle (single-queue / dedicated / forced-non-coherent / forced-binary, all byte-identical to the CPU reference). AT-1409's cfg(feature=noncoherent_fault_injection) dropped-flush variant proves the calls are load-bearing by forcing divergence. The HONEST residual: a memory type whose non-coherence is REAL (where a dropped invalidate genuinely corrupts because the hardware caches actually diverge) is NOT reachable on coherent NVIDIA/Lavapipe; this is explicitly bounded to EB.1 cross-vendor (AMD/Intel) CI and documented in design_md_additions and open_questions as OUT of M3.0 scope. This is an acknowledged, correctly-scoped gap rather than security-theater coverage — the code paths now run everywhere and the byte-exact oracle holds; only the true-non-coherent SEMANTICS await EB.1. Acceptable for M3.0."
+  },
+  "prior_warnings_folded_in": [
+    "WARNING-1 RESOLVED: non_coherent_atom_size is a plumbed parameter from props.limits.non_coherent_atom_size (NEVER hardcoded); AT-1410 now includes {1,64,128,256,1024,65536}.",
+    "WARNING-2 RESOLVED: the .min(alloc) clamp is REMOVED; mapped_range rule is `if align_up(len,atom) >= alloc -> WHOLE_SIZE else align_up(len,atom)`; AT-1410 asserts (size%atom==0 OR offset+size==alloc), covering the VUID-VkMappedMemoryRange-size-01390 boundary including a non-atom-aligned alloc.",
+    "WARNING-3 RESOLVED: one-shot dispatch() routes through prepare_kernel+dispatch_handle and the per-call handle drop unmaps exactly once via the consuming PersistentMapping::unmap(self); double-unmap is unrepresentable. Verified the current one-shot map/unmap at kernel_handle.rs 435-459 is the path being replaced.",
+    "WARNING-4 RESOLVED: the VkPhysicalDeviceVulkan12Features struct is a named local binding outliving create_device (no dangling p_next).",
+    "WARNING-5 RESOLVED: a per-pool lock (compute_pool_lock + transfer_pool_lock) guards vkAllocate/FreeCommandBuffers on BOTH shared pools, fixing the pre-existing latent external-sync race.",
+    "WARNING-6 RESOLVED: the flush loop iterates EVERY uploaded staging slot, not just slot 0; invalidate likewise per readback slot."
+  ],
+  "optimistic_gaps_folded_in": [
+    "queue_submit_lock now listed in context.rs public_api additions (private field, Arc-shared into DispatchQueueCtx).",
+    "force_noncoherent_staging added to VulkanContextOptions alongside the other two, all read in from_env().",
+    "Coder handoff note 3 fixes the drop ordering: unmap (consuming PersistentMapping) BEFORE destroy_buffer BEFORE free_memory, inside the existing guard.drain(..) loop. I verified the current Drop body at kernel_handle.rs 153-211 destroys staging buffer then frees memory with NO unmap today (correct, since there is no persistent mapping yet); the handoff note correctly inserts unmap before destroy_buffer.",
+    "BDA + host_memory_alloc_placement explicitly deferred/out-of-scope."
+  ],
+  "new_holes_introduced_by_revision": [],
+  "critical_issues": [],
+  "warnings": [
+    "WARNING (non-blocking, for Coder): in DedicatedTransfer mode the device-local memory type can still be the iGPU-unified DEVICE_LOCAL|HOST_VISIBLE fallback (find_device_local_memory_type_index, buffers.rs 371-408). CONCURRENT sharing is orthogonal to the memory type and remains correct, but a discrete dedicated-transfer family co-existing with unified memory is unusual; not a correctness issue, just confirm select_queue_families + the memory ladder compose without surprise. No action required for the gate.",
+    "WARNING (non-blocking): §4.B recreates the two binary semaphores on the U-ok/mid-chain-error path. Ensure (Coder) the recreation is itself fallible-safe — a SemaphoreCreationFailed during recovery must still free the CBs and surface a typed error rather than leaving the handle with one old + one new semaphore. The error.rs SemaphoreCreationFailed variant exists for this; just thread it through the recovery path. Timeline mode needs no such recreation."
+  ],
+  "principle_violations": [],
+  "spirv_concerns": [
+    "None. Codegen / SPIR-V emission / spirv-val remain untouched (pure data-movement milestone). Confirmed against kernel_handle.rs and buffers.rs — no shader or pipeline-creation change in the plan."
+  ],
+  "vendor_concerns": [
+    "The canonical NVIDIA-passes/AMD-corrupts pair (CRITICAL-1 muddled host-visibility + CRITICAL-2 mismatched ownership ranges) is now eliminated at the design level: host-visibility is path-identical and CONCURRENT removes ownership transfer entirely. The residual true-non-coherent-hardware risk is honestly bounded to EB.1 (AMD/Intel CI), which is the correct place for it.",
+    "Lavapipe single-queue coherent path is byte-identical to M2.6 (EXCLUSIVE, one CB, QUEUE_FAMILY_IGNORED barriers, flush/invalidate no-ops). AT-1416 guards against a silent DedicatedTransfer pick on Lavapipe (which would hang)."
+  ],
+  "missing_tests": [],
+  "questions_for_architect": [],
+  "summary": "RE-REVIEW VERDICT: APPROVE. All six CRITICALs from r0 are genuinely resolved — not papered over — and I verified each against the real runtime code, not just the prose. CRITICAL-1: the always-emitted in-stream TRANSFER_WRITE->HOST_READ barrier matches kernel_handle.rs 623-647 verbatim and the non-coherent invalidate is additive, not substitutive, correctly placed after the fence and before copy_out. CRITICAL-2: EXCLUSIVE ownership transfer is structurally eliminated by VK_SHARING_MODE_CONCURRENT on device-local in dedicated mode (single-queue stays EXCLUSIVE/byte-identical to today), so no acquire/release range-mismatch class survives; staging stays EXCLUSIVE and is correctly single-family. CRITICAL-3: timeline-primary monotonic base+=2 is reuse-safe across dispatches/errors/skip/degenerate, and the binary fallback state table is complete with semaphore recreation on the dangerous U-ok/error leftover. CRITICAL-4: the partial-submit matrix never waits a never-submitted fence and frees every CB from its own pool after device_wait_idle — no hang, no leak. CRITICAL-5: the atomic-group queue_submit_lock (held across all 3 submits, released before host wait) makes the cross-handle wait-for graph acyclic while preserving within-dispatch overlap and leaving the single-handle perf gate (saxpy_1m) on an uncontended lock, so AT-1400/1401 remain reachable. CRITICAL-6: Send-only PersistentMapping with a private ptr and Mutex-guarded copy_in/copy_out is sound, and I confirmed via the actual `buffers: Mutex<Vec<BufferSlot>>` field that Mutex<T>: Sync needs only T: Send, so KernelHandleInner stays Send+Sync without PersistentMapping: Sync. The acceptance-honesty gap is closed within the bounds of coherent hardware: the force-options are first-class and genuinely execute the flush/invalidate and binary-semaphore paths, AT-1418's four-config byte-exact oracle catches a missing invalidate or mis-sequenced barrier as output divergence on the dev box, and the irreducible true-non-coherent-SEMANTICS gap is explicitly and correctly bounded to EB.1 (AMD/Intel CI) rather than hidden. All six prior WARNINGs and all four OPTIMISTIC gaps are folded in (atom_size plumbed, clamp-bug removed with the correct WHOLE_SIZE rule, named-local p_next, both pool locks, full-slot flush loop, unmap-before-destroy-before-free drop order verified against the current Drop body). No new holes were introduced by the revision. Two non-blocking Coder notes remain (make binary-semaphore recreation in the recovery path fallible-safe via the existing SemaphoreCreationFailed variant; the iGPU-unified device-local fallback composes correctly with CONCURRENT). M3.0 r1 is correct, internally consistent, and ready for implementation."
+}

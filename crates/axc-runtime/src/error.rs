@@ -4,7 +4,15 @@
 //! for structured diagnostic rendering. No `Box<dyn Error>` is used anywhere;
 //! all error context is encoded in typed fields (anti-pattern compliance).
 //!
-//! Variant count: 25 (rev 1, M2.3a). The count is asserted in `at_801`.
+//! Variant count: 28 (rev 2, M3.0). The count is asserted in `at_801`.
+//!
+//! ## M3.0 additions
+//!
+//! - `SemaphoreCreationFailed` — timeline or binary semaphore creation failure.
+//! - `TransferQueueSubmitFailed` — dedicated transfer-queue submit failure
+//!   (distinct from `QueueSubmitFailed` for diagnosis).
+//! - `MappedRangeOpFailed { op: MappedRangeOp }` — `vkFlush/InvalidateMappedMemoryRanges`
+//!   failure, tagged with the `MappedRangeOp` direction enum.
 
 /// Direction of a staging-buffer copy operation.
 ///
@@ -16,6 +24,17 @@ pub enum CopyDirection {
     HostToDevice,
     /// Copying from device (GPU) memory to host (CPU) memory.
     DeviceToHost,
+}
+
+/// Operation type for a mapped-memory-range Vulkan call.
+///
+/// Used in `DispatchError::MappedRangeOpFailed` to distinguish flush from invalidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MappedRangeOp {
+    /// `vkFlushMappedMemoryRanges` — makes host writes visible to the device.
+    Flush,
+    /// `vkInvalidateMappedMemoryRanges` — makes device writes visible to the host.
+    Invalidate,
 }
 
 /// Typed error for all Vulkan dispatch failure modes.
@@ -192,6 +211,34 @@ pub enum DispatchError {
         /// Human-readable reason.
         reason: String,
     },
+
+    // ── M3.0 bandwidth rework errors ──────────────────────────────────────────
+    /// Timeline or binary handoff semaphore creation failed (M3.0).
+    ///
+    /// Returned by `sync::create_handoff` and the binary-semaphore recreation
+    /// path in the partial-submit error recovery matrix (CRITICAL-4).
+    #[error("semaphore creation failed: {0}")]
+    SemaphoreCreationFailed(String),
+
+    /// A dedicated transfer-queue `vkQueueSubmit` failed (M3.0).
+    ///
+    /// Distinct from `QueueSubmitFailed` (compute queue) for per-queue diagnosis.
+    /// Returned for upload-CB or readback-CB submission failures in the
+    /// three-submit dedicated dispatch path.
+    #[error("transfer queue submit failed: {0}")]
+    TransferQueueSubmitFailed(String),
+
+    /// `vkFlushMappedMemoryRanges` or `vkInvalidateMappedMemoryRanges` failed (M3.0).
+    ///
+    /// The `op` field distinguishes flush from invalidate so callers can add targeted
+    /// diagnostic notes. Only raised on `NonCoherent` memory (coherent paths skip these calls).
+    #[error("mapped memory range op {op:?} failed: {reason}")]
+    MappedRangeOpFailed {
+        /// Whether this was a flush (after upload) or invalidate (before readback).
+        op: MappedRangeOp,
+        /// Human-readable reason (Vulkan result code).
+        reason: String,
+    },
 }
 
 /// Convenience type alias for dispatch results.
@@ -201,12 +248,14 @@ pub type DispatchResult<T> = Result<T, DispatchError>;
 mod tests {
     use super::*;
 
-    /// AT-801: DispatchError has exactly 25 variants, all Display and Diagnostic.
+    /// AT-801: DispatchError has exactly 28 variants, all Display and Diagnostic.
     ///
-    /// Supersedes AT-502 (23 variants). The exhaustive match below ensures the
-    /// compiler reminds us to update this test whenever a variant is added or removed.
+    /// Supersedes AT-502 (23 variants) and M2.3a at_801 (25 variants). M3.0 adds 3:
+    /// `SemaphoreCreationFailed`, `TransferQueueSubmitFailed`, `MappedRangeOpFailed`.
+    /// The exhaustive match below ensures the compiler reminds us to update this test
+    /// whenever a variant is added or removed.
     #[test]
-    fn at_801_dispatch_error_variants_count_is_25() {
+    fn at_801_dispatch_error_variants_count_is_28() {
         // Construct one instance of each variant and verify non-empty Display.
         let variants: Vec<DispatchError> = vec![
             DispatchError::VulkanEntryFailed("test".to_owned()),
@@ -244,10 +293,17 @@ mod tests {
                 direction: CopyDirection::HostToDevice,
                 reason: "test".to_owned(),
             },
+            // M3.0 additions (variants 26, 27, 28):
+            DispatchError::SemaphoreCreationFailed("test semaphore".to_owned()),
+            DispatchError::TransferQueueSubmitFailed("test transfer submit".to_owned()),
+            DispatchError::MappedRangeOpFailed {
+                op: MappedRangeOp::Flush,
+                reason: "test flush".to_owned(),
+            },
         ];
 
-        // Verify exactly 25 variants are covered.
-        assert_eq!(variants.len(), 25, "expected exactly 25 DispatchError variants");
+        // Verify exactly 28 variants are covered.
+        assert_eq!(variants.len(), 28, "expected exactly 28 DispatchError variants");
 
         for variant in &variants {
             let msg = variant.to_string();
@@ -299,11 +355,37 @@ mod tests {
         };
     }
 
-    /// AT-502 (legacy test preserved as alias): verifies the new 25-count.
+    /// AT-1415: MappedRangeOp has exactly 2 variants with Debug, PartialEq, Eq.
+    #[test]
+    fn at_1415_mapped_range_op_two_variants() {
+        let flush: MappedRangeOp = MappedRangeOp::Flush;
+        let inv: MappedRangeOp = MappedRangeOp::Invalidate;
+        assert_ne!(flush, inv, "Flush and Invalidate must be distinct");
+        assert!(!format!("{flush:?}").is_empty(), "Flush debug must be non-empty");
+        assert!(!format!("{inv:?}").is_empty(), "Invalidate debug must be non-empty");
+
+        // Exhaustive match — compile error if a third variant is added.
+        let _covered: () = match flush {
+            MappedRangeOp::Flush => {}
+            MappedRangeOp::Invalidate => {}
+        };
+
+        // Both new error variants render correctly.
+        let e1 = DispatchError::SemaphoreCreationFailed("test".to_owned());
+        assert!(e1.to_string().contains("failed"), "SemaphoreCreationFailed must say 'failed'");
+
+        let e2 = DispatchError::TransferQueueSubmitFailed("test".to_owned());
+        assert!(e2.to_string().contains("failed"), "TransferQueueSubmitFailed must say 'failed'");
+
+        let e3 = DispatchError::MappedRangeOpFailed { op: MappedRangeOp::Invalidate, reason: "boom".to_owned() };
+        assert!(e3.to_string().contains("Invalidate"), "MappedRangeOpFailed must include op name");
+    }
+
+    /// AT-502 (legacy test preserved as alias): verifies the new 28-count.
     #[test]
     fn at_502_dispatch_error_variants_are_display_miette() {
         // This test delegates to the more complete at_801 test above.
         // Preserved for backward-compatibility with any test-name grepping.
-        at_801_dispatch_error_variants_count_is_25();
+        at_801_dispatch_error_variants_count_is_28();
     }
 }

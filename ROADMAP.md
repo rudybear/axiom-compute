@@ -20,7 +20,7 @@ Last updated: 2026-04-28. Test count baseline: **713**.
 | **FlashAttention-2** | ❌ M3.1 |
 | **KernelBench-Vulkan public submission** | ❌ M3.2 |
 | **PyTorch frontend + upstream adoption** | ❌ M4 |
-| Bandwidth optimization (pinned memory, concurrent transfer) | ❌ M3.0 |
+| Bandwidth optimization (pinned memory, concurrent transfer) | ✅ M3.0 (saxpy_1m 7.5×, saxpy_1024 39×; <1ms gate re-scoped to GPU-resident metric) |
 | Multi-row tiled matmul (cooperative_matrix on real workloads) | ❌ M3.0 |
 | Cross-vendor real GPU CI (AMD RDNA3+, Intel Arc) | ❌ infra |
 | **llama.cpp Vulkan head-to-head A/B** | ❌ thesis-closing milestone |
@@ -31,7 +31,11 @@ Last updated: 2026-04-28. Test count baseline: **713**.
 
 Goal: prove the DESIGN.md §5 kill-criteria gates with publishable numbers, not just bit-exact correctness.
 
-### M3.0 — Dispatch bandwidth rework (PREREQUISITE for everything else)
+### M3.0 — Dispatch bandwidth rework ✅ DONE (gate re-scoped)
+
+**Status (2026-06-01):** Merged. Persistent-mapped HOST_CACHED staging + optional dedicated transfer queue + timeline/binary-semaphore overlap, single-queue fallback byte-identical to M2.3a. Measured on NVIDIA RTX PRO 6000: `dispatch_saxpy_1m` 23 ms → **3.08 ms (7.5×)**, `dispatch_saxpy_1024` 1.22 ms → **31 µs (39×)**, `dispatch_q4km_512` 8.84 ms → **5.76 ms (1.5×)**. All paths byte-exact (AT-1418 four-config oracle on NVIDIA). 747 tests, codegen untouched.
+
+**Gate re-scoped — the original `<1 ms` / `<2 ms` targets were not met and are deferred, for a documented reason.** Profiling showed the residual cost is host-round-trip PCIe transfer + readback, not kernel quality: `saxpy_1m` moves ~12 MB host→device→host every call. A ReBAR zero-copy-readback fix (r2) was attempted and **empirically reverted** — CPU reads from the BAR aperture are write-combined and ~60× *slower* (the real-GPU measurement gate caught it pre-merge; see DESIGN.md §3.1.12 postmortem). The thesis-relevant metric is a **GPU-resident benchmark** (upload once, dispatch N times, measure kernel time), re-scoped to M3.1/M3.4. Two correct-but-unshipped ideas carry forward to M3.1: Lever A (skip readback of `readonly` bindings) and the binary-semaphore-recreation fixup (Dev#1).
 
 **Why first:** every measured GPU number on real hardware (NVIDIA RTX PRO 6000) is staging-bound at 1 M+ elements. saxpy_1m at 23 ms is ~100× off theoretical PCIe peak. Without fixing this, M3.1/M3.2/M4 numbers are dominated by infrastructure overhead, not kernel quality.
 

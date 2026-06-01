@@ -98,6 +98,7 @@ fn gpu_state() -> &'static GpuState {
             pipeline_cache_path: None,
             physical_device_index: None,
             fence_timeout_ms: None,
+            ..Default::default()
         })
         .expect("dispatch bench: VulkanContext::new_with_options must succeed");
 

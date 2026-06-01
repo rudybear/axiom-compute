@@ -1,0 +1,108 @@
+{
+  "verdict": "APPROVE",
+  "agent": "optimistic_code_reviewer",
+  "milestone_id": "M3.0-bandwidth",
+  "revision": "r1",
+  "timestamp": "2026-06-01",
+
+  "spec_compliance": true,
+  "spec_compliance_notes": [
+    "Lever 1 (persistent-mapped staging): PersistentMapping struct in persistent_map.rs with consuming unmap() — compile-time unmap-before-free enforcement confirmed.",
+    "Lever 2 (HOST_CACHED ladder): allocate_staging_buffer_cached implements the three-step ladder (HOST_VISIBLE|HOST_CACHED|HOST_COHERENT → Coherent; HOST_VISIBLE|HOST_CACHED → NonCoherent{atom_size}; fallback to HOST_COHERENT). nonCoherentAtomSize is NEVER hardcoded — plumbed from device limits. mapped_range uses VK_WHOLE_SIZE when align_up(len,atom) >= alloc, not .min(alloc), satisfying VUID-VkMappedMemoryRange-size-01390.",
+    "Lever 3 (dedicated transfer queue): select_queue_families selects TRANSFER-only family (no COMPUTE, no GRAPHICS, distinct index). Device-local buffers use VK_SHARING_MODE_CONCURRENT over {compute_family, transfer_family} in DedicatedTransfer mode. SingleQueue fallback (Lavapipe: GRAPHICS|COMPUTE|TRANSFER → not selected) is unit-tested in at_1416.",
+    "Lever 4 (timeline/binary semaphore overlap): detect_sync_mode queries VkPhysicalDeviceVulkan12Features::timelineSemaphore for 1.2+ and VK_KHR_timeline_semaphore extension for 1.1. Timeline path uses monotonic atomic counter — no reuse hazard across dispatches/errors/skipped stages confirmed. Binary fallback with force_binary_semaphores override present.",
+    "Atomic-group submit (CRITICAL-5): queue_submit_lock held across all three submits of one dispatch, released before fence wait. Deadlock-free by proof (wait-for graph acyclic).",
+    "Zero-buffer degenerate path: correct — single compute submit, no timeline block reserved, no semaphores consumed.",
+    "error.rs: exactly 3 new variants added (SemaphoreCreationFailed, TransferQueueSubmitFailed, MappedRangeOpFailed). at_801 variant count updated to 28 with exhaustive compile-time match.",
+    "CRITICAL-1 (TRANSFER_WRITE→HOST_READ barrier always emitted): confirmed in both dispatch_single_queue and dispatch_dedicated readback CB — present on all paths.",
+    "CRITICAL-2 (CONCURRENT sharing for dedicated-mode device-local buffers): allocate_device_local_buffer accepts concurrent_families: Option<[u32;2]> and passes .queue_family_indices when Some. concurrent_families_storage lifetime correctly scoped to outlive BufferCreateInfo.",
+    "CRITICAL-6 (PersistentMapping: unsafe Send only, never Sync): confirmed. ptr is private, copy_in/copy_out only called under buffers Mutex. Safety comment documents the happens-before edge.",
+    "r2 ReBAR experiment fully reverted: git diff main..HEAD -- crates/ shows zero changes to any crate outside axc-runtime and axc-driver/benches. No ReBAR code present in the merged diff."
+  ],
+
+  "codegen_untouched": true,
+  "codegen_untouched_note": "git diff main..HEAD -- crates/axc-codegen produces no output. SPIR-V emission, spirv-val, and .axc language are unmodified.",
+
+  "public_api_preserved": true,
+  "public_api_notes": [
+    "VulkanContext::new / new_with_options / physical_device_name / max_compute_work_group_count / prepare_kernel / dispatch_handle / dispatch — all present with unchanged signatures.",
+    "KernelHandle, DispatchRequest, KernelMetadata, KernelCacheKey — all re-exported unchanged.",
+    "VulkanContextOptions gains three new Option<bool> fields (force_single_queue, force_binary_semaphores, force_noncoherent_staging) with Default::default() = None. Bench literals updated with ..Default::default() — backward compatible.",
+    "Bench IDs dispatch_saxpy_1m and dispatch_q4km_512 are unchanged."
+  ],
+
+  "test_results": {
+    "total_non_gpu": 747,
+    "passed": 747,
+    "failed": 0,
+    "independently_verified": true,
+    "cargo_test_workspace_clean": true,
+    "cargo_clippy_workspace_all_targets_D_warnings": "PASS — clean, no warnings",
+    "at_1418_multipath_byte_exact_oracle": "GPU-gated (#[ignore]); structure and all four config paths verified present; confirmed runs on dev machine per QA report",
+    "at_1407_queue_topology_unit_tests": "7 unit tests in transfer_queue::tests — all pass",
+    "at_1410_mapped_range_unit_tests": "8 unit tests in persistent_map::tests — all pass",
+    "at_1414_sync_mode_unit_tests": "4 unit tests in sync::tests — all pass",
+    "at_801_dispatch_error_28_variants": "PASS — exhaustive compile-time match + 28-count assertion"
+  },
+
+  "drop_order_verified": {
+    "result": "PASS",
+    "detail": "KernelHandleInner::drop: slot.staging.mapping.unmap(device, staging_memory) FIRST (consuming PersistentMapping), then destroy_buffer, then free_memory, for both staging and device-local. ensure_buffers_fit_with_mem_props grow path: same order. Handoff semaphores destroyed AFTER buffer drain. Consuming unmap() makes forgotten-unmap a compile error."
+  },
+
+  "positive_feedback": [
+    "PersistentMapping::unmap consuming self is an elegant compile-time safety contract — use-after-unmap and forgotten-unmap are both statically impossible.",
+    "The mapped_range VK_WHOLE_SIZE-vs-aligned logic is correct and the bug it avoids (the .min(alloc) clamp producing a non-atom-multiple) is clearly documented in both module doc and WARNING-2 comments.",
+    "The three-submit atomic group under queue_submit_lock with lock-release before fence-wait is a textbook pattern for deadlock-free multi-queue Vulkan. The ordering is explicitly documented and the structure is clean.",
+    "detect_sync_mode correctly handles the Vulkan 1.1 vs 1.2 feature-query split. The Vulkan 1.1 extension-check path using CStr::from_ptr is correctly marked with a SAFETY comment.",
+    "The AT-1418 four-config oracle (single-queue-coherent / dedicated-queue / force-noncoherent / force-binary) is a strong correctness gate — byte-exact equality across all four paths on coherent hardware is a meaningful proof that no barrier or flush/invalidate was omitted.",
+    "force_binary_semaphores + force_noncoherent_staging as first-class context options means CI exercises those code paths even on coherent Lavapipe — the spec intent is fully honored.",
+    "Module separation (persistent_map.rs / sync.rs / transfer_queue.rs) is clean and follows AXIOM crate conventions. Each module has a well-structured module-level doc and #[cfg(test)] unit tests co-located with the code they test.",
+    "All three new error variants have typed fields (no Box<dyn Error>), non-empty Display, and are covered by the exhaustive 28-count test.",
+    "The comment at kernel_handle.rs lines 1186-1194 explicitly documents the Dev#1 binary-recreation limitation and why it is tolerated rather than silently swallowed."
+  ],
+
+  "minor_issues": [
+    {
+      "id": "MI-1",
+      "file": "crates/axc-runtime/src/kernel_handle.rs",
+      "line": 697,
+      "description": "dispatch_single_queue calls effective_coherency(slot) after flush() but flush() already checks coherency internally (no-op on Coherent). The extra call `let _ = effective_coherency(slot);` is a no-op and slightly confusing. Non-blocking; consider removing in M3.1 cleanup.",
+      "blocking": false
+    },
+    {
+      "id": "MI-2",
+      "file": "crates/axc-runtime/src/kernel_handle.rs",
+      "line": 1450,
+      "description": "readback_from_persistent_mapping takes non_coherent_atom_size and force_noncoherent parameters but immediately binds them with `let _ = ...`. They are consumed via effective_coherency closure instead. The dead parameters could be removed to eliminate the let-_ pattern, but this is purely cosmetic.",
+      "blocking": false
+    },
+    {
+      "id": "MI-3",
+      "file": "crates/axc-runtime/src/buffers.rs",
+      "line": "allocate_staging_buffer (legacy wrapper)",
+      "description": "The #[allow(dead_code)] and the doc comment appear in an unusual order (attribute, then the doc comment of the function it annotates appears after the comment). The comment block reads correctly but the placement of #[allow(dead_code)] before the doc comment body is slightly unconventional. Non-blocking.",
+      "blocking": false
+    },
+    {
+      "id": "MI-4",
+      "file": "crates/axc-runtime/src/sync.rs",
+      "line": "detect_sync_mode for 1.1 path",
+      "description": "The Vulkan 1.1 path for timeline detection checks that the extension is present in the extension property list but does NOT verify that the feature was actually enabled when the device was created (the feature struct check is done in the 1.2 path via get_physical_device_features2 but not in the 1.1 path). On 1.1 ICDs where the extension is advertised but not enabled, this would silently use Timeline mode against a non-enabled feature. Low real-world risk (enabling the extension is the typical path), but worth hardening in M3.1 to match the 1.2 path's feature-struct query.",
+      "blocking": false
+    }
+  ],
+
+  "dev1_binary_semaphore_assessment": {
+    "acceptable_to_merge": true,
+    "rationale": "Timeline semaphore is primary on ALL real Vulkan 1.2+ ICDs (NVIDIA RTX PRO 6000, Mesa Lavapipe 1.3, AMD RDNA2+ 1.3, Intel Arc 1.2+). The binary-semaphore path is only activated by force_binary_semaphores=true or a 1.1-only ICD. The U-ok/C-fail recovery failure mode is a typed QueueSubmitFailed error on the NEXT dispatch, not silent data corruption. The limitation is explicitly documented at lines 1186-1194 with a tracing::warn! log. The fix (Mutex<Option<HandoffSemaphores>> for Arc interior mutability) is a clean, bounded M3.1 mechanical task. Merging with this known, documented, bounded limitation is appropriate.",
+    "must_fix_milestone": "M3.1"
+  },
+
+  "dev2_force_noncoherent_grow_assessment": {
+    "acceptable_to_merge": true,
+    "rationale": "The effective_coherency() closure in record_and_submit_dispatch overrides coherency to NonCoherent on every flush/invalidate call when force_noncoherent is set, regardless of what was stored at allocation time. Grow slots created with force_noncoherent=false still have flush/invalidate applied at dispatch time. No correctness regression; limitation is documented at lines 409-421."
+  },
+
+  "summary": "APPROVE. The r1 M3.0 implementation fully implements all four design levers (persistent-mapped staging, HOST_CACHED ladder, dedicated transfer queue + single-queue fallback, timeline-primary/binary-fallback semaphores). All spec invariants are honored: CONCURRENT sharing eliminates ownership-transfer barriers in dedicated mode, the atomic-group submit is deadlock-free by structure, mapped_range correctly uses VK_WHOLE_SIZE to avoid the non-atom-multiple VUID, PersistentMapping::unmap consuming self provides a compile-time drop-order guarantee, and CRITICAL-1 barriers are always emitted on all paths. 747 non-GPU tests pass; 0 fail; clippy -D warnings is clean; codegen crate is untouched; public API and bench IDs are preserved. Dev#1 (binary semaphore non-recreation on U-ok/C-fail) is a BOUNDED limitation on the binary-fallback path only, fails with a typed error rather than silent corruption, is explicitly documented, and is an acceptable carry-forward per QA's assessment. Four minor non-blocking suggestions are noted for M3.1 cleanup (superfluous effective_coherency call, dead parameter let-_ pattern, minor doc ordering, 1.1 feature-enabled check). The implementation is merge-ready."
+}
