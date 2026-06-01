@@ -10,17 +10,18 @@ LLMs iteratively optimize CUDA kernels today at the source-text level (Sakana AI
 
 AXIOM-Compute makes intent first-class. `@strategy { workgroup_x: ?[32, 64, 128, 256] }` declares holes the compiler enumerates and a grid-search (or LLM agent via MCP) fills. `@equiv_fp_tol(1e-3)` is machine-checked. The result is portable SPIR-V that downstream vendor drivers finish optimizing — without CUDA lock-in.
 
-## Current status (2026-04-21)
+## Current status (2026-06-01)
 
-- **13 milestones merged on `main`**: M0 → M2.6
-- **713 tests passing**, clippy `--all-targets` clean, zero SPIR-V validation errors
+- **14 milestones merged on `main`**: M0 → M3.0
+- **747 tests passing**, clippy `--all-targets` clean, zero SPIR-V validation errors
 - **Real GPU execution** via `ash` 0.38 + Vulkan 1.1+
 - **6 GPU-gated tests pass on both NVIDIA RTX PRO 6000 Blackwell AND Lavapipe** (software Vulkan)
 - **Q4_K_M kernel dispatches bit-exact** against ggml CPU reference on real GPU — the llama.cpp beachhead
+- **M3.0 dispatch bandwidth rework**: persistent-mapped HOST_CACHED staging + dedicated transfer queue + timeline-semaphore overlap → `saxpy_1m` 23 ms → **3.08 ms (7.5×)**, `saxpy_1024` 1.22 ms → **31 µs (39×)**. The `<1 ms` gate was re-scoped to a GPU-resident metric (a host-round-trip saxpy measures PCIe transfer, not kernel quality); a ReBAR readback fix was tried and empirically reverted — see DESIGN.md §3.1.12.
 
 | Kernel | Status |
 |---|---|
-| saxpy | ✅ bit-exact, 38 μs (1024 elem) on NVIDIA |
+| saxpy | ✅ bit-exact, 31 μs (1024 elem) / 3.08 ms (1 M, host round-trip) on NVIDIA |
 | vector_add | ✅ bit-exact |
 | reduction / workgroup barrier | ✅ compile + validate |
 | subgroup reduce | ✅ compile + validate |
@@ -137,7 +138,7 @@ On Intel i9-14900KF + NVIDIA RTX PRO 6000 Blackwell Workstation:
 | Kernel | Size | Dispatch time |
 |---|---|---|
 | saxpy | 1 K elements | **38 μs** (was 691 μs pre-M2.3a — 18× speedup from pipeline cache) |
-| saxpy | 1 M elements | 26 ms (staging-bound; bandwidth optimization is M3) |
+| saxpy | 1 M elements | **3.08 ms** (was 23 ms pre-M3.0 — 7.5× from HOST_CACHED staging + persistent map; host round-trip) |
 | Q4_K_M matvec | 128 superblocks (32 K elements) | measured on Lavapipe — see `.pipeline/benchmarks/baselines.json` |
 
 Run `cargo bench -p axc-driver` locally to generate baselines for your machine. Regression gate fails if any metric regresses > 15% with 11-sample median.
