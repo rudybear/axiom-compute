@@ -90,6 +90,7 @@ pub use icd::{probe_vulkan_available, gpu_tests_enabled, captured_icd_path};
 pub use kernel_handle::{KernelHandle, KernelCacheKey};
 pub use coopmat::{
     CoopMatSupport, CoopMatShapeSupport, CoopMatComponentType, CoopMatScope,
-    CoopMatRequiredShape, coopmat_shape_supported, EnabledDeviceFeatures,
+    CoopMatRequiredShape, coopmat_shape_supported, coopmat_required_shape_from_meta,
+    EnabledDeviceFeatures,
 };
 pub use resident::{ResidentBuffers, ResidentDispatchTiming, ResidentTimingSource, ResidentBenchConfig};

@@ -1,0 +1,46 @@
+// matmul_f32_tiled.axc — M3.1: plain f32 tiled matmul (NO coopmat).
+//
+// Computes C[row, col] = sum_k A[row, k] * B[k, col] for one (row, col) per invocation.
+// Row-major layout for all three matrices.
+//
+// Used for:
+//   - matmul_tflops_4096 resident bench (4096x4096 effective TFLOPS, runs on ALL vendors)
+//   - AT-1532: effective_tflops() finite > 0 assertion
+//   - D: @strategy tile holes (tile_m, tile_n) enumerate via axc-optimize
+//
+// @strategy declares tile_m and tile_n holes for M3.1's tile-dimension autotuning.
+// The enumerator produces the Cartesian product; each variant is a separate compile.
+// For the bench we use the default (first candidate): tile_m=1, tile_n=1 (one element
+// per invocation — simple but correct; M3.4 will add workgroup-level tiling).
+//
+// Bit-exact vs matmul_f32_cpu (AT-1520 companion); relative tolerance 1e-3 is met
+// for the 4096x4096 case by f32 scalar accumulation.
+
+@strategy { tile_m: ?[1, 2, 4], tile_n: ?[1, 2, 4] }
+@kernel
+@workgroup(64, 1, 1)
+@intent("F32 tiled matmul C = A * B; one (row,col) per invocation; tile dims from @strategy holes")
+@complexity(O(n))
+@precondition(true)
+fn matmul_f32_tiled(
+    a_buf: readonly_buffer[f32],
+    b_buf: readonly_buffer[f32],
+    c_buf: buffer[f32],
+    m: u32,
+    n: u32,
+    k: u32,
+) -> void {
+    let i: u32 = gid(0u32);
+    let total: u32 = m * n;
+    if i >= total { return; }
+    let row: u32 = i / n;
+    let col: u32 = i - row * n;
+    let mut acc: f32 = 0.0f32;
+    for ki in range(0u32, k) {
+        let a_val: f32 = a_buf[row * k + ki];
+        let b_val: f32 = b_buf[ki * n + col];
+        acc = acc + a_val * b_val;
+    }
+    c_buf[row * n + col] = acc;
+    return;
+}

@@ -388,7 +388,7 @@ pub(crate) fn required_device_features(
 ///
 /// The runtime ALWAYS uses this function — never a literal shape — so that
 /// the required shape tracks whatever dimensions the source declares (AT-1552/HN-10).
-pub(crate) fn coopmat_required_shape_from_meta(meta: &CoopMatShapeMeta) -> CoopMatRequiredShape {
+pub fn coopmat_required_shape_from_meta(meta: &CoopMatShapeMeta) -> CoopMatRequiredShape {
     CoopMatRequiredShape {
         m: meta.m,
         n: meta.n,

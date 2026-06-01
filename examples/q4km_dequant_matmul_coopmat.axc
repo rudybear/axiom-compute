@@ -1,0 +1,35 @@
+// q4km_dequant_matmul_coopmat.axc — M3.1 STAGED BRIDGE (preflight-gated, NVIDIA-only).
+//
+// PRE-DEQUANTIZED inputs: a_f16 (16x16 f16 weight tile, already dequantized by host/test)
+// and b_f16 (16x16 f16 x tile). Computes C = A * B + 0 using cooperative-matrix ops.
+//
+// This is NOT the fully-fused dequant→coopmat kernel (which needs shared[T,N]/FG.6,
+// deferred to M3.2). It proves that the coopmat dispatch path works on Q4_K_M-DERIVED
+// f16 tiles (the host test pre-dequantizes Q4_K_M blocks before calling this kernel).
+//
+// Skips on Lavapipe (no VK_KHR_cooperative_matrix). NVIDIA-only dispatch (AT-1521).
+//
+// Buffer layout (all row-major f16, stride = 16 elements per row):
+//   a_buf: readonly_buffer[f16]  — pre-dequantized weight tile A (16x16)
+//   b_buf: readonly_buffer[f16]  — pre-dequantized input tile B (16x16)
+//   c_buf: buffer[f16]           — output tile C = A * B (16x16)
+//   tile_offset: u32             — element offset into the flat buffers
+
+@kernel
+@workgroup(32, 1, 1)
+@cooperative_matrix
+@intent("Staged coopmat bridge: pre-dequantized f16 Q4_K_M tiles via 16x16 tensor cores")
+fn q4km_dequant_matmul_coopmat(
+    tile_offset: u32,
+    a_buf: readonly_buffer[f16],
+    b_buf: readonly_buffer[f16],
+    c_buf: buffer[f16]
+) -> void {
+    let stride: u32 = 16u32;
+    let a: matrix[f16, 16, 16, a] = coopmat_load(a_buf, tile_offset, stride);
+    let b: matrix[f16, 16, 16, b] = coopmat_load(b_buf, tile_offset, stride);
+    let acc: matrix[f16, 16, 16, accumulator] = coopmat_zero();
+    let result: matrix[f16, 16, 16, accumulator] = coopmat_mul_add(a, b, acc);
+    coopmat_store(result, c_buf, tile_offset, stride);
+    return;
+}
