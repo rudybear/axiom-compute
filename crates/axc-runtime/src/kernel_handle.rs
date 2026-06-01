@@ -767,9 +767,14 @@ fn dispatch_single_queue(
     unsafe { device.cmd_dispatch(cb, workgroups.0, workgroups.1, workgroups.2); }
 
     // ── Compute→Transfer barriers ────────────────────────────────────────────
+    // M3.1 Lever A: skip readback for ReadOnly bindings (HN-7, AT-1540/1541).
+    // All four readback loops use binding_is_readback to agree (HN-9).
     let mut compute_barriers: Vec<vk::BufferMemoryBarrier<'_>> = Vec::new();
     for i in 0..n {
-        if i >= output_sizes.len() || output_sizes[i] == 0 { continue; }
+        let access = inner.binding_plan.buffers.get(i).map(|b| b.ty.access)
+            .unwrap_or(axc_hir::buffer::BufferAccess::ReadWrite);
+        let out_size = if i < output_sizes.len() { output_sizes[i] } else { 0 };
+        if !binding_is_readback(access, out_size) { continue; }
         let slot = &buffers[i];
         let barrier = vk::BufferMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::SHADER_WRITE)
@@ -790,12 +795,16 @@ fn dispatch_single_queue(
 
     // ── Stage B: device→staging copies + TRANSFER_WRITE→HOST_READ barriers ───
     // (CRITICAL-1: ALWAYS emit this barrier, both coherent and non-coherent paths)
+    // M3.1 Lever A: ReadOnly bindings are NOT copied back (HN-9 — all loops agree).
     let mut readback_barriers: Vec<vk::BufferMemoryBarrier<'_>> = Vec::new();
     for i in 0..n {
-        if i >= output_sizes.len() || output_sizes[i] == 0 { continue; }
+        let access = inner.binding_plan.buffers.get(i).map(|b| b.ty.access)
+            .unwrap_or(axc_hir::buffer::BufferAccess::ReadWrite);
+        let out_size = if i < output_sizes.len() { output_sizes[i] } else { 0 };
+        if !binding_is_readback(access, out_size) { continue; }
         let slot = &buffers[i];
         let copy_region = vk::BufferCopy::default()
-            .src_offset(0).dst_offset(0).size(output_sizes[i] as u64);
+            .src_offset(0).dst_offset(0).size(out_size as u64);
         // SAFETY: valid non-overlapping buffers.
         unsafe {
             device.cmd_copy_buffer(cb, slot.device_local.buffer, slot.staging.buffer, &[copy_region]);
@@ -855,9 +864,11 @@ fn dispatch_single_queue(
     wait_result.map_err(|e| DispatchError::QueueSubmitFailed(e.to_string()))?;
 
     // ── Readback via persistent mapping ──────────────────────────────────────
+    // M3.1 Lever A: pass binding_plan for ReadOnly predicate (HN-9 — all loops agree).
     let outputs = readback_from_persistent_mapping(
         buffers, output_sizes, n, device, ctx.non_coherent_atom_size,
         &effective_coherency, ctx.force_noncoherent,
+        &inner.binding_plan,
     );
 
     Ok(outputs)
@@ -1065,10 +1076,14 @@ fn dispatch_dedicated(
         unsafe { device.cmd_dispatch(compute_cb, workgroups.0, workgroups.1, workgroups.2); }
 
         // Compute→Transfer barriers for readback (SHADER_WRITE→TRANSFER_READ).
+        // M3.1 Lever A: ReadOnly bindings are NOT included (HN-9 — all loops agree).
         if has_outputs {
             let mut compute_barriers: Vec<vk::BufferMemoryBarrier<'_>> = Vec::new();
             for i in 0..n {
-                if i >= output_sizes.len() || output_sizes[i] == 0 { continue; }
+                let access = inner.binding_plan.buffers.get(i).map(|b| b.ty.access)
+                    .unwrap_or(axc_hir::buffer::BufferAccess::ReadWrite);
+                let out_size = if i < output_sizes.len() { output_sizes[i] } else { 0 };
+                if !binding_is_readback(access, out_size) { continue; }
                 let slot = &buffers[i];
                 let barrier = vk::BufferMemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
@@ -1092,6 +1107,7 @@ fn dispatch_dedicated(
     }
 
     // ── Record readback CB (if has_outputs) ───────────────────────────────────
+    // M3.1 Lever A: ReadOnly bindings are NOT copied back (HN-9 — all loops agree).
     if let Some(readback_cb) = readback_cb_opt {
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
@@ -1101,10 +1117,13 @@ fn dispatch_dedicated(
         // Device→staging copies.
         let mut readback_barriers: Vec<vk::BufferMemoryBarrier<'_>> = Vec::new();
         for i in 0..n {
-            if i >= output_sizes.len() || output_sizes[i] == 0 { continue; }
+            let access = inner.binding_plan.buffers.get(i).map(|b| b.ty.access)
+                .unwrap_or(axc_hir::buffer::BufferAccess::ReadWrite);
+            let out_size = if i < output_sizes.len() { output_sizes[i] } else { 0 };
+            if !binding_is_readback(access, out_size) { continue; }
             let slot = &buffers[i];
             let copy_region = vk::BufferCopy::default()
-                .src_offset(0).dst_offset(0).size(output_sizes[i] as u64);
+                .src_offset(0).dst_offset(0).size(out_size as u64);
             unsafe {
                 device.cmd_copy_buffer(readback_cb, slot.device_local.buffer,
                     slot.staging.buffer, &[copy_region]);
@@ -1250,9 +1269,11 @@ fn dispatch_dedicated(
     wait_result.map_err(|e| DispatchError::QueueSubmitFailed(e.to_string()))?;
 
     // ── Readback: invalidate + copy_out via persistent mapping ───────────────
+    // M3.1 Lever A: pass binding_plan for ReadOnly predicate (HN-9 — all loops agree).
     let outputs = readback_from_persistent_mapping(
         buffers, output_sizes, n, device, ctx.non_coherent_atom_size,
         &effective_coherency, ctx.force_noncoherent,
+        &inner.binding_plan,
     );
 
     Ok(outputs)
@@ -1438,6 +1459,7 @@ fn submit_readback(
 /// On NonCoherent memory: calls `vkInvalidateMappedMemoryRanges` BEFORE `copy_out`
 /// for EACH readback slot (CRITICAL-1, WARNING-6).
 #[allow(clippy::undocumented_unsafe_blocks)]
+#[allow(clippy::too_many_arguments)]
 fn readback_from_persistent_mapping(
     buffers: &[BufferSlot],
     output_sizes: &[usize],
@@ -1446,6 +1468,7 @@ fn readback_from_persistent_mapping(
     non_coherent_atom_size: u64,
     effective_coherency: &impl Fn(&BufferSlot) -> Coherency,
     force_noncoherent: bool,
+    binding_plan: &axc_hir::ParamBindingPlan,
 ) -> Vec<Vec<u8>> {
     let _ = non_coherent_atom_size; // used via effective_coherency
     let _ = force_noncoherent;
@@ -1453,7 +1476,11 @@ fn readback_from_persistent_mapping(
     let mut outputs: Vec<Vec<u8>> = Vec::with_capacity(n);
     for i in 0..n {
         let out_size = if i < output_sizes.len() { output_sizes[i] } else { 0 };
-        if out_size == 0 {
+        // M3.1 Lever A: ReadOnly bindings always produce empty output Vec.
+        // This is the fourth readback loop — all four must agree (HN-9).
+        let access = binding_plan.buffers.get(i).map(|b| b.ty.access)
+            .unwrap_or(axc_hir::buffer::BufferAccess::ReadWrite);
+        if !binding_is_readback(access, out_size) {
             outputs.push(Vec::new());
             continue;
         }
@@ -1479,6 +1506,22 @@ fn readback_from_persistent_mapping(
     outputs
 }
 
+// ── M3.1: Lever A readback predicate ─────────────────────────────────────────
+
+/// Lever A (M3.1): determine whether a binding should be read back after dispatch.
+///
+/// A binding is read back iff `output_size > 0` AND `access != ReadOnly`.
+/// ReadOnly bindings are NEVER device→staging copied, never HOST_READ barrier'd,
+/// never invalidated. The output Vec for a skipped binding is empty.
+///
+/// Applied to ALL FOUR readback loops (HN-9 — all loops must agree to avoid
+/// reading from uninitialized staging memory).
+///
+/// AT-1503 covers the predicate; AT-1540/1541 cover the integration.
+pub(crate) fn binding_is_readback(access: axc_hir::buffer::BufferAccess, output_size: usize) -> bool {
+    output_size > 0 && access != axc_hir::buffer::BufferAccess::ReadOnly
+}
+
 // ── Helper: binary semaphore recreation (AT-1419) ────────────────────────────
 // Exposed for use by context.rs error recovery paths.
 #[allow(dead_code)]
@@ -1495,6 +1538,35 @@ pub(crate) fn maybe_recreate_binary_semaphores(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── AT-1503: binding_is_readback predicate ────────────────────────────────
+
+    /// AT-1503: binding_is_readback covers all (access, size) combinations.
+    ///
+    /// ReadOnly+nonzero → false; WriteOnly+nonzero → true; ReadWrite+nonzero → true;
+    /// any+zero → false (no readback when output_size==0 regardless of access).
+    #[test]
+    fn at_1503_binding_is_readback_predicate() {
+        use axc_hir::buffer::BufferAccess;
+
+        // ReadOnly — never read back, even with nonzero size.
+        assert!(!binding_is_readback(BufferAccess::ReadOnly, 64),
+            "ReadOnly+nonzero must be false");
+        assert!(!binding_is_readback(BufferAccess::ReadOnly, 0),
+            "ReadOnly+zero must be false");
+
+        // WriteOnly — read back when nonzero.
+        assert!(binding_is_readback(BufferAccess::WriteOnly, 64),
+            "WriteOnly+nonzero must be true");
+        assert!(!binding_is_readback(BufferAccess::WriteOnly, 0),
+            "WriteOnly+zero must be false");
+
+        // ReadWrite — read back when nonzero.
+        assert!(binding_is_readback(BufferAccess::ReadWrite, 64),
+            "ReadWrite+nonzero must be true");
+        assert!(!binding_is_readback(BufferAccess::ReadWrite, 0),
+            "ReadWrite+zero must be false");
+    }
 
     /// AT-805a: KernelCacheKey implements Ord (BTreeMap invariant).
     #[test]

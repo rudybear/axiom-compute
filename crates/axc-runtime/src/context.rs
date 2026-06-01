@@ -72,6 +72,10 @@ use crate::transfer_queue::{
     concurrent_family_indices, QueueMode, QueueFamilySelection, TransferQueueInfo,
 };
 use crate::sync::{detect_sync_mode, create_handoff, SyncMode};
+use crate::coopmat::{
+    device_advertises_coopmat_ext, query_coopmat_support,
+    CoopMatSupport, EnabledDeviceFeatures,
+};
 
 /// Configuration for `VulkanContext::new_with_options`.
 ///
@@ -115,6 +119,12 @@ pub struct VulkanContextOptions {
     /// `None` = auto. `Some(true)` = treat all staging as NonCoherent for CI coverage.
     /// Reads `AXC_FORCE_NONCOHERENT_STAGING=1` from env in `from_env()`.
     pub force_noncoherent_staging: Option<bool>,
+    /// Force disable cooperative-matrix dispatch (M3.1).
+    ///
+    /// `None` = auto (probe device). `Some(true)` = pretend coopmat is unavailable,
+    /// so the coopmat skip path is exercised even on coopmat-capable hardware (AT-1506).
+    /// Reads `AXC_FORCE_NO_COOPMAT=1` from env in `from_env()`.
+    pub force_no_coopmat: Option<bool>,
 }
 
 impl VulkanContextOptions {
@@ -138,6 +148,7 @@ impl VulkanContextOptions {
             force_single_queue: read_bool_flag("AXC_FORCE_SINGLE_QUEUE"),
             force_binary_semaphores: read_bool_flag("AXC_FORCE_BINARY_SEMAPHORES"),
             force_noncoherent_staging: read_bool_flag("AXC_FORCE_NONCOHERENT_STAGING"),
+            force_no_coopmat: read_bool_flag("AXC_FORCE_NO_COOPMAT"),
         }
     }
 }
@@ -208,6 +219,29 @@ pub struct VulkanContext {
     transfer_pool_lock: Option<Arc<Mutex<()>>>,
     /// Resolved queue family selection (stored for concurrent_families).
     queue_family_sel: QueueFamilySelection,
+    // ── M3.1 fields ───────────────────────────────────────────────────────────
+    /// Cooperative-matrix support queried at context creation (M3.1).
+    ///
+    /// `feature_present=false` on Lavapipe or devices without VK_KHR_cooperative_matrix.
+    coopmat_support: crate::coopmat::CoopMatSupport,
+    /// Record of which optional device features were enabled at device creation (M3.1).
+    ///
+    /// At dispatch time, `required_device_features(binding_plan, uses_coopmat)` is
+    /// compared against this record; missing features return `DeviceFeatureUnsupported`.
+    enabled_features: crate::coopmat::EnabledDeviceFeatures,
+    /// Physical device subgroup size (from VkPhysicalDeviceVulkan11Properties, M3.1).
+    ///
+    /// matmul_tile dispatch requires subgroup_size == 32 (NVIDIA 32-lane assumption).
+    /// wave64/SIMD16 devices skip with CoopMatUnsupported. Stored at init; immutable.
+    subgroup_size: u32,
+    /// Timestamp period in nanoseconds per tick for the compute queue (M3.1).
+    ///
+    /// From VkPhysicalDeviceLimits.timestampPeriod. 0.0 means timestamps not available.
+    timestamp_period: f32,
+    /// Number of valid timestamp bits for the compute queue family (M3.1).
+    ///
+    /// From VkQueueFamilyProperties.timestampValidBits. 0 means timestamps not supported.
+    compute_timestamp_valid_bits: u32,
 }
 
 impl VulkanContext {
@@ -337,25 +371,201 @@ impl VulkanContext {
             instance, physical_device, requested_api_version, force_binary,
         );
 
+        // ── Step 4c: M3.1 coopmat ext check + subgroup/timestamp queries ─────────
+        let force_no_coopmat: bool = opts.force_no_coopmat.unwrap_or(false);
+        let coopmat_ext_present: bool = if force_no_coopmat {
+            false
+        } else {
+            device_advertises_coopmat_ext(instance, physical_device)
+        };
+
+        // Query subgroup size (from VkPhysicalDeviceVulkan11Properties or SubgroupProperties).
+        // Used for the matmul_tile subgroup-size==32 guard (HN-4/AT-1507).
+        let subgroup_size: u32 = {
+            let mut vk11_props = vk::PhysicalDeviceVulkan11Properties::default();
+            let mut props2 = vk::PhysicalDeviceProperties2::default()
+                .push_next(&mut vk11_props);
+            // SAFETY: physical_device is valid; props2 chain is well-formed.
+            unsafe { instance.get_physical_device_properties2(physical_device, &mut props2) };
+            vk11_props.subgroup_size
+        };
+
+        // Query timestamp info for GPU-resident benchmarks (HN-6).
+        let timestamp_period: f32 = props.limits.timestamp_period;
+        let compute_timestamp_valid_bits: u32 = {
+            // SAFETY: physical_device is valid.
+            let qf_props = unsafe {
+                instance.get_physical_device_queue_family_properties(physical_device)
+            };
+            qf_props.get(queue_family_index as usize)
+                .map(|p| p.timestamp_valid_bits)
+                .unwrap_or(0)
+        };
+
+        // ── Step 4d: M3.1 device feature probing (CRITICAL-2/-3 + WARNING fix) ─
+        //
+        // ALL feature-struct locals are declared at function scope so they outlive
+        // create_device (per WARNING about feature-struct lifetime). The pNext chain
+        // is assembled UNCONDITIONALLY for the device-SUPPORTED subset of the required
+        // superset. Availability is probed via Features2 BEFORE enabling.
+        //
+        // This is FAIL-CLOSED: a kernel that needs a feature the device lacks returns
+        // DispatchError::DeviceFeatureUnsupported at dispatch time — never enable-and-hope.
+
+        // Probe which optional features the device supports.
+        // SAFETY: physical_device is valid; feature structs are zeroed via Default.
+        // SAFETY: physical_device is a valid VkPhysicalDevice; get_physical_device_features is safe.
+        let device_available_features: vk::PhysicalDeviceFeatures =
+            unsafe { instance.get_physical_device_features(physical_device) };
+
+        // Probe 16-bit storage feature availability.
+        let device_supports_16bit_storage: bool = {
+            let mut feat_16bit = vk::PhysicalDevice16BitStorageFeatures::default();
+            let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut feat_16bit);
+            // SAFETY: physical_device is valid; chain is well-formed.
+            unsafe { instance.get_physical_device_features2(physical_device, &mut f2) };
+            feat_16bit.storage_buffer16_bit_access == vk::TRUE
+        };
+
+        // Probe 8-bit storage and shaderInt8 feature availability.
+        let (device_supports_8bit_storage, device_supports_shader_int8): (bool, bool) = {
+            let mut feat_8bit = vk::PhysicalDevice8BitStorageFeatures::default();
+            let mut feat_f16i8 = vk::PhysicalDeviceShaderFloat16Int8Features::default();
+            let mut f2 = vk::PhysicalDeviceFeatures2::default()
+                .push_next(&mut feat_8bit)
+                .push_next(&mut feat_f16i8);
+            // SAFETY: chain is well-formed.
+            unsafe { instance.get_physical_device_features2(physical_device, &mut f2) };
+            (feat_8bit.storage_buffer8_bit_access == vk::TRUE,
+             feat_f16i8.shader_int8 == vk::TRUE)
+        };
+        let device_supports_shader_int16: bool = device_available_features.shader_int16 == vk::TRUE;
+
+        // Probe Vulkan Memory Model + CoopMat features.
+        let (device_supports_vmm, device_supports_coopmat_feat): (bool, bool) =
+            if coopmat_ext_present {
+                let mut feat_vmm = vk::PhysicalDeviceVulkanMemoryModelFeatures::default();
+                let mut feat_cm = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
+                let mut f2 = vk::PhysicalDeviceFeatures2::default()
+                    .push_next(&mut feat_vmm)
+                    .push_next(&mut feat_cm);
+                // SAFETY: chain is well-formed; coopmat ext present.
+                unsafe { instance.get_physical_device_features2(physical_device, &mut f2) };
+                (feat_vmm.vulkan_memory_model == vk::TRUE,
+                 feat_cm.cooperative_matrix == vk::TRUE)
+            } else {
+                (false, false)
+            };
+
+        // Decide which features to actually ENABLE (device-supported subset only).
+        let enable_16bit: bool = device_supports_16bit_storage;
+        let enable_8bit: bool = device_supports_8bit_storage;
+        let enable_int8: bool = device_supports_shader_int8;
+        let enable_int16: bool = device_supports_shader_int16;
+        let enable_vmm: bool = coopmat_ext_present && device_supports_vmm;
+        let enable_coopmat: bool = coopmat_ext_present && device_supports_coopmat_feat;
+
+        // Record which features are enabled (used at dispatch time for fail-closed checks).
+        let enabled_features = EnabledDeviceFeatures {
+            storage_16bit: enable_16bit,
+            storage_8bit: enable_8bit,
+            shader_int8: enable_int8,
+            shader_int16: enable_int16,
+            vulkan_memory_model: enable_vmm,
+            cooperative_matrix: enable_coopmat,
+        };
+
         // ── Step 5: Logical device + queues ───────────────────────────────────
         let queue_priorities: [f32; 1] = [1.0f32];
         let queue_create_infos = build_device_queue_create_infos(&queue_family_sel, &queue_priorities);
 
-        // Chain Vulkan12Features for timelineSemaphore when applicable (WARNING-4).
-        // The local binding MUST outlive the DeviceCreateInfo used in create_device.
-        let mut vk12_features = vk::PhysicalDeviceVulkan12Features::default();
-        let device_create_info: vk::DeviceCreateInfo<'_> =
-            if s_mode == SyncMode::Timeline && requested_api_version >= vk::API_VERSION_1_2 {
-                vk12_features.timeline_semaphore = vk::TRUE;
-                vk::DeviceCreateInfo::default()
-                    .queue_create_infos(&queue_create_infos)
-                    .push_next(&mut vk12_features)
-            } else {
-                vk::DeviceCreateInfo::default()
-                    .queue_create_infos(&queue_create_infos)
-            };
+        // M3.1 WARNING fix: ALL feature-struct locals declared at function scope
+        // (NOT inside the timeline+1.2 if-branch) so they outlive create_device.
+        // The pNext chain is assembled unconditionally for every device-supported feature.
+        //
+        // Declare all feature structs at function scope with their enablement flags.
+        // These are referenced from the pNext chain, so they MUST NOT be moved
+        // or go out of scope before create_device.
 
-        // SAFETY: device_create_info is valid; vk12_features outlives this call.
+        // Vulkan 1.2 features (timelineSemaphore, shaderInt8, shaderInt16 via Vulkan12Features).
+        let mut vk12_features = vk::PhysicalDeviceVulkan12Features::default();
+        // 16-bit storage features.
+        let mut feat_16bit_storage = vk::PhysicalDevice16BitStorageFeatures::default();
+        // 8-bit storage features.
+        let mut feat_8bit_storage = vk::PhysicalDevice8BitStorageFeatures::default();
+        // shaderFloat16Int8 features (shaderInt8).
+        let mut feat_f16i8 = vk::PhysicalDeviceShaderFloat16Int8Features::default();
+        // Vulkan Memory Model features.
+        let mut feat_vmm = vk::PhysicalDeviceVulkanMemoryModelFeatures::default();
+        // Cooperative matrix features.
+        let mut feat_coopmat = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
+
+        // Set enabled flags on each struct.
+        if s_mode == SyncMode::Timeline && requested_api_version >= vk::API_VERSION_1_2 {
+            vk12_features.timeline_semaphore = vk::TRUE;
+        }
+        if enable_16bit {
+            feat_16bit_storage.storage_buffer16_bit_access = vk::TRUE;
+        }
+        if enable_8bit {
+            feat_8bit_storage.storage_buffer8_bit_access = vk::TRUE;
+        }
+        if enable_int8 {
+            feat_f16i8.shader_int8 = vk::TRUE;
+        }
+        if enable_vmm {
+            feat_vmm.vulkan_memory_model = vk::TRUE;
+            feat_vmm.vulkan_memory_model_device_scope = vk::TRUE;
+        }
+        if enable_coopmat {
+            feat_coopmat.cooperative_matrix = vk::TRUE;
+        }
+
+        // Build base features2 (for shaderInt16 via base VkPhysicalDeviceFeatures).
+        let mut base_features2 = vk::PhysicalDeviceFeatures2::default();
+        if enable_int16 {
+            base_features2.features.shader_int16 = vk::TRUE;
+        }
+
+        // Device extensions to enable.
+        let mut device_ext_names: Vec<*const std::ffi::c_char> = Vec::new();
+        let coopmat_ext_cstr = std::ffi::CString::new("VK_KHR_cooperative_matrix").unwrap();
+        if enable_coopmat {
+            device_ext_names.push(coopmat_ext_cstr.as_ptr());
+        }
+
+        // Assemble the pNext chain UNCONDITIONALLY for every enabled feature.
+        // Chain: DeviceCreateInfo → vk12_features → 16bit_storage → 8bit_storage
+        //        → f16i8 → vmm → coopmat → base_features2
+        // Each .push_next() adds to the front of the chain. Only the structs with
+        // non-zero fields actually affect device creation; empty structs are benign.
+        let device_create_info: vk::DeviceCreateInfo<'_> = {
+            let mut info = vk::DeviceCreateInfo::default()
+                .queue_create_infos(&queue_create_infos);
+            if !device_ext_names.is_empty() {
+                info = info.enabled_extension_names(&device_ext_names);
+            }
+            // Add base features2 (shaderInt16 lives here).
+            // Note: push_next ordering matters; we build from the outermost to innermost.
+            // In ash, push_next prepends to the pNext chain, so we add in reverse order.
+            // We enable only the fields we need; others remain VK_FALSE (default).
+            // We do NOT push_next(base_features2) directly — VkDeviceCreateInfo can use
+            // pEnabledFeatures (scalar) OR push VkPhysicalDeviceFeatures2 — not both.
+            // For M3.1, we use pEnabledFeatures for shaderInt16 (the simplest approach
+            // avoiding pNext-VkPhysicalDeviceFeatures2 complexity).
+            info = info.enabled_features(&base_features2.features);
+            // Push structured feature structs (timeline, 16bit, 8bit, int8, vmm, coopmat).
+            info = info.push_next(&mut feat_coopmat);
+            info = info.push_next(&mut feat_vmm);
+            info = info.push_next(&mut feat_f16i8);
+            info = info.push_next(&mut feat_8bit_storage);
+            info = info.push_next(&mut feat_16bit_storage);
+            info = info.push_next(&mut vk12_features);
+            info
+        };
+
+        // SAFETY: device_create_info is valid; all feature structs are at function scope
+        // and outlive this call. coopmat_ext_cstr outlives device_create_info.
         let raw_device: ash::Device =
             unsafe { instance.create_device(physical_device, &device_create_info, None) }
                 .map_err(|e| DispatchError::DeviceCreationFailed(e.to_string()))?;
@@ -366,6 +576,15 @@ impl VulkanContext {
         let device_owner: ManuallyDrop<Arc<DeviceOwner>> =
             ManuallyDrop::new(Arc::new(DeviceOwner { device: raw_device }));
         let instance_owner: ManuallyDrop<Arc<InstanceOwner>> = ManuallyDrop::new(instance_owner);
+
+        // ── Step 5b: M3.1 coopmat support query ──────────────────────────────
+        // Query AFTER instance_owner is wrapped (entry is stored in InstanceOwner).
+        let coopmat_support: CoopMatSupport = query_coopmat_support(
+            &instance_owner.entry,
+            &instance_owner.instance,
+            physical_device,
+            coopmat_ext_present,
+        );
 
         // ── Step 6: Compute command pool ──────────────────────────────────────
         let cp_info = vk::CommandPoolCreateInfo::default()
@@ -451,6 +670,12 @@ impl VulkanContext {
             compute_pool_lock: Arc::new(Mutex::new(())),
             transfer_pool_lock,
             queue_family_sel,
+            // M3.1 fields
+            coopmat_support,
+            enabled_features,
+            subgroup_size,
+            timestamp_period,
+            compute_timestamp_valid_bits,
         })
     }
 
@@ -459,6 +684,44 @@ impl VulkanContext {
     /// Useful for diagnostic output in test failures.
     pub fn physical_device_name(&self) -> &str {
         &self.device_name
+    }
+
+    /// Return the cooperative-matrix support queried at context creation (M3.1).
+    ///
+    /// `feature_present=false` on Lavapipe and devices without VK_KHR_cooperative_matrix.
+    /// Used by the dispatch path to determine whether to proceed with coopmat or skip.
+    pub fn coopmat_support(&self) -> &crate::coopmat::CoopMatSupport {
+        &self.coopmat_support
+    }
+
+    /// Return the physical device's subgroup size (M3.1).
+    ///
+    /// matmul_tile dispatch requires subgroup_size == 32 (NVIDIA 32-lane assumption).
+    /// Returns 0 if VkPhysicalDeviceVulkan11Properties was not available.
+    pub fn subgroup_size(&self) -> u32 {
+        self.subgroup_size
+    }
+
+    /// Return the record of which optional device features were enabled (M3.1).
+    ///
+    /// At dispatch time, `required_device_features(binding_plan, uses_coopmat)` is
+    /// compared against this record; missing features return `DeviceFeatureUnsupported`.
+    pub fn enabled_features(&self) -> &crate::coopmat::EnabledDeviceFeatures {
+        &self.enabled_features
+    }
+
+    /// Return the timestamp period in nanoseconds per tick (M3.1).
+    ///
+    /// From VkPhysicalDeviceLimits.timestampPeriod. 0.0 means timestamps not available.
+    pub fn timestamp_period(&self) -> f32 {
+        self.timestamp_period
+    }
+
+    /// Return the number of valid timestamp bits for the compute queue (M3.1).
+    ///
+    /// From VkQueueFamilyProperties.timestampValidBits. 0 means timestamps not supported.
+    pub fn compute_timestamp_valid_bits(&self) -> u32 {
+        self.compute_timestamp_valid_bits
     }
 
     /// Return the cached `max_compute_work_group_count` device limit.

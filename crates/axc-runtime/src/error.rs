@@ -4,7 +4,8 @@
 //! for structured diagnostic rendering. No `Box<dyn Error>` is used anywhere;
 //! all error context is encoded in typed fields (anti-pattern compliance).
 //!
-//! Variant count: 28 (rev 2, M3.0). The count is asserted in `at_801`.
+//! Variant count: 30 (M3.1). M3.1 adds 2: CoopMatUnsupported, DeviceFeatureUnsupported.
+//! The count is asserted in `at_801`.
 //!
 //! ## M3.0 additions
 //!
@@ -239,6 +240,49 @@ pub enum DispatchError {
         /// Human-readable reason (Vulkan result code).
         reason: String,
     },
+
+    // ── M3.1 cooperative-matrix graceful-skip errors ──────────────────────────
+
+    /// The required cooperative-matrix shape is not supported by this device — M3.1.
+    ///
+    /// Returned by the coopmat dispatch path when:
+    /// - The VK_KHR_cooperative_matrix extension is absent, OR
+    /// - The `cooperativeMatrix` feature is not enabled, OR
+    /// - No supported shape tuple matches the required (M,N,K,A/B/C/result types,
+    ///   Subgroup scope, non-saturating), OR
+    /// - The device's subgroup size is not 32 (required for matmul_tile's
+    ///   @workgroup(32,1,1) tile assumption).
+    ///
+    /// Callers should SKIP the coopmat path and fall back to a plain matmul kernel
+    /// when this error is returned. NOT a fatal dispatch failure.
+    #[error("cooperative matrix shape {required_m}x{required_n}x{required_k} not supported by device: {reason}")]
+    CoopMatUnsupported {
+        /// Required M dimension.
+        required_m: u32,
+        /// Required N dimension.
+        required_n: u32,
+        /// Required K dimension.
+        required_k: u32,
+        /// Human-readable reason (missing extension/feature, shape mismatch, wrong subgroup size).
+        reason: String,
+    },
+
+    /// A device feature required by the kernel is not enabled or available — M3.1.
+    ///
+    /// Returned by the dispatch path when `required_device_features` determines a
+    /// feature is needed (e.g. `storageBuffer16BitAccess` for f16 SSBO, `shaderInt8`
+    /// for Q4_K_M u8 SSBO) but the context's `enabled_features` record shows it was
+    /// not enabled (either the device doesn't support it or it was not requested at
+    /// device creation).
+    ///
+    /// Callers should SKIP the kernel on this device. NOT a fatal dispatch failure.
+    #[error("device feature '{feature}' required by kernel '{kernel}' is not supported or not enabled")]
+    DeviceFeatureUnsupported {
+        /// Name of the missing feature (e.g. `"storageBuffer16BitAccess"`).
+        feature: String,
+        /// Source-level kernel name (for diagnostics).
+        kernel: String,
+    },
 }
 
 /// Convenience type alias for dispatch results.
@@ -248,14 +292,14 @@ pub type DispatchResult<T> = Result<T, DispatchError>;
 mod tests {
     use super::*;
 
-    /// AT-801: DispatchError has exactly 28 variants, all Display and Diagnostic.
+    /// AT-801: DispatchError has exactly 30 variants, all Display and Diagnostic.
     ///
-    /// Supersedes AT-502 (23 variants) and M2.3a at_801 (25 variants). M3.0 adds 3:
-    /// `SemaphoreCreationFailed`, `TransferQueueSubmitFailed`, `MappedRangeOpFailed`.
+    /// Supersedes AT-502 (23 variants), M2.3a at_801 (25 variants), M3.0 at_801 (28 variants).
+    /// M3.1 adds 2: `CoopMatUnsupported`, `DeviceFeatureUnsupported`.
     /// The exhaustive match below ensures the compiler reminds us to update this test
     /// whenever a variant is added or removed.
     #[test]
-    fn at_801_dispatch_error_variants_count_is_28() {
+    fn at_801_dispatch_error_variants_count_is_30() {
         // Construct one instance of each variant and verify non-empty Display.
         let variants: Vec<DispatchError> = vec![
             DispatchError::VulkanEntryFailed("test".to_owned()),
@@ -300,10 +344,21 @@ mod tests {
                 op: MappedRangeOp::Flush,
                 reason: "test flush".to_owned(),
             },
+            // M3.1 additions (variants 29, 30):
+            DispatchError::CoopMatUnsupported {
+                required_m: 16,
+                required_n: 16,
+                required_k: 16,
+                reason: "16x16x16 f16 Subgroup not supported".to_owned(),
+            },
+            DispatchError::DeviceFeatureUnsupported {
+                feature: "storageBuffer16BitAccess".to_owned(),
+                kernel: "matmul_tile".to_owned(),
+            },
         ];
 
-        // Verify exactly 28 variants are covered.
-        assert_eq!(variants.len(), 28, "expected exactly 28 DispatchError variants");
+        // Verify exactly 30 variants are covered.
+        assert_eq!(variants.len(), 30, "expected exactly 30 DispatchError variants");
 
         for variant in &variants {
             let msg = variant.to_string();
@@ -381,11 +436,11 @@ mod tests {
         assert!(e3.to_string().contains("Invalidate"), "MappedRangeOpFailed must include op name");
     }
 
-    /// AT-502 (legacy test preserved as alias): verifies the new 28-count.
+    /// AT-502 (legacy test preserved as alias): verifies the new 30-count.
     #[test]
     fn at_502_dispatch_error_variants_are_display_miette() {
         // This test delegates to the more complete at_801 test above.
         // Preserved for backward-compatibility with any test-name grepping.
-        at_801_dispatch_error_variants_count_is_28();
+        at_801_dispatch_error_variants_count_is_30();
     }
 }

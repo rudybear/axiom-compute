@@ -854,7 +854,13 @@ fn pre_register_lets_in_block(block: &past::Block, tc: &mut TypeChecker<'_>) {
                     continue;
                 }
                 let coopmat_use = coopmat_use_ast_to_hir(use_);
-                let key = CoopMatKey { elem: elem_scalar, m: *m, n: *n, use_: coopmat_use };
+                // M3.1: k and result_type are internal-cache-key fields. At per-binding
+                // registration time K is not yet known (it requires both A and B bindings
+                // to be seen together). We use n as a placeholder for k (A.n == K for
+                // MatrixA is a common convention) and elem for result_type (same elem for
+                // all-f16 case). derive_coopmat_shape in lower.rs sources the real K from
+                // the mul_add operand types where K = a.n = b.m is guaranteed by KDimMismatch.
+                let key = CoopMatKey { elem: elem_scalar, m: *m, n: *n, k: *n, use_: coopmat_use, result_type: elem_scalar };
                 tc.register_coopmat_binding(&name.node, key, *is_mut, name.span);
                 continue;
             }
@@ -1221,7 +1227,8 @@ fn typecheck_block_stmts(tc: &mut TypeChecker<'_>, stmts: &[axc_lexer::Spanned<p
                         continue;
                     }
                     let coopmat_use = coopmat_use_ast_to_hir(use_);
-                    let key = CoopMatKey { elem: elem_scalar, m: *m, n: *n, use_: coopmat_use };
+                    // M3.1: k and result_type placeholder — see comment at first construction site.
+                    let key = CoopMatKey { elem: elem_scalar, m: *m, n: *n, k: *n, use_: coopmat_use, result_type: elem_scalar };
                     let hir_init = check_coopmat_init_expr(tc, &init.node, init.span, key);
                     if let Some(bid) = tc.register_coopmat_binding(&name.node, key, *is_mut, name.span) {
                         if let Some(init_expr) = hir_init {

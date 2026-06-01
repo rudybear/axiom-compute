@@ -307,6 +307,7 @@ mod tests {
                 preconditions: Vec::new(),
                 subgroup_uniform: false,
                 cooperative_matrix: false,
+                coop_matrix: None,
                 strategy: Some(StrategyHoles { map }),
             },
             params: Vec::new(),

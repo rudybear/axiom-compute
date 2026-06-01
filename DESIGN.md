@@ -575,6 +575,46 @@ r1 cut `dispatch_saxpy_1m` from 23 ms to 3.08 ms but MISSED the <1 ms gate. A pr
 
 ---
 
+## 3.1.13 M3.1 — Cooperative-matrix dispatch + multi-row matmul + GPU-resident benchmark
+
+M3.1 makes the M2.1 cooperative-matrix codegen EXECUTE on real tensor cores for the first time, adds a multi-row Q4_K_M matmul, and builds the GPU-resident benchmark methodology that M3.0's `<1 ms` gate was re-scoped onto (§3.1.12 r2). The emitted coopmat SPIR-V is UNCHANGED from M2.1; M3.1 is a RUNTIME + metadata + kernel + benchmark milestone. The only codegen touch is a mechanical internal-cache-key extension (CoopMatKey gains K + result_type) that leaves the emitted module byte-identical.
+
+### Coopmat shape metadata (HIR → sidecar → runtime)
+
+Previously the runtime had no way to know a kernel used cooperative matrices or what shape it required: `@cooperative_matrix` was a bare bool, `CoopMatKey` carried no K and no result type, and the metadata sidecar carried nothing coopmat. M3.1 plumbs the shape end-to-end. The HIR derives a kernel-level `CoopMatShape{m,n,k,a/b/c/result element types, scope}` from the body's `matrix[T,M,N,use]` types of the coopmat ops (reusing the M2.1 type-check guarantees, so K = a.n = b.m). The metadata sidecar gains a `coopmat: Option<CoopMatShapeMeta>` field; `CURRENT_SCHEMA_VERSION` is bumped 1→2 and `load_kernel_metadata` accepts both versions (a v1 sidecar with no field deserializes to `None` via `#[serde(default)]`, which is dispatch-identical to a non-coopmat kernel). The runtime builds the required shape FROM the metadata — nothing is hardcoded.
+
+### Device-feature enablement: the capability→feature pass
+
+spirv-val validates a module but does NOT check that the device features its capabilities require are enabled — passing spirv-val does NOT imply `vkCreateComputePipelines` will succeed. M3.1 adds a binding-plan-driven `required_device_features` pass mapping each EMITTED SPIR-V capability to the Vulkan device feature the runtime must enable:
+
+| SPIR-V capability | trigger | Vulkan device feature |
+|---|---|---|
+| VulkanMemoryModel | coopmat op used | VkPhysicalDeviceVulkanMemoryModelFeatures.vulkanMemoryModel (+DeviceScope) |
+| CooperativeMatrixKHR | coopmat op used | VK_KHR_cooperative_matrix ext + VkPhysicalDeviceCooperativeMatrixFeaturesKHR.cooperativeMatrix |
+| StorageBuffer16BitAccess | any f16 SSBO | VkPhysicalDevice16BitStorageFeatures.storageBuffer16BitAccess |
+| StorageBuffer8BitAccess | any u8/i8 SSBO | VkPhysicalDevice8BitStorageFeatures.storageBuffer8BitAccess |
+| Int8 | u8/i8 SSBO / ptr_read_u8 | VkPhysicalDeviceShaderFloat16Int8Features.shaderInt8 |
+| Int16 | f16_bits_to_f32 | VkPhysicalDeviceFeatures.shaderInt16 |
+
+Matmul_tile is the FIRST f16-SSBO kernel ever dispatched (it needs `storageBuffer16BitAccess` on top of the memory-model + coopmat features); the multi-row q4km kernel is the first 8-bit-storage + Int8/Int16 dispatch. The runtime enables the device-SUPPORTED subset of this superset at context creation (all feature-struct locals at function scope so they outlive `create_device`, chain assembled unconditionally), and a kernel that needs a feature the device lacks FAILS CLOSED with the typed `DeviceFeatureUnsupported` skip — never enable-and-hope.
+
+### Preflight, subgroup guard, graceful skip
+
+A preflight queries `vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR` for the device's supported `(M,N,K,AType,BType,CType,ResultType,scope,saturatingAccumulation)` tuples and the `cooperativeMatrix` feature. A pure matcher checks the metadata-derived required shape (16×16×16 f16, Subgroup, non-saturating) against that set. Because matmul_tile is `@workgroup(32,1,1)` and assumes one 32-lane subgroup == one tile, the dispatch path additionally REQUIRES `subgroupSize == 32`; a wave64/SIMD16 device that advertises the shape is SKIPPED (not miscomputed). When unsupported — Lavapipe, software, wrong subgroup size, or the `force_no_coopmat` CI option — the dispatch returns `DispatchError::CoopMatUnsupported` and tests/benches SKIP cleanly. The same single `matmul_tile.axc` SKIPS on Lavapipe and DISPATCHES on NVIDIA Blackwell — the preflight, not the source, decides. The NVIDIA runner is a MANDATORY sign-off gate: an all-device skip of the first-dispatch proof is a milestone FAIL.
+
+### Multi-row Q4_K_M matmul (real workload) — staged honestly
+
+`q4km_dequant_matmul.axc` extends M2.6's single-row matvec to an N-row × M-col output, each invocation computing one output via the proven Q4_K_M dequant dot-product, bit-exact vs a CPU reference for a 256×256 fixture, on Lavapipe AND NVIDIA (a regular, non-ignored GPU test). The TRUE single-kernel `dequant → shared-f16-tile → coopmat` fusion needs `shared[T,N]` (FG.6, deferred to M3.2), so M3.1 delivers two honest pieces: the plain multi-row matmul (the bit-exact deliverable, runs everywhere) plus a pre-dequantized-input coopmat bridge (`q4km_dequant_matmul_coopmat.axc`, NVIDIA-only proof that coopmat runs on a Q4_K_M-derived workload).
+
+### GPU-resident benchmark methodology
+
+The thesis-relevant metric is **upload weights ONCE to resident VRAM, dispatch N times, measure KERNEL time** — exactly how llama.cpp inference works. M3.1 adds `upload_resident` / `dispatch_resident` / `readback_resident`: inputs are staged once, the descriptor set bound to resident device-local buffers, and each iteration records ONLY the compute submit, timed by `vkCmdWriteTimestamp` × 2 (`elapsed = (end−begin) · timestampPeriod`, each endpoint masked to `timestampValidBits` before subtraction), with a CPU fence-wall fallback recorded in `ResidentDispatchTiming.timing_source`. The N-loop reuses one command buffer, fence, and query pool. The 4096×4096 f32 resident matmul reports **effective TFLOPS** (the honest, reproducible in-tree number); the `≥50%-of-cuBLAS` comparison is an external estimate, labeled as such (the project is CUDA-free by thesis) — only effective TFLOPS is asserted.
+
+### Per-vendor @strategy tile holes and Lever A re-land
+
+Tile dimensions are ordinary M2.3 `@strategy` holes; for coopmat variants each candidate is VALIDATED against the preflight supported set (preflight DRIVES selection). Lever A is re-landed cleanly (without the reverted ReBAR Lever B): a binding is read back iff `output_size > 0 && access != ReadOnly`, applied uniformly across all four readback loops; read-only inputs skip the device→staging copy, the HOST_READ barrier, and the invalidate.
+---
+
 ### 3.1 Types
 
 ```
@@ -746,3 +786,45 @@ trigger UB) may be rejected at HIR typecheck in a future milestone.
 - **2026-04-18:** M2.5 revision — added §3.1.8 Q4_0 dequantization builtins: Q4_0 block layout (18 bytes/block, 32 f32 elements), four new builtins (ptr_read_u8_zext, ptr_read_u16_zext, f16_bits_to_f32, f32_from_u32), capability side-effects (Int8=39, Int16=22, Float16=9, StorageBuffer8BitAccess=4448), integration tests AT-901..AT-918, dispatch_gpu_q4_0 bench group (n_blocks=128 and 1024).
 - **2026-04-18:** M2.4 revision — added §3.1.10 MCP server: JSON-RPC 2.0 stdio bridge exposing 6 tools (initialize, load_source, enumerate_variants, compile_variant, bench_variant, grid_search, optimization_history); NDJSON framing; 8 MiB inbound cap; RFC 4648 §4 STANDARD base64; RFC 3339 UTC millisecond timestamps; POSIX flock(LOCK_EX) history append; lazy Vulkan init (OnceVulkan); tri-state CorrectnessStatus; seeded deterministic inputs; AXC_MCP_HISTORY_DIR env override; 10 error codes (-32700 through -32006); acceptance tests AT-1101 through AT-1132.
 - **2026-04-18:** M2.6 revision — added §3.1.11 Q4_K_M superblock layout and dequant kernel: 144-byte block format (2-byte f16 d + 2-byte f16 dmin + 12-byte packed scales + 128-byte packed weights), bit-spread unpacking via inlined get_scale_min_k4 with canonical q[j] (NOT q[j-4]) m-high idiom, four-chunk two-sub-block-per-chunk iteration, dequant formula y=d*sc*nibble-dmin*m (NO -8 offset unlike Q4_0), @equiv_fp_tol(1e-3) tolerance, same M2.5 capability set (zero additions), integration tests AT-1301..AT-1331, bench group dispatch_gpu_q4km (dispatch_q4km_128 + dispatch_q4km_512).
+- **2026-06-01:** M3.1 revision — added §3.1.13 Cooperative-matrix dispatch + multi-row matmul + GPU-resident benchmark: coopmat shape metadata plumbing (HIR CoopMatShape, KernelMetadata schema v1→v2 back-compat), device-feature enablement pass (capability→feature table, CRITICAL-2/-3), preflight + subgroupSize==32 guard + typed graceful skips, multi-row Q4_K_M matmul (bit-exact 256×256), staged pre-dequant coopmat bridge, GPU-resident benchmark methodology (upload-once/dispatch-N/kernel-only timing), Lever A readback skip. See §3.1.13 for full details.
+
+---
+
+## §3.1.13 M3.1 — Cooperative-matrix dispatch + multi-row matmul + GPU-resident benchmark
+
+M3.1 makes the M2.1 cooperative-matrix codegen EXECUTE on real tensor cores for the first time, adds a multi-row Q4_K_M matmul, and builds the GPU-resident benchmark methodology. The emitted coopmat SPIR-V is UNCHANGED from M2.1; M3.1 is a RUNTIME + metadata + kernel + benchmark milestone. The only codegen touch is a mechanical internal-cache-key extension (CoopMatKey gains K + result_type) that leaves the emitted module byte-identical.
+
+### Coopmat shape metadata (HIR → sidecar → runtime)
+
+Previously the runtime had no way to know a kernel used cooperative matrices or what shape it required. M3.1 plumbs the shape end-to-end. The HIR derives a kernel-level `CoopMatShape{m,n,k,a/b/c/result element types, scope}` from the body's `matrix[T,M,N,use]` types of the coopmat ops (reusing M2.1 typecheck guarantees, so K = a.n = b.m). The metadata sidecar gains a `coopmat: Option<CoopMatShapeMeta>` field; `CURRENT_SCHEMA_VERSION` is bumped 1→2 and `load_kernel_metadata` accepts both versions (v1 sidecar with no field deserializes to `None` via `#[serde(default)]`, dispatch-identical to non-coopmat). The runtime builds the required shape FROM the metadata — nothing hardcoded.
+
+### Device-feature enablement: the capability→feature pass
+
+spirv-val validates a module but does NOT check that the device features its capabilities require are enabled. M3.1 adds a binding-plan-driven `required_device_features` pass:
+
+| SPIR-V capability | trigger | Vulkan device feature |
+|---|---|---|
+| VulkanMemoryModel | coopmat op | VkPhysicalDeviceVulkanMemoryModelFeatures.vulkanMemoryModel (+DeviceScope) |
+| CooperativeMatrixKHR | coopmat op | VK_KHR_cooperative_matrix ext + cooperativeMatrix feature |
+| StorageBuffer16BitAccess | f16 SSBO | storageBuffer16BitAccess |
+| StorageBuffer8BitAccess | u8/i8 SSBO | storageBuffer8BitAccess |
+| Int8 | u8/i8 SSBO | shaderInt8 |
+| Int16 | f16_bits_to_f32 | shaderInt16 |
+
+The runtime enables the device-SUPPORTED subset at context creation (all feature-struct locals at function scope so they outlive `create_device`, chain assembled unconditionally), and a kernel that needs a feature the device lacks FAILS CLOSED with `DeviceFeatureUnsupported` — never enable-and-hope.
+
+### Preflight, subgroup guard, graceful skip
+
+A preflight queries `vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR` for the device's supported `(M,N,K,AType,BType,CType,ResultType,scope,saturatingAccumulation)` tuples. A pure matcher checks the metadata-derived required shape against that set. matmul_tile requires `subgroupSize == 32`; wave64/SIMD16 devices are SKIPPED (not miscomputed). When unsupported, dispatch returns `DispatchError::CoopMatUnsupported`. The NVIDIA runner is a mandatory sign-off gate.
+
+### Multi-row Q4_K_M matmul and staged coopmat bridge
+
+`q4km_dequant_matmul.axc` extends M2.6's single-row matvec to N-row × M-col, bit-exact vs CPU reference for 256×256 on Lavapipe AND NVIDIA. A pre-dequantized coopmat bridge (`q4km_dequant_matmul_coopmat.axc`) is provided for NVIDIA-only proof without `shared[T,N]` (deferred to M3.2).
+
+### GPU-resident benchmark methodology
+
+upload_resident / dispatch_resident / readback_resident: inputs staged once, descriptor set bound to resident device-local buffers, each iteration records ONLY the compute submit timed by `vkCmdWriteTimestamp` × 2 (elapsed = (end−begin) · timestampPeriod, each endpoint masked to `timestampValidBits` before subtraction, CPU fallback). Effective TFLOPS = 2*M*N*K / kernel_seconds (the honest, reproducible in-tree number). The cuBLAS comparison is an external estimate, labeled as such.
+
+### Lever A re-land
+
+`binding_is_readback(access, output_size) = output_size > 0 && access != ReadOnly` applied to all four readback loops (HN-9 — all loops must agree). ReadOnly bindings skip the device→staging copy, HOST_READ barrier, and invalidate. Re-landed without the reverted ReBAR Lever B from M3.0.

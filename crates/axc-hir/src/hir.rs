@@ -98,7 +98,21 @@ pub struct KernelAnnotations {
     /// `@subgroup_uniform` flag.
     pub subgroup_uniform: bool,
     /// `@cooperative_matrix` flag — M2.1.
+    ///
+    /// Retained for back-compat. `coop_matrix.is_some()` implies `cooperative_matrix == true`.
+    /// When both are present, they are consistent: the flag is the boolean view and
+    /// `coop_matrix` is the structured view derived from the body.
     pub cooperative_matrix: bool,
+    /// Derived cooperative-matrix shape from the kernel body — M3.1.
+    ///
+    /// `Some` when `cooperative_matrix == true` AND the body contains at least one
+    /// `coopmat_mul_add` op. `None` for non-coopmat kernels and for the degenerate
+    /// case where the flag is set but no coopmat op is found (a `HirWarning` is emitted).
+    ///
+    /// Populated by `lower.rs::derive_coopmat_shape` after typechecking the body.
+    /// The runtime reads this field (via the metadata sidecar) to build the required
+    /// `CoopMatRequiredShape` — nothing is hardcoded in the runtime.
+    pub coop_matrix: Option<crate::coopmat::CoopMatrixShape>,
     /// M2.3: Strategy-hole declarations from `@strategy { ... }`.
     ///
     /// `None` if the kernel has no `@strategy` annotation.

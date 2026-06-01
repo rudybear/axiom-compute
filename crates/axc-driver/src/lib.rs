@@ -21,7 +21,9 @@ use axc_lexer::{tokenize, Span};
 use axc_parser::{Parser, ParseError};
 use axc_hir::{lower_module, HirError};
 use axc_codegen::{emit_module_bytes, CodegenOptions, extract_workgroup_dims};
-use axc_runtime::KernelMetadata;
+use axc_runtime::{KernelMetadata, CoopMatShapeMeta, CoopMatScalarMeta, CoopMatScopeMeta};
+use axc_hir::coopmat::{CoopMatrixShape, CoopMatScopeHir};
+use axc_hir::ty::ScalarTy;
 
 /// Errors that can occur during compilation.
 #[derive(Debug, thiserror::Error, miette::Diagnostic)]
@@ -119,12 +121,17 @@ pub fn compile_source_with_meta(source: &str) -> Result<(Vec<u8>, KernelMetadata
     // or Lavapipe/validation layers raise
     // `VUID-VkPipelineShaderStageCreateInfo-pName-00707` (pName `main` entrypoint
     // not found). Keep this consistent with codegen rather than hardcoding "main".
+    //
+    // M3.1: Fill coopmat shape from HIR (CRITICAL-1). The runtime reads the required
+    // shape FROM METADATA — nothing is hardcoded in the runtime or tests (HN-10/AT-1552).
+    let coopmat_meta: Option<CoopMatShapeMeta> = kernel.annotations.coop_matrix.as_ref()
+        .map(hir_coopmat_shape_to_meta);
     let metadata: KernelMetadata = KernelMetadata::new(
         kernel.name.clone(),
         workgroup_size,
         kernel.binding_plan.clone(),
         kernel.name.clone(),
-    );
+    ).with_coopmat(coopmat_meta);
 
     Ok((bytes, metadata))
 }
@@ -166,6 +173,47 @@ pub fn compile_source_with_assignments(
     // The substituted source is fed to the normal pipeline.
     let substituted: String = substitute_strategy_holes(source, assignments);
     compile_source_with_meta(&substituted)
+}
+
+/// M3.1: Map a HIR `CoopMatrixShape` to a `CoopMatShapeMeta` for the metadata sidecar.
+///
+/// Called by `compile_source_with_meta` to fill `KernelMetadata.coopmat` from the
+/// HIR-derived shape. The runtime reads the shape from the sidecar — nothing is
+/// hardcoded in the runtime (AT-1552/HN-10).
+fn hir_coopmat_shape_to_meta(shape: &CoopMatrixShape) -> CoopMatShapeMeta {
+    CoopMatShapeMeta {
+        m: shape.m,
+        n: shape.n,
+        k: shape.k,
+        a_type: scalar_ty_to_coopmat_scalar_meta(shape.a_elem),
+        b_type: scalar_ty_to_coopmat_scalar_meta(shape.b_elem),
+        c_type: scalar_ty_to_coopmat_scalar_meta(shape.c_elem),
+        result_type: scalar_ty_to_coopmat_scalar_meta(shape.result_type),
+        scope: match shape.scope {
+            CoopMatScopeHir::Subgroup => CoopMatScopeMeta::Subgroup,
+            CoopMatScopeHir::Workgroup => CoopMatScopeMeta::Workgroup,
+        },
+    }
+}
+
+/// Map an HIR `ScalarTy` to the restricted `CoopMatScalarMeta` enum.
+///
+/// Panics if the scalar type is not a valid coopmat element type (this should be
+/// impossible because `is_allowed_coopmat_element` gates HIR coopmat type creation).
+fn scalar_ty_to_coopmat_scalar_meta(ty: ScalarTy) -> CoopMatScalarMeta {
+    match ty {
+        ScalarTy::F16 => CoopMatScalarMeta::F16,
+        ScalarTy::F32 => CoopMatScalarMeta::F32,
+        ScalarTy::I8  => CoopMatScalarMeta::I8,
+        ScalarTy::U8  => CoopMatScalarMeta::U8,
+        ScalarTy::I32 => CoopMatScalarMeta::I32,
+        ScalarTy::U32 => CoopMatScalarMeta::U32,
+        other => panic!(
+            "scalar_ty_to_coopmat_scalar_meta: {:?} is not a valid coopmat element type; \
+             this path should be unreachable (is_allowed_coopmat_element gates coopmat types)",
+            other
+        ),
+    }
 }
 
 /// M2.3: Substitute strategy hole references in source text and strip @strategy block.

@@ -1,0 +1,624 @@
+{
+  "verdict": "PROPOSED",
+  "agent": "architect",
+  "milestone_id": "M3.1-coopmat-matmul",
+  "revision": "r1",
+  "revision_changelog": {
+    "CRITICAL-1 (coopmat shape metadata does not exist; HN-10/AT-1551 unachievable)": "RESOLVED by full HIR→metadata plumbing. (a) axc-hir gains a kernel-level `coop_matrix: Option<CoopMatShape>` derived during lowering from the body's `matrix[T,M,N,use]` types of the coopmat ops; the existing `cooperative_matrix: bool` flag is RETAINED for back-compat and is now redundant-but-true whenever coop_matrix.is_some(). (b) `CoopMatKey` is EXTENDED with `k: u32` and `result_type: ScalarTy` so K (the contraction dim) and the accumulator result type are carried (previously absent). (c) `KernelMetadata` (metadata.rs) gains `#[serde(default)] coopmat: Option<CoopMatShapeMeta>` and CURRENT_SCHEMA_VERSION is bumped 1→2; old sidecars without the field deserialize to `None` via `#[serde(default)]`, and the version check is relaxed to accept BOTH 1 and 2 for read (see metadata back-compat spec). (d) The driver fills `coopmat` from the HIR kernel. (e) The runtime builds `CoopMatRequiredShape` from `metadata.coopmat`, NOT a literal — HN-10 and AT-1551 are now achievable. New AT-1552 proves the runtime reads the shape from metadata with NOTHING hardcoded.",
+    "CRITICAL-2 (16-bit storage device feature never enabled)": "RESOLVED. Added a binding-plan-driven feature-enablement pass `required_device_features(&binding_plan, coopmat: bool) -> RequiredDeviceFeatures`. For matmul_tile (f16 SSBOs) it returns storageBuffer16BitAccess=true; context.rs chains `VkPhysicalDevice16BitStorageFeatures{storageBuffer16BitAccess=VK_TRUE}` (Vulkan 1.1 / VK_KHR_16bit_storage). The decision is driven by `binding_plan.buffers.any(needs_16bit_storage())`, NOT coopmat-presence (plain f16 SSBO kernels need it too). The full capability→feature table is in `capability_to_feature_table`. If a required feature is ABSENT on the device, dispatch returns the typed `DispatchError::DeviceFeatureUnsupported` (fail-closed skip), never enable-and-hope. New AT-1509 proves pipeline CREATION succeeds on a feature-enabled device BEFORE dispatch.",
+    "CRITICAL-3 (8-bit storage + Int8 features never enabled for q4km path)": "RESOLVED via the SAME `required_device_features` pass. For q4km_dequant_matmul (u8 SSBO + f16_bits_to_f32) it returns storageBuffer8BitAccess=true, shaderInt8=true, shaderInt16=true. context.rs chains `VkPhysicalDevice8BitStorageFeatures{storageBuffer8BitAccess=VK_TRUE}` + `VkPhysicalDeviceShaderFloat16Int8Features{shaderInt8=VK_TRUE}` + `VkPhysicalDeviceVulkan11Features{storageBuffer16BitAccess,uniformAndStorageBuffer16BitAccess as needed}`/shaderInt16 via Vulkan12Features. VERIFIED: context.rs currently enables ONLY timelineSemaphore (Vulkan12Features) — so NONE of the 8/16-bit features are enabled today; the M2.6 q4km bench/tests are COMPILE-only (compile_q4km_dequant_matvec.rs), never DISPATCHED — there is no existing q4km DISPATCH, so this is genuinely the first 8/16-bit dispatch and all these features are NEW. Lavapipe is lax and may pass without them; NVIDIA requires them. Added to the capability→feature table; AT-1522 proves q4km pipeline creation on a feature-enabled device.",
+    "CRITICAL-4 (no transpose/stride-bug test)": "RESOLVED. AT-1510 now mandates a NON-SYMMETRIC, transpose-distinguishing 16x16 fixture (see transpose_fixture_spec). A is a row-gradient matrix (A[i][j] = 1 + i*0.5 - j*0.25), B is a distinct column-gradient (B[i][j] = -0.5 + j*0.5 + i*0.125), C0=0. The four products A·B, Aᵀ·B, A·Bᵀ, B·A are all numerically distinct by >> the f16 tolerance at multiple elements (worked example in spec). A transposed/swapped/mis-strided coopmat_load therefore CANNOT pass AT-1510. New AT-1512 explicitly asserts the four reference products differ beyond tolerance (a CPU-only guard that the fixture is actually transpose-distinguishing).",
+    "MINOR optimistic-1 (AT-1520 #[ignore])": "RESOLVED. AT-1520 (plain multi-row q4km matmul, no coopmat) is now a REGULAR GPU integration test (NOT #[ignore]); it runs on Lavapipe and NVIDIA under AXC_ENABLE_GPU_TESTS=1. Only the coopmat-requiring tests (AT-1510, AT-1521) remain #[ignore]+preflight-gated.",
+    "MINOR optimistic-2 (pin q4km x/weight layout)": "RESOLVED. The q4km_dequant_matmul layout is pinned DEFINITIVELY in coder_handoff_notes HN-11: q is the weight matrix as n_rows consecutive weight-rows, each row = n_blocks_per_row Q4_K_M superblocks (144 bytes each) row-major; x is the dense input matrix laid out [n_blocks_per_row*256][n_cols] column-of-output-major (x[k*n_cols + col]); y is [n_rows*n_cols] row-major (y[row*n_cols+col]). No fixture ambiguity.",
+    "MINOR optimistic-3 / pessimistic OQ-1 (subgroupSize==32 guard)": "RESOLVED. context.rs stores `subgroup_size: u32` (from VkPhysicalDeviceSubgroupProperties / VkPhysicalDeviceVulkan11Properties.subgroupSize). The matmul_tile coopmat dispatch path REQUIRES subgroup_size==32 AND scope==Subgroup; if subgroup_size != 32 it returns `DispatchError::CoopMatUnsupported{reason: \"subgroup size N != 32 (matmul_tile is NVIDIA-32-lane-tuned)\"}` — so a wave64 device that advertises 16x16x16 f16 Subgroup is SKIPPED, not silently miscomputed. AMD wave64 / Intel SIMD16 remapping deferred to EB.1/M3.4. New AT-1507.",
+    "MINOR optimistic OQ-5 / pessimistic OQ-5 (drop >=50% hard assert)": "RESOLVED. AT-1532 asserts ONLY `effective_tflops() > 0 && is_finite()`; the cuBLAS ratio is printed labeled 'estimate (external cuBLAS baseline)' and is NOT a test assertion.",
+    "MINOR OQ-6 (DispatchError count)": "RESOLVED. Two NEW variants are added (CoopMatUnsupported + DeviceFeatureUnsupported), so the count goes 28→30. at_801 keeps its name; the asserted count is bumped 28→30 and both new variants added to the exhaustive vec. (Pessimistic review verified current is 28.)",
+    "MINOR optimistic/pessimistic (debug interleaving guard)": "RESOLVED (lightweight). A `debug_assert`-only `resident_bound: bool` flag is added to KernelHandleInner; dispatch_handle clears it, dispatch_resident sets it after re-bind and debug_asserts it is set. NO session type (that is M3.4). See HN-8.",
+    "WARNING pessimistic (matcher must check result_type + saturatingAccumulation + scope)": "RESOLVED. The matcher now compares m/n/k + a/b/c/result component types + scope==Subgroup AND requires saturatingAccumulation==VK_FALSE (codegen emits NONE_KHR operands). CoopMatRequiredShape now carries result_type (sourced from metadata, see CRITICAL-1). AT-1561 extended to cover result_type and saturatingAccumulation near-miss rejection.",
+    "WARNING pessimistic (unconditional feature chaining / non-1.2 path)": "RESOLVED. context.rs assembles the pNext chain UNCONDITIONALLY when any feature is required (not only in the timeline+1.2 branch); all feature-struct locals are declared at function scope so they outlive create_device. See technical_spec §A.feature-chain-assembly.",
+    "WARNING pessimistic (preflight count==0 two-call idiom)": "RESOLVED. query_coopmat_support uses the two-call count idiom; if the first call returns count==0, returns empty shapes WITHOUT a second call. AT-1501 extended to cover ext-present-but-count==0.",
+    "WARNING pessimistic (NVIDIA runner mandatory; all-device-skip = FAIL)": "RESOLVED. acceptance_gate now states the NVIDIA runner is a MANDATORY M3.1 sign-off gate; AT-1510 skipping on EVERY available device is a milestone FAIL, not a pass. Documented in acceptance_gate and design_md_additions.",
+    "WARNING pessimistic (timestamp mask-before-subtract + reset ordering)": "RESOLVED. HN-6 updated: mask EACH of begin/end to valid_bits FIRST, then wrapping_sub; cmd_reset_query_pool recorded before the first write_timestamp in the SAME submission. New unit AT-1535 tests masking across the valid-bit boundary (no GPU)."
+  },
+  "summary": "M3.1 turns M2.1's compile-only cooperative_matrix codegen into the FIRST-EVER real tensor-core dispatch and builds the GPU-resident benchmark methodology that M3.0's <1ms gate was re-scoped onto. r1 closes the four blocking CRITICALs from the pessimistic review: (C1) coopmat shape is now real metadata — HIR carries a kernel-level CoopMatShape derived from the body's matrix types, CoopMatKey gains k + result_type, and KernelMetadata gains a serde-default `coopmat` field with a schema bump 1→2 + back-compat, so the runtime builds CoopMatRequiredShape FROM METADATA (HN-10/AT-1551 now real, not a literal); (C2/C3) a binding-plan-driven `required_device_features` pass enables storageBuffer16BitAccess (f16 SSBO) and storageBuffer8BitAccess+shaderInt8+shaderInt16 (q4km u8) — these are the FIRST 8/16-bit kernels ever dispatched and context.rs currently enables NONE of them; missing features fail-closed with the typed DeviceFeatureUnsupported skip; (C4) AT-1510 uses a non-symmetric transpose-distinguishing fixture so a transposed/swapped/mis-strided coopmat_load cannot pass. Deliverables: (A) coopmat dispatch (VK_KHR_cooperative_matrix + cooperativeMatrix + VulkanMemoryModel + 16-bit storage features, preflight, subgroupSize==32 guard, graceful typed skip); (B) plain multi-row q4km matmul bit-exact 256x256 (runs everywhere, NOT #[ignore]) + staged pre-dequantized coopmat bridge (NVIDIA-only); (C) GPU-resident benchmark (upload-once/dispatch-N/kernel-only-timing); (D) per-vendor @strategy tile holes preflight-validated; (E) Lever A readback skip for readonly bindings, re-landed without ReBAR. AT range AT-1500..AT-1561. spirv-val + clippy -D warnings + cargo test --workspace (+ --ignored) green; existing public API and bench IDs preserved.",
+  "scope_decision": {
+    "must_have_M3.1": [
+      "A — Runtime coopmat dispatch path: VK_KHR_cooperative_matrix ext + cooperativeMatrix feature + VulkanMemoryModel feature + 16-bit-storage feature + preflight + descriptor/pipeline wiring + subgroupSize==32 guard + graceful typed skip. FOUNDATIONAL.",
+      "C1 — HIR CoopMatShape + CoopMatKey {k, result_type} + KernelMetadata.coopmat (schema 1→2, serde-default back-compat). The runtime reads the required shape FROM METADATA, nothing hardcoded (AT-1551, AT-1552).",
+      "C2/C3 — required_device_features(binding_plan, coopmat) pass + context.rs feature chaining for 16-bit / 8-bit storage + Int8/Int16, fail-closed DeviceFeatureUnsupported skip. (AT-1509 pipeline-create matmul_tile; AT-1522 pipeline-create q4km.)",
+      "matmul_tile.axc FIRST coopmat dispatch, bit-exact within f16 tol vs CPU 16x16 reference on NVIDIA Blackwell, NON-SYMMETRIC transpose-distinguishing fixture (AT-1510, AT-1512). PRIMARY ACCEPTANCE.",
+      "Graceful SKIP of the same .axc on Lavapipe via preflight + on non-32-lane vendors (AT-1505, AT-1507, AT-1508). No crash.",
+      "Multi-row q4km_dequant_matmul kernel producing an N-row f32 output, bit-exact vs CPU reference for a 256x256 fixture, runs on Lavapipe AND NVIDIA, NOT #[ignore] (AT-1520). Uses the PROVEN M2.6 Q4_K_M dequant path tiled across rows; coopmat fusion is a SEPARATE preflight-gated path (staged).",
+      "C — GPU-resident benchmark API + bench IDs (dispatch_resident_matmul_tile, matmul_tflops_4096) with kernel-only timing (AT-1530, AT-1531, AT-1535).",
+      "E — Lever A readback skip for readonly bindings, byte-exact preserved for writeonly/readwrite (AT-1540, AT-1541).",
+      "D — @strategy tile holes parsed/enumerated for coopmat tile dims and validated against the preflight supported set (AT-1550, AT-1551)."
+    ],
+    "staged_explicitly_deferred": [
+      "FULL Q4_K_M-dequant-output FED DIRECTLY into coopmat_load/mul_add as f16 A/B matrices in ONE kernel is the hardest integration: it requires dequantizing into a workgroup-shared f16 tile (shared[T,N] — FG.6, NOT yet a language feature, folded into M3.2) before coopmat_load can read a contiguous row-major f16 tile. M3.1 does NOT add shared[T,N]. Therefore the 256x256 q4km bit-exact deliverable (AT-1520) is produced by the multi-row dequant+matmul kernel WITHOUT coopmat (each output = the M2.6 dequant dot-product, tiled), which is provably bit-exact and dispatchable TODAY. A coopmat-fused q4km path is provided as a SECOND kernel (q4km_dequant_matmul_coopmat.axc) that consumes pre-dequantized f16 SSBOs and coopmat_loads from them; it is preflight-gated and tested for bit-exactness ONLY where the 16x16x16 f16 shape is supported (NVIDIA), and SKIPS on Lavapipe. The plain-f16 matmul_tile dispatch is the coopmat PROOF; the multi-row q4km matmul is the REAL-WORKLOAD bit-exact deliverable; the fused coopmat-q4km is the forward-looking bridge to M3.4.",
+      "shared[T,N] workgroup-local memory (FG.6) — deferred to M3.2 (FlashAttention). M3.1 coopmat tiles load directly from device-local SSBOs (row-major f16).",
+      "EXCLUSIVE+ownership-transfer barrier optimization (DESIGN §3.1.12) — NOT pursued; CONCURRENT sharing retained.",
+      "cuBLAS in-tree linkage — NOT done; comparison is an external published estimate (see cublas_comparison_method).",
+      "AMD wave64 / Intel SIMD16 coopmat dispatch (workgroup-to-subgroup remapping) — deferred to EB.1/M3.4. M3.1 ships a subgroupSize==32 guard that SKIPS those devices, never miscomputes.",
+      "Type-enforced ResidentSession — deferred to M3.4; M3.1 uses a method API + a debug_assert resident_bound flag."
+    ]
+  },
+  "cublas_comparison_method": {
+    "how_obtained": "There is NO cuBLAS dependency in-tree (the project is CUDA-free by thesis). The percent-of-cuBLAS figure is evaluated against a DOCUMENTED external cuBLAS f32 GEMM throughput for the NVIDIA RTX PRO 6000 Blackwell, recorded as a named constant CUBLAS_F32_GEMM_TFLOPS_RTX_PRO_6000 in crates/axc-driver/tests/common_matmul.rs with a sourced comment (specific datasheet/microbench URL). The bench reports EFFECTIVE TFLOPS = 2*M*N*K / kernel_seconds for the 4096x4096 resident matmul and prints both the measured TFLOPS and the percent-of-cuBLAS ratio.",
+    "honesty": "The percent-of-cuBLAS is an ESTIMATE, LABELED 'estimate (external cuBLAS baseline)' in bench output and in DESIGN §3.1.13. It is NOT a same-machine A/B. The UNCONDITIONALLY HONEST number is the in-tree effective TFLOPS, fully reproducible. AT-1532 asserts ONLY that effective TFLOPS is finite and > 0 (the >=50% claim is informational, NOT a hard assertion). The constant is asserted > 0 && finite as a sanity check. Mirrors M3.0's acceptance-honesty discipline."
+  },
+  "capability_to_feature_table": {
+    "note": "Every row maps a SPIR-V capability EMITTED by axc-codegen (verified in emit.rs lines 146-356 and q4_0.rs) to the Vulkan device feature/extension the runtime MUST enable at device creation, plus the trigger that requires it. The runtime computes the required set from `required_device_features(binding_plan, kernel_uses_coopmat)`. FAIL-CLOSED: if a required feature is unavailable on the device, dispatch returns DispatchError::DeviceFeatureUnsupported (or CoopMatUnsupported for coopmat-specific) — never enable-and-hope.",
+    "rows": [
+      {
+        "spirv_capability": "Shader",
+        "emitted_when": "always (emit.rs:146)",
+        "vulkan_requirement": "core — no feature toggle",
+        "runtime_action": "none"
+      },
+      {
+        "spirv_capability": "VulkanMemoryModel (+ ext SPV_KHR_vulkan_memory_model)",
+        "emitted_when": "kernel uses any coopmat op (emit.rs:150-159, 320-324)",
+        "vulkan_requirement": "VkPhysicalDeviceVulkanMemoryModelFeatures.vulkanMemoryModel (Vulkan 1.2 / VK_KHR_vulkan_memory_model)",
+        "runtime_action": "chain VkPhysicalDeviceVulkanMemoryModelFeatures{vulkanMemoryModel=VK_TRUE, vulkanMemoryModelDeviceScope=VK_TRUE} when coopmat (HN-1)"
+      },
+      {
+        "spirv_capability": "CooperativeMatrixKHR (+ ext SPV_KHR_cooperative_matrix)",
+        "emitted_when": "kernel uses any coopmat op (emit.rs:320-322)",
+        "vulkan_requirement": "VK_KHR_cooperative_matrix device extension + VkPhysicalDeviceCooperativeMatrixFeaturesKHR.cooperativeMatrix",
+        "runtime_action": "enable ext + chain VkPhysicalDeviceCooperativeMatrixFeaturesKHR{cooperativeMatrix=VK_TRUE} when advertised AND feature present AND not force_no_coopmat; else preflight returns unsupported → typed skip"
+      },
+      {
+        "spirv_capability": "Float16",
+        "emitted_when": "F16 coopmat element types or f16_bits_to_f32 (emit.rs:330-331; q4_0.rs:152)",
+        "vulkan_requirement": "storage/arith: storageBuffer16BitAccess covers SSBO storage; shaderFloat16 (VkPhysicalDeviceShaderFloat16Int8Features) only if f16 ARITHMETIC is performed. matmul_tile does f16 arith INSIDE coopmat ops (covered by cooperativeMatrix), NOT scalar f16 ALU; q4km converts f16→f32 immediately (OpFConvert) so no f16 ALU. Therefore shaderFloat16 is NOT required by the M3.1 kernels; storageBuffer16BitAccess suffices.",
+        "runtime_action": "enable shaderFloat16 ONLY if a future kernel performs scalar f16 arithmetic; M3.1 kernels do not (documented). Storage handled by next row."
+      },
+      {
+        "spirv_capability": "StorageBuffer16BitAccess (+ ext SPV_KHR_16bit_storage)",
+        "emitted_when": "any f16 SSBO binding (emit.rs:336-339; trigger binding_plan.buffers.any(needs_16bit_storage()))",
+        "vulkan_requirement": "VkPhysicalDevice16BitStorageFeatures.storageBuffer16BitAccess (Vulkan 1.1 / VK_KHR_16bit_storage)",
+        "runtime_action": "chain VkPhysicalDevice16BitStorageFeatures{storageBuffer16BitAccess=VK_TRUE} when binding plan has any f16 buffer. REQUIRED by matmul_tile and the coopmat bridge. (CRITICAL-2)"
+      },
+      {
+        "spirv_capability": "StorageBuffer8BitAccess (+ ext SPV_KHR_8bit_storage)",
+        "emitted_when": "any u8/i8 SSBO binding (emit.rs:348-350; trigger binding_plan.buffers.any(needs_8bit_storage()))",
+        "vulkan_requirement": "VkPhysicalDevice8BitStorageFeatures.storageBuffer8BitAccess (Vulkan 1.2 / VK_KHR_8bit_storage)",
+        "runtime_action": "chain VkPhysicalDevice8BitStorageFeatures{storageBuffer8BitAccess=VK_TRUE} when binding plan has any u8/i8 buffer. REQUIRED by q4km_dequant_matmul. (CRITICAL-3)"
+      },
+      {
+        "spirv_capability": "Int8",
+        "emitted_when": "u8 SSBO or ptr_read_u8_zext (emit.rs:345-346; q4_0.rs:49,94)",
+        "vulkan_requirement": "VkPhysicalDeviceShaderFloat16Int8Features.shaderInt8 (Vulkan 1.2 / VK_KHR_shader_float16_int8)",
+        "runtime_action": "chain VkPhysicalDeviceShaderFloat16Int8Features{shaderInt8=VK_TRUE} when binding plan has any u8/i8 buffer OR ptr_read_u8 used (q4km). (CRITICAL-3)"
+      },
+      {
+        "spirv_capability": "Int16",
+        "emitted_when": "f16_bits_to_f32 intermediate u16 (emit.rs:354-355; q4_0.rs:151)",
+        "vulkan_requirement": "VkPhysicalDeviceVulkan11Features.shaderInt16 (Vulkan 1.1; alias VkPhysicalDeviceFeatures.shaderInt16)",
+        "runtime_action": "set features.shaderInt16=VK_TRUE (via VkPhysicalDeviceFeatures2 base features) when binding plan triggers q4km path (u8 buffer present → f16_bits_to_f32 used). (CRITICAL-3)"
+      },
+      {
+        "spirv_capability": "Int64 / Float64",
+        "emitted_when": "i64/f64 usage (emit.rs:280-285)",
+        "vulkan_requirement": "VkPhysicalDeviceFeatures.shaderInt64 / shaderFloat64",
+        "runtime_action": "NOT used by any M3.1 kernel; documented for completeness — required_device_features returns false for these on M3.1 kernels."
+      }
+    ],
+    "required_device_features_api": "pub(crate) struct RequiredDeviceFeatures { pub storage_16bit: bool, pub storage_8bit: bool, pub shader_int8: bool, pub shader_int16: bool, pub vulkan_memory_model: bool, pub cooperative_matrix: bool } ; pub(crate) fn required_device_features(binding_plan: &axc_hir::ParamBindingPlan, uses_coopmat: bool) -> RequiredDeviceFeatures . storage_16bit/8bit/int8/int16 are derived from binding_plan.buffers element types (needs_16bit_storage/needs_8bit_storage + int8/int16 implied by u8 path); vulkan_memory_model and cooperative_matrix are set from uses_coopmat (which the runtime learns from metadata.coopmat.is_some())."
+  },
+  "metadata_schema_bump": {
+    "current_version": 1,
+    "new_version": 2,
+    "new_field": "pub coopmat: Option<CoopMatShapeMeta>  with #[serde(default)] so old sidecars (no field) deserialize to None",
+    "new_type": "#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)] pub struct CoopMatShapeMeta { pub m: u32, pub n: u32, pub k: u32, pub a_type: CoopMatScalarMeta, pub b_type: CoopMatScalarMeta, pub c_type: CoopMatScalarMeta, pub result_type: CoopMatScalarMeta, pub scope: CoopMatScopeMeta }",
+    "scalar_meta_type": "#[derive(...Serialize,Deserialize...)] pub enum CoopMatScalarMeta { F16, F32, I8, U8, I32, U32 }  // mirrors is_allowed_coopmat_element; serde as string tags",
+    "scope_meta_type": "#[derive(...)] pub enum CoopMatScopeMeta { Subgroup, Workgroup }  // M3.1 emits only Subgroup",
+    "back_compat": "load_kernel_metadata accepts schema_version ∈ {1, 2}: version 1 sidecars (pre-M3.1, no coopmat field) deserialize with coopmat=None via #[serde(default)]; version 2 sidecars carry the field. The version check becomes `if meta.schema_version != 1 && meta.schema_version != CURRENT_SCHEMA_VERSION { return Err(MetadataSchemaMismatch{...}) }`. New sidecars are written with schema_version=2. Rationale: a coopmat=None sidecar is dispatch-identical to a v1 sidecar (no coopmat kernel), so v1 read is safe. AT-1553 covers both: a v1 JSON (no field) loads with coopmat=None; a v2 coopmat JSON round-trips the shape.",
+    "filled_by": "axc_driver::compile_source_with_meta reads hir.kernels[0].annotations.coop_matrix (the new HIR Option<CoopMatShape>) and maps it to CoopMatShapeMeta; KernelMetadata::new gains a `coopmat: Option<CoopMatShapeMeta>` parameter (or a `with_coopmat` builder) — existing callers pass None.",
+    "schema_version_test": "AT-503 (metadata_current_schema) updated: CURRENT_SCHEMA_VERSION == 2; KernelMetadata::new sets it; a non-coopmat kernel has coopmat == None."
+  },
+  "hir_coopmat_extension": {
+    "kernel_annotation_field": "KernelAnnotations gains `pub coop_matrix: Option<CoopMatShape>` (the existing `cooperative_matrix: bool` is RETAINED; coop_matrix.is_some() implies cooperative_matrix==true). CoopMatShape already EXISTS in axc-hir/src/coopmat.rs (struct {m,n,k,a_elem,b_elem,c_elem}) — it is REUSED and EXTENDED with `pub result_type: ScalarTy` and `pub scope: CoopMatScopeHir` so the accumulator result type and scope are carried.",
+    "coopmatkey_extension": "CoopMatKey gains `pub k: u32` and `pub result_type: ScalarTy`. RATIONALE: pessimistic CRITICAL-1 verified CoopMatKey had NO k and NO result_type. Today CoopMatKey is {elem, m, n, use_}; for an A-matrix the contraction dim is its N, for a B-matrix its M, for the accumulator the result element IS elem — so result_type can be sourced. Adding k + result_type makes the key self-describing and lets the driver build CoopMatShape without re-deriving. The BTreeMap determinism (PartialOrd/Ord derive) is preserved by appending the new fields to the derive-ordered struct.",
+    "scope_hir_type": "pub enum CoopMatScopeHir { Subgroup, Workgroup } in axc-hir/src/coopmat.rs; M3.1 lowering always produces Subgroup (the only scope M2.1 codegen emits).",
+    "derivation_during_lowering": "In axc-hir/src/lower.rs, when `cooperative_matrix` flag is set, after lowering the body, a new helper `derive_coopmat_shape(&body) -> Option<CoopMatShape>` walks the typed body for the coopmat ops: it finds the MatrixA and MatrixB operand types of the (first) coopmat_mul_add and the accumulator result type. M = a.m, N = b.n, K = a.n (== b.m, already validated by M2.1 typecheck CoopMatrixShapeKind::KDimMismatch), a_elem = a.elem, b_elem = b.elem, c_elem/result_type = accumulator.elem, scope = Subgroup. If the flag is set but no coopmat op is found (degenerate), returns None and a HIR warning is emitted (the kernel is treated as non-coopmat). This reuses EXISTING typecheck guarantees; no new validation logic. For matmul_tile: M=N=K=16, all f16, Subgroup.",
+    "no_codegen_change": "axc-codegen coopmat emission is UNCHANGED except CoopMatKey gains two fields (a mechanical struct-literal update at the key construction sites in body.rs/coopmat.rs — the new fields are filled from the already-known M/N/use/elem). The EMITTED SPIR-V is byte-identical (AT-1508 asserts word-count identity vs pre-M3.1). The CoopMatKey change is internal-cache-key only; it does not alter OpTypeCooperativeMatrixKHR operands."
+  },
+  "transpose_fixture_spec": {
+    "shape": "16x16 f16 tiles, row-major, stride 16, C0 = 0 (16x16 zeros).",
+    "A": "A[i][j] = f16(1.0 + 0.5*i - 0.25*j)  for i,j in 0..16  — a row-gradient: rows increase, columns decrease. A is NOT symmetric (A[i][j] != A[j][i]) and NOT constant.",
+    "B": "B[i][j] = f16(-0.5 + 0.5*j + 0.125*i)  for i,j in 0..16  — a column-gradient distinct from A. B is NOT symmetric and B != A and B != A^T.",
+    "C_expected": "C[i][j] = sum_{k=0..16} A[i][k]*B[k][j], accumulated in f32 then rounded to f16 (matmul_tile_16x16x16_f16_cpu).",
+    "why_transpose_distinguishing": "Because A is row-monotone and B is column-monotone with different slopes/offsets, A·B, Aᵀ·B, A·Bᵀ, and B·A produce different value SURFACES: e.g. element (0,0): A·B uses A row0 (small) · B col0 (small) while B·A uses B row0 · A col0 (different magnitudes); element (15,0) and (0,15) diverge strongly between a product and its transpose because the i- and j- gradients are asymmetric. AT-1512 asserts that for the chosen fixtures, max_elementwise_abs_diff(AB, AtB) , (AB, ABt) , (AB, BA) each exceed 10x the per-element f16 tolerance at one or more elements — i.e. a transpose/swap/stride bug is numerically detectable. The Coder must compute the four CPU references and assert the pairwise max diffs exceed the tolerance band before relying on AT-1510.",
+    "tolerance": "per-element tol = max(2 f16 ULP at the element magnitude, 2^-9 * max(|a_row|,|b_col| accumulated)). For these magnitudes (|A|,|B| <= ~8, K=16, |C| <= ~ a few hundred) the f32-accumulate-then-round reference vs the tensor-core result agree to a handful of ULP; the transpose differences are O(100x) larger, so the test is decisive."
+  },
+  "files_to_create": [
+    {
+      "path": "crates/axc-runtime/src/coopmat.rs",
+      "purpose": "Cooperative-matrix device enablement + preflight + required-feature computation. (1) device_advertises_coopmat_ext: enumerate device extension properties for VK_KHR_cooperative_matrix. (2) query_coopmat_support: two-call vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR (count first; if 0, return empty WITHOUT a second call) into Vec<CoopMatShapeSupport>; VkPhysicalDeviceCooperativeMatrixFeaturesKHR via Features2 for feature_present. (3) coopmat_shape_supported(required, support): pure matcher — m/n/k + a/b/c/result component types + scope==Subgroup + saturatingAccumulation==VK_FALSE. (4) required_device_features(binding_plan, uses_coopmat) -> RequiredDeviceFeatures (CRITICAL-2/-3 feature derivation). NO crash anywhere: ext absent ⇒ feature_present=false, shapes empty ⇒ typed CoopMatUnsupported skip. Instance uses Features2/Properties2 (core in Vulkan 1.1).",
+      "public_api": [
+        "pub struct CoopMatShapeSupport { pub m: u32, pub n: u32, pub k: u32, pub a_type: CoopMatComponentType, pub b_type: CoopMatComponentType, pub c_type: CoopMatComponentType, pub result_type: CoopMatComponentType, pub scope: CoopMatScope, pub saturating_accumulation: bool }",
+        "pub enum CoopMatComponentType { Float16, Float32, Sint8, Uint8, Sint32, Uint32, Other(i32) }",
+        "pub enum CoopMatScope { Subgroup, Workgroup, Other(i32) }",
+        "pub struct CoopMatSupport { pub feature_present: bool, pub shapes: Vec<CoopMatShapeSupport> }",
+        "pub struct CoopMatRequiredShape { pub m: u32, pub n: u32, pub k: u32, pub a_type: CoopMatComponentType, pub b_type: CoopMatComponentType, pub c_type: CoopMatComponentType, pub result_type: CoopMatComponentType, pub scope: CoopMatScope }",
+        "pub(crate) struct RequiredDeviceFeatures { pub storage_16bit: bool, pub storage_8bit: bool, pub shader_int8: bool, pub shader_int16: bool, pub vulkan_memory_model: bool, pub cooperative_matrix: bool }",
+        "pub(crate) fn query_coopmat_support(instance: &ash::Instance, physical_device: vk::PhysicalDevice, coopmat_device_ext_present: bool) -> CoopMatSupport",
+        "pub fn coopmat_shape_supported(required: &CoopMatRequiredShape, support: &CoopMatSupport) -> bool",
+        "pub(crate) fn device_advertises_coopmat_ext(instance: &ash::Instance, physical_device: vk::PhysicalDevice) -> bool",
+        "pub(crate) fn required_device_features(binding_plan: &axc_hir::ParamBindingPlan, uses_coopmat: bool) -> RequiredDeviceFeatures",
+        "pub(crate) fn coopmat_required_shape_from_meta(meta: &crate::metadata::CoopMatShapeMeta) -> CoopMatRequiredShape"
+      ]
+    },
+    {
+      "path": "crates/axc-runtime/src/resident.rs",
+      "purpose": "GPU-resident benchmark primitive (M3.0 carry-forward). ResidentBuffers holds device-local buffers uploaded ONCE from a prepared KernelHandle; dispatch_resident records ONLY the compute submit and measures kernel-only time. Two timing backends: (a) GPU timestamps via vkCmdWriteTimestamp at compute begin/end + timestampPeriod when timestampValidBits>0; (b) CPU fence-delta fallback. The N-iteration loop REUSES one command buffer + one fence + one query pool (single-allocation, no per-iter alloc). Query pool lifetime: created with ResidentBuffers, destroyed in ResidentBuffers::drop (NOT left to device_wait_idle).",
+      "public_api": [
+        "pub struct ResidentBuffers { /* crate-private device-local buffers keyed by binding; one persistent staging upload at construction; owns a TimestampQueryPool + a reusable command buffer + fence */ }",
+        "pub struct ResidentDispatchTiming { pub kernel_ns: u64, pub timing_source: ResidentTimingSource }",
+        "pub enum ResidentTimingSource { GpuTimestamp, CpuFenceWall }",
+        "pub struct ResidentBenchConfig { pub workgroups: (u32, u32, u32), pub push_constants: Vec<u8> }",
+        "impl VulkanContext { pub fn upload_resident(&self, handle: &KernelHandle, inputs: &[&[u8]], output_sizes: &[usize]) -> Result<ResidentBuffers, DispatchError> }",
+        "impl VulkanContext { pub fn dispatch_resident(&self, handle: &KernelHandle, resident: &ResidentBuffers, cfg: &ResidentBenchConfig) -> Result<ResidentDispatchTiming, DispatchError> }",
+        "impl VulkanContext { pub fn readback_resident(&self, handle: &KernelHandle, resident: &ResidentBuffers, output_sizes: &[usize]) -> Result<Vec<Vec<u8>>, DispatchError> }",
+        "pub(crate) struct TimestampQueryPool { /* vk::QueryPool of 2 TIMESTAMP queries + timestamp_period f32 + valid_bits u32 */ }",
+        "pub(crate) fn masked_timestamp_delta(begin: u64, end: u64, valid_bits: u32) -> u64"
+      ]
+    },
+    {
+      "path": "crates/axc-driver/tests/common_matmul.rs",
+      "purpose": "Shared CPU reference + fixture generator for tiled matmul tests AND benches (included via #[path] mirroring common.rs/common_helpers.rs). Provides: the non-symmetric transpose-distinguishing 16x16 f16 fixtures (transpose_fixture_spec), the 16x16x16 C=A*B+C0 f16 CPU reference (accumulate in f32, round to f16), the four transpose-variant references for AT-1512, a general MxNxK row-major f32 matmul reference, and the Q4_K_M multi-row dequant+matmul CPU reference (reuses unpack_scale_min_k4_cpu from common_helpers.rs).",
+      "public_api": [
+        "pub fn make_transpose_fixture_a() -> Vec<u16>  // 256 f16 bit patterns, row-major 16x16",
+        "pub fn make_transpose_fixture_b() -> Vec<u16>",
+        "pub fn matmul_tile_16x16x16_f16_cpu(a: &[u16], b: &[u16], c0: &[u16]) -> Vec<u16>  // f16 result; accumulate in f32",
+        "pub fn transpose_16x16_f16(m: &[u16]) -> Vec<u16>",
+        "pub fn matmul_f32_cpu(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32>",
+        "pub fn q4km_dequant_matmul_cpu(q: &[u8], x: &[f32], n_rows: usize, n_cols: usize, n_blocks_per_row: usize) -> Vec<f32>",
+        "pub const CUBLAS_F32_GEMM_TFLOPS_RTX_PRO_6000: f64  // documented external estimate; sourced URL in comment",
+        "pub fn effective_tflops(m: usize, n: usize, k: usize, kernel_seconds: f64) -> f64",
+        "pub fn f16_tile_tol(magnitude: f32) -> f32  // per-element tolerance band"
+      ]
+    },
+    {
+      "path": "examples/q4km_dequant_matmul.axc",
+      "purpose": "Multi-row Q4_K_M dequant + matmul (the REAL-WORKLOAD bit-exact deliverable, NO coopmat). Signature q4km_dequant_matmul(q: readonly_buffer[u8], x: readonly_buffer[f32], y: buffer[f32], n_rows: u32, n_cols: u32, n_blocks_per_row: u32). Each gid(0) invocation computes one (row, col) output via the EXACT M2.6 inline get_scale_min_k4 + dequant dot-product. Layout pinned in HN-11. @workgroup(64,1,1); grid sized so total invocations >= n_rows*n_cols. Bit-exact vs q4km_dequant_matmul_cpu for the 256x256 fixture (AT-1520).",
+      "public_api": []
+    },
+    {
+      "path": "examples/q4km_dequant_matmul_coopmat.axc",
+      "purpose": "FORWARD-LOOKING staged bridge (preflight-gated, NVIDIA-only, Lavapipe-skip). ASSUMES x and a pre-dequantized f16 weight tile are already laid out row-major in f16 SSBOs (dequant done by a host/test pre-pass) and uses coopmat_load/mul_add/store for a 16x16 f16 output tile. Exercises the coopmat dispatch path on a Q4_K_M-derived workload without shared[T,N]. Bit-exact within f16 tol on NVIDIA; SKIP on Lavapipe (AT-1521).",
+      "public_api": []
+    },
+    {
+      "path": "examples/matmul_f32_tiled.axc",
+      "purpose": "Plain f32 tiled matmul (NO coopmat) for the matmul_tflops_4096 resident bench and the matmul_f32_cpu bit-exact check. Coopmat-FREE 4096x4096 effective-TFLOPS number that runs on ALL vendors incl. Lavapipe. @strategy tile holes (tile_m, tile_n) live here (D).",
+      "public_api": []
+    },
+    {
+      "path": "crates/axc-driver/tests/dispatch_matmul_tile.rs",
+      "purpose": "Integration tests for the FIRST coopmat dispatch (AT-1505, AT-1507, AT-1508, AT-1509, AT-1510, AT-1511, AT-1512). Compiles matmul_tile.axc, builds VulkanContext, runs the coopmat preflight + subgroupSize==32 guard; if 16x16x16 f16 Subgroup is unsupported OR subgroup size != 32, asserts dispatch returns the typed error and SKIPS cleanly. If supported (NVIDIA-32), uploads the non-symmetric A,B,C0 tiles, dispatches, reads back C, asserts bit-exact-within-f16-tol vs matmul_tile_16x16x16_f16_cpu AND that AB differs from the transposes (AT-1512). Gated on AXC_ENABLE_GPU_TESTS=1.",
+      "public_api": []
+    },
+    {
+      "path": "crates/axc-driver/tests/dispatch_q4km_matmul.rs",
+      "purpose": "Integration tests for the multi-row q4km matmul (AT-1520, AT-1522 pipeline-create) + the coopmat-fused bridge (AT-1521, #[ignore]). 256x256 fixture bit-exact vs CPU reference within 1e-3 rel tol on Lavapipe AND NVIDIA. AT-1520 is NOT #[ignore]. Gated on AXC_ENABLE_GPU_TESTS=1.",
+      "public_api": []
+    },
+    {
+      "path": "crates/axc-driver/benches/resident_matmul.rs",
+      "purpose": "GPU-resident benches. bench IDs: dispatch_resident_matmul_tile (16x16 coopmat tile, kernel-only ns, SKIPS if coopmat unsupported), matmul_tflops_4096 (4096x4096 f32 resident matmul, effective TFLOPS + percent-of-cuBLAS estimate label). upload_resident once + dispatch_resident N times. Gated on AXC_ENABLE_GPU_BENCHES=1. NEW bench IDs only.",
+      "public_api": []
+    }
+  ],
+  "files_to_modify": [
+    {
+      "path": "crates/axc-hir/src/coopmat.rs",
+      "changes": "(1) Extend CoopMatKey with `pub k: u32` and `pub result_type: ScalarTy` (CRITICAL-1). PartialOrd/Ord/Hash derives retained (BTreeMap determinism); new fields appended. (2) Extend the existing `CoopMatrixShape` struct with `pub result_type: ScalarTy` and `pub scope: CoopMatScopeHir`. (3) Add `pub enum CoopMatScopeHir { Subgroup, Workgroup }` with serde derives behind the `serde` feature (mirrors CoopMatUse). All additive; existing fields preserved.",
+      "public_api": [
+        "pub struct CoopMatKey { pub elem: ScalarTy, pub m: u32, pub n: u32, pub k: u32, pub use_: CoopMatUse, pub result_type: ScalarTy }",
+        "pub struct CoopMatrixShape { pub m: u32, pub n: u32, pub k: u32, pub a_elem: ScalarTy, pub b_elem: ScalarTy, pub c_elem: ScalarTy, pub result_type: ScalarTy, pub scope: CoopMatScopeHir }",
+        "pub enum CoopMatScopeHir { Subgroup, Workgroup }"
+      ]
+    },
+    {
+      "path": "crates/axc-hir/src/hir.rs",
+      "changes": "Add `pub coop_matrix: Option<CoopMatShape>` to KernelAnnotations (CRITICAL-1). The existing `pub cooperative_matrix: bool` is RETAINED for back-compat (it remains true whenever coop_matrix.is_some()). Doc-note the relationship.",
+      "public_api": [
+        "pub struct KernelAnnotations { /* existing fields incl. cooperative_matrix: bool */ pub coop_matrix: Option<axc_hir::coopmat::CoopMatShape> }"
+      ]
+    },
+    {
+      "path": "crates/axc-hir/src/lower.rs",
+      "changes": "After lowering the kernel body, when `cooperative_matrix` flag is set, call a new `derive_coopmat_shape(&typed_body) -> Option<CoopMatShape>` that extracts M/N/K + a/b/c/result element types + scope=Subgroup from the coopmat_mul_add operand types (reusing the M2.1-typechecked operand types; K = a.n == b.m). Store the result in KernelAnnotations.coop_matrix. If the flag is set but no coopmat op is found, coop_matrix=None + a HirWarning::CoopMatFlagWithoutOps. NO new validation (relies on existing CoopMatrixShapeKind typecheck).",
+      "public_api": [
+        "fn derive_coopmat_shape(body: &KernelBodyTyped) -> Option<axc_hir::coopmat::CoopMatShape>  // private helper"
+      ]
+    },
+    {
+      "path": "crates/axc-codegen/src/body.rs",
+      "changes": "MECHANICAL: every CoopMatKey construction site gains the two new fields (k, result_type). k is filled from the already-known contraction dim (a.n for A, b.m for B, n for accumulator's paired K), result_type from the accumulator elem (== elem for the all-f16 case). The EMITTED SPIR-V is byte-identical (the key is an internal dedup cache key only; OpTypeCooperativeMatrixKHR operands are unchanged). AT-1508 asserts word-count identity vs pre-M3.1 for matmul_tile. No new codegen logic.",
+      "public_api": []
+    },
+    {
+      "path": "crates/axc-codegen/src/coopmat.rs",
+      "changes": "MECHANICAL: CoopMatKey literals (emit_coopmat_zero/mul_add/load/store result_ty construction) updated for the two new fields. No behavioral change to emitted ops.",
+      "public_api": []
+    },
+    {
+      "path": "crates/axc-runtime/src/metadata.rs",
+      "changes": "(1) Bump CURRENT_SCHEMA_VERSION 1→2. (2) Add `#[serde(default)] pub coopmat: Option<CoopMatShapeMeta>` to KernelMetadata. (3) Add CoopMatShapeMeta + CoopMatScalarMeta + CoopMatScopeMeta types (see metadata_schema_bump). (4) load_kernel_metadata accepts schema_version ∈ {1,2}: v1 (no field) deserializes coopmat=None via serde(default), v2 carries it. (5) KernelMetadata::new gains a coopmat parameter (existing callers pass None) OR a `with_coopmat(self, Option<CoopMatShapeMeta>) -> Self` builder; choose with_coopmat to avoid churning every call site. Update AT-503.",
+      "public_api": [
+        "pub const CURRENT_SCHEMA_VERSION: u32 = 2",
+        "pub struct KernelMetadata { /* existing */ #[serde(default)] pub coopmat: Option<CoopMatShapeMeta> }",
+        "pub struct CoopMatShapeMeta { pub m: u32, pub n: u32, pub k: u32, pub a_type: CoopMatScalarMeta, pub b_type: CoopMatScalarMeta, pub c_type: CoopMatScalarMeta, pub result_type: CoopMatScalarMeta, pub scope: CoopMatScopeMeta }",
+        "pub enum CoopMatScalarMeta { F16, F32, I8, U8, I32, U32 }",
+        "pub enum CoopMatScopeMeta { Subgroup, Workgroup }",
+        "impl KernelMetadata { pub fn with_coopmat(self, coopmat: Option<CoopMatShapeMeta>) -> Self }"
+      ]
+    },
+    {
+      "path": "crates/axc-driver/src/lib.rs",
+      "changes": "In compile_source_with_meta, after building KernelMetadata, fill coopmat from hir.kernels[0].annotations.coop_matrix: map CoopMatShape → CoopMatShapeMeta (ScalarTy → CoopMatScalarMeta, CoopMatScopeHir → CoopMatScopeMeta). Use KernelMetadata::new(...).with_coopmat(mapped). Non-coopmat kernels get None. The compile_source_with_assignments path mirrors this.",
+      "public_api": []
+    },
+    {
+      "path": "crates/axc-runtime/src/lib.rs",
+      "changes": "Add `pub mod coopmat;` and `pub mod resident;`. Re-export `pub use coopmat::{CoopMatSupport, CoopMatShapeSupport, CoopMatComponentType, CoopMatScope, CoopMatRequiredShape, coopmat_shape_supported};` and `pub use resident::{ResidentBuffers, ResidentDispatchTiming, ResidentTimingSource, ResidentBenchConfig};` and `pub use metadata::{CoopMatShapeMeta, CoopMatScalarMeta, CoopMatScopeMeta};`. Update module-doc for M3.1.",
+      "public_api": []
+    },
+    {
+      "path": "crates/axc-runtime/src/context.rs",
+      "changes": "(1) Device creation: assemble the pNext chain UNCONDITIONALLY (not only in the timeline+1.2 branch — WARNING fix). Declare ALL feature-struct locals at function scope so they outlive create_device: vk12_features (timeline + shaderInt16 path via Vulkan12Features.shaderFloat16Int8? NO — use dedicated structs), `f16_storage: VkPhysicalDevice16BitStorageFeatures`, `i8_storage: VkPhysicalDevice8BitStorageFeatures`, `f16i8: VkPhysicalDeviceShaderFloat16Int8Features`, `base_features2: VkPhysicalDeviceFeatures2` (for shaderInt16), `vmm: VkPhysicalDeviceVulkanMemoryModelFeatures`, `coopmat_feat: VkPhysicalDeviceCooperativeMatrixFeaturesKHR`. The runtime enables the UNION of features required by the kernels it will dispatch — but since the context is created before any kernel is known, enable the SUPERSET needed by the M3.1 kernels gated on DEVICE SUPPORT: for each candidate feature, query availability via Features2; if available, enable it; if a kernel later needs a feature the device lacks, dispatch returns DeviceFeatureUnsupported. Practically: probe + enable storageBuffer16BitAccess, storageBuffer8BitAccess, shaderInt8, shaderInt16 (all if device-supported), VulkanMemoryModel + cooperativeMatrix + VK_KHR_cooperative_matrix ext (if device-supported AND !force_no_coopmat). This is FAIL-CLOSED at dispatch via required_device_features vs an enabled-features record stored on the context. (2) Store `coopmat_support: CoopMatSupport`, `enabled_features: EnabledDeviceFeatures`, `timestamp_period: f32`, `compute_timestamp_valid_bits: u32`, `subgroup_size: u32` (from VkPhysicalDeviceVulkan11Properties/SubgroupProperties). (3) New accessors: coopmat_support(), subgroup_size(), enabled_features(). (4) VulkanContextOptions gains `force_no_coopmat: Option<bool>` (AXC_FORCE_NO_COOPMAT=1). All additive.",
+      "public_api": [
+        "pub fn coopmat_support(&self) -> &crate::coopmat::CoopMatSupport",
+        "pub fn subgroup_size(&self) -> u32",
+        "pub fn enabled_features(&self) -> &crate::context::EnabledDeviceFeatures",
+        "pub struct EnabledDeviceFeatures { pub storage_16bit: bool, pub storage_8bit: bool, pub shader_int8: bool, pub shader_int16: bool, pub vulkan_memory_model: bool, pub cooperative_matrix: bool }",
+        "pub struct VulkanContextOptions { /* existing */ pub force_no_coopmat: Option<bool> }"
+      ]
+    },
+    {
+      "path": "crates/axc-runtime/src/kernel_handle.rs",
+      "changes": "(1) Lever A (E): a binding is read back ONLY IF binding_is_readback(access, output_size). ReadOnly bindings are NEVER read back / copied / barrier'd, regardless of output_sizes[i]. WriteOnly/ReadWrite read back EXACTLY as M3.0 (byte-exact). Add `pub(crate) fn binding_is_readback(access: axc_hir::buffer::BufferAccess, output_size: usize) -> bool`. Used in ALL FOUR readback loops (HN-9). (2) COOPMAT/FEATURE PREFLIGHT GATE: in the dispatch entry points, before pipeline use, compute required_device_features(&inner.binding_plan, meta.coopmat.is_some()); if a required feature is NOT in ctx.enabled_features(), return DeviceFeatureUnsupported{feature, kernel}. If meta.coopmat.is_some(): build CoopMatRequiredShape from meta.coopmat (NOT a literal); if !coopmat_shape_supported(req, ctx.coopmat_support()) OR ctx.subgroup_size()!=32, return CoopMatUnsupported{...}. (3) Add `resident_bound: bool` to KernelHandleInner (debug-only interleaving guard, HN-8): dispatch_handle sets it false; dispatch_resident sets it true after re-bind and debug_asserts it.",
+      "public_api": [
+        "pub(crate) fn binding_is_readback(access: axc_hir::buffer::BufferAccess, output_size: usize) -> bool"
+      ]
+    },
+    {
+      "path": "crates/axc-runtime/src/error.rs",
+      "changes": "Add TWO variants (count 28→30): (1) `CoopMatUnsupported { required_m: u32, required_n: u32, required_k: u32, reason: String }` (#[error(\"cooperative matrix shape {required_m}x{required_n}x{required_k} not supported by device: {reason}\")]) — typed graceful-skip for coopmat shape/scope/subgroup-size mismatch. (2) `DeviceFeatureUnsupported { feature: String, kernel: String }` (#[error(\"device feature {feature} required by kernel '{kernel}' is not enabled/available\")]) — typed fail-closed skip for missing 8/16-bit storage / int8 / int16. Update at_801: keep name, bump asserted count 28→30, add both to the exhaustive vec.",
+      "public_api": []
+    },
+    {
+      "path": "crates/axc-driver/benches/common.rs",
+      "changes": "Add f16 helpers `pub fn f16_slice_to_bytes(&[u16]) -> Vec<u8>` and `pub fn bytes_to_f16_vec(&[u8]) -> Vec<u16>`. NO change to existing helpers/constants. (Additive; included via #[path].)"
+    },
+    {
+      "path": "DESIGN.md",
+      "changes": "Append §3.1.13 (see design_md_additions): coopmat dispatch (extension/feature/preflight/skip + 16/8-bit storage feature enablement + subgroupSize==32 guard), the metadata schema bump (coopmat shape carried, schema 1→2 back-compat), the resident-benchmark methodology, Lever A re-land, the staged q4km-coopmat decision, the cuBLAS-estimate honesty, and the capability→feature table."
+    },
+    {
+      "path": "ROADMAP.md",
+      "changes": "Update the status-snapshot rows for cooperative-matrix dispatch and multi-row tiled matmul to M3.1-delivered with the staged-scope note; note the >=50%-cuBLAS criterion re-scoped to informational (effective TFLOPS asserted). Note metadata schema bumped to v2. Bump test-count baseline. Documentation only."
+    }
+  ],
+  "coder_handoff_notes": [
+    "HN-1 (Vulkan memory model feature is MANDATORY for coopmat dispatch). emit.rs (lines 150-159, 320-324) emits OpMemoryModel Logical Vulkan + OpCapability VulkanMemoryModel + OpExtension SPV_KHR_vulkan_memory_model for coopmat kernels. vkCreateComputePipelines FAILS on a conformant ICD unless VkPhysicalDeviceVulkanMemoryModelFeatures.vulkanMemoryModel is enabled. Chain it (with vulkanMemoryModelDeviceScope=VK_TRUE) when coopmat is enabled. Wire it FIRST and test pipeline creation (AT-1509) before dispatch.",
+    "HN-2 (preflight uses Properties2/Features2, core in Vulkan 1.1). Instance already requests >=1.1. vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR is the DEVICE-extension entry point — load via ash::khr::cooperative_matrix (ash 0.38). Call it ONLY when device_advertises_coopmat_ext is true. Two-call idiom: first call gets count; if count==0, return empty shapes WITHOUT a second call (WARNING fix). NEVER call the entry point on a device that does not advertise the extension.",
+    "HN-3 (graceful skip is a typed return, NOT a panic). Coopmat shape/scope/subgroup-size mismatch ⇒ Err(DispatchError::CoopMatUnsupported{..}); missing storage/int device feature ⇒ Err(DispatchError::DeviceFeatureUnsupported{..}). Tests inspect ctx.coopmat_support()/ctx.enabled_features() before dispatch and skip with eprintln, OR catch the typed error. Lavapipe lacks VK_KHR_cooperative_matrix — the skip path is the EXPECTED Lavapipe path.",
+    "HN-4 (subgroupSize==32 guard — CRITICAL-4 vendor hole). matmul_tile.axc is @workgroup(32,1,1); coopmat ops are Subgroup scope. The dispatch path REQUIRES ctx.subgroup_size()==32 (sourced from VkPhysicalDeviceVulkan11Properties.subgroupSize or VkPhysicalDeviceSubgroupProperties). On a wave64 device that advertises 16x16x16 f16 Subgroup, RETURN CoopMatUnsupported (do NOT dispatch) — prevents silent miscompute. AMD/Intel remapping is EB.1/M3.4.",
+    "HN-5 (f16 accumulator semantics for the CPU oracle). Per SPV_KHR_cooperative_matrix the accumulation precision is implementation-defined. matmul_tile_16x16x16_f16_cpu accumulates each 16-element dot product in f32 then ROUNDS to f16. The oracle is 'within f16 fp tol' (f16_tile_tol), NOT bit-exact. Do NOT assert raw bit equality of the f16 result tile.",
+    "HN-6 (resident timing: validity + masking + reset ordering). Use GPU timestamps only when timestamp_period>0 AND compute timestamp_valid_bits>0. masked_timestamp_delta: mask BOTH begin and end to valid_bits FIRST, then wrapping_sub, then * timestamp_period (mask-before-subtract — WARNING fix; AT-1535 unit-tests the boundary case). cmd_reset_query_pool MUST be recorded BEFORE the first write_timestamp in the SAME submission (or host-side reset) so re-dispatch in the N-loop is well-defined. When unavailable, fall back to CpuFenceWall; record timing_source honestly. Note: TOP_OF_PIPE measures from when the GPU reaches the command (queue/scheduling latency before TOP is excluded by design — document this in the bench).",
+    "HN-7 (Lever A must not regress existing tests). After Lever A, readonly bindings get an EMPTY output Vec. AUDIT every existing test/bench that indexes outputs[i] for a readonly binding. q4km/saxpy index the WRITABLE output (q4km outputs[2]=y, saxpy the writable) — SAFE. CONFIRM no test reads back a readonly binding's bytes; if one does, update it. AT-1541 encodes this audit.",
+    "HN-8 (resident buffers reuse + debug interleaving guard). ResidentBuffers reuses allocate_device_local_buffer + the descriptor-write path from kernel_handle.rs, with a SEPARATE lifetime owned by ResidentBuffers (its own device-local buffers, command buffer, fence, query pool; query pool destroyed in Drop). The N-loop REUSES one CB + one fence + one query pool (no per-iter alloc — WARNING fix). dispatch_resident re-binds the descriptor set to resident buffers and sets resident_bound=true; dispatch_handle sets resident_bound=false. A debug_assert (NOT a session type) catches interleaving without a re-bind. Do not interleave on the same handle without a re-bind.",
+    "HN-9 (Lever A predicate centralization). All four readback loops (single-queue copy-record, single-queue memcpy, dedicated copy-record, dedicated memcpy) MUST use binding_is_readback so they agree — a binding skipped in copy-record but read in memcpy = reading uninitialized staging = corruption. Honor the M3.0 r2 'all four loops agree' note.",
+    "HN-10 (NO hardcoded coopmat shape — now ACHIEVABLE via metadata). The required shape for matmul_tile is read from metadata.coopmat (CoopMatShapeMeta), which the driver fills from the HIR-derived CoopMatShape (from the body's matrix[f16,16,16,*] types). Build CoopMatRequiredShape via coopmat_required_shape_from_meta — NOT a literal. The runtime DETECTS a coopmat kernel via metadata.coopmat.is_some(). D's @strategy tile holes vary the source dims; the metadata reflects whatever the source declares. AT-1551 (preflight drives tile selection) + AT-1552 (runtime reads shape from metadata, nothing hardcoded) prove this.",
+    "HN-11 (q4km_dequant_matmul layout — PINNED DEFINITIVELY). q (readonly_buffer[u8]) = the weight matrix as n_rows consecutive weight-rows; weight-row `row` occupies bytes [row * n_blocks_per_row * 144 .. (row+1) * n_blocks_per_row * 144], each 144-byte Q4_K_M superblock laid out exactly as M2.6 (q4km_dequant_matvec). x (readonly_buffer[f32]) = the dense input matrix, column-of-output-major: x[k * n_cols + col] is the k-th dequantized-weight-index input for output column col, k in 0..(n_blocks_per_row*256). y (buffer[f32]) = output, row-major: y[row * n_cols + col]. Each invocation i = gid(0): row = i / n_cols, col = i % n_cols; out = sum over the n_blocks_per_row superblocks of weight-row `row`, each superblock's 256 dequantized weights w[k] multiplied by x[(blk*256 + k) * n_cols + col], reusing the EXACT M2.6 inline get_scale_min_k4 + dequant. The CPU reference q4km_dequant_matmul_cpu matches this layout EXACTLY. For the 256x256 fixture: n_rows=256, n_cols=256, n_blocks_per_row=1 (one superblock per weight-row, 256 weights = 256 contraction elements). No fixture ambiguity.",
+    "HN-12 (CoopMatKey new fields — mechanical). CoopMatKey gains k + result_type. At every construction site in body.rs/coopmat.rs fill k from the contraction dim already in scope (a.n / b.m / accumulator's K) and result_type from the accumulator elem. The emitted SPIR-V must be byte-identical for matmul_tile (the key is an internal BTreeMap dedup key; OpTypeCooperativeMatrixKHR operands are M/N/use/elem, unchanged). AT-1508 asserts SPIR-V word-count identity vs the pre-M3.1 baseline.",
+    "HN-13 (metadata back-compat). load_kernel_metadata must accept schema_version 1 AND 2. A v1 sidecar (written by pre-M3.1 compiles) has no `coopmat` key; #[serde(default)] yields coopmat=None, which is dispatch-identical to a non-coopmat kernel. New compiles write schema_version=2. Do NOT reject v1 — existing on-disk sidecars and the M0..M2.6 test corpus depend on it. AT-1553 covers both directions."
+  ],
+  "dependency_graph": {
+    "axc-hir::coopmat": ["axc-hir::ty (ScalarTy)"],
+    "axc-hir::lower": ["axc-hir::coopmat", "axc-hir::hir"],
+    "axc-codegen::body / coopmat": ["axc-hir::coopmat (CoopMatKey +2 fields)"],
+    "axc-runtime::metadata": ["serde", "axc-hir (ParamBindingPlan)"],
+    "axc-runtime::coopmat": ["ash", "axc-hir (ParamBindingPlan, BufferTy)", "axc-runtime::metadata (CoopMatShapeMeta)"],
+    "axc-runtime::resident": ["ash", "axc-runtime::coopmat", "axc-runtime::kernel_handle"],
+    "axc-runtime::context": ["axc-runtime::coopmat", "axc-runtime::resident"],
+    "axc-runtime::kernel_handle": ["axc-hir (BufferAccess)", "axc-runtime::buffers", "axc-runtime::coopmat (required_device_features, CoopMatRequiredShape)", "axc-runtime::metadata"],
+    "axc-driver::lib": ["axc-hir (CoopMatShape)", "axc-runtime::metadata (CoopMatShapeMeta)"],
+    "crates/axc-driver/tests/common_matmul.rs": ["common_helpers.rs (unpack_scale_min_k4_cpu)", "half"]
+  },
+  "spirv_capabilities_required": ["Shader", "CooperativeMatrixKHR", "VulkanMemoryModel", "Float16", "StorageBuffer16BitAccess", "Int8", "StorageBuffer8BitAccess", "Int16"],
+  "spirv_extensions_required": ["SPV_KHR_cooperative_matrix", "SPV_KHR_vulkan_memory_model", "SPV_KHR_16bit_storage", "SPV_KHR_8bit_storage"],
+  "spirv_capabilities_note": "ALL coopmat SPIR-V capabilities/extensions are ALREADY emitted by M2.1/M2.6 codegen (verified emit.rs:146-356, q4_0.rs:49,94,151-152). M3.1 adds NO new codegen emission — the ONLY codegen change is the mechanical CoopMatKey +2 fields (HN-12), which leaves the emitted module byte-identical. spirv-val must remain clean on all emitted modules (AT-1560). The NEW work is RUNTIME device-feature ENABLEMENT (capability→feature table) — spirv-val validates the module but does NOT check device-feature enablement; passing spirv-val does NOT imply pipeline creation succeeds (hence AT-1509/AT-1522 pipeline-create tests).",
+  "vulkan_features_extensions": {
+    "device_extensions_conditional": ["VK_KHR_cooperative_matrix (enabled ONLY when advertised AND !force_no_coopmat)"],
+    "device_features_chained": [
+      "VkPhysicalDevice16BitStorageFeatures { storageBuffer16BitAccess = VK_TRUE } — when any f16 SSBO kernel will dispatch (CRITICAL-2; device-support-gated)",
+      "VkPhysicalDevice8BitStorageFeatures { storageBuffer8BitAccess = VK_TRUE } — when any u8/i8 SSBO kernel will dispatch (CRITICAL-3; device-support-gated)",
+      "VkPhysicalDeviceShaderFloat16Int8Features { shaderInt8 = VK_TRUE } — q4km path (CRITICAL-3; device-support-gated)",
+      "VkPhysicalDeviceFeatures2.features.shaderInt16 = VK_TRUE — f16_bits_to_f32 path (CRITICAL-3; device-support-gated)",
+      "VkPhysicalDeviceVulkanMemoryModelFeatures { vulkanMemoryModel = VK_TRUE, vulkanMemoryModelDeviceScope = VK_TRUE } — when coopmat enabled (HN-1)",
+      "VkPhysicalDeviceCooperativeMatrixFeaturesKHR { cooperativeMatrix = VK_TRUE } — when coopmat enabled",
+      "VkPhysicalDeviceVulkan12Features { timelineSemaphore } — UNCHANGED from M3.0"
+    ],
+    "feature_chain_assembly": "All feature-struct locals are declared at function scope (NOT inside the timeline+1.2 if-branch) so they outlive create_device; the pNext chain is assembled UNCONDITIONALLY for every device-supported feature in the required superset (WARNING fix). Availability is probed via Features2 before enabling; an unavailable-but-needed feature is NOT force-enabled — instead the dispatch-time required_device_features check fails closed with DeviceFeatureUnsupported.",
+    "preflight_query": "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR (device-ext) for supported (MSize,NSize,KSize,AType,BType,CType,ResultType,scope,saturatingAccumulation) tuples; VkPhysicalDeviceCooperativeMatrixFeaturesKHR via Features2 for feature presence.",
+    "subgroup_size_query": "VkPhysicalDeviceVulkan11Properties.subgroupSize (or VkPhysicalDeviceSubgroupProperties.subgroupSize) read at context init; stored as subgroup_size; matmul_tile dispatch requires ==32.",
+    "instance_requirements": "Features2/Properties2 are core in Vulkan 1.1 (instance already requests >=1.1). No new instance extension.",
+    "timestamp_query": "vkCmdWriteTimestamp (TOP/BOTTOM) into a 2-entry vk::QueryPool(TIMESTAMP); cmd_reset_query_pool before the first write in the same submission; elapsed = masked_timestamp_delta(begin,end,valid_bits) * timestamp_period ns. Fallback: CPU wall time."
+  },
+  "technical_spec": "## M3.1 — Cooperative-matrix dispatch + multi-row matmul + GPU-resident benchmark (r1)\n\n### C1. Coopmat shape metadata plumbing (HIR → codegen → metadata → runtime)\n\nThe pessimistic review verified the runtime had NO way to know a kernel is coopmat or what shape it needs. r1 fixes this end-to-end:\n\n1. **HIR** (axc-hir/src/coopmat.rs, hir.rs, lower.rs): CoopMatKey gains `k: u32` + `result_type: ScalarTy`. The existing CoopMatrixShape struct gains `result_type` + `scope: CoopMatScopeHir`. KernelAnnotations gains `coop_matrix: Option<CoopMatShape>`. During lowering, when the `cooperative_matrix` flag is set, `derive_coopmat_shape(&body)` extracts M=a.m, N=b.n, K=a.n(==b.m), a/b/c/result element types, scope=Subgroup from the (typechecked) coopmat_mul_add operands. For matmul_tile: 16×16×16, all f16, Subgroup.\n2. **Codegen** (body.rs, coopmat.rs): MECHANICAL — CoopMatKey literals gain the two fields; emitted SPIR-V byte-identical (HN-12).\n3. **Metadata** (metadata.rs): CURRENT_SCHEMA_VERSION 1→2; KernelMetadata gains `#[serde(default)] coopmat: Option<CoopMatShapeMeta>`. load_kernel_metadata accepts v1 (coopmat=None via default) and v2. Driver fills coopmat from the HIR CoopMatShape.\n4. **Runtime**: builds CoopMatRequiredShape from metadata.coopmat (coopmat_required_shape_from_meta), NOT a literal. Detects coopmat via metadata.coopmat.is_some(). HN-10/AT-1551/AT-1552 are now real.\n\n### A. Coopmat device enablement + preflight + feature pass (coopmat.rs, context.rs)\n\n**required_device_features(binding_plan, uses_coopmat)** (CRITICAL-2/-3) derives the device-feature set from the binding plan: storage_16bit ⇐ any f16 SSBO; storage_8bit + shader_int8 ⇐ any u8/i8 SSBO; shader_int16 ⇐ q4km path; vulkan_memory_model + cooperative_matrix ⇐ uses_coopmat. See the capability→feature table.\n\n**context.rs feature-chain assembly** (WARNING fix): all feature-struct locals at function scope, pNext assembled unconditionally for every device-SUPPORTED feature in the required superset; availability probed via Features2; an unavailable-but-needed feature is NOT force-enabled — dispatch fails closed with DeviceFeatureUnsupported. Stores coopmat_support, enabled_features, timestamp_period, compute_timestamp_valid_bits, subgroup_size.\n\n**Preflight matcher (pure)** coopmat_shape_supported(required, support): true iff feature_present AND ∃ s∈shapes with s.m/n/k == required AND a/b/c/result component types match AND s.scope==Subgroup AND s.saturating_accumulation==false (codegen emits NONE_KHR operands — WARNING fix). query_coopmat_support uses the two-call count idiom (count==0 ⇒ empty, no second call).\n\n**Graceful skip**: coopmat shape/scope mismatch OR subgroup_size!=32 ⇒ CoopMatUnsupported; missing storage/int feature ⇒ DeviceFeatureUnsupported. Non-coopmat f32 kernels never hit the coopmat check; f16/u8 kernels still go through the feature check.\n\n### B. matmul_tile FIRST dispatch (dispatch_matmul_tile.rs)\n\nCompile matmul_tile.axc (reuses M2.1 codegen). binding_plan: tile_offset (push u32), a_buf/b_buf (readonly f16 SSBO), c_buf (readwrite f16 SSBO). Build the NON-SYMMETRIC transpose-distinguishing A,B f16 tiles + C0=0 (transpose_fixture_spec). workgroups=(1,1,1). AT-1509 first asserts pipeline CREATION succeeds (proves HN-1 + 16-bit-storage feature wired). Then dispatch via dispatch_handle; read back c_buf (writable, ReadOnly a/b skipped by Lever A); compare to matmul_tile_16x16x16_f16_cpu within f16 tol. AT-1512 asserts the four transpose-variant references differ beyond tol (CRITICAL-4). On Lavapipe / subgroup!=32: typed skip. PRIMARY ACCEPTANCE (AT-1510).\n\n### B2. Multi-row q4km_dequant_matmul (plain, dispatchable everywhere)\n\nLayout PINNED in HN-11. 256×256 fixture (n_rows=256, n_cols=256, n_blocks_per_row=1). AT-1522 asserts pipeline creation (8-bit storage + Int8/Int16 features wired). Bit-exact within 1e-3 rel tol vs q4km_dequant_matmul_cpu (AT-1520, NOT #[ignore] — runs on Lavapipe AND NVIDIA). NO coopmat.\n\n### B3. q4km coopmat bridge (staged, NVIDIA-only)\n\nq4km_dequant_matmul_coopmat.axc consumes PRE-DEQUANTIZED f16 weight + f16 x SSBOs; coopmat_load/mul_add/store a 16×16 tile. Bit-close on NVIDIA; #[ignore]+preflight-skip elsewhere (AT-1521). Proves coopmat on a Q4_K_M-derived workload without shared[T,N].\n\n### C. GPU-resident benchmark (resident.rs)\n\nupload_resident: device-local buffers, stage-upload inputs ONCE, write descriptor set to resident buffers, allocate ONE reusable CB+fence+query pool. dispatch_resident: record cmd_reset_query_pool, write_timestamp(TOP), bind+push+dispatch, write_timestamp(BOTTOM); submit; wait; kernel_ns = masked_timestamp_delta(...) * timestamp_period; NO upload/readback in the steady-state loop; CpuFenceWall fallback when timestamps invalid. Single-allocation reuse across the N-loop. The §3.1.12-rescoped metric: upload once, dispatch N, measure kernel time.\n\n### D. Per-vendor @strategy tile holes\n\nmatmul_f32_tiled.axc declares @strategy { tile_m, tile_n }. Ordinary M2.3 holes (enumerator unchanged). For coopmat variants, each candidate tile is VALIDATED against ctx.coopmat_support() via coopmat_shape_supported — preflight DRIVES selection, nothing hardcoded. The f32 tiled holes affect only workgroup/loop tiling (no coopmat constraint).\n\n### E. Lever A — skip readback of readonly bindings (kernel_handle.rs)\n\nbinding_is_readback(access, output_size) = output_size>0 && access != ReadOnly. Used in ALL FOUR readback loops (HN-9). ReadOnly bindings never device→staging copied, never HOST barrier'd, never invalidated, empty output Vec. WriteOnly/ReadWrite byte-exact. Re-lands M3.0 Lever A WITHOUT the reverted ReBAR Lever B.",
+  "acceptance_tests": [
+    {
+      "id": "AT-1500",
+      "description": "coopmat_shape_supported pure matcher: true for an exact 16x16x16 f16 Subgroup non-saturating tuple in the supported set; false when feature_present=false, on M/N/K mismatch, on component-type mismatch, on Workgroup-scope-only, on result_type mismatch, and on saturatingAccumulation==true.",
+      "test_name": "at_1500_coopmat_shape_matcher",
+      "expected_behavior": "Table-driven unit test in coopmat.rs #[cfg(test)] with synthetic CoopMatSupport; no GPU.",
+      "verified_via": "cargo test -p axc-runtime"
+    },
+    {
+      "id": "AT-1501",
+      "description": "query_coopmat_support returns {feature_present:false, shapes:[]} WITHOUT calling any coopmat entry point when coopmat_device_ext_present=false; AND returns empty shapes WITHOUT a second properties call when the first count==0 (ext present but zero shapes).",
+      "test_name": "at_1501_query_coopmat_support_no_ext_and_zero_count_safe",
+      "expected_behavior": "Pure-logic test of the ext-absent early return and the count==0 two-call guard.",
+      "verified_via": "cargo test -p axc-runtime"
+    },
+    {
+      "id": "AT-1502",
+      "description": "DispatchError gains CoopMatUnsupported AND DeviceFeatureUnsupported; variant count is 30; Display of CoopMatUnsupported contains 'not supported' and the MxNxK shape; DeviceFeatureUnsupported names the feature and kernel.",
+      "test_name": "at_801_dispatch_error_variants_count_is_30",
+      "expected_behavior": "Existing at_801 updated: constructed vec has 30 entries incl. both new variants; exhaustive coverage.",
+      "verified_via": "cargo test -p axc-runtime"
+    },
+    {
+      "id": "AT-1503",
+      "description": "binding_is_readback predicate: ReadOnly+nonzero -> false; WriteOnly+nonzero -> true; ReadWrite+nonzero -> true; any+zero -> false.",
+      "test_name": "at_1503_binding_is_readback_predicate",
+      "expected_behavior": "Pure unit test covering all (access x size) combinations.",
+      "verified_via": "cargo test -p axc-runtime"
+    },
+    {
+      "id": "AT-1504",
+      "description": "required_device_features pure pass: a binding plan with an f16 SSBO yields storage_16bit=true; with a u8 SSBO yields storage_8bit=true & shader_int8=true & shader_int16=true; an all-f32 plain matmul yields all storage/int flags false; uses_coopmat=true sets vulkan_memory_model & cooperative_matrix.",
+      "test_name": "at_1504_required_device_features_from_binding_plan",
+      "expected_behavior": "Table-driven unit test over synthetic ParamBindingPlans; no GPU. Proves CRITICAL-2/-3 derivation.",
+      "verified_via": "cargo test -p axc-runtime"
+    },
+    {
+      "id": "AT-1505",
+      "description": "matmul_tile.axc compiles, VulkanContext on Lavapipe reports coopmat unsupported, and the coopmat dispatch path returns DispatchError::CoopMatUnsupported (graceful skip, NO crash/hang).",
+      "test_name": "at_1505_matmul_tile_lavapipe_graceful_skip",
+      "expected_behavior": "On Lavapipe with AXC_ENABLE_GPU_TESTS=1: dispatch returns CoopMatUnsupported; test asserts the typed error and passes (skip). On no-GPU: eprintln skip.",
+      "verified_via": "cargo test -p axc-driver -- --ignored (Lavapipe CI)"
+    },
+    {
+      "id": "AT-1506",
+      "description": "force_no_coopmat (AXC_FORCE_NO_COOPMAT=1) forces coopmat_support.feature_present=false on coopmat-capable HW, so the skip path is exercised on NVIDIA in CI.",
+      "test_name": "at_1506_force_no_coopmat_exercises_skip_on_nvidia",
+      "expected_behavior": "With the env/option set, ctx.coopmat_support().feature_present==false and matmul_tile dispatch returns CoopMatUnsupported even on Blackwell.",
+      "verified_via": "cargo test -p axc-driver -- --ignored (NVIDIA runner)"
+    },
+    {
+      "id": "AT-1507",
+      "description": "subgroupSize==32 guard: on a (synthetic or real) device whose subgroup_size != 32, the matmul_tile coopmat dispatch returns CoopMatUnsupported with a reason mentioning the subgroup size — even if the 16x16x16 f16 Subgroup shape is advertised. Prevents wave64 silent miscompute (CRITICAL-4 vendor hole).",
+      "test_name": "at_1507_subgroup_size_guard_skips_non_32",
+      "expected_behavior": "Unit-testable via the pure guard predicate over (subgroup_size, shape_supported); plus a runner assertion that NVIDIA (size 32) does NOT skip for this reason.",
+      "verified_via": "cargo test -p axc-runtime / axc-driver -- --ignored"
+    },
+    {
+      "id": "AT-1508",
+      "description": "Single annotated source: the SAME matmul_tile.axc binary that skips on Lavapipe is the one that dispatches on NVIDIA — no per-vendor recompile. Asserts the compiled SPIR-V word count is identical across runs AND identical to the pre-M3.1 (M2.1) baseline (proves the CoopMatKey +2 fields are emission-invariant, HN-12).",
+      "test_name": "at_1508_single_source_skip_vs_dispatch_and_emission_invariant",
+      "expected_behavior": "compile_source_with_meta(matmul_tile) produces one SPIR-V whose word count == the M2.1 baseline; preflight (not source) decides skip vs run.",
+      "verified_via": "cargo test -p axc-driver"
+    },
+    {
+      "id": "AT-1509",
+      "description": "Pipeline CREATION for matmul_tile (vkCreateComputePipelines) SUCCEEDS on a coopmat+16-bit-storage-feature-enabled device, as a step BEFORE dispatch. Isolates the HN-1 (VulkanMemoryModel) + CRITICAL-2 (storageBuffer16BitAccess) footguns at pipeline-create, not at submit.",
+      "test_name": "at_1509_matmul_tile_pipeline_create_succeeds",
+      "expected_behavior": "#[ignore], AXC_ENABLE_GPU_TESTS=1, NVIDIA: building the KernelHandle (pipeline) returns Ok BEFORE any dispatch; on Lavapipe: skip (no coopmat).",
+      "verified_via": "cargo test -p axc-driver -- --ignored (NVIDIA runner)"
+    },
+    {
+      "id": "AT-1510",
+      "description": "PRIMARY: matmul_tile.axc dispatches on NVIDIA RTX PRO 6000 Blackwell with the NON-SYMMETRIC transpose-distinguishing fixture and produces a 16x16 f16 C=A*B tile bit-exact-within-f16-tol vs matmul_tile_16x16x16_f16_cpu. FIRST-EVER coopmat dispatch.",
+      "test_name": "at_1510_matmul_tile_nvidia_first_coopmat_dispatch_bit_close",
+      "expected_behavior": "#[ignore], AXC_ENABLE_GPU_TESTS=1, NVIDIA: preflight supports 16x16x16 f16 + subgroup 32; dispatch; readback c_buf; every element within f16_tile_tol.",
+      "verified_via": "cargo test -p axc-driver -- --ignored (NVIDIA runner)"
+    },
+    {
+      "id": "AT-1511",
+      "description": "The emitted matmul_tile SPIR-V used for dispatch passes spirv-val (Vulkan 1.1 env) — proves the dispatched module is valid.",
+      "test_name": "at_1511_matmul_tile_dispatched_spirv_passes_val",
+      "expected_behavior": "spirv-tools validate the exact words handed to vkCreateShaderModule.",
+      "verified_via": "cargo test -p axc-driver"
+    },
+    {
+      "id": "AT-1512",
+      "description": "Transpose-distinguishing guard (CRITICAL-4, CPU-only): for the chosen non-symmetric fixtures, max-elementwise-abs-diff(A·B, Aᵀ·B), (A·B, A·Bᵀ), and (A·B, B·A) each EXCEED 10x the per-element f16 tolerance at one or more elements. Proves a transposed/swapped/mis-strided coopmat_load CANNOT pass AT-1510.",
+      "test_name": "at_1512_transpose_fixture_is_distinguishing",
+      "expected_behavior": "Pure CPU test over the four references; asserts the pairwise max diffs exceed the tolerance band. No GPU.",
+      "verified_via": "cargo test -p axc-driver"
+    },
+    {
+      "id": "AT-1520",
+      "description": "q4km_dequant_matmul.axc (multi-row, NO coopmat) dispatches on Lavapipe AND NVIDIA and matches q4km_dequant_matmul_cpu within 1e-3 rel tol for a 256x256 fixture (layout per HN-11). NOT #[ignore] — runs as a normal GPU integration test.",
+      "test_name": "at_1520_q4km_matmul_256x256_bit_exact",
+      "expected_behavior": "AXC_ENABLE_GPU_TESTS=1: full 256x256 output compared element-wise within 1e-3 rel tol. Runs on Lavapipe CI.",
+      "verified_via": "cargo test -p axc-driver -- (AXC_ENABLE_GPU_TESTS=1; NOT --ignored)"
+    },
+    {
+      "id": "AT-1521",
+      "description": "STAGED bridge: q4km_dequant_matmul_coopmat.axc (pre-dequantized f16 inputs) dispatches on NVIDIA and the 16x16 f16 output tile matches the CPU reference within f16 tol; SKIPS on Lavapipe via preflight.",
+      "test_name": "at_1521_q4km_coopmat_bridge_nvidia",
+      "expected_behavior": "#[ignore]; NVIDIA: coopmat dispatch bit-close; Lavapipe: CoopMatUnsupported skip.",
+      "verified_via": "cargo test -p axc-driver -- --ignored (NVIDIA runner)"
+    },
+    {
+      "id": "AT-1522",
+      "description": "Pipeline CREATION for q4km_dequant_matmul (8-bit storage + Int8 + Int16 features) SUCCEEDS on a feature-enabled device BEFORE dispatch. Isolates CRITICAL-3 at pipeline-create. On a device lacking the features, building the handle / dispatch returns DeviceFeatureUnsupported (fail-closed).",
+      "test_name": "at_1522_q4km_pipeline_create_succeeds_or_feature_skip",
+      "expected_behavior": "AXC_ENABLE_GPU_TESTS=1: on a device with 8/16-bit storage + int8/int16, pipeline creates Ok; on a device without, typed DeviceFeatureUnsupported skip. NVIDIA + Lavapipe.",
+      "verified_via": "cargo test -p axc-driver -- (AXC_ENABLE_GPU_TESTS=1)"
+    },
+    {
+      "id": "AT-1530",
+      "description": "GPU-resident bench correctness: upload_resident + dispatch_resident + readback_resident on a small matmul produces the SAME result as a one-shot dispatch_handle (resident path does not corrupt outputs).",
+      "test_name": "at_1530_resident_matches_oneshot",
+      "expected_behavior": "AXC_ENABLE_GPU_TESTS=1: resident readback == one-shot output, byte/tol-equal.",
+      "verified_via": "cargo test -p axc-driver -- --ignored"
+    },
+    {
+      "id": "AT-1531",
+      "description": "ResidentDispatchTiming reports kernel_ns finite and > 0 and a timing_source; timestamp-capable device -> GpuTimestamp; 0-valid-bits device -> CpuFenceWall without panicking.",
+      "test_name": "at_1531_resident_timing_source_and_nonzero",
+      "expected_behavior": "kernel_ns finite and > 0; source recorded honestly.",
+      "verified_via": "cargo test -p axc-driver -- --ignored"
+    },
+    {
+      "id": "AT-1532",
+      "description": "matmul_tflops_4096 resident bench reports a finite effective TFLOPS for the 4096x4096 f32 matmul and prints the percent-of-cuBLAS ESTIMATE label. ONLY effective_tflops() is asserted finite & > 0; the cuBLAS ratio is informational. CUBLAS constant asserted > 0 && finite as a sanity check.",
+      "test_name": "at_1532_matmul_tflops_reported",
+      "expected_behavior": "effective_tflops(...) finite > 0; output line labels the cuBLAS comparison 'estimate (external cuBLAS baseline)'; no >=50% hard assertion.",
+      "verified_via": "cargo bench -p axc-driver --bench resident_matmul (AXC_ENABLE_GPU_BENCHES=1)"
+    },
+    {
+      "id": "AT-1535",
+      "description": "masked_timestamp_delta unit test: synthetic begin/end straddling the timestamp_valid_bits boundary (e.g. valid_bits=32, begin near 2^32-1, end small) returns a sane wrapped delta, not a garbage huge value (mask-before-subtract).",
+      "test_name": "at_1535_masked_timestamp_delta_boundary",
+      "expected_behavior": "Pure unit test; no GPU. Covers wrap across the valid-bit boundary.",
+      "verified_via": "cargo test -p axc-runtime"
+    },
+    {
+      "id": "AT-1540",
+      "description": "Lever A: a kernel with a readonly input binding and a writable output binding, dispatched with output_sizes set for BOTH, returns an EMPTY Vec for the readonly slot and correct bytes for the writable one; the writable output is byte-identical to the M3.0 (pre-Lever-A) result.",
+      "test_name": "at_1540_lever_a_skips_readonly_readback_byte_exact_writable",
+      "expected_behavior": "AXC_ENABLE_GPU_TESTS=1: outputs[readonly_idx].is_empty(); outputs[writable_idx] byte-exact vs reference. Lavapipe + NVIDIA.",
+      "verified_via": "cargo test -p axc-driver -- --ignored"
+    },
+    {
+      "id": "AT-1541",
+      "description": "Lever A regression guard: existing q4km/saxpy dispatch tests still pass after Lever A — no test reads back a readonly binding's bytes (HN-7 audit encoded: readonly slots empty, writable slots match).",
+      "test_name": "at_1541_lever_a_no_existing_test_regression",
+      "expected_behavior": "Full existing GPU test suite green; re-runs q4km/saxpy checking writable correct, readonly empty.",
+      "verified_via": "cargo test --workspace -- --ignored"
+    },
+    {
+      "id": "AT-1550",
+      "description": "@strategy tile holes (tile_m/tile_n) in matmul_f32_tiled.axc enumerate via axc-optimize into the expected Cartesian product of assignments.",
+      "test_name": "at_1550_tile_strategy_holes_enumerate",
+      "expected_behavior": "enumerate_strategy yields the full product; reuses M2.3 enumerator unchanged.",
+      "verified_via": "cargo test -p axc-optimize / axc-driver"
+    },
+    {
+      "id": "AT-1551",
+      "description": "Preflight DRIVES coopmat tile selection: given a synthetic supported set containing only 16x16x16, a candidate 32x32x16 tile is rejected by coopmat_shape_supported and the harness selects 16x16x16 — nothing hardcoded.",
+      "test_name": "at_1551_preflight_drives_tile_selection",
+      "expected_behavior": "Unit test over synthetic CoopMatSupport; the unsupported tile is filtered.",
+      "verified_via": "cargo test -p axc-runtime / axc-driver"
+    },
+    {
+      "id": "AT-1552",
+      "description": "Metadata-driven required shape (CRITICAL-1): compiling matmul_tile.axc produces KernelMetadata.coopmat == Some(16,16,16,f16,f16,f16,f16,Subgroup); the runtime builds CoopMatRequiredShape from THAT metadata (coopmat_required_shape_from_meta), with NO literal 16 in the runtime or test dispatch path. A non-coopmat kernel (saxpy) produces coopmat==None.",
+      "test_name": "at_1552_coopmat_shape_read_from_metadata_not_hardcoded",
+      "expected_behavior": "Compile + inspect metadata; assert the shape; assert the runtime preflight uses the metadata-derived shape (e.g. by varying the source dims in a second fixture and observing the required shape track the source). No GPU needed for the metadata assertion.",
+      "verified_via": "cargo test -p axc-driver / axc-runtime"
+    },
+    {
+      "id": "AT-1553",
+      "description": "Metadata schema back-compat (HN-13): a v1 sidecar JSON (schema_version=1, NO coopmat key) loads successfully with coopmat==None; a v2 coopmat sidecar round-trips the CoopMatShapeMeta exactly; CURRENT_SCHEMA_VERSION==2 and new compiles write 2.",
+      "test_name": "at_1553_metadata_schema_v1_v2_back_compat",
+      "expected_behavior": "Synthetic v1 JSON deserializes (coopmat None); v2 serialize→deserialize round-trips; version check accepts {1,2}, rejects 3.",
+      "verified_via": "cargo test -p axc-runtime"
+    },
+    {
+      "id": "AT-1560",
+      "description": "spirv-val clean on ALL emitted M3.1 modules: matmul_tile (coopmat), q4km_dequant_matmul (plain), q4km_dequant_matmul_coopmat (coopmat), matmul_f32_tiled. spirv-tools Vulkan_1_1 validation passes for each.",
+      "test_name": "at_1560_all_m31_modules_spirv_val_clean",
+      "expected_behavior": "Compile each example; validate; all pass.",
+      "verified_via": "cargo test -p axc-driver"
+    },
+    {
+      "id": "AT-1561",
+      "description": "Vendor-shape heterogeneity + near-miss rejection: coopmat_shape_supported distinguishes a shape with f16 a/b but f32 c/result from the all-f16 requirement (no false-match), AND rejects a property whose result_type differs from the required accumulator type, AND rejects a property with saturatingAccumulation==true.",
+      "test_name": "at_1561_vendor_shape_resulttype_and_saturation_discrimination",
+      "expected_behavior": "Synthetic supported set with mixed component types + saturating variants; matcher requires exact a/b/c/result match + scope==Subgroup + saturating==false.",
+      "verified_via": "cargo test -p axc-runtime"
+    }
+  ],
+  "correctness_oracle": "TWO oracles. (1) Coopmat f16 tile (matmul_tile, q4km coopmat bridge): the CPU reference accumulates each dot product in f32 and rounds the final accumulator to f16; the GPU result is compared element-wise with f16_tile_tol = max(2 f16 ULP at the element magnitude, 2^-9 * max(|a|,|b|,|c|)) — 'within f16 fp tolerance', NOT raw bit equality (tensor-core intermediate rounding order is not bit-identical to a sequential f32 accumulate, HN-5). The fixture is NON-SYMMETRIC and transpose-distinguishing (transpose_fixture_spec); AT-1512 proves the transpose variants differ by >>tol so a transpose/stride/operand-swap bug fails AT-1510. (2) Plain f32/q4km matmul (q4km_dequant_matmul 256x256, matmul_f32_tiled): relative tolerance 1e-3 vs the f32 CPU reference (M2.6 @equiv_fp_tol(1e-3) discipline). Resident-bench correctness (AT-1530) is byte/tol-equal to the one-shot dispatch_handle. Lever A correctness (AT-1540) is byte-exact preservation of every WRITABLE binding vs the M3.0 result.",
+  "edge_cases": [
+    "Coopmat extension advertised but feature reported false: treat as unsupported -> skip. Never enable the extension without the feature.",
+    "Coopmat properties enumeration returns zero shapes despite feature_present true (count==0): skip; do NOT call the second properties function (AT-1501).",
+    "Device advertises 16x16x16 f16 Subgroup but subgroup_size != 32 (wave64/SIMD16): SKIP with CoopMatUnsupported (subgroup-size reason) — no silent miscompute (AT-1507).",
+    "Device supports coopmat but lacks storageBuffer16BitAccess (unlikely on conformant HW, possible on partial ICDs): DeviceFeatureUnsupported skip at dispatch (fail-closed), not a pipeline-create crash.",
+    "q4km kernel on a device lacking storageBuffer8BitAccess / shaderInt8 / shaderInt16: DeviceFeatureUnsupported skip (AT-1522). Lavapipe is lax and typically passes; NVIDIA requires the features.",
+    "Lavapipe: no VK_KHR_cooperative_matrix -> feature_present false -> all coopmat dispatch returns CoopMatUnsupported. Non-coopmat kernels (q4km_dequant_matmul with features enabled, matmul_f32_tiled) run normally.",
+    "v1 metadata sidecar (pre-M3.1) with no coopmat field: deserializes coopmat=None (serde default), dispatch-identical to a non-coopmat kernel (HN-13, AT-1553).",
+    "cooperative_matrix flag set but body has no coopmat op (degenerate): coop_matrix=None + HirWarning; treated as non-coopmat.",
+    "timestamp_valid_bits == 0: resident timing falls back to CPU wall time; timing_source records it (no panic).",
+    "timestamp wrap across the valid-bit boundary in the N-loop: masked_timestamp_delta masks each endpoint first, then wrapping_sub (AT-1535).",
+    "Lever A with a kernel that has ONLY readonly bindings + push-constant output: outputs all empty — acceptable.",
+    "@strategy tile hole yielding an unsupported coopmat shape: filtered by the preflight matcher; if ALL coopmat tiles unsupported, the harness reports 'no supported coopmat tile' and the plain-f32 path still provides a number.",
+    "f16 fixture magnitudes chosen so inputs round-trip cleanly through f16 (|A|,|B| <= ~8) so the f16-tol oracle is meaningful and not dominated by input representation error, while still being transpose-distinguishing."
+  ],
+  "open_questions": [
+    "OQ-1 (vendor-shape heterogeneity): RESOLVED in r1 — NVIDIA-first 32-lane assumption accepted WITH a subgroupSize==32 guard (AT-1507) so wave64/SIMD16 devices are SKIPPED not miscomputed; AMD/Intel remapping deferred to EB.1/M3.4.",
+    "OQ-2 (Lavapipe skip mechanics): tests inspect ctx.coopmat_support()/enabled_features() to decide skip; AT-1505 ALSO asserts the typed error if dispatch is attempted. Resolved.",
+    "OQ-3 (q4km-coopmat fusion scope): staged split accepted (both reviewers) — plain multi-row q4km matmul (AT-1520, everywhere, bit-exact 256x256) + pre-dequantized coopmat bridge (AT-1521, NVIDIA). True dequant->shared-f16->coopmat fusion is M3.2 (needs shared[T,N]/FG.6).",
+    "OQ-4 (resident bench API surface): method form + documented HN-8 caveat + a debug_assert resident_bound flag (lightweight); type-enforced ResidentSession deferred to M3.4. Resolved.",
+    "OQ-5 (cuBLAS estimate): only effective TFLOPS asserted (AT-1532); cuBLAS ratio informational, labeled estimate, sourced constant. Resolved.",
+    "OQ-6 (DispatchError count): at_801 kept, count bumped 28→30 (TWO new variants: CoopMatUnsupported + DeviceFeatureUnsupported). Resolved."
+  ],
+  "acceptance_gate": {
+    "nvidia_runner_mandatory": "The NVIDIA RTX PRO 6000 runner is a MANDATORY M3.1 sign-off gate. AT-1510 (first coopmat dispatch), AT-1509 (pipeline create), and AT-1521 (q4km coopmat bridge) MUST actually RUN (not skip) on the NVIDIA runner. A run where AT-1510 SKIPS on EVERY available device is a milestone FAIL, not a pass (anti-pattern #9 — skip-gaming is prohibited). force_no_coopmat (AT-1506) exercises the skip path on NVIDIA but does NOT substitute for the dispatch proof.",
+    "lavapipe_ci_gate": "Lavapipe CI MUST run and pass: AT-1505/1507/1508 (graceful skip + single-source), AT-1520 (plain q4km 256x256, NOT #[ignore]), AT-1540/1541 (Lever A), and all pure/unit ATs (AT-1500..1504, 1512, 1535, 1551..1553, 1561). spirv-val (AT-1511/1560) green.",
+    "feature_enablement_proof": "AT-1509 (matmul_tile pipeline create with 16-bit storage + VulkanMemoryModel + coopmat features) and AT-1522 (q4km pipeline create with 8-bit storage + Int8/Int16) on the NVIDIA runner are the proof that CRITICAL-2/-3 are fixed — a pipeline-create FAILURE there blocks sign-off."
+  },
+  "acceptance_risk": {
+    "primary_proof_risk": "AT-1510 is load-bearing. Risks: (a) vkCreateComputePipelines fails because VulkanMemoryModel (HN-1) OR storageBuffer16BitAccess (CRITICAL-2) was not enabled — mitigated by the capability→feature table + AT-1509 pipeline-create-before-dispatch; (b) f16 accumulation diverges beyond tol — mitigated by the f32-accumulate-then-round oracle; (c) a transpose/stride bug passes a loose tol — mitigated by the non-symmetric fixture + AT-1512.",
+    "metadata_risk": "CRITICAL-1: the shape is now real metadata, but the HIR derivation (derive_coopmat_shape) must correctly extract K from the mul_add operands. Mitigated: it reuses the M2.1-typechecked operand types (CoopMatrixShapeKind::KDimMismatch already guarantees a.n==b.m). AT-1552 proves the runtime reads the shape from metadata; AT-1553 proves back-compat.",
+    "feature_enablement_risk": "CRITICAL-2/-3: this is the FIRST 8/16-bit dispatch ever (context.rs enables only timelineSemaphore today). Risk: a feature struct's lifetime escapes create_device (borrow trap, WARNING). Mitigated: all feature locals at function scope, unconditional chain assembly, AT-1509/1522 pipeline-create tests catch a missed feature on NVIDIA. Lavapipe laxity could mask a miss — hence the NVIDIA runner is mandatory.",
+    "lavapipe_coverage": "Lavapipe cannot exercise coopmat DISPATCH (no extension) and is LAX about 8/16-bit storage features (may pipeline-create where NVIDIA would fail). The dispatch + feature-enablement correctness is provable ONLY on NVIDIA. Acknowledged hardware-coverage gap; NVIDIA runner mandatory.",
+    "q4km_coopmat_honesty": "The fully-fused dequant->coopmat single kernel is NOT delivered (needs shared[T,N]). M3.1 delivers a plain multi-row q4km matmul (bit-exact everywhere) + a pre-dequantized coopmat bridge (NVIDIA). Staged in scope_decision (OQ-3 accepted).",
+    "cublas_estimate": "Only effective TFLOPS asserted; the >=50% ratio is an external estimate, labeled, not a gate (OQ-5).",
+    "lever_a_regression": "HN-7 audit + AT-1541 guard against any existing test reading back a readonly binding's bytes. Re-landed without the ReBAR bug that forced the M3.0 r2 revert."
+  },
+  "design_md_additions": "## 3.1.13 M3.1 — Cooperative-matrix dispatch + multi-row matmul + GPU-resident benchmark\n\nM3.1 makes the M2.1 cooperative-matrix codegen EXECUTE on real tensor cores for the first time, adds a multi-row Q4_K_M matmul, and builds the GPU-resident benchmark methodology that M3.0's `<1 ms` gate was re-scoped onto (§3.1.12 r2). The emitted coopmat SPIR-V is UNCHANGED from M2.1; M3.1 is a RUNTIME + metadata + kernel + benchmark milestone. The only codegen touch is a mechanical internal-cache-key extension (CoopMatKey gains K + result_type) that leaves the emitted module byte-identical.\n\n### Coopmat shape metadata (HIR → sidecar → runtime)\n\nPreviously the runtime had no way to know a kernel used cooperative matrices or what shape it required: `@cooperative_matrix` was a bare bool, `CoopMatKey` carried no K and no result type, and the metadata sidecar carried nothing coopmat. M3.1 plumbs the shape end-to-end. The HIR derives a kernel-level `CoopMatShape{m,n,k,a/b/c/result element types, scope}` from the body's `matrix[T,M,N,use]` types of the coopmat ops (reusing the M2.1 type-check guarantees, so K = a.n = b.m). The metadata sidecar gains a `coopmat: Option<CoopMatShapeMeta>` field; `CURRENT_SCHEMA_VERSION` is bumped 1→2 and `load_kernel_metadata` accepts both versions (a v1 sidecar with no field deserializes to `None` via `#[serde(default)]`, which is dispatch-identical to a non-coopmat kernel). The runtime builds the required shape FROM the metadata — nothing is hardcoded.\n\n### Device-feature enablement: the capability→feature pass\n\nspirv-val validates a module but does NOT check that the device features its capabilities require are enabled — passing spirv-val does NOT imply `vkCreateComputePipelines` will succeed. M3.1 adds a binding-plan-driven `required_device_features` pass mapping each EMITTED SPIR-V capability to the Vulkan device feature the runtime must enable:\n\n| SPIR-V capability | trigger | Vulkan device feature |\n|---|---|---|\n| VulkanMemoryModel | coopmat op used | VkPhysicalDeviceVulkanMemoryModelFeatures.vulkanMemoryModel (+DeviceScope) |\n| CooperativeMatrixKHR | coopmat op used | VK_KHR_cooperative_matrix ext + VkPhysicalDeviceCooperativeMatrixFeaturesKHR.cooperativeMatrix |\n| StorageBuffer16BitAccess | any f16 SSBO | VkPhysicalDevice16BitStorageFeatures.storageBuffer16BitAccess |\n| StorageBuffer8BitAccess | any u8/i8 SSBO | VkPhysicalDevice8BitStorageFeatures.storageBuffer8BitAccess |\n| Int8 | u8/i8 SSBO / ptr_read_u8 | VkPhysicalDeviceShaderFloat16Int8Features.shaderInt8 |\n| Int16 | f16_bits_to_f32 | VkPhysicalDeviceFeatures.shaderInt16 |\n\nMatmul_tile is the FIRST f16-SSBO kernel ever dispatched (it needs `storageBuffer16BitAccess` on top of the memory-model + coopmat features); the multi-row q4km kernel is the first 8-bit-storage + Int8/Int16 dispatch. The runtime enables the device-SUPPORTED subset of this superset at context creation (all feature-struct locals at function scope so they outlive `create_device`, chain assembled unconditionally), and a kernel that needs a feature the device lacks FAILS CLOSED with the typed `DeviceFeatureUnsupported` skip — never enable-and-hope.\n\n### Preflight, subgroup guard, graceful skip\n\nA preflight queries `vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR` for the device's supported `(M,N,K,AType,BType,CType,ResultType,scope,saturatingAccumulation)` tuples and the `cooperativeMatrix` feature. A pure matcher checks the metadata-derived required shape (16×16×16 f16, Subgroup, non-saturating) against that set. Because matmul_tile is `@workgroup(32,1,1)` and assumes one 32-lane subgroup == one tile, the dispatch path additionally REQUIRES `subgroupSize == 32`; a wave64/SIMD16 device that advertises the shape is SKIPPED (not miscomputed). When unsupported — Lavapipe, software, wrong subgroup size, or the `force_no_coopmat` CI option — the dispatch returns `DispatchError::CoopMatUnsupported` and tests/benches SKIP cleanly. The same single `matmul_tile.axc` SKIPS on Lavapipe and DISPATCHES on NVIDIA Blackwell — the preflight, not the source, decides. The NVIDIA runner is a MANDATORY sign-off gate: an all-device skip of the first-dispatch proof is a milestone FAIL.\n\n### Multi-row Q4_K_M matmul (real workload) — staged honestly\n\n`q4km_dequant_matmul.axc` extends M2.6's single-row matvec to an N-row × M-col output, each invocation computing one output via the proven Q4_K_M dequant dot-product, bit-exact vs a CPU reference for a 256×256 fixture, on Lavapipe AND NVIDIA (a regular, non-ignored GPU test). The TRUE single-kernel `dequant → shared-f16-tile → coopmat` fusion needs `shared[T,N]` (FG.6, deferred to M3.2), so M3.1 delivers two honest pieces: the plain multi-row matmul (the bit-exact deliverable, runs everywhere) plus a pre-dequantized-input coopmat bridge (`q4km_dequant_matmul_coopmat.axc`, NVIDIA-only proof that coopmat runs on a Q4_K_M-derived workload).\n\n### GPU-resident benchmark methodology\n\nThe thesis-relevant metric is **upload weights ONCE to resident VRAM, dispatch N times, measure KERNEL time** — exactly how llama.cpp inference works. M3.1 adds `upload_resident` / `dispatch_resident` / `readback_resident`: inputs are staged once, the descriptor set bound to resident device-local buffers, and each iteration records ONLY the compute submit, timed by `vkCmdWriteTimestamp` × 2 (`elapsed = (end−begin) · timestampPeriod`, each endpoint masked to `timestampValidBits` before subtraction), with a CPU fence-wall fallback recorded in `ResidentDispatchTiming.timing_source`. The N-loop reuses one command buffer, fence, and query pool. The 4096×4096 f32 resident matmul reports **effective TFLOPS** (the honest, reproducible in-tree number); the `≥50%-of-cuBLAS` comparison is an external estimate, labeled as such (the project is CUDA-free by thesis) — only effective TFLOPS is asserted.\n\n### Per-vendor @strategy tile holes and Lever A re-land\n\nTile dimensions are ordinary M2.3 `@strategy` holes; for coopmat variants each candidate is VALIDATED against the preflight supported set (preflight DRIVES selection). Lever A is re-landed cleanly (without the reverted ReBAR Lever B): a binding is read back iff `output_size > 0 && access != ReadOnly`, applied uniformly across all four readback loops; read-only inputs skip the device→staging copy, the HOST_READ barrier, and the invalidate.",
+  "self_check": {
+    "read_claude_md": true,
+    "read_architect_template": true,
+    "read_both_design_reviews": true,
+    "read_prior_architect_spec": true,
+    "read_hir_coopmat_model": true,
+    "read_hir_hir_and_lower_coopmat_flag": true,
+    "read_runtime_metadata_schema": true,
+    "read_codegen_emit_capability_emission": true,
+    "read_q4_0_capability_setting": true,
+    "read_context_feature_chaining": true,
+    "read_matmul_tile_example": true,
+    "read_q4km_matvec_example": true,
+    "read_buffer_ty_needs_storage_helpers": true,
+    "read_driver_metadata_construction": true,
+    "read_error_variant_count": true,
+    "critical_1_metadata_plumbing_specified": true,
+    "critical_2_16bit_storage_feature_specified": true,
+    "critical_3_8bit_int8_int16_feature_specified": true,
+    "critical_4_transpose_fixture_specified": true,
+    "capability_to_feature_table_present": true,
+    "metadata_schema_bump_and_backcompat_specified": true,
+    "subgroup_size_guard_specified": true,
+    "nvidia_runner_mandatory_gate_specified": true,
+    "at_1520_not_ignored": true,
+    "q4km_layout_pinned": true,
+    "cublas_only_effective_tflops_asserted": true,
+    "dispatcherror_count_bumped_to_30": true,
+    "no_implementation_code": true,
+    "spirv_capabilities_confirmed_already_emitted": true,
+    "preserves_existing_public_api_and_bench_ids": true,
+    "respects_50gb_test_memory_cap": true
+  }
+}

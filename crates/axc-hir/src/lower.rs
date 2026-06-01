@@ -15,6 +15,9 @@ use crate::typecheck::typecheck_kernel_body;
 use crate::ty::ScalarTy;
 use crate::buffer::{BufferAccess, BufferTy};
 use crate::param::{KernelParam, Ty as ParamTy, ParamBindingPlan, compute_binding_plan};
+use crate::coopmat::{CoopMatrixShape, CoopMatScopeHir, CoopMatUse};
+use crate::expr::{KernelBodyTyped, HirStmt, HirExprKind};
+use crate::control_flow::HirElse;
 
 /// Lower an AST module to HIR, producing structured errors and warnings.
 ///
@@ -202,16 +205,6 @@ pub fn lower_module(ast: &AstModule) -> (HirModule, Vec<HirError>, Vec<HirWarnin
                     let _ = validate_workgroup_dims(&wg, workgroup_span, &kd.name.node, &mut errors, &mut warnings);
                 }
 
-                let annotations: KernelAnnotations = KernelAnnotations {
-                    workgroup: wg,
-                    intent,
-                    complexity,
-                    preconditions,
-                    subgroup_uniform,
-                    cooperative_matrix,
-                    strategy: strategy_holes_opt,
-                };
-
                 // Lower kernel parameters.
                 let (params, binding_plan) = lower_params(
                     &kd.params,
@@ -221,6 +214,41 @@ pub fn lower_module(ast: &AstModule) -> (HirModule, Vec<HirError>, Vec<HirWarnin
 
                 // Determine body: Empty if trivial (only void return), Typed otherwise.
                 let body = lower_kernel_body(&kd.body.node, &params, &mut errors, &mut warnings);
+
+                // M3.1: Derive coopmat shape from the typechecked body.
+                // Only attempted when the @cooperative_matrix flag is set.
+                let coop_matrix: Option<CoopMatrixShape> = if cooperative_matrix {
+                    match &body {
+                        KernelBody::Typed(typed_body) => {
+                            let shape = derive_coopmat_shape(typed_body);
+                            if shape.is_none() {
+                                warnings.push(HirWarning::CoopMatFlagWithoutOps {
+                                    kernel_name: kd.name.node.clone(),
+                                });
+                            }
+                            shape
+                        }
+                        KernelBody::Empty => {
+                            warnings.push(HirWarning::CoopMatFlagWithoutOps {
+                                kernel_name: kd.name.node.clone(),
+                            });
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                let annotations: KernelAnnotations = KernelAnnotations {
+                    workgroup: wg,
+                    intent,
+                    complexity,
+                    preconditions,
+                    subgroup_uniform,
+                    cooperative_matrix,
+                    coop_matrix,
+                    strategy: strategy_holes_opt,
+                };
 
                 kernels.push(Kernel {
                     id: KernelId(next_id),
@@ -391,6 +419,181 @@ fn lower_scalar_type_ref(str_ref: &ScalarTypeRef) -> ScalarTy {
             panic!("lower_scalar_type_ref: bf16 has no HIR ScalarTy representation; \
                     this path should be unreachable for buffer element types")
         }
+    }
+}
+
+/// M3.1: Derive the cooperative-matrix shape from a typechecked kernel body.
+///
+/// Walks the body for the FIRST `coopmat_mul_add` operation (HirExprKind::CoopMatBuiltin
+/// with op == MulAdd). Extracts M, N, K, element types, and scope from the operand
+/// bindings' `CoopMatKey` values (resolved through `body.bindings`).
+///
+/// Returns `None` if no `coopmat_mul_add` op is found (degenerate kernel).
+///
+/// Relies on M2.1 typecheck guarantees:
+/// - a.n == b.m (KDimMismatch check) — K is derivable from a.n
+/// - All operand uses are correct (AUseMismatch, BUseMismatch, CUseMismatch checks)
+///
+/// The pessimistic reviewer note: operands are `LocalRead(BindingId)` in matmul_tile,
+/// so we must resolve them through `body.bindings`, not just read `HirExpr.ty`.
+fn derive_coopmat_shape(body: &KernelBodyTyped) -> Option<CoopMatrixShape> {
+    // Find the first coopmat_mul_add by searching all statements recursively.
+    let mul_add_expr = find_first_mul_add_in_stmts(&body.stmts)?;
+
+    // Extract the three argument expressions (a, b, c).
+    let (a_key, b_key, c_key) = match mul_add_expr {
+        HirExprKind::CoopMatBuiltin { op: crate::coopmat::CoopMatBuiltin::MulAdd, args, .. } => {
+            if args.len() != 3 {
+                return None;
+            }
+            let a_key = resolve_coopmat_key_from_expr(&args[0], body)?;
+            let b_key = resolve_coopmat_key_from_expr(&args[1], body)?;
+            let c_key = resolve_coopmat_key_from_expr(&args[2], body)?;
+            (a_key, b_key, c_key)
+        }
+        _ => return None,
+    };
+
+    // Validate: a must be MatrixA, b must be MatrixB, c must be Accumulator.
+    // (These should be guaranteed by typecheck, but we check defensively.)
+    if a_key.use_ != CoopMatUse::MatrixA {
+        return None;
+    }
+    if b_key.use_ != CoopMatUse::MatrixB {
+        return None;
+    }
+    if c_key.use_ != CoopMatUse::Accumulator {
+        return None;
+    }
+
+    // M = a.m, N = b.n, K = a.n (== b.m per KDimMismatch typecheck guarantee).
+    let m = a_key.m;
+    let n = b_key.n;
+    let k = a_key.n; // == b_key.m guaranteed by typecheck
+
+    Some(CoopMatrixShape {
+        m,
+        n,
+        k,
+        a_elem: a_key.elem,
+        b_elem: b_key.elem,
+        c_elem: c_key.elem,
+        result_type: c_key.elem, // accumulator elem IS the result type
+        scope: CoopMatScopeHir::Subgroup, // M3.1 always emits Subgroup scope
+    })
+}
+
+/// Resolve the `CoopMatKey` for a cooperative-matrix expression.
+///
+/// Handles the common case where the expression is a `LocalRead(BindingId)` — the
+/// typical form in matmul_tile (`let a: matrix[...] = ...; coopmat_mul_add(a, b, acc)`).
+/// The binding's type (a `BindingTy::CoopMatrix(CoopMatKey)`) carries M, N, use, elem.
+fn resolve_coopmat_key_from_expr(
+    expr: &crate::expr::HirExpr,
+    body: &KernelBodyTyped,
+) -> Option<crate::coopmat::CoopMatKey> {
+    match &expr.kind {
+        HirExprKind::LocalRead(binding_id) => {
+            // Resolve through the bindings table.
+            body.bindings.iter().find(|b| b.id == *binding_id).and_then(|binding| {
+                binding.ty.as_coopmat()
+            })
+        }
+        HirExprKind::CoopMatBuiltin { result_ty, .. } => {
+            // Inline coopmat expression (less common but supported).
+            Some(*result_ty)
+        }
+        _ => None,
+    }
+}
+
+/// Recursively search a list of HIR statements for the first `coopmat_mul_add`.
+///
+/// Returns a reference to the `HirExprKind` of the first MulAdd found.
+fn find_first_mul_add_in_stmts(stmts: &[HirStmt]) -> Option<&HirExprKind> {
+    for stmt in stmts {
+        if let Some(kind) = find_mul_add_in_stmt(stmt) {
+            return Some(kind);
+        }
+    }
+    None
+}
+
+/// Search a `HirElse` arm for the first `coopmat_mul_add`.
+fn find_mul_add_in_else_arm(else_arm: &HirElse) -> Option<&HirExprKind> {
+    match else_arm {
+        HirElse::Block(stmts) => find_first_mul_add_in_stmts(stmts),
+        HirElse::If(hir_if) => {
+            find_mul_add_in_expr(&hir_if.cond)
+                .or_else(|| find_first_mul_add_in_stmts(&hir_if.then_block))
+                .or_else(|| match &hir_if.else_arm {
+                    Some(inner) => find_mul_add_in_else_arm(inner),
+                    None => None,
+                })
+        }
+    }
+}
+
+/// Search a single HIR statement for the first `coopmat_mul_add`.
+fn find_mul_add_in_stmt(stmt: &HirStmt) -> Option<&HirExprKind> {
+    match stmt {
+        HirStmt::Let { init, .. } => find_mul_add_in_expr(init),
+        HirStmt::Assign { value, .. } => find_mul_add_in_expr(value),
+        HirStmt::If(hir_if) => {
+            find_mul_add_in_expr(&hir_if.cond)
+                .or_else(|| find_first_mul_add_in_stmts(&hir_if.then_block))
+                .or_else(|| match &hir_if.else_arm {
+                    Some(else_arm) => find_mul_add_in_else_arm(else_arm),
+                    None => None,
+                })
+        }
+        HirStmt::ForRange(for_range) => {
+            find_first_mul_add_in_stmts(&for_range.body)
+        }
+        HirStmt::While(while_) => {
+            find_mul_add_in_expr(&while_.cond)
+                .or_else(|| find_first_mul_add_in_stmts(&while_.body))
+        }
+        HirStmt::CoopMatStore { .. }
+        | HirStmt::BufferWrite { .. }
+        | HirStmt::Return { .. }
+        | HirStmt::Break { .. }
+        | HirStmt::Continue { .. }
+        | HirStmt::Barrier { .. } => None,
+    }
+}
+
+/// Search a HIR expression for the first `coopmat_mul_add`.
+fn find_mul_add_in_expr(expr: &crate::expr::HirExpr) -> Option<&HirExprKind> {
+    match &expr.kind {
+        HirExprKind::CoopMatBuiltin { op: crate::coopmat::CoopMatBuiltin::MulAdd, .. } => {
+            Some(&expr.kind)
+        }
+        HirExprKind::CoopMatBuiltin { args, .. } => {
+            args.iter().find_map(find_mul_add_in_expr)
+        }
+        HirExprKind::Unary { operand, .. } => find_mul_add_in_expr(operand),
+        HirExprKind::Binary { lhs, rhs, .. } => {
+            find_mul_add_in_expr(lhs).or_else(|| find_mul_add_in_expr(rhs))
+        }
+        HirExprKind::ShortCircuit { lhs, rhs, .. } => {
+            find_mul_add_in_expr(lhs).or_else(|| find_mul_add_in_expr(rhs))
+        }
+        HirExprKind::BitwiseBuiltin { args, .. } => {
+            args.iter().find_map(find_mul_add_in_expr)
+        }
+        HirExprKind::BufferRead { index, .. } => find_mul_add_in_expr(index),
+        HirExprKind::SubgroupBuiltin { args, .. } => {
+            args.iter().find_map(find_mul_add_in_expr)
+        }
+        HirExprKind::Q4_0Builtin { args, .. } => {
+            args.iter().find_map(find_mul_add_in_expr)
+        }
+        HirExprKind::IntLit { .. }
+        | HirExprKind::FloatLit { .. }
+        | HirExprKind::BoolLit(_)
+        | HirExprKind::LocalRead(_)
+        | HirExprKind::GidBuiltin { .. } => None,
     }
 }
 

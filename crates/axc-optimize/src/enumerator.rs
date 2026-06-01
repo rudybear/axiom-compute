@@ -175,6 +175,7 @@ pub fn resolve_single_variant(
         preconditions: kernel.annotations.preconditions.clone(),
         subgroup_uniform: kernel.annotations.subgroup_uniform,
         cooperative_matrix: kernel.annotations.cooperative_matrix,
+        coop_matrix: kernel.annotations.coop_matrix,
         // Resolution clears strategy → None so codegen backstop is satisfied.
         strategy: None,
     };
@@ -244,6 +245,7 @@ mod tests {
                 preconditions: Vec::new(),
                 subgroup_uniform: false,
                 cooperative_matrix: false,
+                coop_matrix: None,
                 strategy: if holes_map.is_empty() {
                     None
                 } else {
