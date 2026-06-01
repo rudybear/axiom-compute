@@ -122,8 +122,9 @@ fn metadata_schema_mismatch_rejected() {
 
     let result = load_kernel_metadata(&path);
     match result {
-        Err(axc_runtime::DispatchError::MetadataSchemaMismatch { got: 99, supported: 1 }) => {}
-        other => panic!("expected MetadataSchemaMismatch{{got:99, supported:1}}, got: {other:?}"),
+        // M3.1: CURRENT_SCHEMA_VERSION is now 2; this test uses schema_version=99 which is rejected.
+        Err(axc_runtime::DispatchError::MetadataSchemaMismatch { got: 99, supported: 2 }) => {}
+        other => panic!("expected MetadataSchemaMismatch{{got:99, supported:2}}, got: {other:?}"),
     }
 
     let _ = std::fs::remove_file(&path);

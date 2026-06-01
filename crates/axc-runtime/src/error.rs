@@ -276,7 +276,7 @@ pub enum DispatchError {
     /// device creation).
     ///
     /// Callers should SKIP the kernel on this device. NOT a fatal dispatch failure.
-    #[error("device feature {feature} required by kernel '{kernel}' is not enabled/available")]
+    #[error("device feature '{feature}' required by kernel '{kernel}' is not supported or not enabled")]
     DeviceFeatureUnsupported {
         /// Name of the missing feature (e.g. `"storageBuffer16BitAccess"`).
         feature: String,
