@@ -1,0 +1,89 @@
+{
+  "verdict": "IMPLEMENTED",
+  "agent": "coder",
+  "milestone_id": "M3.1.5-resident-bench",
+  "revision": "r1",
+  "files_created": [
+    "crates/axc-runtime/tests/resident_timing.rs"
+  ],
+  "files_modified": [
+    "examples/matmul_f32_tiled.axc",
+    "crates/axc-driver/src/lib.rs",
+    "crates/axc-driver/tests/at1560_spirv_val_all_m31.rs",
+    "crates/axc-driver/benches/resident_matmul.rs",
+    "crates/axc-runtime/src/resident.rs",
+    "crates/axc-runtime/src/context.rs"
+  ],
+  "public_apis_implemented": [
+    "pub fn VulkanContext::upload_resident(&self, handle: &KernelHandle, inputs: &[&[u8]], output_sizes: &[u64]) -> DispatchResult<ResidentBuffers>",
+    "pub fn VulkanContext::dispatch_resident(&self, handle: &KernelHandle, resident: &ResidentBuffers, cfg: &ResidentBenchConfig) -> DispatchResult<ResidentDispatchTiming>",
+    "pub fn VulkanContext::readback_resident(&self, handle: &KernelHandle, resident: &ResidentBuffers, output_sizes: &[u64]) -> DispatchResult<Vec<Vec<u8>>>",
+    "pub fn VulkanContext::prepare_kernel_checked(&self, spirv: &[u32], binding_plan: &ParamBindingPlan, push_constant_total_bytes: u32, entry_point: &str, coopmat: Option<&CoopMatShapeMeta>, kernel_name: &str) -> Result<KernelHandle, DispatchError>",
+    "pub(crate) fn select_timing_source(valid_bits: u32, period: f32) -> ResidentTimingSource",
+    "pub fn ResidentBuffers::command_buffer_handle(&self) -> vk::CommandBuffer",
+    "pub fn ResidentBuffers::fence_handle(&self) -> vk::Fence",
+    "pub fn ResidentBuffers::query_pool_handle(&self) -> vk::QueryPool",
+    "pub fn ResidentBuffers::device_local_buf_handles(&self) -> Vec<vk::Buffer>",
+    "DriverError::UnsupportedCoopmatScalar { ty: String }"
+  ],
+  "tests_written": [
+    "AT-1573 (resident_timing.rs in resident.rs unit tests): select_timing_source pure unit test",
+    "AT-1535 (resident.rs unit tests): masked_timestamp_delta boundary (pre-existing, confirmed passing)",
+    "AT-1575 (lib.rs tests): scalar_ty_to_coopmat_scalar_meta no-panic",
+    "AT-1576 (lib.rs tests): matmul_f32_tiled compiles without @strategy holes",
+    "AT-1578 (context.rs tests): preflight_kernel_support isolation — deterministic first-missing feature",
+    "AT-1578b (context.rs tests): coopmat preflight with synthetic metadata",
+    "AT-1530 (resident_timing.rs): resident dispatch span < host round-trip (GpuTimestamp path); CpuFenceWall graceful fallback — #[ignore]",
+    "AT-1531 (resident_timing.rs): resident dispatch over saxpy + coopmat matmul_tile — #[ignore]",
+    "AT-1570 (resident_timing.rs): resident round-trip matches dispatch_handle — #[ignore]",
+    "AT-1571 (resident_timing.rs): CB/fence/query_pool/bufs reused across N dispatches — #[ignore]",
+    "AT-1572 (resident_timing.rs): readback Lever A skips readonly bindings — #[ignore]",
+    "AT-1579 (resident_timing.rs): dispatch_resident rejects out-of-range workgroups — #[ignore]"
+  ],
+  "cargo_check_status": "pass",
+  "cargo_clippy_status": "pass",
+  "cargo_test_status": "pass — all non-ignored tests pass; ignored GPU tests compile and are gated on AXC_ENABLE_GPU_TESTS=1",
+  "bench_build_status": "pass — cargo bench --no-run -p axc-driver --bench resident_matmul succeeds",
+  "bench_ids": [
+    "resident_timing_kernels/saxpy",
+    "resident_timing_kernels/q4km_matvec",
+    "resident_timing_kernels/q4km_matmul",
+    "resident_timing_kernels/matmul_tile_coopmat",
+    "naive_gemm_harness_validation",
+    "dispatch_resident_matmul_tile"
+  ],
+  "git_commits": [
+    "a19362d fix(examples): remove inert @strategy holes from matmul_f32_tiled (HANDOFF-0)",
+    "87588e0 feat(driver): panic→typed error in scalar_ty_to_coopmat_scalar_meta (D, M3.1.5)",
+    "24602e7 feat(runtime): implement upload/dispatch/readback_resident + timing (M3.1.5)",
+    "871e0a9 feat(runtime): add prepare_kernel_checked + preflight_kernel_support (M3.1.5)",
+    "39a800e test(runtime): resident-timing integration tests AT-1530/1531/1570/1571/1572/1579",
+    "b56ccaa feat(bench): rework resident_matmul bench with honest scope (HONESTY-1, M3.1.5)"
+  ],
+  "self_assessment": {
+    "spec_coverage": "All items from M3.1.5-architect.json r1 implemented. HANDOFF-0 through HANDOFF-17 addressed. Both design reviewer coder notes (stale at1560 test fix; resident.rs line 17 + GpuTimestamp doc comment reword) applied.",
+    "known_limitations": [
+      "AT-1580 (partial cleanup) is a QA diff-read item — no fault-injection seam exists on real GPU hardware, so this remains a manual audit checkpoint rather than an automated test. Every early-return Err in upload_resident calls cleanup_partial_resident or explicit teardown; QA should read each path against the diff.",
+      "AT-1574 (prepare_kernel_checked typed skip on capability device) is tested via pure unit tests (AT-1578/AT-1578b) that exercise the preflight logic without GPU. The full integration path (prepare_kernel_checked on a coopmat kernel where the device truly lacks support) is covered in AT-1531 (typed-skip on Lavapipe) which runs under AXC_ENABLE_GPU_TESTS=1.",
+      "The bench q4km matvec/matmul resident benches use simplified 64-byte block size which may not match the exact Q4_K_M block layout. The headline resident_timing_kernels bench is primarily for harness validation; accurate Q4_K_M timings will be profiled on NVIDIA by the orchestrator."
+    ],
+    "deviations": [
+      "The resident.rs module uses three crate-level #![allow] annotations (clippy::manual_inspect, clippy::drain_collect, clippy::needless_range_loop) because the partial-failure cleanup closures require tracking multiple owned Vecs across error paths — the alternative enumerate/inspect_err patterns would obscure the CORRECTNESS-2 cleanup ordering that QA must audit against AT-1580. All three are documented with why-comments.",
+      "AT-1581 label guard is implemented as an inline assert inside the bench iteration closure (bench can only print to stderr; assert guards the label invariant). A separate substring check would require capturing stderr output which Criterion benches do not support."
+    ],
+    "timing_honesty_verification": {
+      "module_header_reworded": true,
+      "GpuTimestamp_doc_reworded": "GPU dispatch duration (submit-to-completion timestamp span; excludes host upload/readback; includes dispatch launch + pipeline latency)",
+      "CpuFenceWall_never_quoted_as_kernel_time": true,
+      "warmup_mandatory_in_dispatch_resident": "No — warmup-discard is a CALLER RESPONSIBILITY (the spec says 2 untimed warm-up dispatch_resident calls discarded by benches/tests). dispatch_resident itself measures ONE dispatch per call. The bench helper resident_min_of_n enforces N_WARMUP=2 before the measured loop. AT-1530 also enforces N_WARMUP=2.",
+      "select_timing_source_pure_and_tested": "AT-1573 passes",
+      "no_competitive_matmul_tflops": "resident_timing_kernels prints ns + timing_source, NO TFLOPS/cuBLAS. naive_gemm_harness_validation prints an explicitly labeled TFLOPS with mandatory qualifiers."
+    },
+    "correctness_verification": {
+      "independent_descriptor_set": "ResidentBuffers owns its own descriptor_pool+set; dispatch_resident binds resident.descriptor_set NOT handle.inner.descriptor_set. HANDOFF-9 comment present. AT-1570 would fail if this regressed.",
+      "workgroup_guard_in_dispatch_resident": "dispatch_resident checks cfg.workgroups against max_compute_work_group_count BEFORE any GPU work. AT-1579 tests this.",
+      "partial_cleanup_in_upload_resident": "cleanup_partial_resident called at every early-return Err after the first allocation; transient upload staging freed on its own error paths; ResidentBuffers only constructed when all objects exist. AT-1580 is a QA diff-read checkpoint.",
+      "HN6_query_reset_ordering": "cmd_reset_query_pool is the FIRST recorded command in dispatch_resident CB, before any write_timestamp. Only on GpuTimestamp path."
+    }
+  }
+}

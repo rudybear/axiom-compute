@@ -1,0 +1,96 @@
+{
+  "verdict": "APPROVE",
+  "agent": "optimistic_design_reviewer",
+  "milestone_id": "M3.1.5-resident-bench",
+  "revision": "r1",
+  "re_review_of": "r0 (APPROVED) — Pessimistic reviewer issued NEEDS_REVISION; this is the r1 re-review",
+  "issue_resolution_check": {
+    "HONESTY-1_matmul_tflops_misrepresentation": {
+      "original_issue": "matmul_f32_tiled.axc @strategy{tile_m,tile_n} holes are inert (never referenced in kernel body); bench was labeled 'matmul TFLOPS' / 'AXIOM-Compute matmul performance'",
+      "resolution_in_spec": "RESOLVED. r1 reframes the milestone deliverable to the RESIDENT-TIMING METHODOLOGY (not a competitive matmul number). The headline bench is now `resident_timing_kernels` reporting kernel-only ns over EXISTING real kernels (saxpy, q4km matvec/matmul, coopmat matmul_tile). The naive GEMM bench is RENAMED `naive_gemm_harness_validation` and its printed line explicitly states 'NAIVE un-tiled scalar f32 GEMM (harness validation only — NOT an optimized matmul; expect low single-digit % of cuBLAS; real tiling is M3.2)'. AT-1581 guards that the printed string contains 'NAIVE' and 'harness validation' so the label cannot silently regress. The example file fix (remove @strategy line, reword header/intent) is mandated as HANDOFF-0 and appears in files_to_modify for matmul_f32_tiled.axc. Competitive matmul TFLOPS is explicitly deferred to M3.2.",
+      "verified_in_example_file": "The example file (matmul_f32_tiled.axc) still contains the old @strategy line and comments AT DESIGN TIME — but this is expected: the file is in files_to_modify and HANDOFF-0 is the Coder's FIRST task. AT-1576 regression-gates that the file compiles without a @strategy block after the edit. The spec is correct; execution is the Coder's phase.",
+      "status": "RESOLVED_IN_SPEC"
+    },
+    "TIMING-1_honest_labeling": {
+      "original_issue": "TOP_OF_PIPE->BOTTOM_OF_PIPE span incorrectly called 'kernel-only ALU time'; CpuFenceWall quoted as kernel time; warmup only recommended not mandatory",
+      "resolution_in_spec": "RESOLVED. r1 renames the measured quantity to 'GPU dispatch duration — TOP_OF_PIPE→BOTTOM_OF_PIPE timestamp span covering the single dispatch; EXCLUDES host upload/readback; INCLUDES dispatch launch + pipeline latency'. Module header reword is explicitly mandated (HANDOFF-16). Warmup-discard elevated to MANDATORY: 2 untimed warm-up dispatches, report MIN-of-N (N=10 bench, N>=3 AT-1530). CpuFenceWall is explicitly labeled '— scheduling-inclusive, NOT a GPU kernel time' everywhere it appears (AT-1582 guards). Query pool is NOT created when timestampValidBits==0 OR timestampPeriod==0 (per HANDOFF-3 / select_timing_source helper), so no vkCmdWriteTimestamp is ever recorded on a 0-valid-bits queue.",
+      "status": "RESOLVED_IN_SPEC"
+    },
+    "CORRECTNESS-1_workgroup_guard": {
+      "original_issue": "dispatch_resident lacked a workgroup-count check; guard was only in the bench, not in the library method; any non-bench caller of dispatch_resident could trigger an out-of-range validation error or hang",
+      "resolution_in_spec": "RESOLVED. dispatch_resident now calls the existing validate_request workgroup guard (max_compute_work_group_count check) on cfg.workgroups at the TOP of the method, BEFORE any GPU work, returning DispatchError::WorkgroupCountExceedsDeviceLimit. Guard lives in the LIBRARY METHOD, not in callers. AT-1579 added (pure/Lavapipe-testable: out-of-range workgroups rejected). The bench pre-shrink is retained as a friendly UX check but is now subsumed by the library guard.",
+      "status": "RESOLVED_IN_SPEC"
+    },
+    "CORRECTNESS-2_upload_partial_failure_cleanup": {
+      "original_issue": "No RAII guard for partially-created Vulkan objects inside upload_resident; a failure mid-allocation would leak device-local buffers, descriptor pool, staging buffers, etc.",
+      "resolution_in_spec": "RESOLVED. upload_resident builds persistent objects into local Options; an explicit cleanup_partial_resident helper (CORRECTNESS-2, HANDOFF-8) destroys already-created objects in REVERSE creation order (query_pool, fence, command_pool, descriptor_pool, staging_bufs, device_local_bufs) at every early-return Err after the first allocation. Transient upload staging buffer and transient CB/pool are freed on their own error paths. ResidentBuffers is constructed ONLY when ALL objects exist, so Drop never double-frees. AT-1580 documents the cleanup-ordering contract for QA to verify against the diff.",
+      "status": "RESOLVED_IN_SPEC"
+    },
+    "PREFLIGHT_additive_decision": {
+      "original_issue": "prepare_kernel_checked additive vs folding in — spec must switch bench/tests to checked variant and stop claiming the gap is 'closed' for raw prepare_kernel callers",
+      "resolution_in_spec": "RESOLVED. Decision is documented and justified: folding in would break prepare_kernel's signature (it lacks coopmat/kernel_name params). prepare_kernel_checked is ADDITIVE. Driver/bench/test paths SWITCHED to checked variant (HANDOFF-10/11). Milestone summary explicitly states the gap is 'closeable opt-in', not 'closed'. Future milestone may fold in once KernelHandleInner carries the coopmat shape.",
+      "status": "RESOLVED_IN_SPEC"
+    },
+    "WARNING_warmup_mandatory": {
+      "original_issue": "Warmup was 'RECOMMENDED'; should be MANDATORY to prevent first-iter outlier skewing AT-1530",
+      "resolution_in_spec": "ELEVATED TO MANDATORY. 2 untimed warm-up dispatch_resident calls discarded, MIN-of-N reported. HANDOFF-12 explicit. AT-1530 updated to discard warm-up before the measured samples. Open_question shows RESOLVED.",
+      "status": "RESOLVED_IN_SPEC"
+    },
+    "WARNING_cpufencewall_labeling": {
+      "original_issue": "CpuFenceWall number returned under same kernel_ns field; bench/AT-1530 could quote it as a kernel time",
+      "resolution_in_spec": "RESOLVED via AT-1582 and HANDOFF-13. If timing_source==CpuFenceWall, bench appends '— scheduling-inclusive, NOT a GPU kernel time'. AT-1530 skips the smaller-than assertion on Lavapipe. The GpuTimestamp enum comment in resident.rs still says 'Accurate kernel-only time' — acceptable given the surrounding caveats, but the Coder should harmonize with the module-header reword per HANDOFF-16.",
+      "status": "RESOLVED_IN_SPEC",
+      "minor_note": "ResidentTimingSource::GpuTimestamp doc comment ('Accurate kernel-only time') is slightly optimistic vs the module-header reword ('GPU dispatch duration, includes pipeline latency') — but this is a minor documentation drift that does not affect correctness; HANDOFF-16 covers module-header prose and the Coder can align the enum comment at the same time."
+    },
+    "WARNING_query_pool_on_zero_validbits": {
+      "original_issue": "Query pool was created unconditionally; on devices with timestampValidBits==0 recording vkCmdWriteTimestamp is a validation error",
+      "resolution_in_spec": "RESOLVED. Per HANDOFF-3: when select_timing_source(valid_bits, period)==CpuFenceWall, the query pool is NOT created in upload_resident (query_pool = vk::QueryPool::null()) and NO vkCmdWriteTimestamp is recorded in dispatch_resident. The timing source is decided ONCE from snapshotted valid_bits/period at upload time.",
+      "status": "RESOLVED_IN_SPEC"
+    },
+    "FIELD_DOC_FIX": {
+      "original_issue": "resident.rs uses_coopmat field comment incorrectly says 'shaderInt16 (for diagnostics)'",
+      "resolution_in_spec": "Explicitly mandated in HANDOFF-16 and FIELD-DOC-FIX changelog entry. Coder fixes to 'Diagnostic-only: whether these buffers back a coopmat kernel. Set false in M3.1.5 (handle carries no coopmat flag).' Confirmed needed — current resident.rs line 104 reads: 'Whether these buffers need shaderInt16 (for diagnostics).'",
+      "status": "MANDATED_FOR_CODER"
+    }
+  },
+  "strengths": [
+    "HONESTY-1 resolution is thorough and structurally sound: the milestone deliverable is correctly reframed as the resident-timing methodology, NOT a competitive matmul number. The two-bench split (resident_timing_kernels for honest ns, naive_gemm_harness_validation with mandatory labeling) is the minimal clean fix that preserves all existing machinery while making the thesis-honesty violation impossible to reintroduce silently (AT-1581 is a label guard, not just a documentation note).",
+    "TIMING-1 resolution is precise: the terminology shift from 'kernel-only ALU time' to 'GPU dispatch duration (TOP→BOTTOM, includes pipeline latency, excludes upload/readback)' is accurate and matches Vulkan spec §18.2 semantics. The 'measured quantity vs dispatch_handle' framing gives a clear, honest interpretation of what the timing proves. External validation: Khronos Vulkan-Samples timestamp_queries sample uses the identical TOP_OF_PIPE→BOTTOM_OF_PIPE pattern with the same prose (https://github.com/KhronosGroup/Vulkan-Samples/blob/main/samples/performance/timestamp_queries/timestamp_queries.cpp).",
+    "CORRECTNESS-1 guard placement in the library (dispatch_resident) rather than only in callers is the correct API-safety decision. validate_request's workgroup branch is already proven in AT-1519+; moving it into dispatch_resident means every future caller is protected without needing to remember a pre-check. AT-1579 is Lavapipe-testable and does not require an oversized GPU.",
+    "CORRECTNESS-2 explicit cleanup_partial_resident helper is the correct pattern over incremental RAII: it makes the cleanup order AUDITABLE (QA can grep for each early return) without requiring Option-wrapped fields in a struct whose Drop already handles the fully-constructed case. Reverse-creation-order teardown is the standard Vulkan object lifecycle requirement (Vulkan spec §3.3.3 Object Lifetime). AT-1580 as a QA diff-read item is an honest acknowledgment that full fault-injection testing is impractical on real GPU hardware.",
+    "The select_timing_source(valid_bits, period) pure helper gives a deterministic, unit-testable boundary for the GpuTimestamp/CpuFenceWall decision (AT-1573). Snapshotting the values at upload time means a single ResidentBuffers never flips paths mid-life — no stale-result hazard across the N-iteration dispatch loop.",
+    "prepare_kernel_checked additive design with a factored preflight_kernel_support private helper (HANDOFF-10) cleanly separates the safety check from the Vulkan object creation. The HONEST gap statement ('closeable opt-in, not universally closed') is accurate and prevents the milestone summary from overclaiming. AT-1574/1578 test the preflight in isolation without GPU.",
+    "AT-1577 regression gate (cargo test + clippy -D warnings + bench builds + bench IDs match honest set + spirv-val unchanged) is a comprehensive, automatable exit criterion that catches any drift back toward the misleading matmul_tflops_4096 bench ID.",
+    "OPT-NOTE-2 (transient upload staging vs retained readback staging, no aliasing) and OPT-NOTE-3 (readback call-order contract: upload→dispatch(s)→readback) are correctly documented as spec-level contracts with // comment requirements, reducing the chance of Coder confusion on the staging buffer lifecycle.",
+    "The 50 GB cap assertion is correctly placed in the bench (not the library), consistent with CLAUDE.md hard rule #1 and HANDOFF-12/OPT-NOTE-4. 4096² f32 ×3 ≈ 192 MB is trivially under the cap."
+  ],
+  "concerns": [
+    "Minor: resident.rs module header still reads 'kernel-only timing' on line 17 ('giving kernel-only timing') and ResidentTimingSource::GpuTimestamp doc still reads 'Accurate kernel-only time' on line 56. HANDOFF-16 mandates rewording lines 21-34; the Coder should extend that reword to line 17 and the enum doc to align with the honest 'GPU dispatch duration' framing. This is a prose drift risk, not a correctness risk — the runtime behavior is governed by select_timing_source, not the comment.",
+    "Minor: AT-1530 description says 'timing_source==GpuTimestamp AND min kernel_ns < measured dispatch_handle wall ns (margin)' — the 'margin' is unspecified. To prevent flakiness, the Coder should use a concrete relative margin (e.g., kernel_ns < 0.5 * dispatch_handle_ns) that is wide enough to be robust across GPU frequency states but narrow enough to catch a regression where upload/readback time is inadvertently included. The spec doesn't pin the margin; QA should flag if the test is written with a tight absolute margin.",
+    "Minor: The open_question 'RESOLVED (warmup)' entry says 'report MIN-of-N (N=10 bench, N>=3 AT-1530)' but N=3 is a very small sample for a GPU timing assertion on a real device under clock-management variability. This is acceptable for a design review pass but QA and the pessimistic code reviewer should verify the Coder uses N>=5 post-warmup samples for AT-1530 to avoid a single-outlier flake on NVIDIA Blackwell under boost-clock ramp."
+  ],
+  "validation_against_existing": [
+    "Vulkan spec §18.2 (Query Operations): vkCmdResetQueryPool must appear in the same CB before vkCmdWriteTimestamp — HANDOFF-2 explicitly mandates cmd_reset_query_pool as the FIRST recorded command. The spec has removed the query-pool-created-unconditionally defect by tying creation to select_timing_source==GpuTimestamp (HANDOFF-3). https://registry.khronos.org/vulkan/specs/latest/html/vkspec.html#queries-operation-time",
+    "Vulkan spec §3.3.3 (Object Lifetime): objects must be destroyed before their parent; cleanup_partial_resident reverse-creation-order teardown honors this. The fully-constructed Drop (resident.rs:127-162) already does this correctly and is unchanged. https://registry.khronos.org/vulkan/specs/latest/html/vkspec.html#fundamentals-objectmodel-lifetime",
+    "KhronosGroup/Vulkan-Samples timestamp_queries: uses TOP_OF_PIPE→BOTTOM_OF_PIPE span for 'GPU execution time of a single draw/dispatch', same convention as r1 spec. The sample's prose calls it 'execution time' (not ALU time) — matching the r1 'GPU dispatch duration' label. https://github.com/KhronosGroup/Vulkan-Samples/blob/main/samples/performance/timestamp_queries/timestamp_queries.cpp",
+    "NVIDIA Nsight documentation on timestampPeriod==0 behavior (e.g., Lavapipe / Mesa software): the driver returns 0 for timestampPeriod when GPU timestamps are not meaningful; vkCmdWriteTimestamp on a queue with timestampValidBits==0 is explicitly undefined behavior per the spec. r1's gate (select_timing_source returns CpuFenceWall when period==0 OR valid_bits==0, no query pool created) is the correct portable workaround. https://docs.nvidia.com/nsight-systems/",
+    "llama.cpp Vulkan backend (ggml-org/llama.cpp#16230, #17273): the resident-timing methodology (upload weights once, dispatch N times, time only the dispatch span) directly mirrors how production Vulkan inference benchmarks measure kernel throughput vs host-overhead-inclusive wall time. This framing is validated by the llama.cpp beachhead rationale in CLAUDE.md.",
+    "Sakana AI CUDA Engineer / STARK prior art: the project thesis (annotation-first verified intent) is reinforced by r1's HONESTY-1 fix — presenting a naive un-tiled scalar GEMM as 'matmul TFLOPS' would be exactly the label-gaming those systems are vulnerable to. r1 eliminates this by mandatory labeling and deferring competitive numbers to a properly-tiled M3.2 kernel."
+  ],
+  "external_references": [
+    "https://registry.khronos.org/vulkan/specs/latest/html/vkspec.html#queries-operation-time",
+    "https://registry.khronos.org/vulkan/specs/latest/html/vkspec.html#fundamentals-objectmodel-lifetime",
+    "https://github.com/KhronosGroup/Vulkan-Samples/blob/main/samples/performance/timestamp_queries/timestamp_queries.cpp",
+    "https://docs.nvidia.com/nsight-systems/",
+    "https://registry.khronos.org/vulkan/specs/latest/html/vkspec.html#descriptorsets-sets",
+    "https://github.com/EmbarkStudios/rust-gpu",
+    "https://github.com/gfx-rs/rspirv"
+  ],
+  "test_adequacy": "SUFFICIENT",
+  "test_suggestions": [
+    "AT-1530 N>=3 post-warmup samples: consider raising to N>=5 in the test (N=10 is already specified for the bench). Three samples on a real GPU under boost-clock management is borderline; five gives more confidence in the MIN-of-N assertion.",
+    "AT-1530 margin: the spec says 'kernel_ns < measured dispatch_handle wall ns (margin)' without pinning the margin. Recommend Coder uses kernel_ns < dispatch_handle_ns / 2 (50% headroom) — wide enough to survive clock ramp, narrow enough to catch a regression where upload time leaks into the resident measurement.",
+    "HANDOFF-16 reword scope: Coder should extend the module-header reword to resident.rs line 17 ('giving kernel-only timing') and ResidentTimingSource::GpuTimestamp doc comment ('Accurate kernel-only time') to match the honest 'GPU dispatch duration' language, not just lines 21-34."
+  ],
+  "summary": "All five issues raised by the Pessimistic reviewer are fully and correctly addressed in r1: HONESTY-1 (inert @strategy holes, misleading TFLOPS label) is resolved by reframing the milestone to the resident-timing methodology and mandating explicit 'NAIVE / harness validation only' labeling with AT-1581 as a regression guard; TIMING-1 (honest timing semantics, mandatory warmup, CpuFenceWall falleling) is resolved by precise prose, mandatory warmup-discard, AT-1582 label guard, and query-pool creation gated on select_timing_source; CORRECTNESS-1 (workgroup guard) moves the check into the library method with AT-1579; CORRECTNESS-2 (partial-failure cleanup) adds cleanup_partial_resident with reverse-order teardown and AT-1580 QA audit; and the PREFLIGHT decision is honestly documented as 'closeable opt-in, not universally closed'. Remaining concerns are minor prose drifts and a recommendation to raise AT-1530's sample count — neither blocks implementation. The r1 spec is ready to proceed to Coder."
+}

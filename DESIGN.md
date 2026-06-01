@@ -613,6 +613,20 @@ The thesis-relevant metric is **upload weights ONCE to resident VRAM, dispatch N
 ### Per-vendor @strategy tile holes and Lever A re-land
 
 Tile dimensions are ordinary M2.3 `@strategy` holes; for coopmat variants each candidate is VALIDATED against the preflight supported set (preflight DRIVES selection). Lever A is re-landed cleanly (without the reverted ReBAR Lever B): a binding is read back iff `output_size > 0 && access != ReadOnly`, applied uniformly across all four readback loops; read-only inputs skip the device→staging copy, the HOST_READ barrier, and the invalidate.
+
+### 3.1.13 (M3.1.5) — resident benchmark COMPLETED + honest reframe
+
+M3.1 shipped the resident benchmark as a typed skeleton (struct/Drop/timestamp-masking) with the three `*_resident` methods stubbed. **M3.1.5 implements them** and corrects an honesty overreach in the paragraph above. Measured on the NVIDIA RTX PRO 6000 (all `GpuTimestamp`, zero `CpuFenceWall`):
+
+| kernel | resident kernel-only span | host-round-trip (dispatch_handle) |
+|---|---|---|
+| saxpy 1M | **~2.0 µs** | 3.08 ms |
+| q4km matvec | **~131 µs** | 5.47 ms (q4km_512) |
+| q4km matmul (256-out) | **~1.9 µs** | — |
+
+This is the milestone's real result: the saxpy_1m "3.08 ms" from M3.0 is **~99.9 % PCIe transfer, ~2 µs actual kernel** — fully validating the M3.0 decision to re-scope the `<1 ms` host-round-trip gate to this resident metric. Timing semantics are labeled honestly: the `TOP→BOTTOM` span is *GPU dispatch duration* (excludes host upload/readback, **includes** dispatch launch + pipeline latency), NOT isolated ALU time; warmup-discard is mandatory (2 discarded, min-of-N); `CpuFenceWall` (Lavapipe / `timestampValidBits==0`) is flagged and never quoted as a GPU kernel time (no query pool or `vkCmdWriteTimestamp` is recorded there).
+
+**Correction to the paragraph above:** there is **no honest competitive 4096² matmul TFLOPS in M3.1/M3.1.5.** `matmul_f32_tiled.axc` had inert `@strategy{tile_m,tile_n}` holes (never referenced in the body — removed in M3.1.5), so it is a *naive un-tiled scalar GEMM*. Its number is reported only via the `naive_gemm_harness_validation` bench, explicitly labeled "NAIVE … harness validation only … NOT an optimized matmul … real tiling is M3.2" — measured **4.5 TFLOPS ≈ 3.6 % of cuBLAS f32 (datasheet ESTIMATE, not a same-machine A/B)**. A *competitive* tiled/coopmat matmul TFLOPS needs `shared[T,N]` workgroup memory (FG.6) and is **deferred to M3.2**. The dispatch-time coopmat/feature preflight is wired via an additive `prepare_kernel_checked`; raw `prepare_kernel` remains an opt-in gap (M3.2 carry-forward).
 ---
 
 ### 3.1 Types

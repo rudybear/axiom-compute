@@ -54,6 +54,17 @@ pub enum DriverError {
     /// Metadata sidecar emission failed.
     #[error("metadata emit failed: {0}")]
     MetadataEmitFailed(axc_runtime::DispatchError),
+    /// A `ScalarTy` that is not a valid coopmat element type was passed to
+    /// `scalar_ty_to_coopmat_scalar_meta` (D, M3.1.5).
+    ///
+    /// This path is effectively unreachable (gated by `is_allowed_coopmat_element`
+    /// in HIR) but returns a typed error rather than panicking (Hard rule: no panic
+    /// in library code).
+    #[error("scalar type '{ty}' is not a valid cooperative-matrix element type")]
+    UnsupportedCoopmatScalar {
+        /// Debug representation of the unsupported `ScalarTy`.
+        ty: String,
+    },
 }
 
 impl DriverError {
@@ -124,8 +135,10 @@ pub fn compile_source_with_meta(source: &str) -> Result<(Vec<u8>, KernelMetadata
     //
     // M3.1: Fill coopmat shape from HIR (CRITICAL-1). The runtime reads the required
     // shape FROM METADATA — nothing is hardcoded in the runtime or tests (HN-10/AT-1552).
+    // M3.1.5 (D): hir_coopmat_shape_to_meta now returns Result to avoid panic.
     let coopmat_meta: Option<CoopMatShapeMeta> = kernel.annotations.coop_matrix.as_ref()
-        .map(hir_coopmat_shape_to_meta);
+        .map(hir_coopmat_shape_to_meta)
+        .transpose()?;
     let metadata: KernelMetadata = KernelMetadata::new(
         kernel.name.clone(),
         workgroup_size,
@@ -180,39 +193,42 @@ pub fn compile_source_with_assignments(
 /// Called by `compile_source_with_meta` to fill `KernelMetadata.coopmat` from the
 /// HIR-derived shape. The runtime reads the shape from the sidecar — nothing is
 /// hardcoded in the runtime (AT-1552/HN-10).
-fn hir_coopmat_shape_to_meta(shape: &CoopMatrixShape) -> CoopMatShapeMeta {
-    CoopMatShapeMeta {
+///
+/// M3.1.5 (D): returns `Result` so `scalar_ty_to_coopmat_scalar_meta` errors propagate
+/// without panicking (Hard rule: no panic in library code).
+fn hir_coopmat_shape_to_meta(shape: &CoopMatrixShape) -> Result<CoopMatShapeMeta, DriverError> {
+    Ok(CoopMatShapeMeta {
         m: shape.m,
         n: shape.n,
         k: shape.k,
-        a_type: scalar_ty_to_coopmat_scalar_meta(shape.a_elem),
-        b_type: scalar_ty_to_coopmat_scalar_meta(shape.b_elem),
-        c_type: scalar_ty_to_coopmat_scalar_meta(shape.c_elem),
-        result_type: scalar_ty_to_coopmat_scalar_meta(shape.result_type),
+        a_type: scalar_ty_to_coopmat_scalar_meta(shape.a_elem)?,
+        b_type: scalar_ty_to_coopmat_scalar_meta(shape.b_elem)?,
+        c_type: scalar_ty_to_coopmat_scalar_meta(shape.c_elem)?,
+        result_type: scalar_ty_to_coopmat_scalar_meta(shape.result_type)?,
         scope: match shape.scope {
             CoopMatScopeHir::Subgroup => CoopMatScopeMeta::Subgroup,
             CoopMatScopeHir::Workgroup => CoopMatScopeMeta::Workgroup,
         },
-    }
+    })
 }
 
 /// Map an HIR `ScalarTy` to the restricted `CoopMatScalarMeta` enum.
 ///
-/// Panics if the scalar type is not a valid coopmat element type (this should be
-/// impossible because `is_allowed_coopmat_element` gates HIR coopmat type creation).
-fn scalar_ty_to_coopmat_scalar_meta(ty: ScalarTy) -> CoopMatScalarMeta {
+/// Returns `Err(DriverError::UnsupportedCoopmatScalar)` if the scalar type is not
+/// a valid coopmat element type. This path is effectively unreachable because
+/// `is_allowed_coopmat_element` gates HIR coopmat type creation, but we return a
+/// typed error rather than panicking (Hard rule: no panic in library code — M3.1.5 D).
+fn scalar_ty_to_coopmat_scalar_meta(ty: ScalarTy) -> Result<CoopMatScalarMeta, DriverError> {
     match ty {
-        ScalarTy::F16 => CoopMatScalarMeta::F16,
-        ScalarTy::F32 => CoopMatScalarMeta::F32,
-        ScalarTy::I8  => CoopMatScalarMeta::I8,
-        ScalarTy::U8  => CoopMatScalarMeta::U8,
-        ScalarTy::I32 => CoopMatScalarMeta::I32,
-        ScalarTy::U32 => CoopMatScalarMeta::U32,
-        other => panic!(
-            "scalar_ty_to_coopmat_scalar_meta: {:?} is not a valid coopmat element type; \
-             this path should be unreachable (is_allowed_coopmat_element gates coopmat types)",
-            other
-        ),
+        ScalarTy::F16 => Ok(CoopMatScalarMeta::F16),
+        ScalarTy::F32 => Ok(CoopMatScalarMeta::F32),
+        ScalarTy::I8  => Ok(CoopMatScalarMeta::I8),
+        ScalarTy::U8  => Ok(CoopMatScalarMeta::U8),
+        ScalarTy::I32 => Ok(CoopMatScalarMeta::I32),
+        ScalarTy::U32 => Ok(CoopMatScalarMeta::U32),
+        other => Err(DriverError::UnsupportedCoopmatScalar {
+            ty: format!("{other:?}"),
+        }),
     }
 }
 
@@ -640,6 +656,61 @@ mod tests {
             result.contains("fn k()"),
             "kernel declaration must be preserved; got {result:?}"
         );
+    }
+
+    // ── AT-1575: scalar_ty_to_coopmat_scalar_meta — no panic (M3.1.5 D) ─────────
+
+    /// AT-1575: Valid CoopMat scalar types map to Ok; invalid types return Err without panic.
+    ///
+    /// The effective error path is unreachable in production (guarded by is_allowed_coopmat_element
+    /// in HIR), but the function must NOT panic — it must return a typed Err (M3.1.5 D).
+    #[test]
+    fn at_1575_coopmat_scalar_meta_no_panic() {
+        // Valid types (F16, F32, I8, U8, I32, U32) must all map to Ok.
+        assert!(matches!(scalar_ty_to_coopmat_scalar_meta(ScalarTy::F16), Ok(CoopMatScalarMeta::F16)));
+        assert!(matches!(scalar_ty_to_coopmat_scalar_meta(ScalarTy::F32), Ok(CoopMatScalarMeta::F32)));
+        assert!(matches!(scalar_ty_to_coopmat_scalar_meta(ScalarTy::I8),  Ok(CoopMatScalarMeta::I8)));
+        assert!(matches!(scalar_ty_to_coopmat_scalar_meta(ScalarTy::U8),  Ok(CoopMatScalarMeta::U8)));
+        assert!(matches!(scalar_ty_to_coopmat_scalar_meta(ScalarTy::I32), Ok(CoopMatScalarMeta::I32)));
+        assert!(matches!(scalar_ty_to_coopmat_scalar_meta(ScalarTy::U32), Ok(CoopMatScalarMeta::U32)));
+        // Invalid type (Bool is not a coopmat element type) must return Err, not panic.
+        let result = scalar_ty_to_coopmat_scalar_meta(ScalarTy::Bool);
+        assert!(
+            matches!(result, Err(DriverError::UnsupportedCoopmatScalar { .. })),
+            "Bool is not a valid coopmat element type; expected UnsupportedCoopmatScalar, got: {result:?}"
+        );
+    }
+
+    // ── AT-1576: matmul_f32_tiled compiles without @strategy holes (M3.1.5) ─────
+
+    /// AT-1576: matmul_f32_tiled.axc compiles via compile_source_with_meta after the
+    /// inert @strategy holes are removed (HANDOFF-0). No UnresolvedStrategyHole, no
+    /// compile_source_with_assignments needed.
+    #[test]
+    fn at_1576_matmul_f32_tiled_compiles_without_strategy_holes() {
+        let src = include_str!("../../../examples/matmul_f32_tiled.axc");
+        // Must NOT contain a live @strategy annotation (non-comment lines only).
+        // Comments documenting the removal are fine; the annotation itself must be gone.
+        let has_strategy_annotation = src.lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .any(|line| line.contains("@strategy"));
+        assert!(
+            !has_strategy_annotation,
+            "matmul_f32_tiled.axc must NOT contain @strategy annotation (non-comment) after M3.1.5 HANDOFF-0"
+        );
+        let result = compile_source_with_meta(src);
+        assert!(
+            result.is_ok(),
+            "matmul_f32_tiled.axc must compile via compile_source_with_meta (no assignments): {result:?}"
+        );
+        let (bytes, meta) = result.unwrap();
+        assert_eq!(&bytes[0..4], &[0x03, 0x02, 0x23, 0x07], "SPIR-V magic must be correct");
+        // Push constants: m, n, k as 3 × u32 = 12 bytes.
+        assert_eq!(meta.push_constant_total_bytes, 12,
+            "matmul_f32_tiled must have 12 push constant bytes (m, n, k as u32)");
+        // 3 buffer bindings: a_buf (readonly), b_buf (readonly), c_buf (readwrite).
+        assert_eq!(meta.binding_plan.buffers.len(), 3,
+            "matmul_f32_tiled must have 3 buffer bindings");
     }
 
     /// AT-1045: compile_source_with_assignments + strategy strips correctly produce valid SPIR-V.

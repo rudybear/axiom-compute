@@ -1,0 +1,63 @@
+{
+  "verdict": "APPROVE",
+  "agent": "optimistic_code_reviewer",
+  "milestone_id": "M3.1.5-resident-bench",
+  "revision": "r1",
+  "date": "2026-06-01",
+  "spec_compliance": true,
+
+  "positive_feedback": [
+    "HONESTY-1 fully executed: @strategy{tile_m,tile_n} holes gone from matmul_f32_tiled.axc; header comment accurately labels the file as 'NAIVE un-tiled scalar f32 GEMM — harness validation only'; bench IDs are the honest set (resident_timing_kernels, naive_gemm_harness_validation, dispatch_resident_matmul_tile); old matmul_tflops_4096 ID is gone; no competitive TFLOPS headline is asserted.",
+    "Timing methodology honest and complete: module header (resident.rs lines 21-66) explicitly says 'GPU dispatch duration: TOP_OF_PIPE→BOTTOM_OF_PIPE; EXCLUDES host upload/readback; INCLUDES dispatch launch + pipeline latency; NOT isolated ALU time'. GpuTimestamp variant doc mirrors this. CpuFenceWall is labeled 'scheduling-inclusive, NOT a GPU kernel time' everywhere it appears (timing_source_label(), AT-1530, AT-1582 branch).",
+    "HN-6 query-reset ordering correct: cmd_reset_query_pool is the FIRST recorded command in dispatch_resident's CB after begin_command_buffer (before any cmd_write_timestamp), in the SAME submission, and only on the GpuTimestamp path.",
+    "Query pool lifecycle honest: upload_resident creates the 2-entry TIMESTAMP pool only when select_timing_source(valid_bits, period)==GpuTimestamp; on the CpuFenceWall path query_pool=vk::QueryPool::null() and no vkCmdWriteTimestamp is ever recorded. This correctly avoids the Vulkan validation error on Lavapipe (timestampValidBits==0).",
+    "CORRECTNESS-1 workgroup guard placed correctly: dispatch_resident validates cfg.workgroups against max_compute_work_group_count AT THE TOP, before any GPU work, and returns WorkgroupCountExceedsDeviceLimit. Uses a clean per-axis loop. AT-1579 covers it.",
+    "CORRECTNESS-2 partial cleanup: upload_resident builds all persistent Vulkan objects into local Options/Vecs; cleanup_partial_resident is called at all 10 documented early-return paths with the correct destruction order (query_pool→fence→descriptor_pool→command_pool→staging_bufs→device_local_bufs, per Vulkan spec §3.3.3); ResidentBuffers is constructed only when all objects are successfully created, so Drop never double-frees.",
+    "Independent descriptor set (HANDOFF-9): dispatch_resident binds resident.descriptor_set, NOT handle.inner.descriptor_set. The HANDOFF-9 comment is present at the binding site (dispatch_resident line 863). AT-1570 guards any regression.",
+    "Upload fence independence: record_and_submit_upload creates its own TRANSIENT upload_fence (separate from the resident fence stored in ResidentBuffers), destroys it at every exit path, and uses self.fence_timeout_ms via AXC_FENCE_TIMEOUT_MS. No aliasing between upload fence and the resident fence that dispatch/readback_resident reuse.",
+    "Transient vs retained staging separation: upload uses per-binding transient staging buffers freed immediately after the upload CB completes; retained staging_bufs[] are readback-only. OPT-NOTE-2 comment is present at the allocation site. No aliasing.",
+    "prepare_kernel_checked is correctly additive: same signature as prepare_kernel plus coopmat/kernel_name; calls preflight_kernel_support? then prepare_kernel. Raw prepare_kernel signature is unchanged. Gap is honestly documented in the method doc and the honest gap statement.",
+    "preflight_kernel_support iterates features in fixed declaration order (storage_16bit < storage_8bit < shader_int8 < shader_int16 < vulkan_memory_model < cooperative_matrix) — deterministic first-missing-feature per AT-1578. Subgroup==32 check includes the edge case subgroup_size==0 → CoopMatUnsupported.",
+    "panic→Result conversion complete and clean: scalar_ty_to_coopmat_scalar_meta returns Result<CoopMatScalarMeta, DriverError>; hir_coopmat_shape_to_meta returns Result; transpose()? propagates in compile_source_with_meta. DriverError::UnsupportedCoopmatScalar { ty: String } is well-typed with thiserror #[error].",
+    "Public API is additive only: upload_resident, dispatch_resident, readback_resident, prepare_kernel_checked are new pub methods; ResidentBuffers handle-inspection methods (command_buffer_handle, fence_handle, query_pool_handle, device_local_buf_handles) are new pub; DriverError::UnsupportedCoopmatScalar is a new variant. All existing signatures unchanged.",
+    "Re-export hygiene in lib.rs: all four resident types (ResidentBuffers, ResidentDispatchTiming, ResidentTimingSource, ResidentBenchConfig) are re-exported from the crate root on a single pub use resident::... line. CoopMatShapeMeta was already re-exported; prepare_kernel_checked is an inherent method on the already-exported VulkanContext. No missing re-export.",
+    "CB reuse pattern correct: dispatch_resident calls reset_command_buffer before re-recording; readback_resident does the same; both reset the fence before submit. AT-1571 verifies handle invariance across N=4 dispatches.",
+    "Three clippy allow annotations are at the module level (#![allow] in resident.rs), each with an explicit why-comment explaining the CORRECTNESS-2 audit reason. No annotation is hiding a correctness problem.",
+    "All new unsafe blocks have // SAFETY: comments. No unwrap/expect in library code (bench/test use expect where appropriate per CLAUDE.md).",
+    "50 GB cap is asserted in the bench size-selection loop (not in the library method), matching HANDOFF-17 and OPT-NOTE-4.",
+    "AT-1576 passes non-ignored: matmul_f32_tiled.axc compiles via compile_source_with_meta with no @strategy block; spirv-val of the produced module passes. AT-1573, AT-1575, AT-1578, AT-1578b also pass non-ignored.",
+    "Bench warmup methodology: resident_min_of_n enforces N_WARMUP=2 untimed dispatches before the N_MEASURED=10 measured loop, reports MIN-of-N. AT-1530 also enforces N_WARMUP=2 with N_MEASURED>=5. Matches mandatory-warmup requirement.",
+    "AT-1530 split correctly: on GpuTimestamp path asserts min_ns < host_round_trip_ns/2 (50% headroom). On CpuFenceWall path prints the qualifier and asserts only kernel_ns>0. AT-1582 branch in the test is correct.",
+    "AT-1581 inline asserts: the label string for naive_gemm_harness_validation is checked for both 'NAIVE' and 'harness validation' substrings immediately after printing, preventing silent label regression.",
+    "matmul_f32_tiled.axc body unchanged (no codegen regression): only the header comment, @intent, and @strategy line were touched; the fn body computing one (row,col) per invocation is verbatim from before. SPIR-V output is unchanged per AT-1577."
+  ],
+
+  "minor_issues": [
+    {
+      "file": "crates/axc-runtime/src/resident.rs",
+      "line": "upload loop (record_and_submit_upload via AXC_FENCE_TIMEOUT_MS parse)",
+      "severity": "non-blocking",
+      "description": "record_and_submit_upload re-reads AXC_FENCE_TIMEOUT_MS from the environment at every upload call instead of using the already-resolved self.fence_timeout_ms stored on VulkanContext (which was resolved once at context creation in VulkanContextOptions). This is a minor inconsistency with how dispatch_handle resolves the timeout (also via env at call-time, so it is at least self-consistent across the codebase). No correctness issue; the env var approach just re-parses on every upload. Consider using self.fence_timeout_ms in a future pass for parity with the stated intent of VulkanContextOptions.fence_timeout_ms."
+    },
+    {
+      "file": "crates/axc-driver/benches/resident_matmul.rs",
+      "line": "q4km_matvec / q4km_matmul bench input construction",
+      "severity": "non-blocking",
+      "description": "The q4km matvec and matmul inputs are constructed as generic zero-filled byte slices sized by the binding plan without validating against the actual Q4_K_M block layout (n_blocks * block_size_bytes where block_size_bytes=64 is noted as 'simplified'). This is fine for harness validation — the bench only asserts kernel_ns>0 and not correctness. The inline comment 'The actual size depends on the meta binding plan; use at least what's needed' is honest. No action required; worth a note for M3.2 when correctness of q4km resident outputs will need to be cross-checked against dispatch_handle."
+    },
+    {
+      "file": "crates/axc-runtime/src/resident.rs",
+      "line": "readback_resident: copy size vs alloc size",
+      "severity": "non-blocking",
+      "description": "readback_resident passes output_sizes[i] as the BufferCopy.size into cmd_copy_buffer (device_local→staging). This is correct, but if output_sizes[i] > the allocated staging buffer size (possible if a caller passes a larger output_sizes than originally passed to upload_resident), the copy would silently truncate or overflow. In practice the same output_sizes array is passed to both upload_resident and readback_resident by all callers (bench + tests), and upload_resident allocates at least max(input_len, output_size).max(4) for each binding. A defensive assert or a min clamp against the staging buffer's actual allocation size would make this more robust. Non-blocking: not a correctness bug in current callers."
+    },
+    {
+      "file": "crates/axc-runtime/tests/resident_timing.rs",
+      "line": "AT-1530 N_MEASURED constant",
+      "severity": "trivial",
+      "description": "AT-1530 uses N_MEASURED=5 while the spec says N>=3 (passes) and the bench uses N=10. Both are conforming. The spec says 'N>=3 AT-1530', so 5 exceeds the minimum. No action needed; just noting the intentional increase mentioned in the QA report."
+    }
+  ],
+
+  "summary": "The M3.1.5 implementation is a well-executed, honest scope delivery. All spec-mandated deliverables are present and correct: the three resident methods are fully implemented (not stubs) with proper workgroup guard, partial-failure cleanup, independent descriptor set, and GPU-timestamp vs CpuFenceWall timing. The HONESTY-1 reframe is clean throughout — bench IDs, printed labels, and the matmul_f32_tiled.axc example are all consistent. Timing semantics are accurately labeled everywhere. prepare_kernel_checked is correctly additive. The panic→DriverError conversion is complete. 785 non-ignored tests pass, clippy is clean, the bench builds, and the public API is additive only. The four minor issues are non-blocking and do not affect correctness, honesty, or spec compliance. This branch is merge-ready."
+}

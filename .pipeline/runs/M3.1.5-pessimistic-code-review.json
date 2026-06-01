@@ -1,0 +1,47 @@
+{
+  "verdict": "APPROVE",
+  "agent": "pessimistic_code_reviewer",
+  "milestone_id": "M3.1.5-resident-bench",
+  "branch": "coder/M315-20260601-1500/M3.1.5-resident-bench",
+  "scope": "git diff main..HEAD",
+  "files_reviewed": [
+    "crates/axc-runtime/src/resident.rs",
+    "crates/axc-runtime/src/context.rs",
+    "crates/axc-runtime/src/kernel_handle.rs (binding_is_readback, allocate_descriptor_pool_and_set)",
+    "crates/axc-runtime/src/buffers.rs (allocators, round_up_pow2, no-Drop structs)",
+    "crates/axc-runtime/tests/resident_timing.rs",
+    "crates/axc-driver/benches/resident_matmul.rs",
+    "crates/axc-driver/src/lib.rs",
+    "crates/axc-driver/tests/at1560_spirv_val_all_m31.rs",
+    "examples/matmul_f32_tiled.axc"
+  ],
+  "critical_bugs": [],
+  "warnings": [
+    {
+      "description": "Item 2 (minor): a sub-nanosecond/coalesced-timestamp dispatch can yield ticks=0 -> kernel_ns=0, which the bench's `assert!(min_ns > 0)` would treat as a panic. This is bench-only (panic-OK context) and physically a real TOP_OF_PIPE->BOTTOM_OF_PIPE span over a dispatch is >0; the LIBRARY returns 0 honestly with no UB and never reports it as a competitive number. Not a correctness hole.",
+      "file": "crates/axc-driver/benches/resident_matmul.rs",
+      "line": "183/241/295/336/479/566"
+    },
+    {
+      "description": "Item 4 (note): naive_gemm_harness_validation does compute effective TFLOPS + a cuBLAS percentage, but it is heavily labeled ('NAIVE', 'harness validation only', 'NOT an optimized matmul', 'datasheet ESTIMATE - not a same-machine A/B'), asserts only tflops>0 && finite (no competitive ratio assert), and the NAIVE/harness-validation label assert is inline (AT-1581). resident_timing_kernels carries NO TFLOPS/ratio. Honest.",
+      "file": "crates/axc-driver/benches/resident_matmul.rs",
+      "line": "458-481"
+    }
+  ],
+  "probe_results": {
+    "1_vulkan_sync_in_dispatch_resident": "PASS — fence reset_fences before EVERY submit (dispatch L897, readback L1060); CB reset_command_buffer + begin/end with ONE_TIME_SUBMIT each iter (L842-849, L893); cmd_reset_query_pool recorded in SAME submission before write_timestamp(TOP,0) (L856-858) so no stale results; get_query_pool_results uses TYPE_64|WAIT AFTER fence wait, and the in-submission reset guarantees no prior-iter read. AT-1571 proves CB/fence/qp handles invariant across N iters.",
+    "2_timestamp_correctness": "PASS — ash passes query_count=2, stride=8, TYPE_64 (verified against ash-0.38 source); masked_timestamp_delta masks each endpoint then wrapping_sub (AT-1535 covers wrap, valid_bits 0 and 64). No garbage-huge value: wrap is contained by the mask. ticks=0 -> ns=0 is honest, not negative-as-u64.",
+    "3_upload_resident_cleanup": "PASS — DeviceLocalBuffer and StagingBuffer have NO Drop impl, so manual destroy in resident.rs is sole-owner; every one of the early-return paths frees in reverse creation order via cleanup_partial_resident with Option args; transient upload staging + upload_command_pool freed on their OWN paths and never overlap cleanup_partial's persistent staging/device-local sets -> no double-free, no UAF. drain+clear on the overflow path is safe (no Drop).",
+    "3b_descriptor_aliasing": "PASS — dispatch_resident binds resident.descriptor_set (independent set written to resident device-local buffers, L866-871), NEVER handle.inner.descriptor_set; pipeline + pipeline_layout from handle used read-only. AT-1570 guards regression.",
+    "4_honesty": "PASS — CpuFenceWall is never compared against a GPU-kernel expectation (AT-1530 match arm skips the smaller-than assert on CpuFenceWall, asserts only >0; timing_source_label appends the scheduling-inclusive qualifier). resident_timing_kernels emits no TFLOPS/ratio. naive bench label asserts present.",
+    "5_no_unwrap_panic_in_lib": "PASS — resident.rs has ZERO unwrap/expect/panic; the only unwrap/expect in context.rs are pre-existing (CString on static literals + M2.3a/M3.0 lines, none added by this diff). panic->DriverError::UnsupportedCoopmatScalar conversion complete (AT-1575). All unsafe blocks carry // SAFETY comments. The 3 #![allow] in resident.rs (manual_inspect, drain_collect, needless_range_loop) are justified for the synchronous multi-Vec cleanup logic and hide no real lint (clippy -p axc-runtime is clean).",
+    "6_workgroup_guard": "PASS — dispatch_resident validates all 3 axes against max_compute_work_group_count BEFORE reset/record/dispatch (L817-823), returns WorkgroupCountExceedsDeviceLimit. AT-1579 exercises rejection.",
+    "7_no_regression": "PASS — codegen untouched; at1560 matmul_f32_tiled spirv-val test still validates (now via validate_src, passes); prepare_kernel signature unchanged, prepare_kernel_checked is additive; CpuFenceWall (Lavapipe) path creates no query pool and records no write_timestamp; existing bench IDs in dispatch.rs/dispatch_q4km.rs untouched. Build + 63 runtime + 61 driver unit tests pass."
+  },
+  "spirv_val_check": "PASS",
+  "ub_check": "PASS",
+  "race_condition_check": "PASS",
+  "vendor_divergence_check": "PASS",
+  "most_dangerous_remaining_issue": "The bench's `assert!(min_ns > 0)` could panic on a hypothetical device that coalesces TOP/BOTTOM timestamps to identical ticks for a trivial dispatch (kernel_ns=0). This is bench-only (acceptable panic context) and the LIBRARY itself is correct — no library/correctness hole. No blocker.",
+  "summary": "M3.1.5 resident-bench is correct and honest. Vulkan sync is right: fence reset before every submit, query pool reset in-submission before each timestamp write, CB reset+ONE_TIME_SUBMIT re-recorded per iter, results read TYPE_64|WAIT post-fence with no stale-read path. The 10 cleanup early-returns are leak/double-free/UAF-free (buffer structs have no Drop; transient vs persistent resource sets never overlap). Descriptor set is the independent resident set, not the handle's. Timing is honest: CpuFenceWall always carries the scheduling-inclusive qualifier and is never compared to a GPU-kernel expectation; resident_timing_kernels emits no TFLOPS; the naive GEMM is exhaustively labeled and asserts no competitive ratio. No unwrap/panic in lib (panic replaced by typed UnsupportedCoopmatScalar). Workgroup guard fires before any GPU work. Codegen/spirv-val unchanged; prepare_kernel additive-only. clippy clean, all unit tests green. APPROVE."
+}

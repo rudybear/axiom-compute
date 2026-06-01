@@ -36,23 +36,14 @@ fn at_1560_q4km_dequant_matmul_coopmat_spirv_val() {
     validate_src("q4km_dequant_matmul_coopmat", include_str!("../../../examples/q4km_dequant_matmul_coopmat.axc"));
 }
 
-/// AT-1560: matmul_f32_tiled (no coopmat) passes spirv-val.
+/// AT-1560 / AT-1576: matmul_f32_tiled (no coopmat, no @strategy holes) passes spirv-val.
 ///
-/// Uses compile_source_with_assignments to resolve the @strategy holes before validation.
+/// The @strategy { tile_m, tile_n } holes were removed (M3.1.5 / HANDOFF-0) because
+/// they were inert (never referenced in the kernel body). This test now compiles via
+/// compile_source_with_meta (no assignments needed), consistent with AT-1576.
 #[test]
 fn at_1560_matmul_f32_tiled_spirv_val() {
-    use axc_driver::compile_source_with_assignments;
     let src = include_str!("../../../examples/matmul_f32_tiled.axc");
-    // Resolve strategy holes: tile_m=1, tile_n=1 (first/default candidates).
-    let mut assignments = std::collections::BTreeMap::new();
-    assignments.insert("tile_m".to_owned(), 1_i64);
-    assignments.insert("tile_n".to_owned(), 1_i64);
-    let (bytes, _) = compile_source_with_assignments(src, &assignments)
-        .expect("matmul_f32_tiled must compile with tile_m=1,tile_n=1");
-    let words: Vec<u32> = bytes.chunks_exact(4).map(|c| {
-        u32::from_le_bytes([c[0], c[1], c[2], c[3]])
-    }).collect();
-    let validator = create_validator(Some(TargetEnv::Vulkan_1_1));
-    validator.validate(&words, None)
-        .expect("matmul_f32_tiled SPIR-V (tile_m=1,tile_n=1) must pass spirv-val");
+    // No @strategy block remains — compile_source_with_meta is sufficient (AT-1576).
+    validate_src("matmul_f32_tiled (no strategy holes)", src);
 }
