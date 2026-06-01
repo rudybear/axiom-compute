@@ -69,6 +69,7 @@ fn at_828_push_constants_only_kernel_dispatches() {
         pipeline_cache_path: Some(tmp_dir.path().join("at_828.cache")),
         physical_device_index: None,
         fence_timeout_ms: None,
+        ..Default::default()
     })
     .expect("VulkanContext::new_with_options must succeed");
 

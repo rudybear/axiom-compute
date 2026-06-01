@@ -59,6 +59,7 @@ fn at_810_pipeline_cache_disk_roundtrip() {
             pipeline_cache_path: Some(cache_path.clone()),
             physical_device_index: None,
             fence_timeout_ms: None,
+            ..Default::default()
         })
         .expect("ctx1 must succeed");
         eprintln!("AT-810: ctx1 device = {}", ctx.physical_device_name());
@@ -105,6 +106,7 @@ fn at_810_pipeline_cache_disk_roundtrip() {
             pipeline_cache_path: Some(cache_path.clone()),
             physical_device_index: None,
             fence_timeout_ms: None,
+            ..Default::default()
         })
         .expect("ctx2 must succeed");
         eprintln!("AT-810: ctx2 device = {}", ctx.physical_device_name());
