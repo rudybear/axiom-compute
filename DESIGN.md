@@ -521,6 +521,39 @@ Bench group `dispatch_gpu_q4km` in `crates/axc-driver/benches/dispatch_q4km.rs`
 
 ---
 
+## 3.1.12 M3.0 — Dispatch bandwidth rework (runtime, no codegen change) [revision r1]
+
+M3.0 eliminates the staging-bound per-dispatch overhead that made `dispatch_saxpy_1m` cost 23 ms and `dispatch_q4km_512` cost 8.84 ms on the NVIDIA RTX PRO 6000 (~100x off PCIe peak). It is a pure **data-movement** change: SPIR-V codegen, the `.axc` language, and `spirv-val` are untouched, so the correctness oracle is **bit-exact preservation** against the existing CPU references AND **byte-equality across four execution paths** (single-queue coherent / dedicated-queue / forced-non-coherent / forced-binary-semaphore).
+
+### Four layered levers (each falls back cleanly to prior behavior)
+
+1. **Persistent-mapped staging.** Each HOST_VISIBLE staging allocation is `vkMapMemory`'d exactly once at allocation time; the raw host pointer is PRIVATE inside `PersistentMapping`, accessed only via guarded `copy_in`/`copy_out` under the per-handle Mutex. `PersistentMapping` is `Send`-only (never `Sync`). **Unmap-before-free** is mandatory: on buffer-pool growth and on `KernelHandleInner::drop`, each staging memory is `vkUnmapMemory`'d BEFORE `vkDestroyBuffer`/`vkFreeMemory`; `unmap` consumes `self` so a forgotten unmap is a compile error.
+
+2. **HOST_CACHED staging + flush/invalidate.** Staging prefers `HOST_VISIBLE|HOST_CACHED|HOST_COHERENT`, then `HOST_VISIBLE|HOST_CACHED` (non-coherent), then `HOST_VISIBLE|HOST_COHERENT` (prior behavior; Lavapipe/iGPU). Cached host **reads** are ~100x faster than write-combined coherent reads — the single largest contributor to the 23 ms readback. On non-coherent memory, `vkFlushMappedMemoryRanges` fires after EACH upload slot (before submit) and `vkInvalidateMappedMemoryRanges` before EACH readback slot (after the fence). Ranges use `offset=0` and `size = align_up(len, nonCoherentAtomSize)` or `VK_WHOLE_SIZE` when that meets/exceeds the allocation (no clamp-to-alloc bug). On coherent memory both are no-ops (zero Lavapipe regression). **Host-visibility on readback is path-identical:** the device->staging copy is ALWAYS followed by an in-stream TRANSFER_WRITE->HOST_READ barrier (dstStage=HOST) on every path, and on non-coherent memory the host invalidate is ALSO unconditional — neither relies on the fence-signal host-domain guarantee as a substitute.
+
+3. **Dedicated transfer queue.** When the device exposes a queue family with TRANSFER but **not** COMPUTE/GRAPHICS (the discrete DMA copy engine), the context acquires it plus its own command pool. In this mode the **device-local buffer is created `VK_SHARING_MODE_CONCURRENT`** over `{compute_family, transfer_family}`, so there are **no queue-family ownership-transfer barriers anywhere** — the canonical NVIDIA-passes/AMD-corrupts release/acquire-range-mismatch failure class is structurally eliminated. (EXCLUSIVE+ownership-transfer is a possible M3.1 optimization once real AMD/Intel CI can validate the barrier pairs.) Cross-queue visibility uses plain `QUEUE_FAMILY_IGNORED` memory barriers + semaphore execution dependencies. When no distinct family exists (Lavapipe), the context uses `QueueMode::SingleQueue` with the **identical** command stream to M2.3a (EXCLUSIVE buffers, one CB, one queue).
+
+4. **Transfer/compute overlap via timeline semaphores.** The dedicated path splits each dispatch into three submits — transfer upload -> compute -> transfer readback — synchronized by a **timeline semaphore** (Vulkan 1.2 / `VK_KHR_timeline_semaphore`, **primary**; monotonic per-dispatch values `B+1`,`B+2` reserved atomically, so there is NO reuse hazard across dispatches/errors/skipped stages) with a **binary-semaphore fallback** for 1.1-only ICDs (safe via the per-handle Mutex + mandatory host fence wait; binaries recreated on mid-chain error). The host still blocks on a single `readback_fence`. A context-level `queue_submit_lock` serializes the **entire three-submit group of one dispatch** (atomic group), released before any host wait, which makes cross-handle FIFO-queue interleaving impossible and the wait-for graph acyclic (deadlock-free); per-pool `command_pool_lock`s guard shared-pool alloc/free.
+
+### Error recovery
+The three-submit dedicated chain has a fully specified partial-failure matrix: on any mid-chain submit failure the host calls `device_wait_idle()`, frees every allocated CB from its OWN pool (transfer/compute) under the pool locks, recreates binary semaphores (Binary mode only), and returns the typed error WITHOUT waiting a never-submitted fence — no CB leak, no hang.
+
+### Acceptance honesty — coherent-hardware coverage + bounded gap
+The dedicated-queue and non-coherent paths are only naturally exercised on coherent NVIDIA + coherent single-queue Lavapipe. To make their risk visible, the three force-options (`force_single_queue`, `force_binary_semaphores`, `force_noncoherent_staging`) are FIRST-CLASS so CI EXECUTES the binary-semaphore and flush/invalidate code paths even on coherent hardware (semantic no-ops, but the code runs and the byte-exact oracle still holds). The central test **AT-1418** runs the same kernel through all four configurations and asserts byte-identical output to the CPU reference, so a missing invalidate/flush or a sync bug surfaces as divergence on the dev box. **Bounded, acknowledged gap:** TRUE non-coherent-hardware validation (where a dropped invalidate genuinely corrupts) requires **EB.1 cross-vendor CI (AMD/Intel)**, which is **OUT of M3.0 scope**. M3.0 proves code-path execution + byte-exact equality on coherent hardware; EB.1 proves non-coherent semantics on real hardware.
+
+### VK_KHR_buffer_device_address — deferred to M3.1; VK_EXT_host_memory_alloc_placement — out of scope
+BDA would change the **shader** (descriptor-bound SSBO -> 64-bit `PhysicalStorageBuffer` pointer, requiring `PhysicalStorageBufferAddresses`, codegen, and a `@target` declaration), violating M3.0's no-codegen invariant, and it does not address the M3.0 bottleneck. Deferred to M3.1 (tiled matmul + cooperative_matrix), which already touches codegen. **VK_EXT_host_memory_alloc_placement** (import-host-pointer) is consciously scoped OUT in favor of the HOST_CACHED ladder, which reaches the gate; revisit only if a target vendor lacks HOST_CACHED.
+
+### Acceptance gates
+- `dispatch_saxpy_1m` < **1 ms** and `dispatch_q4km_512` < **2 ms** on NVIDIA RTX PRO 6000 (bench IDs unchanged).
+- All existing dispatch + Q4_K_M bit-exact tests pass; the four force-option paths (AT-1418) produce byte-identical output.
+- Lavapipe single-queue fallback shows no regression; `cargo test --workspace` (+`--ignored`) green; `clippy -D warnings` clean; `spirv-val` clean.
+
+### New/changed error variants
+`DispatchError` grows to 28 variants: `SemaphoreCreationFailed`, `TransferQueueSubmitFailed`, and `MappedRangeOpFailed { op: MappedRangeOp }` (`MappedRangeOp in {Flush, Invalidate}`).
+
+---
+
 ### 3.1 Types
 
 ```
