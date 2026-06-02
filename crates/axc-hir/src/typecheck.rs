@@ -17,6 +17,7 @@
 //! - Error recovery is per-statement: a failed statement may still emit a HIR
 //!   statement (without the failing init) so later references resolve.
 
+use std::collections::BTreeMap;
 use axc_lexer::Span;
 use axc_parser::ast as past;
 use crate::expr::{
@@ -32,6 +33,7 @@ use crate::coopmat::{
     CoopMatUse, CoopMatKey, CoopMatrixShapeKind, CoopMatrixShape,
     is_allowed_coopmat_element,
 };
+use crate::shared::{SharedId, SharedDecl, SharedTy, MAX_SHARED_ELEMS, is_allowed_shared_element};
 
 /// Typecheck error — emitted from `typecheck_kernel_body`.
 ///
@@ -522,9 +524,148 @@ pub enum TypecheckError {
         #[label("here")]
         span: Span,
     },
+
+    // ── M3.2 shared-array typecheck errors ───────────────────────────────────
+
+    /// `tile[i]` where `i` is not `U32` — no implicit coercion (anti-pattern #1).
+    #[error("shared array index must be `u32`; got `{got}` (no implicit coercion — anti-pattern #1)")]
+    SharedIndexNotU32 {
+        got: &'static str,
+        #[label("here")]
+        span: Span,
+    },
+
+    /// `tile[i] = v;` where `v` type does not exactly match elem type.
+    #[error("shared array `{name}` element type is `{expected}`; got `{got}` (exact match required — no implicit conversion)")]
+    SharedWriteTypeMismatch {
+        name: String,
+        expected: &'static str,
+        got: &'static str,
+        #[label("here")]
+        span: Span,
+    },
+
+    /// A shared array name collides with a parameter or binding.
+    #[error("shared array name `{name}` collides with an existing parameter or binding")]
+    SharedNameCollision {
+        name: String,
+        #[label("collision here")]
+        span: Span,
+    },
+
+    /// A name reference resolves as a shared array but it was not declared.
+    #[error("shared array `{name}` is not declared in this kernel body")]
+    SharedNotDeclared {
+        name: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    /// Duplicate shared array name in the same kernel.
+    #[error("duplicate shared array name `{name}`")]
+    SharedDuplicateName {
+        name: String,
+        #[label("duplicate here")]
+        span: Span,
+    },
+
+    /// N = 0 in `shared[T, 0]` — must be at least 1.
+    #[error("shared array `{name}` has length 0; N must be >= 1")]
+    SharedZeroLength {
+        name: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    /// N > MAX_SHARED_ELEMS.
+    #[error("shared array `{name}` length {len} exceeds maximum {max}")]
+    SharedTooLarge {
+        name: String,
+        len: u32,
+        max: u32,
+        #[label("here")]
+        span: Span,
+    },
+
+    /// Disallowed element type (Bool).
+    #[error("shared array `{name}` element type `{ty_name}` is not allowed (Bool has no stable Vulkan memory representation)")]
+    SharedElementTypeUnsupported {
+        name: String,
+        ty_name: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    /// Missing barrier — provable cross-slot RAW hazard (OQ1, sound, SET-based).
+    #[error("shared array `{name}`: read at index {read_index_desc} follows writes at [{write_indices_desc}] with no barrier — provable cross-invocation RAW hazard; add workgroup_barrier() between write and read phases")]
+    SharedMissingBarrierBeforeCrossInvocationRead {
+        name: String,
+        read_index_desc: String,
+        write_indices_desc: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    /// Barrier inside an if/else body — BarrierInDivergentContext (OQ2).
+    #[error("workgroup_barrier() inside an if/else body is undefined behavior in Vulkan (not all invocations provably reach the barrier); move the barrier outside the conditional")]
+    BarrierInDivergentContext {
+        #[label("barrier here")]
+        span: Span,
+    },
 }
 
 // ── Internal binding table ────────────────────────────────────────────────────
+
+// ── Index-relation predicate for missing-barrier analysis (A.4.1) ─────────────
+
+/// The result of the structural index-relation predicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexRelation {
+    ProvablyEqual,
+    ProvablyDisequal,
+    Unknown,
+}
+
+/// Structural predicate over HIR expression indices.
+///
+/// ProvablyEqual when:
+/// - Both are `LocalRead(BindingId)` with the SAME id (same SSA binding).
+/// - Both are `IntLit` with EQUAL value (same type AND same bits).
+/// - Both are `GidBuiltin` with the SAME axis.
+///
+/// ProvablyDisequal when:
+/// - Both are `IntLit` with DISTINCT values (same type, different bits).
+/// - Both are `GidBuiltin` with DISTINCT axes.
+///
+/// Unknown otherwise (Binary, different LocalRead ids, mixed constant/variable, etc.).
+fn index_relation(w: &HirExprKind, r: &HirExprKind) -> IndexRelation {
+    match (w, r) {
+        (HirExprKind::LocalRead(wid), HirExprKind::LocalRead(rid)) => {
+            // Same SSA binding id → provably equal (straight-line, no reassignment tracking
+            // needed for the simple read-after-write case where the binding hasn't changed).
+            if wid == rid { IndexRelation::ProvablyEqual } else { IndexRelation::Unknown }
+        }
+        (HirExprKind::IntLit { value: wv }, HirExprKind::IntLit { value: rv }) => {
+            // IntLiteralValue is a struct { ty: ScalarTy, bits: u64 }.
+            // Same type + same bits → equal; same type + different bits → disequal;
+            // different types → unknown (could in theory compare across widths but that
+            // is an edge case we conservatively leave as unknown).
+            if wv.ty == rv.ty {
+                if wv.bits == rv.bits {
+                    IndexRelation::ProvablyEqual
+                } else {
+                    IndexRelation::ProvablyDisequal
+                }
+            } else {
+                IndexRelation::Unknown
+            }
+        }
+        (HirExprKind::GidBuiltin { axis: wa }, HirExprKind::GidBuiltin { axis: ra }) => {
+            if wa == ra { IndexRelation::ProvablyEqual } else { IndexRelation::ProvablyDisequal }
+        }
+        _ => IndexRelation::Unknown,
+    }
+}
 
 struct TypeChecker<'p> {
     bindings: Vec<Binding>,
@@ -543,6 +684,31 @@ struct TypeChecker<'p> {
     /// Incremented AFTER the cond expression is evaluated, decremented AFTER the body.
     /// For-range bodies do NOT increment this (M1.4 §5(8)).
     divergent_context_depth: u32,
+
+    // ── M3.2 shared-array fields ─────────────────────────────────────────────
+
+    /// Declared workgroup-shared arrays in source order.
+    ///
+    /// Indexed by SharedId.0 (monotonically from 0 per kernel).
+    shared_decls: Vec<SharedDecl>,
+
+    /// Maps shared array name -> index into shared_decls.
+    shared_name_map: BTreeMap<String, usize>,
+
+    /// Conditional nesting depth — incremented ONLY at if-then and else bodies.
+    ///
+    /// NOT incremented at `while` or `for-range` bodies. Used by the
+    /// divergent-barrier hard error (OQ2, A.4.2). Distinct from `divergent_context_depth`
+    /// which while DOES increment and gates the subgroup-collective warning.
+    conditional_depth: u32,
+
+    /// Per-shared-id SET of write index expressions since the last barrier (OQ1, A.4.1, r3).
+    ///
+    /// Key: SharedId.0. Value: Vec of index HirExprKinds from preceding SharedWrites.
+    /// A `HirStmt::Barrier` clears ALL sets.
+    /// A `SharedWrite` of id X appends its index kind to the set.
+    /// A `SharedRead` of id X triggers the missing-barrier analysis.
+    shared_write_sets: BTreeMap<u32, Vec<HirExprKind>>,
 }
 
 impl<'p> TypeChecker<'p> {
@@ -556,10 +722,113 @@ impl<'p> TypeChecker<'p> {
             loop_stack: HirLoopStack::new(),
             scope_stack: ScopeStack::new(),
             divergent_context_depth: 0,
+            // M3.2 shared-array fields
+            shared_decls: Vec::new(),
+            shared_name_map: BTreeMap::new(),
+            conditional_depth: 0,
+            shared_write_sets: BTreeMap::new(),
         };
         // Push the top-level scope frame (pops at end of typecheck_kernel_body).
         tc.scope_stack.push_frame();
         tc
+    }
+
+    /// Look up a shared array by name. Returns `(SharedId, elem ScalarTy, len)` or `None`.
+    fn find_shared(&self, name: &str) -> Option<(SharedId, ScalarTy, u32)> {
+        self.shared_name_map.get(name).map(|&idx| {
+            let decl = &self.shared_decls[idx];
+            (decl.id, decl.ty.elem, decl.ty.len)
+        })
+    }
+
+    /// Register a new shared array declaration.
+    /// Returns `Some(SharedId)` on success, `None` on duplicate (error pushed).
+    fn register_shared(
+        &mut self,
+        name: &str,
+        ty: SharedTy,
+        span: Span,
+    ) -> Option<SharedId> {
+        if self.shared_name_map.contains_key(name) {
+            self.errors.push(TypecheckError::SharedDuplicateName {
+                name: name.to_owned(),
+                span,
+            });
+            return None;
+        }
+        // Also check for collision with param or binding names.
+        if self.find_param(name).is_some() || self.find_binding(name).is_some() {
+            self.errors.push(TypecheckError::SharedNameCollision {
+                name: name.to_owned(),
+                span,
+            });
+            return None;
+        }
+        let id = SharedId(self.shared_decls.len() as u32);
+        let idx = self.shared_decls.len();
+        self.shared_decls.push(SharedDecl {
+            id,
+            name: name.to_owned(),
+            ty,
+            span,
+        });
+        self.shared_name_map.insert(name.to_owned(), idx);
+        Some(id)
+    }
+
+    /// Clear all shared write sets — called when a Barrier statement is encountered.
+    fn clear_shared_write_sets(&mut self) {
+        self.shared_write_sets.clear();
+    }
+
+    /// Append a write index to the shared write set for `shared_id`.
+    fn append_shared_write(&mut self, shared_id: u32, index_kind: HirExprKind) {
+        self.shared_write_sets.entry(shared_id).or_default().push(index_kind);
+    }
+
+    /// Run the missing-barrier analysis for a SharedRead of `shared_id` with `read_index`.
+    ///
+    /// Checks the SET W_X of prior write indices (A.4.1, r3 SET-based rule).
+    /// Returns the advisory warning kind if applicable.
+    fn analyze_shared_read_barrier(
+        &self,
+        shared_id: u32,
+        read_index: &HirExprKind,
+        name: &str,
+        span: Span,
+    ) -> Option<SharedReadBarrierDiag> {
+        let write_set = match self.shared_write_sets.get(&shared_id) {
+            Some(set) if !set.is_empty() => set,
+            _ => return None, // no prior writes — no hazard
+        };
+
+        // Check 1: ProvablyEqual to ANY prior write -> NO diagnostic (self-RAW).
+        for wk in write_set {
+            if index_relation(wk, read_index) == IndexRelation::ProvablyEqual {
+                return None; // correct self-read, zero false positive
+            }
+        }
+
+        // Check 2: ProvablyDisequal to EVERY prior write -> HARD ERROR.
+        let all_disequal = write_set.iter()
+            .all(|wk| index_relation(wk, read_index) == IndexRelation::ProvablyDisequal);
+        if all_disequal {
+            let write_descs: Vec<String> = write_set.iter()
+                .map(format_index_kind)
+                .collect();
+            return Some(SharedReadBarrierDiag::HardError {
+                name: name.to_owned(),
+                read_index_desc: format_index_kind(read_index),
+                write_indices_desc: write_descs.join(", "),
+                span,
+            });
+        }
+
+        // Check 3: Unknown vs at least one prior write -> advisory warning.
+        Some(SharedReadBarrierDiag::Warning {
+            name: name.to_owned(),
+            span,
+        })
     }
 
     /// Look up a kernel parameter by name.
@@ -646,6 +915,34 @@ impl<'p> TypeChecker<'p> {
         });
         self.scope_stack.insert(name.to_owned(), idx);
         Some(id)
+    }
+}
+
+// ── Shared-read barrier diagnostic result type ────────────────────────────────
+
+enum SharedReadBarrierDiag {
+    HardError {
+        name: String,
+        read_index_desc: String,
+        write_indices_desc: String,
+        span: Span,
+    },
+    Warning {
+        name: String,
+        span: Span,
+    },
+}
+
+/// Format an HirExprKind index for use in diagnostic messages.
+fn format_index_kind(k: &HirExprKind) -> String {
+    match k {
+        HirExprKind::IntLit { value } => {
+            // IntLiteralValue is { ty: ScalarTy, bits: u64 }.
+            format!("{}({})", value.ty.display_name(), value.bits)
+        }
+        HirExprKind::LocalRead(BindingId(id)) => format!("binding#{id}"),
+        HirExprKind::GidBuiltin { axis } => format!("gid({axis})"),
+        _ => "<dynamic>".to_owned(),
     }
 }
 
@@ -805,6 +1102,16 @@ pub fn typecheck_kernel_body(
             past::Stmt::BuiltinCallStmt { call } => {
                 // M1.4: handle reserved subgroup builtin call at statement position.
                 if let Some(stmt) = check_builtin_call_stmt(&mut tc, call, spanned_stmt.span) {
+                    // M3.2: If this is a Barrier, clear all shared write sets (A.4.1).
+                    if matches!(stmt, HirStmt::Barrier { .. }) {
+                        tc.clear_shared_write_sets();
+                    }
+                    hir_stmts.push(stmt);
+                }
+            }
+            // M3.2: workgroup-shared array declaration.
+            past::Stmt::SharedDecl { name, elem, len } => {
+                if let Some(stmt) = check_shared_decl_stmt(&mut tc, name, elem, len, spanned_stmt.span) {
                     hir_stmts.push(stmt);
                 }
             }
@@ -817,6 +1124,7 @@ pub fn typecheck_kernel_body(
     let body_typed = KernelBodyTyped {
         bindings: tc.bindings,
         stmts: hir_stmts,
+        shared: tc.shared_decls,
     };
 
     (body_typed, tc.errors, tc.warns)
@@ -953,18 +1261,24 @@ fn check_if_stmt(
     }
 
     // Increment divergent depth AFTER cond is evaluated, BEFORE entering then-block.
+    // M3.2: Also increment conditional_depth (if/else only — NOT while/for-range).
     tc.divergent_context_depth += 1;
+    tc.conditional_depth += 1;
     let then_stmts = typecheck_nested_block(tc, then_block);
     // Decrement AFTER then-block statements complete.
     tc.divergent_context_depth -= 1;
+    tc.conditional_depth -= 1;
 
     let hir_else: Option<Box<HirElse>> = match else_arm {
         None => None,
         Some(past::ElseArm::Block(block)) => {
             // Increment divergent depth for the else-block.
+            // M3.2: Also increment conditional_depth.
             tc.divergent_context_depth += 1;
+            tc.conditional_depth += 1;
             let else_stmts = typecheck_nested_block(tc, block);
             tc.divergent_context_depth -= 1;
+            tc.conditional_depth -= 1;
             Some(Box::new(HirElse::Block(else_stmts)))
         }
         Some(past::ElseArm::If(inner_spanned)) => {
@@ -1352,6 +1666,16 @@ fn typecheck_block_stmts(tc: &mut TypeChecker<'_>, stmts: &[axc_lexer::Spanned<p
             }
             past::Stmt::BuiltinCallStmt { call } => {
                 if let Some(stmt) = check_builtin_call_stmt(tc, call, spanned_stmt.span) {
+                    // M3.2: If this is a Barrier, clear all shared write sets (A.4.1).
+                    if matches!(stmt, HirStmt::Barrier { .. }) {
+                        tc.clear_shared_write_sets();
+                    }
+                    hir_stmts.push(stmt);
+                }
+            }
+            // M3.2: shared array declarations are allowed in nested blocks too.
+            past::Stmt::SharedDecl { name, elem, len } => {
+                if let Some(stmt) = check_shared_decl_stmt(tc, name, elem, len, spanned_stmt.span) {
                     hir_stmts.push(stmt);
                 }
             }
@@ -1382,6 +1706,11 @@ fn typeref_to_scalar(tr: &past::TypeRef) -> Result<ScalarTy, &'static str> {
         // Return a sentinel error so callers fall back to the coopmat path.
         past::TypeRef::CoopMatrix { .. } => {
             Err("__coopmat__")
+        }
+        // M3.2: shared[T,N] is not a valid scalar type for let bindings.
+        // It is a declaration statement type, not a let-binding type.
+        past::TypeRef::Shared { .. } => {
+            Err("shared[T,N] is not a valid let-binding type; use `shared name: shared[T,N];` to declare a shared array")
         }
     }
 }
@@ -1576,12 +1905,17 @@ fn check_expr(
             }
         }
 
-        // ── Buffer index read: name[index] ────────────────────────────────────
+        // ── Buffer/shared index read: name[index] ─────────────────────────────
         past::Expr::Index { base, index } => {
             // The M1.2 parser only produces Index with an Ident base (postfix `name[expr]`).
             // Multi-dimensional chained indexing (e.g. buf[i][j]) is not parseable in M1.2.
             match &base.node {
                 past::Expr::Ident(name) => {
+                    // M3.2: Check if this is a shared array read first.
+                    let shared_info: Option<(SharedId, ScalarTy, u32)> = tc.find_shared(name);
+                    if let Some((shared_id, elem_ty, _len)) = shared_info {
+                        return check_shared_read(tc, shared_id, elem_ty, index, span);
+                    }
                     check_buffer_read(tc, name, base.span, index, span, expected)
                 }
                 _ => {
@@ -2034,6 +2368,16 @@ fn check_builtin_call_stmt(
                     expected_arity: 0,
                     got_arity: args.len(),
                     span: call.span,
+                });
+                return None;
+            }
+            // M3.2 (OQ2): barrier inside an if/else body (conditional_depth > 0) is UB.
+            // Note: this DOES NOT fire for while/for-range bodies (those do NOT increment
+            // conditional_depth). The existing divergent_context_depth is left unchanged
+            // for the subgroup-collective warning.
+            if tc.conditional_depth > 0 {
+                tc.errors.push(TypecheckError::BarrierInDivergentContext {
+                    span: stmt_span,
                 });
                 return None;
             }
@@ -3067,6 +3411,43 @@ fn check_index_assign_stmt(
 ) -> Option<HirStmt> {
     let name: &str = &target.node;
 
+    // M3.2: Check if the target is a shared array first.
+    let shared_info: Option<(SharedId, ScalarTy, u32)> = tc.find_shared(name);
+    if let Some((shared_id, elem_ty, _len)) = shared_info {
+        // Typecheck the index (must be U32 — no coercion, anti-pattern #1).
+        let index_hir: HirExpr = check_expr(tc, &index.node, index.span, Some(ScalarTy::U32))?;
+        if index_hir.ty != ScalarTy::U32 {
+            tc.errors.push(TypecheckError::SharedIndexNotU32 {
+                got: index_hir.ty.display_name(),
+                span: index.span,
+            });
+            return None;
+        }
+
+        // Typecheck the value (must match elem type exactly).
+        let value_hir: HirExpr = check_expr(tc, &value.node, value.span, Some(elem_ty))?;
+        if value_hir.ty != elem_ty {
+            tc.errors.push(TypecheckError::SharedWriteTypeMismatch {
+                name: name.to_owned(),
+                expected: elem_ty.display_name(),
+                got: value_hir.ty.display_name(),
+                span: value.span,
+            });
+            return None;
+        }
+
+        // M3.2 A.4.1: append to the shared write SET.
+        let index_kind = index_hir.kind.clone();
+        tc.append_shared_write(shared_id.0, index_kind);
+
+        return Some(HirStmt::SharedWrite {
+            shared_id: shared_id.0,
+            index: index_hir,
+            value: value_hir,
+            span: stmt_span,
+        });
+    }
+
     // Look up the param — clone the needed data to release the borrow before
     // calling check_expr (which borrows tc mutably).
     let param_info: Option<(ParamTy, u32)> = tc.find_param(name)
@@ -3223,6 +3604,148 @@ fn check_buffer_read(
     })
 }
 
+// ── M3.2 shared-array typecheck helpers ──────────────────────────────────────
+
+/// Typecheck a shared-array read expression: `shared_name[index]`.
+///
+/// Called from the `Expr::Index` handler when the base ident resolves to a shared decl.
+/// Runs the OQ1 SET-based missing-barrier analysis.
+fn check_shared_read(
+    tc: &mut TypeChecker<'_>,
+    shared_id: SharedId,
+    elem_ty: ScalarTy,
+    index: &axc_lexer::Spanned<past::Expr>,
+    expr_span: Span,
+) -> Option<HirExpr> {
+    // Index must be U32 (no implicit coercion — anti-pattern #1).
+    let index_hir: HirExpr = check_expr(tc, &index.node, index.span, Some(ScalarTy::U32))?;
+    if index_hir.ty != ScalarTy::U32 {
+        tc.errors.push(TypecheckError::SharedIndexNotU32 {
+            got: index_hir.ty.display_name(),
+            span: index.span,
+        });
+        return None;
+    }
+
+    // Look up the shared array name for diagnostic messages.
+    // We clone the name to avoid holding a borrow into tc.shared_decls during analysis.
+    let shared_name: String = tc.shared_decls.get(shared_id.0 as usize)
+        .map(|d| d.name.clone())
+        .unwrap_or_else(|| format!("<shared#{}>", shared_id.0));
+
+    // M3.2 A.4.1: OQ1 SET-based missing-barrier analysis.
+    // analyze_shared_read_barrier takes a reference to tc; we need to avoid
+    // a double borrow. Extract the diagnostic first, then push errors/warns.
+    let diag = tc.analyze_shared_read_barrier(
+        shared_id.0,
+        &index_hir.kind,
+        &shared_name,
+        expr_span,
+    );
+
+    if let Some(d) = diag {
+        match d {
+            SharedReadBarrierDiag::HardError { name, read_index_desc, write_indices_desc, span } => {
+                tc.errors.push(TypecheckError::SharedMissingBarrierBeforeCrossInvocationRead {
+                    name,
+                    read_index_desc,
+                    write_indices_desc,
+                    span,
+                });
+                return None;
+            }
+            SharedReadBarrierDiag::Warning { name, span } => {
+                tc.warns.push(crate::validate::HirWarning::SharedWriteWithoutBarrierBeforeRead {
+                    name,
+                    span,
+                });
+            }
+        }
+    }
+
+    Some(HirExpr {
+        kind: HirExprKind::SharedRead {
+            shared_id: shared_id.0,
+            index: Box::new(index_hir),
+        },
+        ty: elem_ty,
+        span: expr_span,
+    })
+}
+
+/// Typecheck a `shared name: shared[elem, N];` declaration statement.
+///
+/// Validates N > 0, N <= MAX_SHARED_ELEMS, allowed elem type, no collision,
+/// then registers the shared array in the TypeChecker.
+fn check_shared_decl_stmt(
+    tc: &mut TypeChecker<'_>,
+    name: &axc_lexer::Spanned<String>,
+    elem: &axc_parser::ast::ScalarTypeRef,
+    len: &axc_lexer::Spanned<u32>,
+    stmt_span: Span,
+) -> Option<HirStmt> {
+    // Validate element type.
+    let elem_ty: ScalarTy = match elem {
+        past::ScalarTypeRef::I8  => ScalarTy::I8,
+        past::ScalarTypeRef::U8  => ScalarTy::U8,
+        past::ScalarTypeRef::I32 => ScalarTy::I32,
+        past::ScalarTypeRef::U32 => ScalarTy::U32,
+        past::ScalarTypeRef::I64 => ScalarTy::I64,
+        past::ScalarTypeRef::U64 => ScalarTy::U64,
+        past::ScalarTypeRef::F16 => ScalarTy::F16,
+        past::ScalarTypeRef::F32 => ScalarTy::F32,
+        past::ScalarTypeRef::F64 => ScalarTy::F64,
+        past::ScalarTypeRef::Bf16 => {
+            // bf16 is not a valid shared element type (not even a valid scalar in SPIR-V
+            // without the BF16 extension). Reject with a clear error.
+            tc.errors.push(TypecheckError::SharedElementTypeUnsupported {
+                name: name.node.clone(),
+                ty_name: "bf16".to_owned(),
+                span: stmt_span,
+            });
+            return None;
+        }
+    };
+
+    if !is_allowed_shared_element(elem_ty) {
+        tc.errors.push(TypecheckError::SharedElementTypeUnsupported {
+            name: name.node.clone(),
+            ty_name: elem_ty.display_name().to_owned(),
+            span: stmt_span,
+        });
+        return None;
+    }
+
+    // Validate N.
+    let n: u32 = len.node;
+    if n == 0 {
+        tc.errors.push(TypecheckError::SharedZeroLength {
+            name: name.node.clone(),
+            span: len.span,
+        });
+        return None;
+    }
+    if n > MAX_SHARED_ELEMS {
+        tc.errors.push(TypecheckError::SharedTooLarge {
+            name: name.node.clone(),
+            len: n,
+            max: MAX_SHARED_ELEMS,
+            span: len.span,
+        });
+        return None;
+    }
+
+    let ty = SharedTy { elem: elem_ty, len: n };
+    let maybe_id = tc.register_shared(&name.node, ty, stmt_span);
+
+    let shared_id = maybe_id?;
+
+    Some(HirStmt::SharedDeclMarker {
+        id: shared_id,
+        span: stmt_span,
+    })
+}
+
 /// Check a `gid(axis)` call.
 fn check_gid_call(
     tc: &mut TypeChecker<'_>,
@@ -3302,7 +3825,7 @@ mod tests {
             let (typed, errs, _warns) = typecheck_kernel_body(&kd.body.node, &[]);
             return (typed, errs);
         }
-        (KernelBodyTyped { bindings: Vec::new(), stmts: Vec::new() }, Vec::new())
+        (KernelBodyTyped { bindings: Vec::new(), stmts: Vec::new(), shared: Vec::new() }, Vec::new())
     }
 
     /// Helper: parse kernel body statements with params and run typecheck. Also returns warnings.
@@ -3317,7 +3840,7 @@ mod tests {
             let axc_parser::Item::Kernel(ref kd) = item.node;
             return typecheck_kernel_body(&kd.body.node, &[]);
         }
-        (KernelBodyTyped { bindings: Vec::new(), stmts: Vec::new() }, Vec::new(), Vec::new())
+        (KernelBodyTyped { bindings: Vec::new(), stmts: Vec::new(), shared: Vec::new() }, Vec::new(), Vec::new())
     }
 
     // 1. tc_let_i32_literal_happy
@@ -3585,7 +4108,7 @@ mod tests {
             let (typed, errs, _warns) = typecheck_kernel_body(&kd.body.node, &params);
             return (typed, errs);
         }
-        (KernelBodyTyped { bindings: Vec::new(), stmts: Vec::new() }, Vec::new())
+        (KernelBodyTyped { bindings: Vec::new(), stmts: Vec::new(), shared: Vec::new() }, Vec::new())
     }
 
     // AT-210: WriteToReadonlyBuffer
@@ -4390,17 +4913,17 @@ mod tests {
         );
     }
 
-    // AT-429: workgroup_barrier inside if body — NO divergent warning (CRITICAL-4)
+    // AT-429 (INVERTED per M3.2 r3): workgroup_barrier inside if body — now a HARD ERROR
+    // (OQ2 BarrierInDivergentContext). Previously asserted errors.is_empty(); now inverted.
     #[test]
-    fn warn_barrier_in_if_body_no_warning() {
-        let (_body, errors, warns) = tc_body_with_warns(
+    fn error_barrier_in_if_body_is_divergent_context() {
+        let (_body, errors, _warns) = tc_body_with_warns(
             "let p: bool = true; if p { workgroup_barrier(); } return;"
         );
-        assert!(errors.is_empty(), "errors: {errors:?}");
-        // workgroup_barrier must NOT produce a divergent context warning (CRITICAL-4)
+        // Under M3.2 the barrier-in-if-body is a HARD ERROR (Vulkan UB).
         assert!(
-            !warns.iter().any(|w| matches!(w, crate::validate::HirWarning::SubgroupOpInDivergentContext { .. })),
-            "workgroup_barrier must not warn in divergent context; warns: {warns:?}"
+            errors.iter().any(|e| matches!(e, TypecheckError::BarrierInDivergentContext { .. })),
+            "expected BarrierInDivergentContext error for barrier in if-body; errors: {errors:?}"
         );
     }
 

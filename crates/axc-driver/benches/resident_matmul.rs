@@ -152,6 +152,7 @@ fn bench_resident_timing_kernels(c: &mut Criterion) {
         let handle = match ctx.prepare_kernel_checked(
             &words, &meta.binding_plan, meta.push_constant_total_bytes,
             &meta.entry_point, None, "saxpy",
+            meta.shared_memory_bytes,
         ) {
             Ok(h) => h,
             Err(e) => { eprintln!("saxpy prepare failed: {e}"); return; }
@@ -200,6 +201,7 @@ fn bench_resident_timing_kernels(c: &mut Criterion) {
         let handle = match ctx.prepare_kernel_checked(
             &words, &meta.binding_plan, meta.push_constant_total_bytes,
             &meta.entry_point, None, "q4km_dequant_matvec",
+            meta.shared_memory_bytes,
         ) {
             Ok(h) => h,
             Err(DispatchError::DeviceFeatureUnsupported { feature, kernel }) => {
@@ -258,6 +260,7 @@ fn bench_resident_timing_kernels(c: &mut Criterion) {
         let handle = match ctx.prepare_kernel_checked(
             &words, &meta.binding_plan, meta.push_constant_total_bytes,
             &meta.entry_point, None, "q4km_dequant_matmul",
+            meta.shared_memory_bytes,
         ) {
             Ok(h) => h,
             Err(DispatchError::DeviceFeatureUnsupported { feature, kernel }) => {
@@ -313,6 +316,7 @@ fn bench_resident_timing_kernels(c: &mut Criterion) {
         match ctx.prepare_kernel_checked(
             &words, &meta.binding_plan, meta.push_constant_total_bytes,
             &meta.entry_point, meta.coopmat.as_ref(), "matmul_tile",
+            meta.shared_memory_bytes,
         ) {
             Ok(handle) => {
                 let a_f16 = vec![0u8; 512];
@@ -387,6 +391,7 @@ fn bench_naive_gemm_harness_validation(c: &mut Criterion) {
     let handle = match ctx.prepare_kernel_checked(
         &words, &meta.binding_plan, meta.push_constant_total_bytes,
         &meta.entry_point, None, "matmul_f32_tiled",
+        meta.shared_memory_bytes,
     ) {
         Ok(h) => h,
         Err(DispatchError::DeviceFeatureUnsupported { feature, kernel }) => {
@@ -514,6 +519,7 @@ fn bench_dispatch_resident_matmul_tile(c: &mut Criterion) {
     let handle = match ctx.prepare_kernel_checked(
         &words, &meta.binding_plan, meta.push_constant_total_bytes,
         &meta.entry_point, meta.coopmat.as_ref(), "matmul_tile",
+        meta.shared_memory_bytes,
     ) {
         Ok(h) => h,
         Err(DispatchError::CoopMatUnsupported { reason, .. }) => {

@@ -65,6 +65,13 @@ pub struct KernelResources<'r> {
     /// Subgroup builtin variables (SubgroupLocalInvocationId, SubgroupSize) emitted before fn.
     /// M1.4: None if the kernel body uses no subgroup scalar builtins.
     pub subgroup_vars: Option<&'r SubgroupBuiltinVars>,
+    /// Workgroup-shared array bindings emitted before the function (M3.2).
+    ///
+    /// `Some` when the kernel body has any `shared[T,N]` declarations.
+    /// `None` for kernels without shared arrays. SharedRead/SharedWrite handlers
+    /// return `BodyCodegenError::UnexpectedHir` if this is `None` but a shared
+    /// access is encountered (compiler bug — emit.rs must populate this).
+    pub shared_bindings: Option<&'r crate::shared::SharedBindings>,
 }
 
 /// Errors from SPIR-V body emission.
@@ -544,6 +551,26 @@ fn emit_stmt(em: &mut BodyEmitter<'_>, stmt: &HirStmt) -> Result<(), BodyCodegen
                 }
             }
         }
+        // M3.2: SharedDeclMarker is a no-op in codegen (OpVariable emitted by emit_shared_globals).
+        HirStmt::SharedDeclMarker { .. } => Ok(()),
+
+        // M3.2: SharedWrite → OpAccessChain (single index) + OpStore.
+        HirStmt::SharedWrite { shared_id, index, value, .. } => {
+            let index_id = emit_expr(em, index)?;
+            let value_id = emit_expr(em, value)?;
+            let shared_bindings = em.res.shared_bindings
+                .ok_or(BodyCodegenError::UnexpectedHir(
+                    "SharedWrite: no SharedBindings in KernelResources"
+                ))?;
+            crate::shared::emit_shared_write(
+                em.b,
+                shared_bindings,
+                *shared_id,
+                index_id,
+                value_id,
+            )
+        }
+
         HirStmt::CoopMatStore { matrix_binding, buf_param_index, element_offset, stride, .. } => {
             // M2.1: Emit OpCooperativeMatrixStoreKHR via coopmat module.
             let mat_val_id = *em.var_ids.get(matrix_binding)
@@ -1028,6 +1055,22 @@ fn emit_expr(em: &mut BodyEmitter<'_>, expr: &HirExpr) -> Result<Word, BodyCodeg
                     q::emit_f32_from_u32(em.b, em.type_cache, u_id)
                 }
             }
+        }
+        // M3.2: SharedRead → emit_shared_read (SINGLE-index access chain + OpLoad).
+        HirExprKind::SharedRead { shared_id, index } => {
+            let index_id = emit_expr(em, index)?;
+            let elem_ty_id = em.type_id(expr.ty);
+            let shared_bindings = em.res.shared_bindings
+                .ok_or(BodyCodegenError::UnexpectedHir(
+                    "SharedRead: no SharedBindings in KernelResources"
+                ))?;
+            crate::shared::emit_shared_read(
+                em.b,
+                shared_bindings,
+                *shared_id,
+                index_id,
+                elem_ty_id,
+            )
         }
     }
 }

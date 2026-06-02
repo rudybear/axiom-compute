@@ -139,12 +139,26 @@ pub fn compile_source_with_meta(source: &str) -> Result<(Vec<u8>, KernelMetadata
     let coopmat_meta: Option<CoopMatShapeMeta> = kernel.annotations.coop_matrix.as_ref()
         .map(hir_coopmat_shape_to_meta)
         .transpose()?;
+
+    // M3.2: Compute aggregate shared_memory_bytes from the typed body's shared decls.
+    // This is Σ total_byte_size() for all shared[T,N] declarations in the kernel body.
+    let shared_memory_bytes: u32 = match &kernel.body {
+        axc_hir::KernelBody::Typed(tb) => {
+            let total: u64 = tb.shared.iter().map(|s| s.ty.total_byte_size()).sum();
+            // Saturate to u32::MAX if somehow overflow occurs (should not in practice
+            // since the HIR validator rejects > 65536 bytes at compile time).
+            total.min(u64::from(u32::MAX)) as u32
+        }
+        axc_hir::KernelBody::Empty => 0,
+    };
+
     let metadata: KernelMetadata = KernelMetadata::new(
         kernel.name.clone(),
         workgroup_size,
         kernel.binding_plan.clone(),
         kernel.name.clone(),
-    ).with_coopmat(coopmat_meta);
+    ).with_coopmat(coopmat_meta)
+     .with_shared_memory_bytes(shared_memory_bytes);
 
     Ok((bytes, metadata))
 }

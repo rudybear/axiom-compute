@@ -11,11 +11,13 @@
 use axc_lexer::Span;
 use crate::hir::{
     Module as HirModule,
+    KernelBody,
     PORTABLE_MIN_WORKGROUP_INVOCATIONS,
     DESKTOP_MAX_WORKGROUP_INVOCATIONS,
 };
 use crate::typecheck::TypecheckError;
 use crate::param::BindingPlanError;
+use crate::shared::{PORTABLE_MIN_SHARED_BYTES, MAX_SHARED_BYTES};
 
 /// Diagnostic error from HIR validation.
 #[derive(Debug, thiserror::Error, miette::Diagnostic)]
@@ -162,6 +164,131 @@ pub enum HirError {
         #[label("here")]
         span: Span,
     },
+
+    // ── M3.2: shared[T,N] workgroup-memory errors ────────────────────────────
+
+    /// `shared[T, 0]` — length must be at least 1.
+    #[error("shared array `{name}` has length 0; N must be at least 1")]
+    SharedZeroLength {
+        name: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    /// `shared[T, N]` with N > MAX_SHARED_ELEMS (65536).
+    #[error("shared array `{name}` length {len} exceeds maximum {max} elements")]
+    SharedTooLarge {
+        name: String,
+        len: u32,
+        max: u32,
+        #[label("here")]
+        span: Span,
+    },
+
+    /// `shared[bool, N]` — Bool is not allowed as shared array element type.
+    #[error("shared array `{name}`: element type `{ty_name}` is not allowed (Bool has no stable Vulkan memory representation; use i32/u32 instead)")]
+    SharedElementTypeUnsupported {
+        name: String,
+        ty_name: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    /// Two shared arrays in the same kernel body have the same name.
+    #[error("duplicate shared array name `{name}` in kernel body")]
+    SharedDuplicateName {
+        name: String,
+        #[label("duplicate here")]
+        span: Span,
+        #[label("original declaration")]
+        original_span: Span,
+    },
+
+    /// `shared[T, N]` used as a kernel parameter type — not allowed.
+    #[error("shared-array type `shared[T, N]` cannot be used as a kernel parameter (`{param_name}`); shared arrays are kernel-local and consume no descriptor")]
+    SharedTypeNotAllowedAsParam {
+        param_name: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    /// `tile[index]` where `index` is not `U32`.
+    ///
+    /// Part of anti-pattern #1 compliance — no silent coercion to U32.
+    #[error("shared array index must be `u32`; got `{got}` (no implicit coercion — anti-pattern #1)")]
+    SharedIndexNotU32 {
+        got: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    /// `tile[i] = value;` where `value` type does not match the element type.
+    #[error("shared array `{name}` element type is `{expected}`; got `{got}` (no implicit conversion — exact match required)")]
+    SharedWriteTypeMismatch {
+        name: String,
+        expected: String,
+        got: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    /// `shared` name collides with a kernel parameter or local binding name.
+    #[error("shared array name `{name}` collides with an existing parameter or binding")]
+    SharedNameCollision {
+        name: String,
+        #[label("collision here")]
+        span: Span,
+    },
+
+    /// Shared array name used but not declared.
+    #[error("shared array `{name}` is not declared (did you forget `shared name: shared[T, N];`?)")]
+    SharedNotDeclared {
+        name: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    /// A SharedRead in the same basic block with no barrier accesses a PROVABLY DIFFERENT
+    /// slot than any of the prior SharedWrites since the last barrier.
+    ///
+    /// This is the sound provable-cross-slot hard error (OQ1, r3 — SET-based):
+    /// the read index is ProvablyDisequal to EVERY prior write index in W_X.
+    /// A ProvablyEqual self-read emits NO diagnostic; unknown index emits advisory warning.
+    ///
+    /// Note: the diagnostic name says "missing barrier" because the correct fix is to add
+    /// a `workgroup_barrier()` between the cross-invocation write and read phases.
+    #[error("shared array `{name}`: a read at index {read_index_desc} follows writes at {write_indices_desc} with no barrier between them; this invocation provably reads a slot written by a DIFFERENT invocation (cross-invocation RAW hazard — add workgroup_barrier() between write and read phases)")]
+    SharedMissingBarrierBeforeCrossInvocationRead {
+        name: String,
+        read_index_desc: String,
+        write_indices_desc: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    /// `workgroup_barrier()` inside an `if`/`else` body (conditional_depth > 0).
+    ///
+    /// Barriers in non-uniform control flow are UB in Vulkan — not all invocations
+    /// will reach the barrier, causing the hardware to deadlock or produce incorrect results.
+    ///
+    /// Barriers inside `for`-range or `while` loop bodies ARE permitted (conditional_depth 0).
+    #[error("workgroup_barrier() inside an if/else body is undefined behavior (not all invocations provably enter); move the barrier outside the conditional or restructure the kernel")]
+    BarrierInDivergentContext {
+        #[label("barrier here")]
+        span: Span,
+    },
+
+    /// Aggregate shared bytes exceed the compiler's static maximum (65536 bytes).
+    ///
+    /// This is a compile-time ceiling. At runtime, `SharedMemoryExceedsDeviceLimit`
+    /// may fire even below this threshold if the device's `maxComputeSharedMemorySize`
+    /// is smaller (e.g. a 16 KiB mobile GPU).
+    #[error("kernel uses {total_bytes} bytes of shared memory (sum of all shared arrays), exceeding the compile-time maximum of 65536 bytes; reduce shared array sizes")]
+    SharedMemoryTooLarge {
+        total_bytes: u64,
+        #[label("here")]
+        span: Span,
+    },
 }
 
 /// Non-fatal diagnostic warning from HIR validation.
@@ -221,6 +348,31 @@ pub enum HirWarning {
     CoopMatFlagWithoutOps {
         kernel_name: String,
     },
+
+    // ── M3.2: shared-memory warnings ────────────────────────────────────────
+
+    /// Aggregate shared bytes exceed the Vulkan portable minimum (16 KiB) but
+    /// stay within the compile-time ceiling (65536 bytes).
+    ///
+    /// The kernel will fail preflight on devices with `maxComputeSharedMemorySize < total_bytes`
+    /// (e.g. some mobile GPUs). Use `@target` annotations (future) or reduce shared array sizes.
+    SharedMemoryExceedsPortableMinimum {
+        total_bytes: u64,
+        min_bytes: u32,
+        span: Span,
+    },
+
+    /// A SharedWrite of id X is followed (in the same basic block, no intervening barrier)
+    /// by a SharedRead of the SAME id X, and the index relation is UNDECIDABLE
+    /// (the read index is neither provably equal NOR provably disequal to all prior write
+    /// indices — e.g. dynamic/arithmetic index).
+    ///
+    /// Advisory only: cross-invocation aliasing through dynamic indices is undecidable
+    /// in general. Add `workgroup_barrier()` if cross-invocation visibility is required.
+    SharedWriteWithoutBarrierBeforeRead {
+        name: String,
+        span: Span,
+    },
 }
 
 /// Run post-lowering validation rules on a `HirModule`.
@@ -267,6 +419,25 @@ pub fn validate(module: &HirModule) -> (Vec<HirError>, Vec<HirWarning>) {
             });
         }
         // product <= PORTABLE_MIN: clean, no action needed
+
+        // M3.2: Validate aggregate shared memory size.
+        if let KernelBody::Typed(ref tb) = kernel.body {
+            let total_bytes: u64 = tb.shared.iter()
+                .map(|s| s.ty.total_byte_size())
+                .sum();
+            if total_bytes > MAX_SHARED_BYTES {
+                errors.push(HirError::SharedMemoryTooLarge {
+                    total_bytes,
+                    span: kernel.span,
+                });
+            } else if total_bytes > u64::from(PORTABLE_MIN_SHARED_BYTES) {
+                warnings.push(HirWarning::SharedMemoryExceedsPortableMinimum {
+                    total_bytes,
+                    min_bytes: PORTABLE_MIN_SHARED_BYTES,
+                    span: kernel.span,
+                });
+            }
+        }
     }
 
     (errors, warnings)

@@ -4,7 +4,8 @@
 //! for structured diagnostic rendering. No `Box<dyn Error>` is used anywhere;
 //! all error context is encoded in typed fields (anti-pattern compliance).
 //!
-//! Variant count: 30 (M3.1). M3.1 adds 2: CoopMatUnsupported, DeviceFeatureUnsupported.
+//! Variant count: 31 (M3.2). M3.1 adds 2: CoopMatUnsupported, DeviceFeatureUnsupported.
+//! M3.2 adds 1: SharedMemoryExceedsDeviceLimit.
 //! The count is asserted in `at_801`.
 //!
 //! ## M3.0 additions
@@ -283,6 +284,23 @@ pub enum DispatchError {
         /// Source-level kernel name (for diagnostics).
         kernel: String,
     },
+
+    /// The kernel declares more workgroup-shared memory than the device supports — M3.2.
+    ///
+    /// Returned by `preflight_kernel_support` when `kernel.shared_memory_bytes > device.maxComputeSharedMemorySize`.
+    /// Callers should SKIP the kernel on this device (graceful typed skip, not a fatal failure).
+    ///
+    /// This mirrors the `CoopMatUnsupported` / `DeviceFeatureUnsupported` pattern: a typed,
+    /// diagnostic-friendly error with `required`, `device_max`, and `kernel` fields.
+    #[error("kernel '{kernel}' requires {required} bytes of shared memory which exceeds device maximum of {device_max} bytes")]
+    SharedMemoryExceedsDeviceLimit {
+        /// Shared memory bytes required by the kernel.
+        required: u32,
+        /// Device's `maxComputeSharedMemorySize` limit.
+        device_max: u32,
+        /// Source-level kernel name (for diagnostics).
+        kernel: String,
+    },
 }
 
 /// Convenience type alias for dispatch results.
@@ -299,7 +317,7 @@ mod tests {
     /// The exhaustive match below ensures the compiler reminds us to update this test
     /// whenever a variant is added or removed.
     #[test]
-    fn at_801_dispatch_error_variants_count_is_30() {
+    fn at_801_dispatch_error_variants_count_is_31() {
         // Construct one instance of each variant and verify non-empty Display.
         let variants: Vec<DispatchError> = vec![
             DispatchError::VulkanEntryFailed("test".to_owned()),
@@ -355,10 +373,16 @@ mod tests {
                 feature: "storageBuffer16BitAccess".to_owned(),
                 kernel: "matmul_tile".to_owned(),
             },
+            // M3.2 addition (variant 31):
+            DispatchError::SharedMemoryExceedsDeviceLimit {
+                required: 65536,
+                device_max: 16384,
+                kernel: "shared_reduce".to_owned(),
+            },
         ];
 
-        // Verify exactly 30 variants are covered.
-        assert_eq!(variants.len(), 30, "expected exactly 30 DispatchError variants");
+        // Verify exactly 31 variants are covered (M3.2 adds SharedMemoryExceedsDeviceLimit).
+        assert_eq!(variants.len(), 31, "expected exactly 31 DispatchError variants");
 
         for variant in &variants {
             let msg = variant.to_string();
@@ -436,11 +460,11 @@ mod tests {
         assert!(e3.to_string().contains("Invalidate"), "MappedRangeOpFailed must include op name");
     }
 
-    /// AT-502 (legacy test preserved as alias): verifies the new 30-count.
+    /// AT-502 (legacy test preserved as alias): verifies the new 31-count.
     #[test]
     fn at_502_dispatch_error_variants_are_display_miette() {
         // This test delegates to the more complete at_801 test above.
         // Preserved for backward-compatibility with any test-name grepping.
-        at_801_dispatch_error_variants_count_is_30();
+        at_801_dispatch_error_variants_count_is_31();
     }
 }

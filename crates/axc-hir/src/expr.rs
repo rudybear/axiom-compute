@@ -11,6 +11,8 @@
 //! M2.1 adds `CoopMatBuiltin` expression kind and `CoopMatStore` statement kind for
 //!       cooperative-matrix operations.
 //! M2.5 adds `Q4_0Builtin` expression kind for byte-level access and f16 conversion.
+//! M3.2 adds `SharedRead` expression kind and `SharedWrite`/`SharedDecl` statement kinds,
+//!       plus the `shared` field on `KernelBodyTyped`.
 
 use axc_lexer::Span;
 use crate::ty::{ScalarTy, IntLiteralValue, FloatLiteralValue};
@@ -173,6 +175,17 @@ pub enum HirExprKind {
         /// Buffer-parameter binding slot (0-based); `Some` for ptr_read_* builtins.
         buf_param_index: Option<u32>,
     },
+    /// Read one element from a workgroup-shared array: `tile[index]` (M3.2).
+    ///
+    /// `shared_id` is the 0-based index into `KernelBodyTyped.shared`.
+    /// `index` must have type `U32` (no implicit coercion — anti-pattern #1).
+    /// Result type is the shared array's element `ScalarTy`.
+    SharedRead {
+        /// Id of the shared array being read.
+        shared_id: u32,
+        /// Index expression — must be U32.
+        index: Box<HirExpr>,
+    },
 }
 
 /// Unary operator.
@@ -287,11 +300,46 @@ pub enum HirStmt {
         stride: HirExpr,
         span: Span,
     },
+    /// Write one element to a workgroup-shared array: `tile[index] = value;` (M3.2).
+    ///
+    /// `shared_id` is the 0-based index into `KernelBodyTyped.shared`.
+    /// `index` must have type `U32` (no implicit coercion).
+    /// `value` must match the shared array's element type exactly.
+    SharedWrite {
+        /// Id of the shared array being written.
+        shared_id: u32,
+        /// Index expression — must be U32.
+        index: HirExpr,
+        /// Value to write — must match elem ScalarTy exactly.
+        value: HirExpr,
+        span: Span,
+    },
+    /// No-op marker preserving shared-array declaration order in the statement list (M3.2).
+    ///
+    /// The actual `OpVariable Workgroup` is emitted by `emit_shared_globals` from the
+    /// `KernelBodyTyped.shared` table, NOT from this statement. This marker exists to
+    /// preserve lexical ordering of declarations in diagnostic messages and preserves
+    /// the correspondence between source order and emission order.
+    SharedDeclMarker {
+        /// Id of the declared shared array.
+        id: crate::shared::SharedId,
+        span: Span,
+    },
 }
 
 /// The typed body of a kernel: a binding table plus ordered statements.
+///
+/// M3.2 adds `shared`: the ordered list of workgroup-shared array declarations,
+/// analogous to `bindings` for local variables and the buffer table in HIR params.
 #[derive(Debug, Clone)]
 pub struct KernelBodyTyped {
     pub bindings: Vec<Binding>,
     pub stmts: Vec<HirStmt>,
+    /// Workgroup-shared array declarations in source order (M3.2).
+    ///
+    /// Each entry is a `SharedDecl` with a unique `SharedId`. The codegen uses this
+    /// table to emit `OpVariable Workgroup` before the function body. The typecheck
+    /// resolves `name[i]` references into `SharedRead`/`SharedWrite` HIR nodes
+    /// using the ids from this table.
+    pub shared: Vec<crate::shared::SharedDecl>,
 }

@@ -10,6 +10,7 @@
 //! M1.4 adds subgroup operations and workgroup barrier.
 //! M2.1 adds cooperative-matrix types, F16 primitive, and four coopmat builtins.
 //! M2.5 adds U8 buffer element type and four Q4_0-path builtins for LLM dequant.
+//! M3.2 adds shared[T,N] workgroup-local memory (FG.6).
 
 pub mod hir;
 pub mod lower;
@@ -24,6 +25,8 @@ pub mod control_flow;
 pub mod subgroup;
 pub mod coopmat;
 pub mod q4_0;
+/// Workgroup-shared array HIR types (M3.2).
+pub mod shared;
 
 pub use hir::{
     Module as HirModule,
@@ -56,3 +59,4 @@ pub use loop_ctx::{HirLoopStack, ScopeStack};
 pub use subgroup::{SubgroupOp, SubgroupReduceKind, BarrierKind};
 pub use coopmat::{CoopMatUse, CoopMatBuiltin, CoopMatrixShapeKind, CoopMatKey, CoopMatrixShape};
 pub use q4_0::{Q4_0Builtin, RESERVED_Q4_0_BUILTIN_NAMES, is_reserved_q4_0_builtin};
+pub use shared::{SharedId, SharedTy, SharedDecl, MAX_SHARED_ELEMS, PORTABLE_MIN_SHARED_BYTES, is_allowed_shared_element};

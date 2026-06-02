@@ -394,6 +394,14 @@ fn lower_type_ref(
             });
             None
         }
+        // M3.2: shared[T,N] as a parameter is a hard error.
+        TypeRef::Shared { .. } => {
+            errors.push(HirError::SharedTypeNotAllowedAsParam {
+                param_name: param_name.to_owned(),
+                span,
+            });
+            None
+        }
     }
 }
 
@@ -559,7 +567,10 @@ fn find_mul_add_in_stmt(stmt: &HirStmt) -> Option<&HirExprKind> {
         | HirStmt::Return { .. }
         | HirStmt::Break { .. }
         | HirStmt::Continue { .. }
-        | HirStmt::Barrier { .. } => None,
+        | HirStmt::Barrier { .. }
+        // M3.2: SharedWrite / SharedDeclMarker don't contain coopmat_mul_add.
+        | HirStmt::SharedWrite { .. }
+        | HirStmt::SharedDeclMarker { .. } => None,
     }
 }
 
@@ -593,7 +604,10 @@ fn find_mul_add_in_expr(expr: &crate::expr::HirExpr) -> Option<&HirExprKind> {
         | HirExprKind::FloatLit { .. }
         | HirExprKind::BoolLit(_)
         | HirExprKind::LocalRead(_)
-        | HirExprKind::GidBuiltin { .. } => None,
+        | HirExprKind::GidBuiltin { .. }
+        // M3.2: SharedRead carries an index expression; scan it for completeness (unlikely
+        // to contain coopmat_mul_add but must be exhaustive).
+        | HirExprKind::SharedRead { .. } => None,
     }
 }
 
