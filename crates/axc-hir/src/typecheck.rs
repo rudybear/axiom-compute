@@ -612,6 +612,14 @@ pub enum TypecheckError {
         #[label("barrier here")]
         span: Span,
     },
+
+    /// Aggregate shared memory > 65536 bytes — compile-time ceiling exceeded.
+    #[error("kernel uses {total_bytes} bytes of shared memory (sum of all shared arrays), exceeding the compile-time maximum of 65536 bytes; reduce shared array sizes")]
+    SharedMemoryTooLarge {
+        total_bytes: u64,
+        #[label("here")]
+        span: Span,
+    },
 }
 
 // ── Internal binding table ────────────────────────────────────────────────────
@@ -1120,6 +1128,29 @@ pub fn typecheck_kernel_body(
 
     // Pop the top-level scope frame opened in TypeChecker::new.
     tc.scope_stack.pop_frame();
+
+    // M3.2: Check aggregate shared-memory size limits.
+    // - > MAX_SHARED_BYTES (65536) → SharedMemoryTooLarge hard error.
+    // - > PORTABLE_MIN_SHARED_BYTES (16384) → advisory warning.
+    {
+        use crate::shared::{MAX_SHARED_BYTES, PORTABLE_MIN_SHARED_BYTES};
+        let total_bytes: u64 = tc.shared_decls.iter()
+            .map(|s| s.ty.total_byte_size())
+            .sum();
+        if total_bytes > MAX_SHARED_BYTES {
+            tc.errors.push(TypecheckError::SharedMemoryTooLarge {
+                total_bytes,
+                // Use the span of the last shared decl for location.
+                span: tc.shared_decls.last().map(|s| s.span).unwrap_or_default(),
+            });
+        } else if total_bytes > u64::from(PORTABLE_MIN_SHARED_BYTES) {
+            tc.warns.push(crate::validate::HirWarning::SharedMemoryExceedsPortableMinimum {
+                total_bytes,
+                min_bytes: PORTABLE_MIN_SHARED_BYTES,
+                span: tc.shared_decls.last().map(|s| s.span).unwrap_or_default(),
+            });
+        }
+    }
 
     let body_typed = KernelBodyTyped {
         bindings: tc.bindings,

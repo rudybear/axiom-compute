@@ -1,0 +1,65 @@
+// examples/shared_reduce.axc — Workgroup parallel SUM reduction over shared[f32,256].
+//
+// PART A correctness fixture (AT-1606).
+//
+// The tree-reduction reads a DIFFERENT slot than each invocation wrote
+// (provable cross-slot via the distinct stride index). A workgroup_barrier()
+// between the shared write phase and the tree-reduction read phase is REQUIRED
+// for correct cross-invocation visibility.
+//
+// The barrier-ABSENT variant triggers the OQ1 HARD ERROR
+// SharedMissingBarrierBeforeCrossInvocationRead at compile time (provable cross-slot).
+//
+// Anti-pattern #8: lshr() for stride halving (NOT `>>`).
+// Anti-pattern #2: explicit `return;`.
+// Anti-pattern #9: real GPU execution required for the full correctness proof;
+//                  on Lavapipe (serial CPU) and NVIDIA (lockstep subgroup)
+//                  the race hazard is NOT observable; the OQ1 compiler hard error
+//                  is the in-CI protection.
+//
+// CROSS-VENDOR RACE HONESTY (bounded gap):
+//   A missing WorkgroupMemory barrier passes on NVIDIA (subgroup-32 lockstep)
+//   AND Lavapipe (serial CPU emulation) but RACES on AMD wave64 / Intel where
+//   a workgroup spans independent SIMD groups. True race validation requires
+//   EB.1 (AMD/Intel CI). The compiler OQ1 hard error is the real protection.
+
+@kernel
+@workgroup(256, 1, 1)
+@intent("workgroup parallel sum reduction over shared[f32,256]; barrier-visibility oracle")
+@complexity(O(n))
+fn shared_reduce(input: readonly_buffer[f32], output: buffer[f32]) -> void {
+    shared tile: shared[f32, 256];
+
+    let lid: u32 = gid(0u32);
+
+    // Stage: each invocation loads its element from the input buffer into shared memory.
+    tile[lid] = input[lid];
+
+    // REQUIRED barrier: ensures all writes to shared memory are visible
+    // to all invocations in the workgroup before any reads begin.
+    workgroup_barrier();
+
+    // Tree reduction: each active invocation reads from a stride-offset slot
+    // (a DIFFERENT slot than it wrote — the barrier is load-bearing for correctness).
+    // lshr() is used for stride halving per anti-pattern #8.
+    let stride: u32 = lshr(256u32, 1u32);
+    let step0_target: u32 = lid + stride;
+    tile[lid] = tile[lid] + tile[step0_target];
+
+    workgroup_barrier();
+
+    let stride1: u32 = lshr(stride, 1u32);
+    let step1_target: u32 = lid + stride1;
+    tile[lid] = tile[lid] + tile[step1_target];
+
+    workgroup_barrier();
+
+    // Write the final reduction result from lane 0.
+    // (A complete reduction would loop; this 2-level version is a correctness fixture.)
+    let is_lane0: bool = lid == 0u32;
+    if is_lane0 {
+        output[0u32] = tile[0u32];
+    }
+
+    return;
+}

@@ -893,4 +893,26 @@ mod tests {
             "matrix must be a plain Ident at the lexer layer, not a keyword"
         );
     }
+
+    /// AT-1600: `shared[f32, 256]` tokenizes to Shared, LBracket, F32, Comma, IntLiteral(256), RBracket.
+    ///
+    /// Parallel to buffer_bracket_elem_lexes_correctly (AT-526).
+    /// Confirms `shared` is a dedicated TokenKind::Shared (not an Ident).
+    #[test]
+    fn at1600_shared_array_lexes_correctly() {
+        let (tokens, errs) = Lexer::new("shared[f32, 256]").tokenize();
+        assert!(errs.is_empty(), "unexpected lex errors: {errs:?}");
+        let kinds: Vec<&TokenKind> = tokens.iter().map(|t| &t.kind).collect();
+        // Expected: Shared, LBracket, F32, Comma, IntLiteral(256, no suffix), RBracket, Eof
+        assert!(matches!(kinds[0], TokenKind::Shared), "token[0] must be Shared; got {:?}", kinds[0]);
+        assert!(matches!(kinds[1], TokenKind::LBracket), "token[1] must be LBracket; got {:?}", kinds[1]);
+        assert!(matches!(kinds[2], TokenKind::F32), "token[2] must be F32; got {:?}", kinds[2]);
+        assert!(matches!(kinds[3], TokenKind::Comma), "token[3] must be Comma; got {:?}", kinds[3]);
+        assert!(
+            matches!(kinds[4], TokenKind::IntLiteral { value: 256, suffix: None, .. }),
+            "token[4] must be IntLiteral(256, no suffix); got {:?}", kinds[4]
+        );
+        assert!(matches!(kinds[5], TokenKind::RBracket), "token[5] must be RBracket; got {:?}", kinds[5]);
+        assert!(matches!(kinds[6], TokenKind::Eof), "token[6] must be Eof");
+    }
 }
