@@ -81,24 +81,29 @@ Goal: prove the DESIGN.md §5 kill-criteria gates with publishable numbers, not 
 **Depends on:** M3.0 (bandwidth), M2.1 cooperative matrix infra.
 **Blocks:** M3.2.
 
-### M3.2 — FlashAttention-2 kernel
+### M3.2 — shared[T,N] workgroup memory + competitive tiled matmul + tiled attention ✅ LANDED (2026-06-02)
 
-**Why:** the second-most-cited LLM kernel after matmul. Tests `@strategy` holes on a kernel with non-trivial control flow (online softmax, accumulating denominator).
+**LANDED:** M3.2 (r3 design, Coder) implemented the largest single milestone:
+- **FG.6 `shared[T,N]` IMPLEMENTED**: lexer→parser→HIR→typecheck→codegen→spirv-val full pipeline. OQ1 SET-based missing-barrier analysis (zero false positives). OQ2 divergent-barrier hard error. AT-429 inverted. CRITICAL-1/2/3/4 all resolved.
+- **Competitive tiled matmul**: examples/matmul_shared_coopmat.axc + matmul_shared_f32.axc. CoopMatLoadSource discriminator + emit_coopmat_load_shared_inline/store_shared_inline (single-index Workgroup path). @strategy tile holes genuinely used.
+- **C1 tiled attention** (NON-streaming): examples/tiled_attention.axc. Full two-pass softmax with max-subtraction. NOT FlashAttention-2. `flash_attention_v2` name reserved for C2 (M3.2b).
+- **Metadata schema v3**: SUPPORTED_SCHEMA_VERSIONS=[1,2,3], shared_memory_bytes field, maxComputeSharedMemorySize preflight.
 
-**Scope in:**
-- FA2-shape kernel: `flash_attention_v2(Q: buffer[f16], K: buffer[f16], V: buffer[f16], O: buffer[f16], n_heads: u32, seq_len: u32, head_dim: u32)`
-- Block-level streaming softmax with scaling re-correction
-- Workgroup-shared K/V tile in shared memory (requires `shared[T, N]` syntax — currently DESIGN.md §3.1 lists it but not implemented; M3.2 adds the language feature)
-- `@strategy { tile_q: ?[64, 128], tile_k: ?[64, 128], stages: ?[1, 2, 3] }` on shared-memory tile sizes
+**Still M3.2b (deferred):** FlashAttention-2 streaming online softmax (C2 — block-streaming running max/denom rescaling); shared-source coopmat_load fully wired through HIR typecheck for at-runtime dispatch (AT-1614/1620-1622 GPU bit-exact #[ignore] tests).
 
-**Acceptance:**
-- ≥ **80% of FlashAttention-3 cuBLAS+FA3 wrapper** on NVIDIA H100/Blackwell at seq_len=8192, head_dim=128
-- ≥ 90% of rocBLAS-flash equivalent on MI300X (if access available)
-- Bit-exact vs reference within 1e-3 fp tolerance
+**Acceptance (what passed):** AT-1600..AT-1636 passing (cargo test --workspace); cargo clippy -D warnings clean; spirv-val via structural disassembly checks; metadata v1/v2 back-compat. GPU tests (#[ignore]) require AXC_ENABLE_GPU_TESTS=1 on NVIDIA.
 
-**Effort:** ~4000–6000 LOC. Largest single milestone. Includes new language feature (`shared[T, N]`).
+**FG.6 status:** `shared[T,N]` is **IMPLEMENTED** (see §3.1.14).
+
+**Effort:** ~5800 LOC across 19+ files. Largest single milestone. New language feature FG.6 landed.
 **Depends on:** M3.0, M3.1.
-**Blocks:** KernelBench submission (M3.3).
+**Blocks:** M3.2b (C2 FlashAttention-2), KernelBench submission (M3.3).
+
+### M3.2b — FlashAttention-2 streaming softmax (C2, deferred from M3.2)
+
+**Why:** FA2's defining contribution — block-streaming ONLINE softmax (running max m_i, running denominator l_i, output rescale O_i ← O_i * exp(m_old-m_new) + P*V) — AVOIDS materializing the SxS score block. Deferred from M3.2 because its online-rescale arithmetic is a separate high-risk bit-exactness surface verified against C1 (`tiled_attention`) as the baseline. C2 earns the `flash_attention_v2` kernel name.
+
+**Acceptance:** ≥ 80% of FlashAttention-3 cuBLAS+FA3 wrapper. @equiv_fp_tol(1e-3) vs C1 baseline. Streaming HIR path fully wired through coopmat_load-from-shared dispatch.
 
 ### M3.3 — KernelBench-Vulkan public submission
 
@@ -243,11 +248,11 @@ Straightforward extension of M2.6 Q4_K_M pattern. Q5_K_M adds a 1-bit overlay to
 
 **Effort:** ~500 LOC each (mostly CPU reference + tests; codegen is small).
 
-### FG.6 — `shared[T, N]` workgroup-local memory
+### FG.6 — `shared[T, N]` workgroup-local memory ✅ IMPLEMENTED (M3.2, 2026-06-02)
 
-DESIGN.md §3.1 lists it. Required for FA2 (M3.2). Lex/parse + HIR + SPIR-V `OpTypePointer Workgroup` codegen.
+IMPLEMENTED. Full pipeline: lexer (token already existed) → parser (TypeRef::Shared, Stmt::SharedDecl) → HIR (SharedId, SharedTy, SharedDecl, KernelBodyTyped.shared, SharedRead/SharedWrite HIR nodes, OQ1 SET-based missing-barrier analysis, OQ2 conditional_depth divergent-barrier) → codegen (SharedBindings, emit_shared_globals with Float16/Int8/etc. caps, single-index OpAccessChain, Workgroup OpVariable, SPIR-V 1.3 interface list exclusion) → runtime (metadata v3, SharedMemoryExceedsDeviceLimit preflight, maxComputeSharedMemorySize cached). See DESIGN.md §3.1.14. Tests AT-1600..AT-1636 passing.
 
-**Effort:** ~1000 LOC. (Folded into M3.2 above.)
+**Effort:** ~5800 LOC across 19+ files. Landed as part of M3.2.
 
 ### FG.7 — Sized arrays as locals
 
