@@ -94,10 +94,22 @@ pub struct CoopMatShapeMeta {
 
 /// Schema version for the `.axc.meta.json` sidecar format.
 ///
-/// M3.1 bumps this from 1 to 2 to add the optional `coopmat: Option<CoopMatShapeMeta>` field.
-/// `load_kernel_metadata` accepts BOTH version 1 (pre-M3.1, coopmat=None via serde default)
-/// and version 2 (M3.1+, coopmat field present). Version 3+ is rejected.
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+/// M3.1 bumped this from 1 to 2 to add `coopmat: Option<CoopMatShapeMeta>`.
+/// M3.2 bumps this from 2 to 3 to add `shared_memory_bytes: u32`.
+///
+/// `load_kernel_metadata` accepts versions 1, 2, and 3 via the `SUPPORTED_SCHEMA_VERSIONS`
+/// allowed-set guard (CRITICAL-1 fix). Version 4+ is rejected.
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+
+/// All schema versions accepted by this runtime (CRITICAL-1 back-compat guard).
+///
+/// - v1: pre-M3.1 (no coopmat, no shared_memory_bytes). Deserializes with both
+///   `coopmat=None` and `shared_memory_bytes=0` via `#[serde(default)]`.
+/// - v2: M3.1 coopmat. Deserializes with `shared_memory_bytes=0` via default.
+/// - v3: M3.2 shared memory. New; all fields present.
+///
+/// v4+ (or 0) are rejected with `MetadataSchemaMismatch`.
+pub const SUPPORTED_SCHEMA_VERSIONS: [u32; 3] = [1, 2, 3];
 
 /// Metadata sidecar for a compiled AXIOM-Compute kernel.
 ///
@@ -111,9 +123,15 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 ///
 /// Adds `coopmat: Option<CoopMatShapeMeta>` with `#[serde(default)]` so
 /// version 1 sidecars (no field) deserialize to `coopmat = None`.
+///
+/// ## Schema v3 (M3.2)
+///
+/// Adds `shared_memory_bytes: u32` with `#[serde(default)]` so v1 and v2
+/// sidecars deserialize with `shared_memory_bytes = 0` (no shared memory = 0 bytes).
+/// The allowed-set version guard {1, 2, 3} ensures v1 and v2 still load.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KernelMetadata {
-    /// Schema version. Must be 1 or 2 for this runtime; others rejected.
+    /// Schema version. Must be in `SUPPORTED_SCHEMA_VERSIONS` [1, 2, 3] for this runtime.
     pub schema_version: u32,
     /// Source-level kernel name (e.g. `"saxpy"`).
     pub kernel_name: String,
@@ -144,6 +162,19 @@ pub struct KernelMetadata {
     /// `coopmat_required_shape_from_meta` — nothing is hardcoded.
     #[serde(default)]
     pub coopmat: Option<CoopMatShapeMeta>,
+
+    /// Total static workgroup-shared memory bytes declared in this kernel — M3.2 (schema v3).
+    ///
+    /// Sum of `shared_decl.ty.total_byte_size()` for all `shared[T,N]` declarations
+    /// in the kernel body. `0` for kernels without shared arrays.
+    ///
+    /// On schema v1 and v2 sidecars (no field in JSON), serde deserializes this as `0`
+    /// via `#[serde(default)]`, which is dispatch-identical to a zero-shared-memory kernel.
+    ///
+    /// The runtime uses this in `preflight_kernel_support` to check against the device's
+    /// `maxComputeSharedMemorySize` limit (CRITICAL-4 wiring).
+    #[serde(default)]
+    pub shared_memory_bytes: u32,
 }
 
 impl KernelMetadata {
@@ -167,6 +198,7 @@ impl KernelMetadata {
             push_constant_total_bytes,
             entry_point,
             coopmat: None,
+            shared_memory_bytes: 0,
         }
     }
 
@@ -180,6 +212,19 @@ impl KernelMetadata {
     /// ```
     pub fn with_coopmat(mut self, coopmat: Option<CoopMatShapeMeta>) -> Self {
         self.coopmat = coopmat;
+        self
+    }
+
+    /// Builder: set the total static workgroup-shared memory bytes (M3.2).
+    ///
+    /// Populated by the driver from `Σ shared_decl.ty.total_byte_size()`.
+    /// Callers with no shared arrays pass `0` (or omit this builder step).
+    ///
+    /// ```rust,ignore
+    /// let meta = KernelMetadata::new(...).with_shared_memory_bytes(4096);
+    /// ```
+    pub fn with_shared_memory_bytes(mut self, bytes: u32) -> Self {
+        self.shared_memory_bytes = bytes;
         self
     }
 
@@ -205,11 +250,12 @@ pub fn load_kernel_metadata(path: &Path) -> Result<KernelMetadata, DispatchError
     let meta: KernelMetadata = serde_json::from_str(&text)
         .map_err(|e| DispatchError::MetadataParseError(e.to_string()))?;
 
-    // Accept both schema version 1 (pre-M3.1) and version 2 (M3.1+).
-    // Version 1 sidecars have no `coopmat` field; serde deserializes coopmat=None
-    // via #[serde(default)], which is dispatch-identical to a non-coopmat kernel.
-    // Version 3+ (or 0) is rejected as unsupported.
-    if meta.schema_version != 1 && meta.schema_version != CURRENT_SCHEMA_VERSION {
+    // CRITICAL-1 back-compat guard: accept an explicit allowed-set {1, 2, 3}.
+    // - v1 (pre-M3.1): no coopmat field, no shared_memory_bytes. Both default to 0/None.
+    // - v2 (M3.1 coopmat): has coopmat, no shared_memory_bytes. shared defaults to 0.
+    // - v3 (M3.2 shared): has both coopmat and shared_memory_bytes.
+    // - v4+ (or 0): rejected with MetadataSchemaMismatch.
+    if !SUPPORTED_SCHEMA_VERSIONS.contains(&meta.schema_version) {
         return Err(DispatchError::MetadataSchemaMismatch {
             got: meta.schema_version,
             supported: CURRENT_SCHEMA_VERSION,
@@ -267,13 +313,13 @@ mod tests {
         }
     }
 
-    /// AT-503: CURRENT_SCHEMA_VERSION equals 2 (M3.1 bump), and KernelMetadata::new sets it.
+    /// AT-503: CURRENT_SCHEMA_VERSION equals 3 (M3.2 bump), and KernelMetadata::new sets it.
     ///
-    /// Updated from "version 1" in M1.5 to "version 2" in M3.1.
-    /// Non-coopmat kernels have coopmat==None.
+    /// Updated from "version 2" in M3.1 to "version 3" in M3.2.
+    /// Non-coopmat kernels have coopmat==None; non-shared kernels have shared_memory_bytes==0.
     #[test]
-    fn at_503_metadata_current_schema_is_2_and_new_sets_it() {
-        assert_eq!(CURRENT_SCHEMA_VERSION, 2, "CURRENT_SCHEMA_VERSION must be 2 for M3.1");
+    fn at_503_metadata_current_schema_is_3_and_new_sets_it() {
+        assert_eq!(CURRENT_SCHEMA_VERSION, 3, "CURRENT_SCHEMA_VERSION must be 3 for M3.2");
 
         // AT-503a: entry_point is set to the kernel name (matches OpEntryPoint
         // emitted by axc-codegen), not a hard-coded `"main"`. See the fix for
@@ -285,24 +331,29 @@ mod tests {
             "saxpy".to_owned(),
         );
 
-        assert_eq!(meta.schema_version, 2);
+        assert_eq!(meta.schema_version, 3);
         assert_eq!(meta.kernel_name, "saxpy");
         assert_eq!(meta.workgroup_size, [64, 1, 1]);
         assert_eq!(meta.entry_point, "saxpy");
         assert_eq!(meta.push_constant_total_bytes, 8);
         // Non-coopmat kernel has None.
         assert!(meta.coopmat.is_none(), "non-coopmat kernel must have coopmat=None");
+        // Non-shared kernel has 0 shared_memory_bytes.
+        assert_eq!(meta.shared_memory_bytes, 0, "non-shared kernel must have shared_memory_bytes=0");
     }
 
-    /// AT-1553: Metadata schema back-compat (HN-13).
+    /// AT-1553 (restructured for M3.2): Metadata schema back-compat.
     ///
-    /// A v1 sidecar JSON (schema_version=1, no coopmat key) loads with coopmat==None.
-    /// A v2 coopmat sidecar round-trips the CoopMatShapeMeta exactly.
-    /// CURRENT_SCHEMA_VERSION==2 and new compiles write 2.
-    /// The version check accepts {1,2} and rejects 3.
+    /// Tests that:
+    /// (a) v1 sidecar (no coopmat/shared fields) deserializes with coopmat=None, shared=0.
+    /// (b) v2 sidecar (hand-written literal with schema_version=2, coopmat field) loads correctly.
+    ///     NOTE: KernelMetadata::new now stamps version 3 — we use a hand-written v2 JSON literal
+    ///     to avoid testing serialization from a v2 instance (which would now produce v3).
+    /// (c) v3 sidecar with shared_memory_bytes ACCEPTED (INVERTED from old reject-v3 assertion).
+    /// (d) v4 sidecar REJECTED with MetadataSchemaMismatch { supported: 3 }.
     #[test]
     fn at_1553_metadata_schema_v1_v2_back_compat() {
-        // V1 sidecar: no coopmat field — must deserialize with coopmat=None.
+        // (a) V1 sidecar: no coopmat field — must deserialize with coopmat=None, shared=0.
         let v1_json = r#"{
             "schema_version": 1,
             "kernel_name": "saxpy",
@@ -315,43 +366,62 @@ mod tests {
             .expect("v1 sidecar must deserialize");
         assert_eq!(v1_meta.schema_version, 1);
         assert!(v1_meta.coopmat.is_none(), "v1 sidecar must have coopmat=None");
+        assert_eq!(v1_meta.shared_memory_bytes, 0, "v1 sidecar must have shared_memory_bytes=0");
 
-        // V2 coopmat sidecar round-trip.
-        let v2_shape = CoopMatShapeMeta {
-            m: 16, n: 16, k: 16,
-            a_type: CoopMatScalarMeta::F16,
-            b_type: CoopMatScalarMeta::F16,
-            c_type: CoopMatScalarMeta::F16,
-            result_type: CoopMatScalarMeta::F16,
-            scope: CoopMatScopeMeta::Subgroup,
-        };
-        let v2_meta = KernelMetadata::new(
-            "matmul_tile".to_owned(),
-            [32, 1, 1],
-            saxpy_plan(),
-            "matmul_tile".to_owned(),
-        ).with_coopmat(Some(v2_shape.clone()));
+        // (b) V2 sidecar — hand-written literal with schema_version=2.
+        // KernelMetadata::new now stamps version 3 (M3.2 bump), so we write the v2 JSON
+        // by hand and verify it round-trips coopmat + shared defaults to 0.
+        let v2_json_literal = r#"{
+            "schema_version": 2,
+            "kernel_name": "matmul_tile",
+            "workgroup_size": [32, 1, 1],
+            "binding_plan": {"buffers": [], "scalars": [], "push_constant_total_bytes": 0},
+            "push_constant_total_bytes": 0,
+            "entry_point": "matmul_tile",
+            "coopmat": {
+                "m": 16, "n": 16, "k": 16,
+                "a_type": "F16", "b_type": "F16", "c_type": "F16", "result_type": "F16",
+                "scope": "Subgroup"
+            }
+        }"#;
+        let v2_meta: KernelMetadata = serde_json::from_str(v2_json_literal)
+            .expect("v2 sidecar must deserialize");
         assert_eq!(v2_meta.schema_version, 2);
-        let v2_json = serde_json::to_string(&v2_meta).expect("serialize v2");
-        let v2_rt: KernelMetadata = serde_json::from_str(&v2_json).expect("deserialize v2");
-        assert_eq!(v2_rt.coopmat.as_ref(), Some(&v2_shape));
+        assert!(v2_meta.coopmat.is_some(), "v2 sidecar must have coopmat field");
+        assert_eq!(v2_meta.coopmat.as_ref().unwrap().m, 16);
+        assert_eq!(v2_meta.shared_memory_bytes, 0, "v2 sidecar must have shared_memory_bytes=0 (default)");
 
-        // Version 3 is rejected.
+        // (c) V3 sidecar with shared_memory_bytes — now ACCEPTED (INVERTED from old reject-v3).
         let v3_json = r#"{
             "schema_version": 3,
+            "kernel_name": "shared_reduce",
+            "workgroup_size": [256, 1, 1],
+            "binding_plan": {"buffers": [], "scalars": [], "push_constant_total_bytes": 0},
+            "push_constant_total_bytes": 0,
+            "entry_point": "shared_reduce",
+            "shared_memory_bytes": 1024
+        }"#;
+        let v3_meta: KernelMetadata = serde_json::from_str(v3_json)
+            .expect("v3 sidecar must deserialize");
+        assert_eq!(v3_meta.schema_version, 3);
+        assert_eq!(v3_meta.shared_memory_bytes, 1024, "v3 sidecar shared_memory_bytes must be 1024");
+        assert!(v3_meta.coopmat.is_none(), "v3 sidecar without coopmat field must have coopmat=None");
+
+        // (d) V4 sidecar — REJECTED (supported: 3 is the new CURRENT).
+        let v4_json = r#"{
+            "schema_version": 4,
             "kernel_name": "test",
             "workgroup_size": [1, 1, 1],
             "binding_plan": {"buffers": [], "scalars": [], "push_constant_total_bytes": 0},
             "push_constant_total_bytes": 0,
             "entry_point": "test"
         }"#;
-        // Write to temp file and use load_kernel_metadata.
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(tmp.path(), v3_json).unwrap();
+        std::fs::write(tmp.path(), v4_json).unwrap();
         let result = load_kernel_metadata(tmp.path());
         assert!(
-            matches!(result, Err(DispatchError::MetadataSchemaMismatch { got: 3, supported: 2 })),
-            "version 3 must be rejected: {result:?}"
+            matches!(result, Err(DispatchError::MetadataSchemaMismatch { got: 4, supported: 3 })),
+            "version 4 must be rejected with supported: 3; got: {result:?}"
         );
     }
 

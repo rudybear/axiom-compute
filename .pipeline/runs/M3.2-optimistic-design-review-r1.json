@@ -1,0 +1,102 @@
+{
+  "verdict": "APPROVE",
+  "agent": "optimistic_design_reviewer",
+  "milestone_id": "M3.2-shared-tiled-attention",
+  "revision_reviewed": "r1",
+  "review_pass": "r1",
+
+  "r0_additions_confirmed": [
+    "AT-1613 (Buffer-source coopmat byte-identity guard): PRESENT. revision_changelog.AT_hardening records it; acceptance_tests entry at AT-1613 covers q4km_dequant_matmul_coopmat.axc AND matmul_tile fixtures. coopmat.rs files_to_modify states existing Buffer-source fns are 'BYTE-IDENTICAL'; CoopMatLoadSource::Buffer default preserves existing construction sites.",
+    "AT-1606 (warning/error emission asserted): PRESENT and HARDENED. AT-1606 description now explicitly states 'the test ASSERTS the diagnostic is present' for the barrier-absent variant. The decidable-case hard error (SharedMissingBarrierBeforeCrossInvocationRead) vs undecidable advisory warning is correctly distinguished. The Lavapipe bounded-gap caveat is accurately recorded (per my r0 minor note).",
+    "AT-1615 (shared-array dedup edge): PRESENT. Acceptance test explicitly specifies a kernel with two distinct shared[f32,128] arrays and asserts 2 OpVariable Workgroup ids + 2 OpTypeArray ids + 1 shared elem-ptr type; spirv-val clean."
+  ],
+
+  "critical_issues_resolved": [
+    {
+      "id": "CRITICAL-1",
+      "label": "metadata back-compat guard {1,2,3}",
+      "status": "RESOLVED",
+      "evidence": "revision_changelog.CRITICAL-1__metadata_back_compat_guard specifies an explicit 'const SUPPORTED_SCHEMA_VERSIONS: [u32; 3] = [1, 2, 3];' allowed-set replacing the broken two-term != guard at metadata.rs:212. The additive #[serde(default)] on shared_memory_bytes ensures v1 and v2 sidecar forward-loads are correct (0 for v1/v2 shared_memory_bytes, None for v1 coopmat). AT-1633 asserts hand-written literal v1 and v2 sidecars load Ok after the bump.",
+      "external_ref": "serde documentation: #[serde(default)] guarantees missing JSON fields deserialize to Default::default() — correct for u32 (0) and Option<_> (None)."
+    },
+    {
+      "id": "CRITICAL-2",
+      "label": "metadata roundtrip test audit + all hardcoded-version literal fixes",
+      "status": "RESOLVED",
+      "evidence": "revision_changelog.CRITICAL-2__metadata_roundtrip_and_other_hardcoded_asserts provides a complete 8-site audit: (a) metadata_roundtrip.rs:126-127 supported:2->3; (b) metadata.rs:276 CURRENT==2->3; (c) :288 schema_version 2->3; (d) :334 restructure to hand-written v2 literal; (e) :340-355 INVERT — v3 now ACCEPTED; (f) dispatch_error_paths.rs:217 AUDITED-BENIGN; (g) compile_emits_metadata_sidecar.rs:46 + driver:532 SYMBOLIC-SAFE; (h) bench postprocess/regression DIFFERENT schema SAFE. metadata_roundtrip.rs is now in files_to_modify. AT-1634 replaces the old reject-v3 assertion with an accept-v3 + reject->3 policy.",
+      "external_ref": "AXIOM-Compute project anti-patterns: 'Independent verification is mandatory' — the Architect self-audited and found 4 additional sites the pessimistic reviewer missed, which strengthens confidence in completeness."
+    },
+    {
+      "id": "CRITICAL-3",
+      "label": "separate shared-source coopmat single-index emit; Buffer-source byte-identical",
+      "status": "RESOLVED",
+      "evidence": "revision_changelog.CRITICAL-3__coopmat_load_from_shared_access_chain_arity mandates two NEW functions emit_coopmat_load_shared_inline / emit_coopmat_store_shared_inline using access_chain(wg_elem_ptr_ty, None, shared_var_id, [element_offset_id]) — ONE index, Workgroup-class pointer, NO leading zero. The existing Buffer-source fns (coopmat.rs:221/261) are explicitly left BYTE-IDENTICAL. The HIR CoopMatLoadSource::{Buffer,Shared} discriminator is additive; existing construction sites remain Buffer(). body.rs branches on the discriminator. Guards: AT-1613 (Buffer byte-identity) + AT-1614 (single-index arity + Workgroup class via disassembly inspection). The shared-tile stride-in-elements vs SSBO-row-stride distinction is explicitly documented in the spec and coder_handoff_notes.",
+      "external_ref": "SPV_KHR_cooperative_matrix spec: 'The Pointer operand may be any storage class the implementation supports for the instruction; Workgroup is permitted' — confirmed in revision_changelog. SPIR-V spec §3.32.14 OpAccessChain: 'Indexes walk the type hierarchy to the desired depth' — a flat OpTypeArray has no struct wrapper, so one index is correct and correct arity is verifiable by spirv-val."
+    },
+    {
+      "id": "CRITICAL-4",
+      "label": "runtime preflight shared-mem plumbing wired",
+      "status": "RESOLVED",
+      "evidence": "revision_changelog.CRITICAL-4__runtime_preflight_wireable gives exact wiring: max_compute_shared_memory_size cached at context.rs:624-627 (limits read) + struct field at context.rs:160 + Self{} init block + accessor mirroring max_compute_work_group_count() at :731. prepare_kernel_checked (:871) gains shared_memory_bytes: u32 parameter; preflight_kernel_support (:766) gains same. The check fires AFTER existing coopmat/feature checks (deterministic ordering). Returns DispatchError::SharedMemoryExceedsDeviceLimit { required, device_max, kernel } (3-field, matching DeviceFeatureUnsupported style). files_to_modify CORRECTED: dispatch.rs entry reduced to call-site plumbing; context.rs entry added. AT-1631 covers the graceful-skip path.",
+      "external_ref": "Vulkan spec §10.2.3 VkPhysicalDeviceLimits: maxComputeSharedMemorySize is a required limit present on every Vulkan 1.0+ device. The ash crate exposes it as limits.max_compute_shared_memory_size (type u32) — the field name used in the spec is confirmed correct."
+    }
+  ],
+
+  "honesty_relabel_confirmed": {
+    "c1_fa2_relabel": "CONFIRMED RESOLVED. milestone_id is now 'M3.2-shared-tiled-attention' (not 'M3.2-shared-fa2'). All kernel/example names are tiled_attention. design_md_additions explicitly states: 'This is the bit-exact baseline; it is NOT FlashAttention-2.' FA2's streaming online softmax is correctly deferred to C2/M3.2b. The flash_attention_v2 name is reserved. Max-subtraction retained (correct softmax, not the FA2 streaming trick — accurate distinction). The honesty principle is fully enforced.",
+    "external_ref": "Dao et al. 'FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning' (2023): the defining algorithmic contribution is the online softmax (running max m_i, running denominator l_i, tiled output rescaling) that avoids materializing the full S×S score matrix. C1 materializes the score row — correct and useful, but NOT FA2 by any definition."
+  },
+
+  "oq1_oq2_adoption_confirmed": {
+    "OQ1": "ADOPTED. HirError::SharedMissingBarrierBeforeCrossInvocationRead for the decidable same-block no-back-edge straight-line case (zero false positives, the canonical NVIDIA-passes/AMD-races trap). HirWarning::SharedWriteWithoutBarrierBeforeRead retained for undecidable cases (cross-block, loop-carried, divergent). technical_spec A.4.1 clearly defines the decidable/undecidable boundary. No feasibility regression: the decidable case requires only a forward scan within one basic block.",
+    "OQ2": "ADOPTED. HirError::BarrierInDivergentContext for workgroup_barrier() at divergent_context_depth > 0 in an if/else body. Reuses the EXISTING divergent_context_depth (typecheck.rs:545; incremented at lines 956-967 for if/else and 1174-1176 for loops). Implementation site is exactly identified (check_builtin_call_stmt typecheck.rs:2008-2044 ~2030). Loop bodies that all invocations enter are correctly treated as uniform (the matmul/attention K-loops are unaffected). AT-1635 covers both the error and the accepted uniform-loop case.",
+    "feasibility": "Both checks are provably feasible: OQ1 is a forward linear scan within one basic block; OQ2 reuses existing depth-counting infrastructure with one additional guard condition. Neither requires new dataflow analysis."
+  },
+
+  "strengths": [
+    "Scope discipline is exceptional: the FA2 relabel is thorough and the C1/C2 staging rationale is compelling (C1 provides the bit-exact baseline for @equiv_fp_tol verification of C2's streaming arithmetic — textbook anti-reward-hacking).",
+    "The CRITICAL-2 self-audit found 4 additional hardcoded-version sites the pessimistic reviewer missed (metadata.rs:276, :288, :334, :340-355), demonstrating a genuine codebase read. The at_1553 reject-v3 inversion (site (e)) is identified as the most dangerous missed one — correct prioritization.",
+    "The shared-source coopmat emit separation (CRITICAL-3) is cleanly specified: separate functions, no storage-class flag added to the Buffer path, CoopMatLoadSource additive enum with Buffer as the default, and the stride-in-elements vs SSBO-row-stride distinction explicitly called out in both the spec and coder_handoff_notes.",
+    "AT-1622 hardening correctly addresses the M3.1.5 anti-lesson: the genuineness test now requires different K-loop trip-count AND bit-exact GPU results for both tile_k values, not just different array sizes. Size-diff alone is insufficient — this insight is explicitly captured.",
+    "Cross-vendor race honesty is fully adopted and accurately bounded: AT-1606 proves only (i) bit-exact WITH barrier and (ii) diagnostic emission; the OQ1 hard error is labeled the real protection; EB.1 (AMD/Intel) is the untested gap. The design does not overclaim.",
+    "26 acceptance tests in the M3.2 range (AT-1600..AT-1635), each with specific expected_behavior and verified_via. The test structure is complete and honest about hardware gating.",
+    "The dedup rule for shared arrays (distinct OpTypeArray+OpVariable per SharedId, shared elem-ptr type per elem ScalarTy) is technically correct per the SPIR-V type-caching model and is guarded by AT-1615.",
+    "Workgroup StorageClass capability minimality is correctly specified: no new capability or extension, f16/i8/i16/i64/f64 pull only type capabilities (NOT StorageBuffer8/16BitAccess KHR extensions which gate StorageBuffer only). This is a subtle but critical distinction confirmed by the SPIR-V and Vulkan specs.",
+    "SPIR-V 1.3 OpEntryPoint interface exclusion of Workgroup vars is correct and the forward-compat note for SPIR-V 1.4+ is appreciated."
+  ],
+
+  "concerns": [
+    "Minor: AT-1623 (resident benchmark) gates correctness on 'presence + correctness, not a hardcoded threshold.' The no-per-iter-allocation guarantee is stated in the AT description and coder_handoff_notes. This is sufficient for the design phase; the Coder must confirm by inspecting the dispatch-N loop. Not blocking.",
+    "Minor: The tiled_attention.axc (C1) Lavapipe + NVIDIA dual-path note in PART C1 says it 'runs on Lavapipe (scalar f16->f32 dot products, no coopmat).' The Lavapipe f16->f32 promotion for scalar ops is a Mesa llvmpipe behavior; confirm at Coder time that the f16 SSBO loads don't require a Float16 capability that Lavapipe's SPIR-V translator rejects. This is an implementation-time concern, not a design blocker. AT-1630 covers the full GPU path.",
+    "Minor: The 'all-invocations-enter loop body is uniform' rule for OQ2 is correct as a conservative approximation for the M3.2 shipped kernels (the K-loop trip count is workgroup-uniform). If a future kernel has a loop with a data-dependent trip count per-invocation, OQ2 would miss a divergent barrier in that loop body. This is acceptable as a known limitation documented in technical_spec A.4.2 and does not affect M3.2 correctness."
+  ],
+
+  "validation_against_existing": [
+    "workgroup_barrier() reuse is verified against actual codebase: codegen/src/subgroup.rs:34,298-300 emits OpControlBarrier scope=Workgroup(2)/Workgroup(2)/semantics=0x108 (AcquireRelease|WorkgroupMemory); test lines 517-519 assert the scope/semantics values. Single-barrier sufficiency for the straight-line stage->barrier->read pattern and dual-barrier requirement for the K-loop WAR are both correct per the Vulkan Memory Model.",
+    "The single-index vs two-index access-chain distinction mirrors the actual buffer implementation: buffers.rs:111 wraps the runtime array in OpTypeStruct (confirmed by the Architect's CRITICAL-3 codebase verification), requiring a leading zero_id for member-0 selection. A Workgroup OpTypeArray has no struct wrapper, so a single index is not only correct but required by spirv-val.",
+    "CoopMatLoadSource additive-enum pattern mirrors the existing CoopMatShapeMeta additive field from M3.1 — proven pattern for back-compat.",
+    "The metadata SUPPORTED_SCHEMA_VERSIONS allowed-set pattern mirrors explicit version lists used in mature SPIR-V toolchains (e.g. IREE's module_utils.cc: 'kSupportedVersions' list for ABI back-compat) — a proven approach over range checks.",
+    "The divergent_context_depth reuse (OQ2) mirrors validate.rs:189's SubgroupOpInDivergentContext warning that already uses the same depth. Extending it to workgroup_barrier is consistent with the existing architecture.",
+    "Rust-GPU (gfx-rs/rust-gpu): emits Workgroup OpVariables as global module-scope variables (not Function-block locals), consistent with the spec's global-variable scoping rule. The AXIOM-Compute spec mirrors this pattern (emit_shared_globals before begin_block)."
+  ],
+
+  "external_references": [
+    "SPIR-V Unified Specification §3.32.6 (OpTypeArray): 'Length must be the <id> of a constant instruction of scalar integer type. It specifies the number of elements in the array.' — confirms OpConstant id, not a literal.",
+    "SPIR-V Unified Specification §3.32.14 (OpAccessChain): 'Indexes walk the type hierarchy' — a flat OpTypeArray needs exactly one index operand; spirv-val enforces this.",
+    "SPIR-V Unified Specification §3.47 Storage Class: Workgroup requires Shader capability only — no extension. Int8/Float16/etc. type capabilities are separate.",
+    "SPV_KHR_cooperative_matrix (Khronos): 'The Pointer operand to OpCooperativeMatrixLoadKHR may be a pointer of any storage class supported by the implementation, including Workgroup.' — validates the shared-source coopmat load.",
+    "Vulkan spec §10.2.3 VkPhysicalDeviceLimits: maxComputeSharedMemorySize (mandatory limit, present on all Vulkan 1.0+ devices) — validates the preflight design.",
+    "VK_KHR_8bit_storage / VK_KHR_16bit_storage: these extensions gate StorageBuffer and (optionally) UniformConstant/Input/Output storage classes only — Workgroup storage requires only the type-level Int8/Float16 capability, NOT these extensions. Confirmed by VK_KHR_8bit_storage spec §1.",
+    "Vulkan Memory Model spec §4: OpControlBarrier with Workgroup scope and AcquireRelease|WorkgroupMemory semantics is the correct synchronization primitive for cross-invocation shared-memory visibility within a workgroup — exactly what subgroup.rs:298-300 emits.",
+    "Dao et al. 'FlashAttention-2' (2023) arXiv:2307.08691: online softmax (running m_i, l_i, output rescaling) is the defining contribution — C1's full two-pass softmax is correct and useful but is not FA2 by any definition.",
+    "SPIR-V 1.3 spec §2.16.1 (OpEntryPoint interface): 'The interface operands are the <id>s of all global variables in Input and Output Storage Classes' — Workgroup vars correctly excluded. SPIR-V 1.4 changed this to all global vars — the forward-compat note in the spec is appropriate.",
+    "Rust-GPU (gfx-rs/rust-gpu) source: global Workgroup variables emitted in the module's types_global_values section, not as Function-block OpVariables — consistent with AXIOM-Compute's emit_shared_globals before begin_block."
+  ],
+
+  "test_adequacy": "SUFFICIENT",
+  "test_suggestions": [
+    "The 26 ATs cover all critical paths. No additions required for APPROVE. The three previously-minor items from r0 are confirmed present and the four CRITICALs are guarded by AT-1613/1614/1633/1634/1631. AT-1635 covers OQ2. The AT-1622 hardening (K-loop trip-count diff + bit-exact both values) is the strongest possible guard against the M3.1.5 inert-holes failure mode."
+  ],
+
+  "summary": "r1 resolves all four CRITICALs and the FA2-relabel blocking issue cleanly and thoroughly. The metadata allowed-set guard is correctly specified with SUPPORTED_SCHEMA_VERSIONS; the hardcoded-version audit is complete (including 4 sites the pessimistic reviewer missed); the separate shared-source coopmat emit functions preserve Buffer-source byte-identity with AT-1613/1614 guards; the preflight wiring is exact and at the correct location (context.rs, not dispatch.rs). The FA2 relabel is thorough and the C1/C2 staging rationale is architecturally sound. All three r0 minor AT additions are present. OQ1 and OQ2 are adopted with no feasibility regression. This design is ready for Coder handoff."
+}

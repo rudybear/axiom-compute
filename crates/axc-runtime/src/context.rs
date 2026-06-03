@@ -187,6 +187,11 @@ pub struct VulkanContext {
     pub(crate) memory_properties: vk::PhysicalDeviceMemoryProperties,
     /// Cached `max_compute_work_group_count` from device limits (used for pre-validation).
     pub(crate) max_compute_work_group_count: [u32; 3],
+    /// Cached `maxComputeSharedMemorySize` from device limits (M3.2).
+    ///
+    /// Used by `preflight_kernel_support` to fail-close kernels that request more
+    /// shared memory than the device offers (SharedMemoryExceedsDeviceLimit).
+    pub(crate) max_compute_shared_memory_size: u32,
     /// Human-readable device name for diagnostics.
     device_name: String,
     /// On-disk and in-memory Vulkan pipeline cache.
@@ -625,6 +630,8 @@ impl VulkanContext {
         let limits: vk::PhysicalDeviceLimits = props.limits;
         let max_compute_work_group_count: [u32; 3] = limits.max_compute_work_group_count;
         let non_coherent_atom_size: u64 = limits.non_coherent_atom_size;
+        // M3.2: Cache maxComputeSharedMemorySize for the shared-memory preflight check.
+        let max_compute_shared_memory_size: u32 = limits.max_compute_shared_memory_size;
 
         // ── Step 9: Pipeline cache ────────────────────────────────────────────
         let pipeline_cache: PipelineCache =
@@ -657,6 +664,7 @@ impl VulkanContext {
             command_pool,
             memory_properties,
             max_compute_work_group_count,
+            max_compute_shared_memory_size,
             device_name,
             pipeline_cache,
             in_mem_kernel_cache: Mutex::new(BTreeMap::new()),
@@ -732,6 +740,16 @@ impl VulkanContext {
         self.max_compute_work_group_count
     }
 
+    /// Return the cached `maxComputeSharedMemorySize` device limit (M3.2).
+    ///
+    /// Used by `preflight_kernel_support` to check whether a kernel's static
+    /// shared-memory usage is within device limits (SharedMemoryExceedsDeviceLimit).
+    /// Also accessible externally for test assertions (AT-1631).
+    #[allow(dead_code)] // Used in tests / future public API
+    pub(crate) fn max_compute_shared_memory_size(&self) -> u32 {
+        self.max_compute_shared_memory_size
+    }
+
     /// Return the `nonCoherentAtomSize` device limit (M3.0).
     ///
     /// Used by buffer allocation helpers for NonCoherent staging flush/invalidate
@@ -757,10 +775,12 @@ impl VulkanContext {
     ///    Returns `DeviceFeatureUnsupported` for the FIRST missing feature (declaration order).
     /// 2. If `coopmat` is `Some`: coopmat shape supported + subgroup size == 32.
     ///    Returns `CoopMatUnsupported` on mismatch.
+    /// 3. If `shared_memory_bytes > 0`: check against the device's `maxComputeSharedMemorySize`.
+    ///    Returns `SharedMemoryExceedsDeviceLimit` on exceeding the limit (graceful skip).
     ///
     /// Returns `Ok(())` when all checks pass. This function is pure with respect to
     /// Vulkan state — it only reads `self.enabled_features`, `self.coopmat_support`,
-    /// and `self.subgroup_size`.
+    /// `self.subgroup_size`, and `self.max_compute_shared_memory_size`.
     ///
     /// AT-1578: deterministic first-missing-feature in fixed declaration order.
     fn preflight_kernel_support(
@@ -768,6 +788,7 @@ impl VulkanContext {
         binding_plan: &ParamBindingPlan,
         coopmat: Option<&crate::metadata::CoopMatShapeMeta>,
         kernel_name: &str,
+        shared_memory_bytes: u32,
     ) -> Result<(), DispatchError> {
         let uses_coopmat = coopmat.is_some();
         let required = crate::coopmat::required_device_features(binding_plan, uses_coopmat);
@@ -843,6 +864,16 @@ impl VulkanContext {
             }
         }
 
+        // M3.2 (CRITICAL-4): Check shared-memory limit.
+        // After coopmat/feature checks so ordering is preserved and deterministic.
+        if shared_memory_bytes > self.max_compute_shared_memory_size {
+            return Err(DispatchError::SharedMemoryExceedsDeviceLimit {
+                required: shared_memory_bytes,
+                device_max: self.max_compute_shared_memory_size,
+                kernel: kernel_name.to_owned(),
+            });
+        }
+
         Ok(())
     }
 
@@ -868,6 +899,11 @@ impl VulkanContext {
     /// - `coopmat`: Optional coopmat shape metadata from the compiled kernel's sidecar.
     ///   Pass `meta.coopmat.as_ref()` from `KernelMetadata`.
     /// - `kernel_name`: Human-readable name for diagnostics in error messages.
+    /// - `shared_memory_bytes`: Total static workgroup-shared memory bytes from the kernel's
+    ///   sidecar (M3.2). Pass `meta.shared_memory_bytes`. The preflight checks this against
+    ///   the device's `maxComputeSharedMemorySize`; returns `SharedMemoryExceedsDeviceLimit`
+    ///   on failure (graceful typed skip, not a fatal error).
+    #[allow(clippy::too_many_arguments)] // Spec-required API: additive preflight params (CRITICAL-4)
     pub fn prepare_kernel_checked(
         &self,
         spirv: &[u32],
@@ -876,8 +912,9 @@ impl VulkanContext {
         entry_point: &str,
         coopmat: Option<&crate::metadata::CoopMatShapeMeta>,
         kernel_name: &str,
+        shared_memory_bytes: u32,
     ) -> Result<KernelHandle, DispatchError> {
-        self.preflight_kernel_support(binding_plan, coopmat, kernel_name)?;
+        self.preflight_kernel_support(binding_plan, coopmat, kernel_name, shared_memory_bytes)?;
         self.prepare_kernel(spirv, binding_plan, push_constant_total_bytes, entry_point)
     }
 

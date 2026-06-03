@@ -27,6 +27,7 @@ use crate::buffers::{
     BufferBindings, PushConstantBlock, GlobalInvocationIdVar,
 };
 use crate::subgroup::{SubgroupBuiltinVars, emit_subgroup_scalar_builtin_var};
+use crate::shared::{SharedBindings, emit_shared_globals};
 
 /// The SPIR-V version this codegen targets.
 ///
@@ -250,6 +251,19 @@ pub fn emit_module(hir: &HirModule, opts: &CodegenOptions) -> Result<Vec<u32>, C
             // Since begin_block has NOT been called yet here, selected_block() is None,
             // so b.variable() will correctly go to types_global_values.
 
+            // (a5) M3.2: Workgroup-shared array globals.
+            // emit_shared_globals sets caps.float16 / int8 / int16 / int64 / float64
+            // for the element types in the shared arrays (observe_type does NOT cover F16).
+            // Emitted before begin_block (like SSBOs); Workgroup OpVariables are global.
+            // Use a temporary CapabilitiesRequired to collect shared caps; merge after begin_block.
+            let mut shared_pre_caps = CapabilitiesRequired::default();
+            let shared_bindings: Option<SharedBindings> = if !typed_body.shared.is_empty() {
+                let sb = emit_shared_globals(&mut b, &mut type_cache, &mut shared_pre_caps, &typed_body.shared);
+                Some(sb)
+            } else {
+                None
+            };
+
             let first_block_id = b.id();
             b.begin_block(Some(first_block_id))
                 .expect("rspirv: begin_block should not fail after begin_function");
@@ -259,7 +273,12 @@ pub fn emit_module(hir: &HirModule, opts: &CodegenOptions) -> Result<Vec<u32>, C
                 storage_16bit: uses_f16_ssbo,
                 // M2.5: Set storage_8bit / int8 flags from binding plan (U8 SSBO buffers).
                 storage_8bit: uses_u8_ssbo,
-                int8: uses_u8_ssbo,
+                // M3.2: Merge shared-array capability pre-scan flags with binding-plan flags.
+                int8: uses_u8_ssbo || shared_pre_caps.int8,
+                float16: shared_pre_caps.float16,
+                int16: shared_pre_caps.int16,
+                int64: shared_pre_caps.int64,
+                float64: shared_pre_caps.float64,
                 ..Default::default()
             };
 
@@ -270,6 +289,8 @@ pub fn emit_module(hir: &HirModule, opts: &CodegenOptions) -> Result<Vec<u32>, C
                 gid_var: gid_var.as_ref(),
                 scalar_params: &scalar_params_table,
                 subgroup_vars: subgroup_vars_ref,
+                // M3.2: shared-array bindings (None for kernels without shared arrays).
+                shared_bindings: shared_bindings.as_ref(),
             };
 
             emit_kernel_body(&mut b, typed_body, &mut type_cache, &mut caps, &res)
@@ -461,6 +482,12 @@ fn stmt_uses_gid(stmt: &HirStmt) -> bool {
         HirStmt::CoopMatStore { element_offset, stride, .. } => {
             expr_uses_gid(element_offset) || expr_uses_gid(stride)
         }
+        // M3.2: SharedWrite may have gid-using index/value expressions.
+        HirStmt::SharedWrite { index, value, .. } => {
+            expr_uses_gid(index) || expr_uses_gid(value)
+        }
+        // SharedDeclMarker is a no-op with no expressions.
+        HirStmt::SharedDeclMarker { .. } => false,
     }
 }
 
@@ -491,6 +518,8 @@ fn expr_uses_gid(expr: &axc_hir::expr::HirExpr) -> bool {
         | HirExprKind::FloatLit { .. }
         | HirExprKind::BoolLit(_)
         | HirExprKind::LocalRead(_) => false,
+        // M3.2: SharedRead's index expression may use gid.
+        HirExprKind::SharedRead { index, .. } => expr_uses_gid(index),
     }
 }
 
@@ -537,6 +566,11 @@ fn stmt_uses_subgroup_op(stmt: &HirStmt, target: SubgroupOp) -> bool {
             expr_uses_subgroup_op(element_offset, target)
                 || expr_uses_subgroup_op(stride, target)
         }
+        // M3.2: SharedWrite may contain subgroup-op using expressions.
+        HirStmt::SharedWrite { index, value, .. } => {
+            expr_uses_subgroup_op(index, target) || expr_uses_subgroup_op(value, target)
+        }
+        HirStmt::SharedDeclMarker { .. } => false,
     }
 }
 
@@ -583,6 +617,8 @@ fn expr_uses_subgroup_op(expr: &axc_hir::expr::HirExpr, target: SubgroupOp) -> b
         | HirExprKind::FloatLit { .. }
         | HirExprKind::BoolLit(_)
         | HirExprKind::LocalRead(_) => false,
+        // M3.2: SharedRead index may use subgroup ops.
+        HirExprKind::SharedRead { index, .. } => expr_uses_subgroup_op(index, target),
     }
 }
 
@@ -621,6 +657,8 @@ fn stmt_uses_coopmat(stmt: &HirStmt) -> bool {
             expr_uses_coopmat(&hir_while.cond)
                 || hir_while.body.iter().any(stmt_uses_coopmat)
         }
+        // M3.2: SharedWrite does not involve coopmat ops directly.
+        HirStmt::SharedWrite { .. } | HirStmt::SharedDeclMarker { .. } => false,
     }
 }
 
@@ -659,6 +697,8 @@ fn expr_uses_coopmat(expr: &axc_hir::expr::HirExpr) -> bool {
         | HirExprKind::FloatLit { .. }
         | HirExprKind::BoolLit(_)
         | HirExprKind::LocalRead(_) => false,
+        // M3.2: SharedRead index may theoretically contain coopmat-using exprs; recurse.
+        HirExprKind::SharedRead { index, .. } => expr_uses_coopmat(index),
     }
 }
 

@@ -49,7 +49,6 @@ const MATMUL_F32_SRC: &str = include_str!("../../../examples/matmul_f32_tiled.ax
 const SAXPY_SRC: &str = include_str!("../../../examples/saxpy.axc");
 const Q4KM_MATVEC_SRC: &str = include_str!("../../../examples/q4km_dequant_matvec.axc");
 const Q4KM_MATMUL_SRC: &str = include_str!("../../../examples/q4km_dequant_matmul.axc");
-
 /// External cuBLAS f32 GEMM throughput estimate for the NVIDIA RTX PRO 6000 Blackwell.
 ///
 /// Source: NVIDIA RTX PRO 6000 Blackwell datasheet.
@@ -152,6 +151,7 @@ fn bench_resident_timing_kernels(c: &mut Criterion) {
         let handle = match ctx.prepare_kernel_checked(
             &words, &meta.binding_plan, meta.push_constant_total_bytes,
             &meta.entry_point, None, "saxpy",
+            meta.shared_memory_bytes,
         ) {
             Ok(h) => h,
             Err(e) => { eprintln!("saxpy prepare failed: {e}"); return; }
@@ -200,6 +200,7 @@ fn bench_resident_timing_kernels(c: &mut Criterion) {
         let handle = match ctx.prepare_kernel_checked(
             &words, &meta.binding_plan, meta.push_constant_total_bytes,
             &meta.entry_point, None, "q4km_dequant_matvec",
+            meta.shared_memory_bytes,
         ) {
             Ok(h) => h,
             Err(DispatchError::DeviceFeatureUnsupported { feature, kernel }) => {
@@ -258,6 +259,7 @@ fn bench_resident_timing_kernels(c: &mut Criterion) {
         let handle = match ctx.prepare_kernel_checked(
             &words, &meta.binding_plan, meta.push_constant_total_bytes,
             &meta.entry_point, None, "q4km_dequant_matmul",
+            meta.shared_memory_bytes,
         ) {
             Ok(h) => h,
             Err(DispatchError::DeviceFeatureUnsupported { feature, kernel }) => {
@@ -313,6 +315,7 @@ fn bench_resident_timing_kernels(c: &mut Criterion) {
         match ctx.prepare_kernel_checked(
             &words, &meta.binding_plan, meta.push_constant_total_bytes,
             &meta.entry_point, meta.coopmat.as_ref(), "matmul_tile",
+            meta.shared_memory_bytes,
         ) {
             Ok(handle) => {
                 let a_f16 = vec![0u8; 512];
@@ -387,6 +390,7 @@ fn bench_naive_gemm_harness_validation(c: &mut Criterion) {
     let handle = match ctx.prepare_kernel_checked(
         &words, &meta.binding_plan, meta.push_constant_total_bytes,
         &meta.entry_point, None, "matmul_f32_tiled",
+        meta.shared_memory_bytes,
     ) {
         Ok(h) => h,
         Err(DispatchError::DeviceFeatureUnsupported { feature, kernel }) => {
@@ -514,6 +518,7 @@ fn bench_dispatch_resident_matmul_tile(c: &mut Criterion) {
     let handle = match ctx.prepare_kernel_checked(
         &words, &meta.binding_plan, meta.push_constant_total_bytes,
         &meta.entry_point, meta.coopmat.as_ref(), "matmul_tile",
+        meta.shared_memory_bytes,
     ) {
         Ok(h) => h,
         Err(DispatchError::CoopMatUnsupported { reason, .. }) => {
@@ -573,6 +578,16 @@ fn bench_dispatch_resident_matmul_tile(c: &mut Criterion) {
 
     group.finish();
 }
+
+// AT-1623 (dispatch_matmul_shared_coopmat bench) was REMOVED in M3.2 retry:2.
+//
+// The matmul_shared_coopmat.axc kernel computes incorrect results (gpu=0.0 on NVIDIA
+// RTX PRO 6000, measured 2026-06-01). Reporting TFLOPS for a zero-computing kernel
+// would be misleading. The bench harness path (compile → pipeline create → dispatch
+// loop → min-of-N timing) is exercised by bench_dispatch_resident_matmul_tile.
+//
+// M3.3: re-introduce this bench once the kernel computes correct results via OpPhi
+// loop-carried SSA support.
 
 criterion_group!(
     resident_matmul_benches,

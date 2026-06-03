@@ -65,6 +65,13 @@ pub struct KernelResources<'r> {
     /// Subgroup builtin variables (SubgroupLocalInvocationId, SubgroupSize) emitted before fn.
     /// M1.4: None if the kernel body uses no subgroup scalar builtins.
     pub subgroup_vars: Option<&'r SubgroupBuiltinVars>,
+    /// Workgroup-shared array bindings emitted before the function (M3.2).
+    ///
+    /// `Some` when the kernel body has any `shared[T,N]` declarations.
+    /// `None` for kernels without shared arrays. SharedRead/SharedWrite handlers
+    /// return `BodyCodegenError::UnexpectedHir` if this is `None` but a shared
+    /// access is encountered (compiler bug — emit.rs must populate this).
+    pub shared_bindings: Option<&'r crate::shared::SharedBindings>,
 }
 
 /// Errors from SPIR-V body emission.
@@ -544,38 +551,76 @@ fn emit_stmt(em: &mut BodyEmitter<'_>, stmt: &HirStmt) -> Result<(), BodyCodegen
                 }
             }
         }
-        HirStmt::CoopMatStore { matrix_binding, buf_param_index, element_offset, stride, .. } => {
-            // M2.1: Emit OpCooperativeMatrixStoreKHR via coopmat module.
+        // M3.2: SharedDeclMarker is a no-op in codegen (OpVariable emitted by emit_shared_globals).
+        HirStmt::SharedDeclMarker { .. } => Ok(()),
+
+        // M3.2: SharedWrite → OpAccessChain (single index) + OpStore.
+        HirStmt::SharedWrite { shared_id, index, value, .. } => {
+            let index_id = emit_expr(em, index)?;
+            let value_id = emit_expr(em, value)?;
+            let shared_bindings = em.res.shared_bindings
+                .ok_or(BodyCodegenError::UnexpectedHir(
+                    "SharedWrite: no SharedBindings in KernelResources"
+                ))?;
+            crate::shared::emit_shared_write(
+                em.b,
+                shared_bindings,
+                *shared_id,
+                index_id,
+                value_id,
+            )
+        }
+
+        HirStmt::CoopMatStore { matrix_binding, store_source, element_offset, stride, .. } => {
+            // M2.1 / M3.2: Emit OpCooperativeMatrixStoreKHR via coopmat module.
+            // Branch on store_source: Buffer -> SSBO two-index path; Shared -> Workgroup single-index path.
             let mat_val_id = *em.var_ids.get(matrix_binding)
                 .ok_or(BodyCodegenError::UnexpectedHir(
                     "CoopMatStore: matrix binding not in var_ids"
                 ))?;
             let offset_id = emit_expr(em, element_offset)?;
             let stride_id = emit_expr(em, stride)?;
-            let bindings = em.res.buffer_bindings
-                .ok_or(BodyCodegenError::UnexpectedHir(
-                    "CoopMatStore: no BufferBindings in resources"
-                ))?;
-            // Split borrows: extract what we need before the coopmat call.
-            let buf_param = *buf_param_index;
-            let buf_var_id = *bindings.var_ids.get(&buf_param)
-                .ok_or(BodyCodegenError::UnexpectedHir(
-                    "CoopMatStore: buffer_binding not in var_ids"
-                ))?;
-            let elem_ptr_ty = *bindings.elem_ptr_ids.get(&buf_param)
-                .ok_or(BodyCodegenError::UnexpectedHir(
-                    "CoopMatStore: buffer_binding not in elem_ptr_ids"
-                ))?;
-            crate::coopmat::emit_coopmat_store_inline(
-                em.b,
-                em.type_cache,
-                em.caps,
-                buf_var_id,
-                elem_ptr_ty,
-                mat_val_id,
-                offset_id,
-                stride_id,
-            )
+            use axc_hir::coopmat::CoopMatLoadSource;
+            match store_source {
+                CoopMatLoadSource::Buffer(buf_param) => {
+                    // M2.1 default: SSBO two-index access chain (byte-identical to pre-M3.2).
+                    let bindings = em.res.buffer_bindings
+                        .ok_or(BodyCodegenError::UnexpectedHir(
+                            "CoopMatStore(Buffer): no BufferBindings in resources"
+                        ))?;
+                    let buf_var_id = *bindings.var_ids.get(buf_param)
+                        .ok_or(BodyCodegenError::UnexpectedHir(
+                            "CoopMatStore(Buffer): buffer slot not in var_ids"
+                        ))?;
+                    let elem_ptr_ty = *bindings.elem_ptr_ids.get(buf_param)
+                        .ok_or(BodyCodegenError::UnexpectedHir(
+                            "CoopMatStore(Buffer): buffer slot not in elem_ptr_ids"
+                        ))?;
+                    crate::coopmat::emit_coopmat_store_inline(
+                        em.b, em.type_cache, em.caps,
+                        buf_var_id, elem_ptr_ty, mat_val_id, offset_id, stride_id,
+                    )
+                }
+                CoopMatLoadSource::Shared(shared_id) => {
+                    // M3.2 PART B: Workgroup shared array — SINGLE-index access chain.
+                    let shared_bindings = em.res.shared_bindings
+                        .ok_or(BodyCodegenError::UnexpectedHir(
+                            "CoopMatStore(Shared): no SharedBindings in resources"
+                        ))?;
+                    let shared_var_id = *shared_bindings.var_ids.get(shared_id)
+                        .ok_or(BodyCodegenError::UnexpectedHir(
+                            "CoopMatStore(Shared): shared_id not in SharedBindings.var_ids"
+                        ))?;
+                    let wg_elem_ptr_ty = *shared_bindings.elem_ptr_ids.get(shared_id)
+                        .ok_or(BodyCodegenError::UnexpectedHir(
+                            "CoopMatStore(Shared): shared_id not in SharedBindings.elem_ptr_ids"
+                        ))?;
+                    crate::coopmat::emit_coopmat_store_shared_inline(
+                        em.b, em.type_cache, em.caps,
+                        shared_var_id, wg_elem_ptr_ty, mat_val_id, offset_id, stride_id,
+                    )
+                }
+            }
         }
     }
 }
@@ -903,10 +948,10 @@ fn emit_expr(em: &mut BodyEmitter<'_>, expr: &HirExpr) -> Result<Word, BodyCodeg
         HirExprKind::SubgroupBuiltin { op, args } => {
             emit_subgroup_builtin(em, *op, args, expr.ty)
         }
-        HirExprKind::CoopMatBuiltin { op, args, result_ty, buf_param_index } => {
-            // M2.1: Dispatch to coopmat module.
+        HirExprKind::CoopMatBuiltin { op, args, result_ty, source } => {
+            // M2.1 / M3.2: Dispatch to coopmat module.
             use crate::coopmat as cm;
-            use axc_hir::coopmat::CoopMatBuiltin;
+            use axc_hir::coopmat::{CoopMatBuiltin, CoopMatLoadSource};
             match op {
                 CoopMatBuiltin::Zero => {
                     // Split borrow: extract b, type_cache, caps, coopmat_type_cache.
@@ -916,8 +961,8 @@ fn emit_expr(em: &mut BodyEmitter<'_>, expr: &HirExpr) -> Result<Word, BodyCodeg
                     Ok(result)
                 }
                 CoopMatBuiltin::Load => {
-                    let buf_slot = buf_param_index.ok_or(BodyCodegenError::UnexpectedHir(
-                        "coopmat_load: buf_param_index is None"
+                    let load_source = source.ok_or(BodyCodegenError::UnexpectedHir(
+                        "coopmat_load: source is None (should be Some(Buffer|Shared))"
                     ))?;
                     if args.len() != 2 {
                         return Err(BodyCodegenError::UnexpectedHir(
@@ -926,22 +971,46 @@ fn emit_expr(em: &mut BodyEmitter<'_>, expr: &HirExpr) -> Result<Word, BodyCodeg
                     }
                     let offset_id = emit_expr(em, &args[0])?;
                     let stride_id = emit_expr(em, &args[1])?;
-                    let bindings = em.res.buffer_bindings
-                        .ok_or(BodyCodegenError::UnexpectedHir(
-                            "coopmat_load: no BufferBindings in resources"
-                        ))?;
-                    let buf_var_id = *bindings.var_ids.get(&buf_slot)
-                        .ok_or(BodyCodegenError::UnexpectedHir(
-                            "coopmat_load: buffer_binding not in var_ids"
-                        ))?;
-                    let elem_ptr_ty = *bindings.elem_ptr_ids.get(&buf_slot)
-                        .ok_or(BodyCodegenError::UnexpectedHir(
-                            "coopmat_load: buffer_binding not in elem_ptr_ids"
-                        ))?;
-                    cm::emit_coopmat_load_inline(
-                        em.b, em.type_cache, &mut em.coopmat_type_cache, em.caps,
-                        *result_ty, buf_var_id, elem_ptr_ty, offset_id, stride_id,
-                    )
+                    match load_source {
+                        CoopMatLoadSource::Buffer(buf_slot) => {
+                            // M2.1 default: SSBO two-index access chain (byte-identical).
+                            let bindings = em.res.buffer_bindings
+                                .ok_or(BodyCodegenError::UnexpectedHir(
+                                    "coopmat_load(Buffer): no BufferBindings in resources"
+                                ))?;
+                            let buf_var_id = *bindings.var_ids.get(&buf_slot)
+                                .ok_or(BodyCodegenError::UnexpectedHir(
+                                    "coopmat_load(Buffer): buffer slot not in var_ids"
+                                ))?;
+                            let elem_ptr_ty = *bindings.elem_ptr_ids.get(&buf_slot)
+                                .ok_or(BodyCodegenError::UnexpectedHir(
+                                    "coopmat_load(Buffer): buffer slot not in elem_ptr_ids"
+                                ))?;
+                            cm::emit_coopmat_load_inline(
+                                em.b, em.type_cache, &mut em.coopmat_type_cache, em.caps,
+                                *result_ty, buf_var_id, elem_ptr_ty, offset_id, stride_id,
+                            )
+                        }
+                        CoopMatLoadSource::Shared(shared_id) => {
+                            // M3.2 PART B: Workgroup shared array — SINGLE-index access chain.
+                            let shared_bindings = em.res.shared_bindings
+                                .ok_or(BodyCodegenError::UnexpectedHir(
+                                    "coopmat_load(Shared): no SharedBindings in resources"
+                                ))?;
+                            let shared_var_id = *shared_bindings.var_ids.get(&shared_id)
+                                .ok_or(BodyCodegenError::UnexpectedHir(
+                                    "coopmat_load(Shared): shared_id not in SharedBindings.var_ids"
+                                ))?;
+                            let wg_elem_ptr_ty = *shared_bindings.elem_ptr_ids.get(&shared_id)
+                                .ok_or(BodyCodegenError::UnexpectedHir(
+                                    "coopmat_load(Shared): shared_id not in SharedBindings.elem_ptr_ids"
+                                ))?;
+                            cm::emit_coopmat_load_shared_inline(
+                                em.b, em.type_cache, &mut em.coopmat_type_cache, em.caps,
+                                *result_ty, shared_var_id, wg_elem_ptr_ty, offset_id, stride_id,
+                            )
+                        }
+                    }
                 }
                 CoopMatBuiltin::MulAdd => {
                     if args.len() != 3 {
@@ -1028,6 +1097,22 @@ fn emit_expr(em: &mut BodyEmitter<'_>, expr: &HirExpr) -> Result<Word, BodyCodeg
                     q::emit_f32_from_u32(em.b, em.type_cache, u_id)
                 }
             }
+        }
+        // M3.2: SharedRead → emit_shared_read (SINGLE-index access chain + OpLoad).
+        HirExprKind::SharedRead { shared_id, index } => {
+            let index_id = emit_expr(em, index)?;
+            let elem_ty_id = em.type_id(expr.ty);
+            let shared_bindings = em.res.shared_bindings
+                .ok_or(BodyCodegenError::UnexpectedHir(
+                    "SharedRead: no SharedBindings in KernelResources"
+                ))?;
+            crate::shared::emit_shared_read(
+                em.b,
+                shared_bindings,
+                *shared_id,
+                index_id,
+                elem_ty_id,
+            )
         }
     }
 }

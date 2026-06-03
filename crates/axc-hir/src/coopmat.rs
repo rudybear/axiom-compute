@@ -111,6 +111,42 @@ pub enum CoopMatrixShapeKind {
     ABElementMismatch { a_elem: ScalarTy, b_elem: ScalarTy },
 }
 
+// ── CoopMatLoadSource ─────────────────────────────────────────────────────────
+
+/// Discriminates the source of a coopmat_load / coopmat_store operation (M3.2).
+///
+/// - `Buffer(slot)`: load from an SSBO buffer parameter (the M2.1 default).
+///   Uses a TWO-index access chain `[%0, %element_offset]` (struct member 0 + array index).
+///   Byte-identical to the pre-M3.2 emit path — existing call sites use this variant.
+///
+/// - `Shared(id)`: load from a workgroup-shared array (M3.2 PART B).
+///   Uses a SINGLE-index access chain `[%element_offset]` with Workgroup pointer class.
+///   Uses `emit_coopmat_load_shared_inline` / `emit_coopmat_store_shared_inline`.
+///   The stride is in ELEMENTS of the shared row (differs from SSBO row stride).
+///
+/// Adding this as an additive enum is safe: existing construction sites build
+/// `Buffer(..)` — the Buffer path is byte-identical to M2.1 (AT-1613 guards this).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoopMatLoadSource {
+    /// Load/store via a buffer SSBO parameter (M2.1 default). `u32` is the 0-based
+    /// buffer-parameter slot (buffer_position), same as the old `buf_param_index`.
+    Buffer(u32),
+    /// Load/store via a workgroup-shared array (M3.2 PART B). `u32` is the SharedId.0.
+    Shared(u32),
+}
+
+impl CoopMatLoadSource {
+    /// True if this is a Buffer source (SSBO path, M2.1 default).
+    pub fn is_buffer(&self) -> bool {
+        matches!(self, CoopMatLoadSource::Buffer(_))
+    }
+
+    /// True if this is a Shared source (Workgroup path, M3.2).
+    pub fn is_shared(&self) -> bool {
+        matches!(self, CoopMatLoadSource::Shared(_))
+    }
+}
+
 // ── CoopMatBuiltin ────────────────────────────────────────────────────────────
 
 /// The four new cooperative-matrix builtin call names (M2.1).

@@ -59,6 +59,7 @@ fn at_1530_resident_dispatch_span_smaller_than_host_roundtrip() {
     let handle = ctx.prepare_kernel_checked(
         &words, &meta.binding_plan, meta.push_constant_total_bytes,
         &meta.entry_point, meta.coopmat.as_ref(), "saxpy",
+        meta.shared_memory_bytes,
     ).expect("saxpy prepare must succeed");
 
     // Prepare inputs.
@@ -168,6 +169,7 @@ fn at_1531_resident_dispatch_existing_kernels() {
         let handle = ctx.prepare_kernel_checked(
             &words, &meta.binding_plan, meta.push_constant_total_bytes,
             &meta.entry_point, None, "saxpy",
+            meta.shared_memory_bytes,
         ).expect("saxpy prepare_kernel_checked must succeed");
 
         let alpha: f32 = 1.0_f32;
@@ -211,6 +213,7 @@ fn at_1531_resident_dispatch_existing_kernels() {
         match ctx.prepare_kernel_checked(
             &words, &meta.binding_plan, meta.push_constant_total_bytes,
             &meta.entry_point, meta.coopmat.as_ref(), "matmul_tile",
+            meta.shared_memory_bytes,
         ) {
             Ok(handle) => {
                 let a_f16: Vec<u8> = vec![0u8; 512]; // 16x16 f16 zeros
@@ -271,6 +274,7 @@ fn at_1570_resident_roundtrip_matches_dispatch_handle() {
     let handle = ctx.prepare_kernel_checked(
         &words, &meta.binding_plan, meta.push_constant_total_bytes,
         &meta.entry_point, None, "saxpy",
+        meta.shared_memory_bytes,
     ).expect("prepare");
 
     let alpha: f32 = 3.0_f32;
@@ -349,6 +353,7 @@ fn at_1571_resident_reuses_cb_fence_querypool() {
     let handle = ctx.prepare_kernel_checked(
         &words, &meta.binding_plan, meta.push_constant_total_bytes,
         &meta.entry_point, None, "saxpy",
+        meta.shared_memory_bytes,
     ).expect("prepare");
 
     let x: Vec<f32> = vec![1.0_f32; N];
@@ -407,6 +412,7 @@ fn at_1572_readback_resident_lever_a_skips_readonly() {
     let handle = ctx.prepare_kernel_checked(
         &words, &meta.binding_plan, meta.push_constant_total_bytes,
         &meta.entry_point, None, "saxpy",
+        meta.shared_memory_bytes,
     ).expect("prepare");
 
     let x: Vec<f32> = vec![1.0_f32; N];
@@ -462,6 +468,7 @@ fn at_1579_dispatch_resident_rejects_oversize_workgroups() {
     let handle = ctx.prepare_kernel_checked(
         &words, &meta.binding_plan, meta.push_constant_total_bytes,
         &meta.entry_point, None, "saxpy",
+        meta.shared_memory_bytes,
     ).expect("prepare");
 
     let x: Vec<f32> = vec![1.0_f32; 64];

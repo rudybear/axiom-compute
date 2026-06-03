@@ -11,6 +11,8 @@
 //! M2.1 adds `CoopMatBuiltin` expression kind and `CoopMatStore` statement kind for
 //!       cooperative-matrix operations.
 //! M2.5 adds `Q4_0Builtin` expression kind for byte-level access and f16 conversion.
+//! M3.2 adds `SharedRead` expression kind and `SharedWrite`/`SharedDecl` statement kinds,
+//!       plus the `shared` field on `KernelBodyTyped`.
 
 use axc_lexer::Span;
 use crate::ty::{ScalarTy, IntLiteralValue, FloatLiteralValue};
@@ -138,7 +140,7 @@ pub enum HirExprKind {
         op: crate::subgroup::SubgroupOp,
         args: Vec<HirExpr>,
     },
-    /// Cooperative-matrix builtin call (M2.1).
+    /// Cooperative-matrix builtin call (M2.1 / M3.2).
     ///
     /// Covers `coopmat_zero`, `coopmat_load`, and `coopmat_mul_add`.
     /// `coopmat_store` is a STATEMENT (`HirStmt::CoopMatStore`).
@@ -147,14 +149,16 @@ pub enum HirExprKind {
     /// - `Zero` / `Load`: resolved from the let-binding's expected type.
     /// - `MulAdd`: determined by the c-argument type.
     ///
-    /// `buf_param_index` is `Some(n)` for `Load` where `n` is the 0-based
-    /// buffer-parameter index used for `OpAccessChain`. `None` for Zero/MulAdd.
+    /// `source` discriminates the load source (M3.2):
+    /// - `Some(Buffer(slot))`: SSBO buffer param (M2.1 default, byte-identical emit path).
+    /// - `Some(Shared(id))`: Workgroup shared array (M3.2 PART B, single-index emit path).
+    /// - `None`: Zero/MulAdd (not a load).
     CoopMatBuiltin {
         op: crate::coopmat::CoopMatBuiltin,
         args: Vec<HirExpr>,
         result_ty: CoopMatKey,
-        /// Buffer-parameter binding slot (0-based) used by Load to synthesize OpAccessChain.
-        buf_param_index: Option<u32>,
+        /// Load source discriminator (M3.2). `Some` for Load (Buffer or Shared). `None` for Zero/MulAdd.
+        source: Option<crate::coopmat::CoopMatLoadSource>,
     },
     /// Q4_0-path builtin call (M2.5).
     ///
@@ -172,6 +176,17 @@ pub enum HirExprKind {
         args: Vec<HirExpr>,
         /// Buffer-parameter binding slot (0-based); `Some` for ptr_read_* builtins.
         buf_param_index: Option<u32>,
+    },
+    /// Read one element from a workgroup-shared array: `tile[index]` (M3.2).
+    ///
+    /// `shared_id` is the 0-based index into `KernelBodyTyped.shared`.
+    /// `index` must have type `U32` (no implicit coercion — anti-pattern #1).
+    /// Result type is the shared array's element `ScalarTy`.
+    SharedRead {
+        /// Id of the shared array being read.
+        shared_id: u32,
+        /// Index expression — must be U32.
+        index: Box<HirExpr>,
     },
 }
 
@@ -270,28 +285,63 @@ pub enum HirStmt {
         kind: crate::subgroup::BarrierKind,
         span: Span,
     },
-    /// `coopmat_store(m, buf, element_offset, stride);` (M2.1).
+    /// `coopmat_store(m, buf_or_shared, element_offset, stride);` (M2.1 / M3.2).
     ///
     /// Lowers to `OpAccessChain` + `OpCooperativeMatrixStoreKHR`.
     /// Only valid as a statement (void return type).
     /// `matrix_binding` is the BindingId of the matrix variable being stored.
-    /// `buf_param_index` is the 0-based buffer-parameter binding slot.
+    /// `store_source` discriminates Buffer (SSBO) vs Shared (Workgroup) destination (M3.2).
     CoopMatStore {
         /// BindingId of the cooperative-matrix value to store.
         matrix_binding: BindingId,
-        /// 0-based buffer-parameter slot (for OpAccessChain).
-        buf_param_index: u32,
+        /// Store destination discriminator (M3.2): Buffer(slot) for SSBO, Shared(id) for workgroup array.
+        store_source: crate::coopmat::CoopMatLoadSource,
         /// Element offset argument (must be U32).
         element_offset: HirExpr,
         /// Stride argument (must be U32).
         stride: HirExpr,
         span: Span,
     },
+    /// Write one element to a workgroup-shared array: `tile[index] = value;` (M3.2).
+    ///
+    /// `shared_id` is the 0-based index into `KernelBodyTyped.shared`.
+    /// `index` must have type `U32` (no implicit coercion).
+    /// `value` must match the shared array's element type exactly.
+    SharedWrite {
+        /// Id of the shared array being written.
+        shared_id: u32,
+        /// Index expression — must be U32.
+        index: HirExpr,
+        /// Value to write — must match elem ScalarTy exactly.
+        value: HirExpr,
+        span: Span,
+    },
+    /// No-op marker preserving shared-array declaration order in the statement list (M3.2).
+    ///
+    /// The actual `OpVariable Workgroup` is emitted by `emit_shared_globals` from the
+    /// `KernelBodyTyped.shared` table, NOT from this statement. This marker exists to
+    /// preserve lexical ordering of declarations in diagnostic messages and preserves
+    /// the correspondence between source order and emission order.
+    SharedDeclMarker {
+        /// Id of the declared shared array.
+        id: crate::shared::SharedId,
+        span: Span,
+    },
 }
 
 /// The typed body of a kernel: a binding table plus ordered statements.
+///
+/// M3.2 adds `shared`: the ordered list of workgroup-shared array declarations,
+/// analogous to `bindings` for local variables and the buffer table in HIR params.
 #[derive(Debug, Clone)]
 pub struct KernelBodyTyped {
     pub bindings: Vec<Binding>,
     pub stmts: Vec<HirStmt>,
+    /// Workgroup-shared array declarations in source order (M3.2).
+    ///
+    /// Each entry is a `SharedDecl` with a unique `SharedId`. The codegen uses this
+    /// table to emit `OpVariable Workgroup` before the function body. The typecheck
+    /// resolves `name[i]` references into `SharedRead`/`SharedWrite` HIR nodes
+    /// using the ids from this table.
+    pub shared: Vec<crate::shared::SharedDecl>,
 }

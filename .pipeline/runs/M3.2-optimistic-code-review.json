@@ -1,0 +1,76 @@
+{
+  "verdict": "APPROVE",
+  "agent": "optimistic_code_reviewer",
+  "milestone_id": "M3.2-shared-fa2",
+  "revision": "r3 (retry 2 honesty-cleanup)",
+  "branch": "coder/M32-20260602-0900/M3.2-shared-fa2",
+  "review_date": "2026-06-03",
+  "spec_compliance": true,
+  "shipped_scope_assessment": {
+    "shared_language_feature": "COMPLETE and clean — lexer→parser→HIR→typecheck→codegen follows every existing AXIOM-Compute pipeline pattern without deviation",
+    "oq1_set_based_barrier_analysis": "MATCHES r3 design exactly — BTreeMap<u32,Vec<HirExprKind>> tracks the SET W_X of all prior write indices per id; ProvablyEqual-to-ANY suppresses diagnostic; ProvablyDisequal-to-ALL fires hard error; unknown fires advisory warning",
+    "oq2_divergent_barrier": "MATCHES r3 design — dedicated conditional_depth counter (not reusing divergent_context_depth); if/else bodies increment it, while/for-range do NOT; AT-429 test inverted as mandated",
+    "coopmat_from_shared_wiring": "CORRECT — CoopMatLoadSource enum is additive; Buffer path byte-identical (AT-1613); Shared path uses distinct emit_coopmat_load_shared_inline/store_shared_inline with SINGLE-index Workgroup access chain; spirv-val confirms (AT-1614)",
+    "honest_deferral": "EXEMPLARY — AT-1620/1621/1622/1630 converted to compile+spirv-val-only non-ignored tests; AT-1623 bench REMOVED with explanatory comment (not replaced with a zero-computing TFLOPS number); WIP headers on 3 example files",
+    "metadata_v3_back_compat": "CORRECT — SUPPORTED_SCHEMA_VERSIONS=[1,2,3] allowed-set guard; serde(default) on shared_memory_bytes; v1/v2 sidecars deserve shared_memory_bytes=0; v4 rejected; AT-503/AT-1553 fully updated and inverted where required",
+    "runtime_preflight": "CORRECT — max_compute_shared_memory_size cached on VulkanContext at construction; preflight_kernel_support gains the check after coopmat check (deterministic ordering preserved); SharedMemoryExceedsDeviceLimit graceful typed error"
+  },
+  "positive_feedback": [
+    "shared.rs (HIR) is the cleanest new module in this diff: pure data types, no codegen dependency, mirrors buffer.rs/subgroup.rs discipline exactly; comprehensive inline tests including Bool-rejection, all-numeric acceptance, SharedId ordering",
+    "codegen/shared.rs documents the ONE-vs-TWO index arity distinction prominently at the top of the file — this is the most critical correctness invariant and it is impossible to miss; comment references AT-1615 for the dedup story",
+    "OQ1 SET-based analysis is both sound and documented: the r3 changelog rationale (multi-slot self-write `tile[0]=a; tile[1]=b; let w=tile[0];` is silent) is captured in a DESIGN.md paragraph, in typecheck.rs field comments, and in AT-1636(b) test — the three-source documentation makes the zero-false-positive claim auditable",
+    "AT-429 inversion is handled correctly: the test is renamed (not just the assertion changed), and the comment explains why the OQ2 policy supersedes the prior CRITICAL-4 exception",
+    "Capability emission for F16 shared arrays is explicitly handled in emit_shared_globals with a comment calling out that observe_type does NOT cover F16 — prevents a class of silent missing-capability bugs from future maintainers",
+    "The double-counted aggregate shared memory check (typecheck + validate) is conservative rather than under-counting; duplicating a compile error is low-severity vs missing one",
+    "All 5 existing callers of prepare_kernel_checked (resident_timing.rs x2, resident_matmul.rs x4, dispatch_shared_m32.rs) are updated to pass meta.shared_memory_bytes — no partial migration",
+    "BTreeMap used throughout shared module (SharedBindings, shared_write_sets, shared_name_map) — consistent with AT-227 no-HashMap policy",
+    "Bench AT-1623 removal with explanatory comment is the right call — shipping TFLOPS for a kernel that computes zeros would have been a trust violation against benchmarking integrity"
+  ],
+  "minor_issues": [
+    {
+      "file": "crates/axc-hir/src/typecheck.rs",
+      "description": "Aggregate shared-memory size check runs in both typecheck_kernel_body (TypecheckError::SharedMemoryTooLarge) and validate.rs (HirError::SharedMemoryTooLarge). A kernel with >65536 bytes will report the error twice to the user. Not a correctness problem (both copies say the same thing), but cosmetically noisy. Suggest: skip the validate.rs check if typecheck already populates shared_decls, or fold one into the other in M3.3.",
+      "severity": "non-blocking"
+    },
+    {
+      "file": "crates/axc-hir/tests/shared_typecheck.rs",
+      "line": 367,
+      "description": "AT-1636(d) ends with `let _any_warn = ...;` and a comment 'Don't assert strictly'. The test verifies the hard error does NOT fire but does not assert the advisory warning fires. This is a known conservative choice given binding-id tracking uncertainty. A follow-up in M3.3 with a more deterministic undecidable-index fixture would tighten this.",
+      "severity": "non-blocking"
+    },
+    {
+      "file": "crates/axc-hir/src/lower.rs + crates/axc-hir/src/typecheck.rs",
+      "description": "find_mul_add_in_expr returns None for SharedRead (line 603-605) without recursing into the index sub-expression. This is conservative (SharedRead.index cannot contain coopmat_mul_add in the current type system), but the comment acknowledges this: 'scan it for completeness (unlikely to contain coopmat_mul_add)'. The current behavior is safe; a future kernel with a complex index expression that happens to call coopmat_mul_add would silently suppress the check. Low risk given type constraints, but worth a TODO note.",
+      "severity": "non-blocking"
+    },
+    {
+      "file": "crates/axc-codegen/src/shared.rs",
+      "line": 59,
+      "description": "elem_byte_size() uses panic! for unsupported bit widths (the _ arm). This is the only panic in new lib code. It is properly documented and cannot be reached via well-typed HIR (Bool is rejected by is_allowed_shared_element), but differs from the Result-returning error style elsewhere. Could return a BodyCodegenError in a future cleanup pass.",
+      "severity": "non-blocking"
+    }
+  ],
+  "at_spec_crosscheck": {
+    "AT-1600": "PASS — TokenKind::Shared in lexer; at1600_shared_array_lexes_correctly test present",
+    "AT-1601": "PASS — SharedDecl AST node; TypeRef::Shared HIR node; parse round-trip test",
+    "AT-1602": "PASS — parser recovers to semicolon/brace on malformed N; ALL errors reported (anti-pattern #6)",
+    "AT-1603": "PASS — N=0 rejected at parse time",
+    "AT-1604": "PASS — duplicate name rejected; SharedTypeNotAllowedAsParam in lower.rs",
+    "AT-1605": "PASS — non-u32 index rejected; wrong elem-type write rejected",
+    "AT-1606_compile": "PASS — OQ1 hard error fires for literal cross-slot; advisory for dynamic index",
+    "AT-1606_gpu": "PASS on NVIDIA RTX PRO 6000 (measured by orchestrator)",
+    "AT-1607": "PASS — Workgroup OpVariable + OpTypeArray present in disasm",
+    "AT-1608": "PASS — single-index access chain (structural check + spirv-val)",
+    "AT-1609": "PASS — OpCapability Float16 emitted for standalone shared[f16] declaration",
+    "AT-1610": "PASS — Workgroup OpVariable excluded from OpEntryPoint interface list",
+    "AT-1612": "PASS — >65536 bytes hard error; 16384-65536 range advisory warning",
+    "AT-1613": "PASS — Buffer-source coopmat byte-identical across recompiles",
+    "AT-1614": "PASS — shared-source coopmat spirv-val clean (proves single-index Workgroup path)",
+    "AT-1615": "PASS — two shared arrays, same elem type, distinct var_ids in SharedBindings",
+    "AT-1620_1621_1622_1630": "compile+spirv-val PASS; GPU numerics correctly deferred to M3.3 (WIP headers, no zero-computing tests shipped as passing)",
+    "AT-1636": "PASS — zero-false-positive for same-index self-read, multi-slot self-write, and undecidable index",
+    "AT-429_inverted": "PASS — error_barrier_in_if_body_is_divergent_context now expects BarrierInDivergentContext error"
+  },
+  "m30_m31_regression": "NONE — 834 tests pass; M3.0 saxpy, M3.1 matmul_tile, q4km_dequant_matmul_coopmat spirv-val all green; CoopMatLoadSource addition is purely additive (Buffer path byte-identical)",
+  "summary": "M3.2 (re-scoped to shared[T,N] language feature) is a high-quality, merge-ready implementation. The shared[T,N] pipeline is clean end-to-end. OQ1 (set-based missing-barrier) and OQ2 (divergent-barrier) analyses match the r3 design precisely. The honest deferral of the four compute-zeros GPU tests and the TFLOPS bench removal are the right calls and are executed correctly. Metadata v3 back-compat, coopmat-from-shared wiring, and the runtime preflight addition are all correct and additive. Four minor non-blocking issues are noted for M3.3 cleanup."
+}

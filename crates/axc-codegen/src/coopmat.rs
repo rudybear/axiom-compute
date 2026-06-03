@@ -295,3 +295,94 @@ pub fn emit_coopmat_load_inline(
 
     Ok(result_id)
 }
+
+// ── CRITICAL-3: Shared-source coopmat emit (SEPARATE from Buffer path) ─────────
+
+/// Emit `coopmat_load` from a Workgroup-class shared array (M3.2 PART B).
+///
+/// CRITICAL arity difference vs `emit_coopmat_load_inline`:
+/// - Buffer path: `access_chain(elem_ptr_ty, None, buf_var_id, [zero_id, element_offset_id])`
+///   (TWO indices: struct member-0 + array index — SSBO wraps runtime array in OpTypeStruct).
+/// - Shared path: `access_chain(wg_elem_ptr_ty, None, shared_var_id, [element_offset_id])`
+///   (ONE index: direct array index — shared array has NO wrapping struct).
+///
+/// The `wg_elem_ptr_ty` MUST be a Workgroup-class pointer type (from `SharedBindings.elem_ptr_ids`),
+/// NOT a StorageBuffer pointer. Using the wrong class or arity produces invalid SPIR-V.
+///
+/// Sets `caps.coopmat = true`. Also calls `observe_coopmat_elem_caps` for the result type.
+/// AT-1614: the shared-source coopmat OpAccessChain has EXACTLY ONE index operand.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_coopmat_load_shared_inline(
+    b: &mut Builder,
+    type_cache: &mut ScalarTypeCache,
+    coopmat_cache: &mut CoopMatTypeCache,
+    caps: &mut CapabilitiesRequired,
+    result_ty: CoopMatKey,
+    shared_var_id: Word,
+    wg_elem_ptr_ty: Word,
+    element_offset_id: Word,
+    stride_id: Word,
+) -> Result<Word, BodyCodegenError> {
+    caps.coopmat = true;
+    observe_coopmat_elem_caps(caps, result_ty);
+
+    let mat_type_id = coopmat_cache.get_or_emit(b, type_cache, result_ty);
+
+    // SINGLE-index access chain: only element offset — NO leading struct-member-0.
+    // wg_elem_ptr_ty is a Workgroup-class pointer (NOT StorageBuffer).
+    let ptr_id = b.access_chain(wg_elem_ptr_ty, None, shared_var_id, [element_offset_id])
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+
+    // RowMajorKHR = 0.
+    let layout_id = type_cache.get_or_emit_u32_const(b, ROW_MAJOR_LAYOUT);
+
+    let result_id = b.cooperative_matrix_load_khr(
+        mat_type_id,
+        None,
+        ptr_id,
+        layout_id,
+        Some(stride_id),
+        None,                  // no MemoryAccess flags
+        std::iter::empty(),
+    )
+    .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+
+    Ok(result_id)
+}
+
+/// Emit `coopmat_store` to a Workgroup-class shared array (M3.2 PART B).
+///
+/// Same CRITICAL arity difference: SINGLE-index access chain with Workgroup-class pointer.
+/// Sets `caps.coopmat = true`.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_coopmat_store_shared_inline(
+    b: &mut Builder,
+    type_cache: &mut ScalarTypeCache,
+    caps: &mut CapabilitiesRequired,
+    shared_var_id: Word,
+    wg_elem_ptr_ty: Word,
+    mat_val_id: Word,
+    element_offset_id: Word,
+    stride_id: Word,
+) -> Result<(), BodyCodegenError> {
+    caps.coopmat = true;
+
+    // SINGLE-index access chain: Workgroup-class pointer, no struct-member-0.
+    let ptr_id = b.access_chain(wg_elem_ptr_ty, None, shared_var_id, [element_offset_id])
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+
+    // RowMajorKHR layout constant.
+    let layout_id = type_cache.get_or_emit_u32_const(b, ROW_MAJOR_LAYOUT);
+
+    b.cooperative_matrix_store_khr(
+        ptr_id,
+        mat_val_id,
+        layout_id,
+        Some(stride_id),
+        None,              // no MemoryAccess flags
+        std::iter::empty(),
+    )
+    .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+
+    Ok(())
+}

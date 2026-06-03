@@ -112,6 +112,16 @@ pub enum TypeRef {
         n: u32,
         use_: CoopMatUseAst,
     },
+    /// `shared[elem, N]` — workgroup-local array type (M3.2+).
+    ///
+    /// `elem` is a scalar element type (Bool not allowed).
+    /// `N` is a compile-time unsuffixed positive integer literal (1..=65536).
+    /// Only valid as the type in a `Stmt::SharedDecl`; rejected in parameter position.
+    Shared {
+        elem: ScalarTypeRef,
+        /// Number of elements (validated N > 0, N <= MAX_SHARED_ELEMS at HIR lower time).
+        len: u32,
+    },
 }
 
 /// An annotation on a kernel: `@name` or `@name(arg, …)`.
@@ -247,6 +257,22 @@ pub enum Stmt {
     ///
     /// The inner `Expr` is always `Expr::Call { name, args }`.
     BuiltinCallStmt { call: Spanned<Expr> },
+    /// `shared name: shared[elem, N];` — workgroup-shared array declaration (M3.2+).
+    ///
+    /// The leading `shared` keyword introduces the declaration.
+    /// The type is `shared[elem, N]` where `elem` is a scalar type and `N` is a
+    /// compile-time unsuffixed positive integer literal.
+    ///
+    /// Shared arrays are KERNEL-WIDE workgroup storage; they are NOT parameters
+    /// (consumes no descriptor), and may NOT be used as return types or let-binding types.
+    SharedDecl {
+        /// Source-level name of the shared array.
+        name: axc_lexer::Spanned<String>,
+        /// Element type scalar reference.
+        elem: ScalarTypeRef,
+        /// Length (number of elements), as a spanned u32 for error messages.
+        len: axc_lexer::Spanned<u32>,
+    },
 }
 
 /// Binary arithmetic / comparison operator.

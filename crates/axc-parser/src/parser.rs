@@ -170,6 +170,26 @@ pub enum ParseError {
         #[label("here")]
         span: Span,
     },
+
+    // ── M3.2 shared-array parse errors ──────────────────────────────────────
+
+    /// `shared x: shared[f32];` — missing N in `shared[elem, N]`.
+    /// `shared y: shared[f32, 3.0];` — N must be an unsuffixed positive integer literal.
+    #[error("shared-array size N must be an unsuffixed positive integer literal (1..=65536); got {found_kind}")]
+    SharedSizeMustBeUnsuffixedPositiveIntegerLiteral {
+        found_kind: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    /// N > 65536 — checked at parse time for a direct literal.
+    #[error("shared-array size {got} exceeds maximum {max}; reduce N or split into multiple arrays")]
+    SharedSizeTooLarge {
+        got: u32,
+        max: u32,
+        #[label("here")]
+        span: Span,
+    },
 }
 
 /// Internal enum for infix operators used by the Pratt parser.
@@ -762,9 +782,19 @@ impl<'tok> Parser<'tok> {
                 }
                 return None;
             }
+            // M3.2: `shared[elem, N]` — workgroup-local array type.
+            // `shared` IS a keyword (TokenKind::Shared); parse `shared[elem, N]`.
+            TokenKind::Shared => {
+                self.advance();
+                if let Some(shared_ty) = self.parse_shared_type_args() {
+                    let end_span: Span = self.last_span();
+                    return Some(Spanned::new(shared_ty, span.merge(end_span)));
+                }
+                return None;
+            }
             other => {
                 self.errors.push(ParseError::Unexpected {
-                    expected: "type (void, bool, i32, u32, i64, u64, f16, f32, f64, buffer[T], readonly_buffer[T], writeonly_buffer[T], matrix[T, M, N, use])".into(),
+                    expected: "type (void, bool, i32, u32, i64, u64, f16, f32, f64, buffer[T], readonly_buffer[T], writeonly_buffer[T], matrix[T, M, N, use], shared[T, N])".into(),
                     found: format!("{:?}", other),
                     span,
                 });
@@ -920,6 +950,214 @@ impl<'tok> Parser<'tok> {
         Some(elem)
     }
 
+    // ── Shared array type and declaration (M3.2) ────────────────────────────
+
+    /// Parse `[elem, N]` after `shared` keyword in a type context.
+    ///
+    /// Called after `shared` has been consumed. Produces `TypeRef::Shared { elem, len }`.
+    /// On error, pushes an error and returns `None`; parser can still continue.
+    fn parse_shared_type_args(&mut self) -> Option<TypeRef> {
+        if !self.expect_token(TokenKind::LBracket, "[") {
+            return None;
+        }
+        // Parse element type from the allowed shared elem set.
+        let elem: ScalarTypeRef = self.parse_shared_elem_type()?;
+        if !self.expect_token(TokenKind::Comma, ",") {
+            return None;
+        }
+        // Parse N — unsuffixed positive integer literal.
+        let len: u32 = self.parse_shared_len()?;
+        if !self.expect_token(TokenKind::RBracket, "]") {
+            return None;
+        }
+        Some(TypeRef::Shared { elem, len })
+    }
+
+    /// Parse an element type token from the shared-array allowed set (all scalars).
+    fn parse_shared_elem_type(&mut self) -> Option<ScalarTypeRef> {
+        match self.peek_kind().clone() {
+            TokenKind::I8  => { self.advance(); Some(ScalarTypeRef::I8) }
+            TokenKind::U8  => { self.advance(); Some(ScalarTypeRef::U8) }
+            TokenKind::I32 => { self.advance(); Some(ScalarTypeRef::I32) }
+            TokenKind::U32 => { self.advance(); Some(ScalarTypeRef::U32) }
+            TokenKind::I64 => { self.advance(); Some(ScalarTypeRef::I64) }
+            TokenKind::U64 => { self.advance(); Some(ScalarTypeRef::U64) }
+            TokenKind::F16 => { self.advance(); Some(ScalarTypeRef::F16) }
+            TokenKind::F32 => { self.advance(); Some(ScalarTypeRef::F32) }
+            TokenKind::F64 => { self.advance(); Some(ScalarTypeRef::F64) }
+            other => {
+                self.errors.push(ParseError::Unexpected {
+                    expected: "shared-array element type (i8, u8, i32, u32, i64, u64, f16, f32, f64)".into(),
+                    found: format!("{:?}", other),
+                    span: self.peek_span(),
+                });
+                None
+            }
+        }
+    }
+
+    /// Parse an unsuffixed positive integer literal N for `shared[elem, N]`.
+    ///
+    /// Validates: N >= 1 (zero rejected); N <= MAX_SHARED_ELEMS (65536).
+    /// Suffix → error. Non-integer → error.
+    fn parse_shared_len(&mut self) -> Option<u32> {
+        let len_span: Span = self.peek_span();
+        match self.peek_kind().clone() {
+            TokenKind::IntLiteral { value, suffix: None, .. } => {
+                self.advance();
+                if value <= 0 {
+                    self.errors.push(ParseError::SharedSizeMustBeUnsuffixedPositiveIntegerLiteral {
+                        found_kind: format!("{value} (must be >= 1)"),
+                        span: len_span,
+                    });
+                    return None;
+                }
+                // MAX_SHARED_ELEMS = 65536
+                const MAX_N: u32 = 65536;
+                let n: u32 = if value > i128::from(MAX_N) { MAX_N + 1 } else { value as u32 };
+                if n > MAX_N {
+                    self.errors.push(ParseError::SharedSizeTooLarge {
+                        got: n,
+                        max: MAX_N,
+                        span: len_span,
+                    });
+                    return None;
+                }
+                Some(n)
+            }
+            TokenKind::IntLiteral { suffix: Some(_), .. } => {
+                self.advance();
+                self.errors.push(ParseError::SharedSizeMustBeUnsuffixedPositiveIntegerLiteral {
+                    found_kind: "suffixed integer literal (remove the suffix, e.g. 256 not 256u32)".into(),
+                    span: len_span,
+                });
+                None
+            }
+            TokenKind::FloatLiteral { .. } => {
+                self.advance();
+                self.errors.push(ParseError::SharedSizeMustBeUnsuffixedPositiveIntegerLiteral {
+                    found_kind: "float literal (N must be an integer, e.g. 256)".into(),
+                    span: len_span,
+                });
+                None
+            }
+            other => {
+                self.errors.push(ParseError::SharedSizeMustBeUnsuffixedPositiveIntegerLiteral {
+                    found_kind: format!("{:?}", other),
+                    span: len_span,
+                });
+                None
+            }
+        }
+    }
+
+    /// Parse `shared name: shared[elem, N];` — a workgroup-shared array declaration.
+    ///
+    /// Called when `TokenKind::Shared` is the leading token. Consumes the leading
+    /// `shared` keyword, then parses: `name : shared [ elem , N ] ;`.
+    ///
+    /// Recovers to `;` or `}` on malformed input (anti-pattern #6 — reports ALL errors).
+    fn parse_shared_decl_stmt(&mut self) -> Option<Spanned<Stmt>> {
+        let stmt_start: Span = self.peek_span();
+        self.advance(); // consume `shared`
+
+        // Parse name
+        let name_span: Span = self.peek_span();
+        let name: String = match self.peek_kind().clone() {
+            TokenKind::Ident(n) => { self.advance(); n }
+            other => {
+                self.errors.push(ParseError::Unexpected {
+                    expected: "identifier for shared array name".into(),
+                    found: format!("{:?}", other),
+                    span: name_span,
+                });
+                self.recover_to_semicolon_or_brace();
+                return None;
+            }
+        };
+
+        // Expect ':'
+        if !self.expect_token(TokenKind::Colon, ":") {
+            self.recover_to_semicolon_or_brace();
+            return None;
+        }
+
+        // Expect 'shared' keyword again for the type
+        let type_shared_span: Span = self.peek_span();
+        if self.peek_kind() != &TokenKind::Shared {
+            self.errors.push(ParseError::Unexpected {
+                expected: "shared[elem, N] type annotation".into(),
+                found: format!("{:?}", self.peek_kind()),
+                span: type_shared_span,
+            });
+            self.recover_to_semicolon_or_brace();
+            return None;
+        }
+        self.advance(); // consume `shared` in the type position
+
+        // Parse the `[elem, N]` part.
+        let type_start: Span = self.peek_span();
+        if self.peek_kind() != &TokenKind::LBracket {
+            self.errors.push(ParseError::Unexpected {
+                expected: "[elem, N] after shared type keyword".into(),
+                found: format!("{:?}", self.peek_kind()),
+                span: type_start,
+            });
+            self.recover_to_semicolon_or_brace();
+            return None;
+        }
+        // Consume `[`
+        self.advance();
+
+        // Elem type — parse carefully so we can recover on error.
+        let elem_opt: Option<ScalarTypeRef> = self.parse_shared_elem_type();
+        let elem: ScalarTypeRef = match elem_opt {
+            Some(e) => e,
+            None => {
+                self.recover_to_semicolon_or_brace();
+                return None;
+            }
+        };
+
+        if !self.expect_token(TokenKind::Comma, ",") {
+            self.recover_to_semicolon_or_brace();
+            return None;
+        }
+
+        // N — length
+        let len_span: Span = self.peek_span();
+        let len_opt: Option<u32> = self.parse_shared_len();
+        let len: u32 = match len_opt {
+            Some(n) => n,
+            None => {
+                self.recover_to_semicolon_or_brace();
+                return None;
+            }
+        };
+
+        if !self.expect_token(TokenKind::RBracket, "]") {
+            self.recover_to_semicolon_or_brace();
+            return None;
+        }
+
+        let semi_span: Span = self.peek_span();
+        if !self.expect_token(TokenKind::Semicolon, ";") {
+            self.recover_to_semicolon_or_brace();
+            return None;
+        }
+
+        let stmt_end: Span = semi_span;
+        let full_span: Span = stmt_start.merge(stmt_end);
+        Some(Spanned::new(
+            Stmt::SharedDecl {
+                name: Spanned::new(name, name_span),
+                elem,
+                len: Spanned::new(len, len_span),
+            },
+            full_span,
+        ))
+    }
+
     // ── Block ────────────────────────────────────────────────────────────────
 
     fn parse_block(&mut self) -> Option<Spanned<Block>> {
@@ -989,6 +1227,8 @@ impl<'tok> Parser<'tok> {
         match self.peek_kind().clone() {
             TokenKind::Let    => self.parse_let_stmt(),
             TokenKind::Return => self.parse_return_stmt(),
+            // M3.2: `shared name: shared[elem, N];` workgroup-shared array declaration.
+            TokenKind::Shared => self.parse_shared_decl_stmt(),
             TokenKind::If     => self.parse_if_stmt(),
             TokenKind::For    => self.parse_for_stmt(),
             TokenKind::While  => self.parse_while_stmt(),

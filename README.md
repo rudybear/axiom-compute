@@ -12,8 +12,9 @@ AXIOM-Compute makes intent first-class. `@strategy { workgroup_x: ?[32, 64, 128,
 
 ## Current status (2026-06-01)
 
-- **15 milestones merged on `main`**: M0 → M3.1
-- **780 tests passing**, clippy `--all-targets` clean, zero SPIR-V validation errors
+- **16 milestones merged on `main`**: M0 → M3.2
+- **834 tests passing**, clippy `--all-targets` clean, zero SPIR-V validation errors
+- **`shared[T,N]` workgroup memory (M3.2)**: new language feature (lexer→codegen) with a provably-sound missing-barrier analysis; a shared parallel reduction + `workgroup_barrier()` runs **bit-exact on NVIDIA**. The competitive matmul + tiled attention that use it compile + spirv-val clean but need `OpPhi` loop-carried SSA (`emit_for_range`) to compute correctly — re-scoped to M3.3.
 - **First cooperative_matrix dispatch on real Blackwell tensor cores** (M3.1): `matmul_tile` 16×16 C=A·B **bit-exact** on NVIDIA RTX PRO 6000; multi-row Q4_K_M matmul bit-exact 256×256; same `.axc` graceful-skips on Lavapipe via coopmat preflight. Resident-buffer TFLOPS benchmark + full dequant→coopmat fusion carried to M3.2.
 - **Real GPU execution** via `ash` 0.38 + Vulkan 1.1+
 - **6 GPU-gated tests pass on both NVIDIA RTX PRO 6000 Blackwell AND Lavapipe** (software Vulkan)

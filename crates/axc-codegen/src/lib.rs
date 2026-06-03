@@ -9,6 +9,8 @@ pub mod buffers;
 pub mod subgroup;
 pub mod coopmat;
 pub mod q4_0;
+/// Workgroup-shared array SPIR-V emission (M3.2).
+pub mod shared;
 
 pub use emit::{emit_module, emit_module_bytes, CodegenError, CodegenOptions};
 pub use body::{ScalarTypeCache, CapabilitiesRequired, BodyCodegenError, KernelResources, emit_kernel_body};
@@ -17,6 +19,7 @@ pub use buffers::{
     BufferBindings, PushConstantBlock, GlobalInvocationIdVar,
 };
 pub use subgroup::{SubgroupBuiltinVars, SubgroupVote, SubgroupReduceOp, SubgroupCodegenError};
+pub use shared::{SharedBindings, emit_shared_globals, emit_shared_read, emit_shared_write};
 
 /// Extract the workgroup dimensions from the first kernel in a HIR module.
 ///
