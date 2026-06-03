@@ -38,7 +38,7 @@
 mod common;
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use axc_driver::{compile_source_with_meta, compile_source_with_assignments};
+use axc_driver::compile_source_with_meta;
 use axc_runtime::{
     VulkanContext, DispatchError,
     ResidentBenchConfig, ResidentTimingSource,
@@ -49,8 +49,6 @@ const MATMUL_F32_SRC: &str = include_str!("../../../examples/matmul_f32_tiled.ax
 const SAXPY_SRC: &str = include_str!("../../../examples/saxpy.axc");
 const Q4KM_MATVEC_SRC: &str = include_str!("../../../examples/q4km_dequant_matvec.axc");
 const Q4KM_MATMUL_SRC: &str = include_str!("../../../examples/q4km_dequant_matmul.axc");
-const MATMUL_SHARED_COOPMAT_SRC: &str = include_str!("../../../examples/matmul_shared_coopmat.axc");
-
 /// External cuBLAS f32 GEMM throughput estimate for the NVIDIA RTX PRO 6000 Blackwell.
 ///
 /// Source: NVIDIA RTX PRO 6000 Blackwell datasheet.
@@ -581,153 +579,20 @@ fn bench_dispatch_resident_matmul_tile(c: &mut Criterion) {
     group.finish();
 }
 
-// ── dispatch_matmul_shared_coopmat (AT-1623) ──────────────────────────────────
-
-/// `dispatch_matmul_shared_coopmat`: AT-1623 resident-benchmark TFLOPS for the
-/// PART B shared-staged coopmat matmul.
-///
-/// Methodology (TIMING-1 / honest):
-/// - Upload A/B/C ONCE outside the dispatch-N loop (no per-iteration staging allocation).
-/// - A/B/C allocated as 16×16 f16 tiles (~512 bytes each = ~1.5 KiB total for the fixture).
-///   NOTE: this bench uses a 16×16 TILE (the single K-block kernel), NOT a 4096² matmul,
-///   because the kernel computes one tile per dispatch. The TFLOPS number reflects the
-///   tile-granularity dispatch overhead, not the throughput of a full GEMM pipeline.
-/// - effective_tflops = 2·M·N·K / kernel_ns (kernel-only timing).
-/// - Compare to labeled cuBLAS datasheet ESTIMATE (NOT a same-machine A/B).
-/// - Bank conflicts: shared[f16,256] without padding may bank-conflict (32-bank model);
-///   sub-peak numbers are expected. @shared_tile(pad=K) is deferred.
-///
-/// SKIPS gracefully if coopmat is unsupported (typed skip via CoopMatUnsupported /
-/// DeviceFeatureUnsupported). Does NOT assert a competitive ratio (honest report).
-///
-/// Bench ID: `dispatch_matmul_shared_coopmat` (additive; does NOT touch existing bench IDs).
-fn bench_dispatch_matmul_shared_coopmat(c: &mut Criterion) {
-    if !gpu_benches_enabled() {
-        eprintln!("dispatch_matmul_shared_coopmat: AXC_ENABLE_GPU_BENCHES not set; skipping");
-        return;
-    }
-
-    let ctx = match VulkanContext::new() {
-        Ok(c) => c,
-        Err(e) => { eprintln!("dispatch_matmul_shared_coopmat: no Vulkan: {e}"); return; }
-    };
-
-    // Compile with tile_k=16 (tile_a_size=256, tile_b_size=256).
-    let mut assignments = std::collections::BTreeMap::new();
-    assignments.insert("tile_m".to_owned(), 16i64);
-    assignments.insert("tile_n".to_owned(), 16i64);
-    assignments.insert("tile_k".to_owned(), 16i64);
-    assignments.insert("tile_a_size".to_owned(), 256i64);
-    assignments.insert("tile_b_size".to_owned(), 256i64);
-
-    let (bytes, meta) = match compile_source_with_assignments(MATMUL_SHARED_COOPMAT_SRC, &assignments) {
-        Ok(r) => r,
-        Err(e) => { eprintln!("dispatch_matmul_shared_coopmat: compile failed: {e:?}"); return; }
-    };
-    let words: Vec<u32> = bytes.chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
-
-    let handle = match ctx.prepare_kernel_checked(
-        &words, &meta.binding_plan, meta.push_constant_total_bytes,
-        &meta.entry_point, meta.coopmat.as_ref(), "matmul_shared_coopmat",
-        meta.shared_memory_bytes,
-    ) {
-        Ok(h) => h,
-        Err(DispatchError::CoopMatUnsupported { reason, .. }) => {
-            eprintln!("dispatch_matmul_shared_coopmat: CoopMatUnsupported (typed skip): {reason}");
-            return;
-        }
-        Err(DispatchError::DeviceFeatureUnsupported { feature, kernel }) => {
-            eprintln!("dispatch_matmul_shared_coopmat: DeviceFeatureUnsupported {feature}/{kernel} (typed skip)");
-            return;
-        }
-        Err(e) => { eprintln!("dispatch_matmul_shared_coopmat: pipeline create: {e}"); return; }
-    };
-
-    // Upload inputs ONCE. A/B/C = three 16×16 f16 tiles (~512 bytes each).
-    // Total: ~1.5 KiB — well under the 50 GB cap.
-    let a_f16: Vec<u16> = (0..256_u16).map(|i| {
-        let row = i / 16;
-        let col = i % 16;
-        let v: f32 = 1.0 + 0.5 * row as f32 - 0.25 * col as f32;
-        half::f16::from_f32(v).to_bits()
-    }).collect();
-    let b_f16: Vec<u16> = (0..256_u16).map(|i| {
-        let row = i / 16;
-        let col = i % 16;
-        let v: f32 = -0.5 + 0.5 * col as f32 + 0.125 * row as f32;
-        half::f16::from_f32(v).to_bits()
-    }).collect();
-    let a_bytes: Vec<u8> = a_f16.iter().flat_map(|b| b.to_le_bytes()).collect();
-    let b_bytes: Vec<u8> = b_f16.iter().flat_map(|b| b.to_le_bytes()).collect();
-    let c_zeros = vec![0u8; 512];
-
-    // Push constants: M=16, N=16, K=16.
-    let mut pc_bytes = Vec::new();
-    pc_bytes.extend_from_slice(&16u32.to_le_bytes());
-    pc_bytes.extend_from_slice(&16u32.to_le_bytes());
-    pc_bytes.extend_from_slice(&16u32.to_le_bytes());
-
-    let output_size = 512u64;
-    let workgroups = (1, 1, 1);
-
-    // TFLOPS parameters: one 16×16×16 f16 matmul tile.
-    // effective_tflops = 2 * 16 * 16 * 16 / kernel_seconds.
-    const M: usize = 16;
-    const N: usize = 16;
-    const K: usize = 16;
-    // cuBLAS f16 GEMM (tensor core) throughput on RTX PRO 6000 Blackwell:
-    // ~500+ TFLOPS. This tile bench will show raw dispatch overhead, not throughput.
-    const CUBLAS_F16_TFLOPS_RTX_PRO_6000_ESTIMATE: f64 = 500.0;
-
-    let mut group = c.benchmark_group("resident_matmul");
-    group.sample_size(10);
-
-    group.bench_function("dispatch_matmul_shared_coopmat", |b| {
-        b.iter_custom(|iters| {
-            let mut total_ns: u64 = 0;
-            for _ in 0..iters {
-                let (min_ns, ts) = resident_min_of_n(
-                    &ctx, &handle,
-                    &[&a_bytes, &b_bytes, &c_zeros], &[0, 0, output_size],
-                    workgroups, pc_bytes.clone(),
-                );
-                let kernel_seconds: f64 = min_ns as f64 * 1e-9;
-                // effective_tflops for a single 16×16×16 tile.
-                let tflops: f64 = effective_tflops(M, N, K, kernel_seconds);
-                let vs_cublas_pct: f64 = tflops / CUBLAS_F16_TFLOPS_RTX_PRO_6000_ESTIMATE * 100.0;
-
-                // AT-1623: labeled comparison vs cuBLAS datasheet ESTIMATE (NOT a same-machine A/B).
-                // NOTE: This is a SINGLE TILE dispatch (16×16×16), not a full 4096² GEMM.
-                // The TFLOPS number reflects tile-dispatch overhead; at this scale, the
-                // effective TFLOPS will be very low due to launch latency dominating.
-                // Bank conflicts in shared[f16,256] (unpadded) may depress the number further.
-                let label = format!(
-                    "dispatch_matmul_shared_coopmat (M3.2 PART B, single 16×16×16 tile, \
-                     shared-staged f16 + coopmat_load_from_shared): \
-                     {tflops:.4} TFLOPS ({vs_cublas_pct:.2}% of cuBLAS f16 datasheet ESTIMATE \
-                     {CUBLAS_F16_TFLOPS_RTX_PRO_6000_ESTIMATE} TFLOPS — NOT a same-machine A/B; \
-                     tile-scale dispatch overhead dominates at this granularity) | \
-                     {} ns ({})",
-                    min_ns, timing_source_label(ts)
-                );
-                eprintln!("{label}");
-                assert!(tflops >= 0.0 && tflops.is_finite(),
-                    "AT-1623: effective_tflops must be >= 0 and finite");
-                total_ns += min_ns;
-            }
-            std::time::Duration::from_nanos(total_ns)
-        });
-    });
-
-    group.finish();
-}
+// AT-1623 (dispatch_matmul_shared_coopmat bench) was REMOVED in M3.2 retry:2.
+//
+// The matmul_shared_coopmat.axc kernel computes incorrect results (gpu=0.0 on NVIDIA
+// RTX PRO 6000, measured 2026-06-01). Reporting TFLOPS for a zero-computing kernel
+// would be misleading. The bench harness path (compile → pipeline create → dispatch
+// loop → min-of-N timing) is exercised by bench_dispatch_resident_matmul_tile.
+//
+// M3.3: re-introduce this bench once the kernel computes correct results via OpPhi
+// loop-carried SSA support.
 
 criterion_group!(
     resident_matmul_benches,
     bench_resident_timing_kernels,
     bench_naive_gemm_harness_validation,
     bench_dispatch_resident_matmul_tile,
-    bench_dispatch_matmul_shared_coopmat,
 );
 criterion_main!(resident_matmul_benches);

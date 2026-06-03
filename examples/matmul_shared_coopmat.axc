@@ -1,4 +1,7 @@
-// examples/matmul_shared_coopmat.axc — Competitive tiled f16 matmul (shared-staged + coopmat).
+// examples/matmul_shared_coopmat.axc — WIP (M3.3): compiles + spirv-val clean; GPU numerics
+// incorrect pending OpPhi loop support. See M3.2-coder.json retry:2 for details.
+//
+// Competitive tiled f16 matmul (shared-staged + coopmat).
 //
 // PART B: The competitive tiled matmul (AT-1620, AT-1621, AT-1622).
 //

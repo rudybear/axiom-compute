@@ -1,4 +1,7 @@
-// examples/tiled_attention.axc — Correctness-first NON-streaming tiled attention (PART C1).
+// examples/tiled_attention.axc — WIP (M3.3): compiles + spirv-val clean; GPU numerics
+// incorrect pending OpPhi loop support + kernel debugging. See M3.2-coder.json retry:2.
+//
+// Correctness-first NON-streaming tiled attention (PART C1).
 //
 // This is tiled_attention, NOT flash_attention_v2.
 // FlashAttention-2 (streaming online softmax with running max/denom rescaling) is C2,

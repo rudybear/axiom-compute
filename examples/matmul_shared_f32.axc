@@ -1,4 +1,7 @@
-// examples/matmul_shared_f32.axc — Shared-staged f32 tiled matmul (no coopmat).
+// examples/matmul_shared_f32.axc — WIP (M3.3): compiles + spirv-val clean; GPU numerics
+// incorrect pending OpPhi loop support. See M3.2-coder.json retry:2 for details.
+//
+// Shared-staged f32 tiled matmul (no coopmat).
 //
 // PART B: Lavapipe-friendly variant of the competitive tiled matmul.
 // Same shared-staging tile structure as matmul_shared_coopmat.axc but using
