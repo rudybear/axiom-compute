@@ -81,23 +81,21 @@ Goal: prove the DESIGN.md §5 kill-criteria gates with publishable numbers, not 
 **Depends on:** M3.0 (bandwidth), M2.1 cooperative matrix infra.
 **Blocks:** M3.2.
 
-### M3.2 — shared[T,N] workgroup memory + competitive tiled matmul + tiled attention ✅ LANDED (2026-06-02)
+### M3.2 — shared[T,N] workgroup memory ✅ LANDED; competitive matmul + attention → M3.3 (2026-06-03)
 
-**LANDED:** M3.2 (r3 design, Coder) implemented the largest single milestone:
-- **FG.6 `shared[T,N]` IMPLEMENTED**: lexer→parser→HIR→typecheck→codegen→spirv-val full pipeline. OQ1 SET-based missing-barrier analysis (zero false positives). OQ2 divergent-barrier hard error. AT-429 inverted. CRITICAL-1/2/3/4 all resolved.
-- **Competitive tiled matmul**: examples/matmul_shared_coopmat.axc + matmul_shared_f32.axc. CoopMatLoadSource discriminator + emit_coopmat_load_shared_inline/store_shared_inline (single-index Workgroup path). @strategy tile holes genuinely used.
-- **C1 tiled attention** (NON-streaming): examples/tiled_attention.axc. Full two-pass softmax with max-subtraction. NOT FlashAttention-2. `flash_attention_v2` name reserved for C2 (M3.2b).
-- **Metadata schema v3**: SUPPORTED_SCHEMA_VERSIONS=[1,2,3], shared_memory_bytes field, maxComputeSharedMemorySize preflight.
+**LANDED — the `shared[T,N]` language feature (FG.6):**
+- **FG.6 `shared[T,N]` IMPLEMENTED + GPU-VALIDATED**: full lexer→parser→HIR→typecheck→codegen→spirv-val pipeline. OQ1 SET-based missing-barrier analysis (provably zero false positives — verified by the pessimistic reviewer with 5 adversarial patterns). OQ2 `conditional_depth` divergent-barrier hard error. AT-429 inverted. CRITICAL-1/2/3/4 resolved across 3 design-revision cycles. **AT-1606: a shared[f32,256] parallel reduction + `workgroup_barrier()` runs BIT-EXACT on the NVIDIA RTX PRO 6000 (=384.0)** — the feature executes correctly on real hardware, not just compiles.
+- **Coopmat-from-shared infrastructure**: `CoopMatLoadSource::{Buffer,Shared}` discriminator + `emit_coopmat_load_shared_inline`/`store_shared_inline` (single-index Workgroup access chain); existing Buffer-source coopmat SPIR-V byte-identical (AT-1613).
+- **Metadata schema v3**: `SUPPORTED_SCHEMA_VERSIONS=[1,2,3]` (v1/v2 back-compat), `shared_memory_bytes`, `maxComputeSharedMemorySize` graceful-skip preflight.
 
-**Still M3.2b (deferred):** FlashAttention-2 streaming online softmax (C2 — block-streaming running max/denom rescaling); shared-source coopmat_load fully wired through HIR typecheck for at-runtime dispatch (AT-1614/1620-1622 GPU bit-exact #[ignore] tests).
+**RE-SCOPED to M3.3 (honest — GPU-measured):** the competitive tiled matmul (`matmul_shared_coopmat.axc`, `matmul_shared_f32.axc`) and the tiled attention (`tiled_attention.axc`) **compile + spirv-val clean but compute INCORRECT results (zeros) on real GPU.** Root cause: `emit_for_range` lacks **OpPhi loop-carried SSA**, so a K-loop accumulator can't carry the coopmat/sum value across iterations — without it the matmul is single-tile and the kernels don't accumulate. Their bit-exact GPU tests were converted to compile/spirv-val-only (no zero-computing test ships as passing); the misleading TFLOPS bench was removed; the examples carry `WIP (M3.3)` headers. **M3.3 = OpPhi loop-carried SSA in `emit_for_range` → real multi-tile matmul (competitive TFLOPS) + working tiled attention.** FlashAttention-2 streaming softmax (C2) remains M3.2b after that.
 
-**Acceptance (what passed):** AT-1600..AT-1636 passing (cargo test --workspace); cargo clippy -D warnings clean; spirv-val via structural disassembly checks; metadata v1/v2 back-compat. GPU tests (#[ignore]) require AXC_ENABLE_GPU_TESTS=1 on NVIDIA.
+**Acceptance (what passed):** 834 tests green; clippy -D warnings clean; AT-1606 GPU bit-exact on NVIDIA; AT-1613/1614 coopmat byte-identity + shared spirv-val; metadata v1/v2/v3 back-compat. Both code reviewers APPROVE.
 
-**FG.6 status:** `shared[T,N]` is **IMPLEMENTED** (see §3.1.14).
+**FG.6 status:** `shared[T,N]` is **IMPLEMENTED + GPU-validated** (see DESIGN.md §3.1.14).
 
-**Effort:** ~5800 LOC across 19+ files. Largest single milestone. New language feature FG.6 landed.
-**Depends on:** M3.0, M3.1.
-**Blocks:** M3.2b (C2 FlashAttention-2), KernelBench submission (M3.3).
+**Effort:** ~4800 LOC. The new language feature landed; the kernels exploiting it need OpPhi (M3.3).
+**Depends on:** M3.0, M3.1. **Blocks:** M3.3 (OpPhi + competitive matmul + attention), then M3.2b (C2 FA2).
 
 ### M3.2b — FlashAttention-2 streaming softmax (C2, deferred from M3.2)
 

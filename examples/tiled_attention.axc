@@ -19,7 +19,9 @@
 //
 // The K and V rows are staged one-at-a-time into shared[f32, 64] per K-block.
 // This materializes the full score row (seq_len scores per query).
-// Does NOT scale to FA2 regime but is bit-exact for small fixtures.
+// Does NOT scale to the FA2 regime. WIP (M3.3): GPU numerics are currently
+// INCORRECT (computes zeros) pending OpPhi loop-carried SSA support; no test
+// asserts bit-exactness yet.
 //
 // Implementation notes:
 //   - K and V buffers contain f32 elements (avoids f16 scalar limitation in current HIR).
@@ -28,7 +30,8 @@
 //   - exp() is approximated via the exp2(x * log2e) builtin approximation (f32 arithmetic).
 //   - For the test fixture, exp(x) is implemented as a first-order approximation.
 //
-// AT-1630: bit-exact within 1e-3 fp tol vs a CPU reference attention.
+// AT-1630 (M3.3 target): bit-exact within 1e-3 vs a CPU reference attention —
+// NOT yet achieved; the current AT-1630 test is compile + spirv-val only.
 //
 // Anti-pattern #2: explicit `return;`.
 // Anti-pattern #8: no `>>`.
