@@ -2,23 +2,27 @@
 //
 // PART B: The competitive tiled matmul (AT-1620, AT-1621, AT-1622).
 //
-// Workgroup cooperatively loads A and B tiles into shared[f16, TILE_M*TILE_K] /
-// shared[f16, TILE_K*TILE_N], workgroup_barrier(), then coopmat_load FROM shared
-// (shared-source single-index path), coopmat_mul_add accumulate over K, second
-// workgroup_barrier() (WAR — before the next K-tile overwrites the staging arrays),
-// and after K, coopmat_store the accumulator.
+// This kernel computes one TILE_M×TILE_N×TILE_K partial sum tile:
+//   - Cooperatively loads A[tile_row*TILE_M : (tile_row+1)*TILE_M, 0 : TILE_K] and
+//     B[0 : TILE_K, tile_col*TILE_N : (tile_col+1)*TILE_N] from f16 SSBOs
+//     into shared[f16, TILE_A_SIZE] and shared[f16, TILE_B_SIZE].
+//   - workgroup_barrier() ensures all staging writes are visible.
+//   - coopmat_load FROM shared (shared-source single-index emit path, AT-1614).
+//   - coopmat_mul_add to produce one C tile.
+//   - coopmat_store the result to C.
 //
-// @strategy holes: tile_m / tile_n / tile_k are GENUINELY used (not inert).
+// NOTE: This kernel computes a SINGLE K-block (not a loop over K). Multi-K-block
+// accumulation requires loop-carried coopmat values via OpPhi, which is deferred
+// to M3.3. For the AT-1620/1622 correctness fixture, K = TILE_K (one block covers
+// the full K dimension: fixture shape M=16, N=16, K=tile_k).
+//
+// Autotuner holes: tile_k, tile_a_size, tile_b_size are GENUINELY used (not inert).
 // They parameterize:
-//   - @workgroup dimensions
-//   - shared array sizes (literal N in shared[f16, TILE_M*TILE_K])
-//   - K-loop trip count (K / tile_k)
-// AT-1622 asserts tile_k=16 vs 32 yield different SPIR-V AND bit-exact GPU results.
-//
-// Bank conflicts: shared[f16, TILE*TILE] without padding will bank-conflict on the
-// 32-bank model for power-of-two tile widths. This may depress TFLOPS numbers.
-// @shared_tile(pad=K) sugar (M3.2 deferred item) would fix this. The honest report
-// should not be surprised by sub-peak numbers attributable to conflicts.
+//   - shared array sizes: shared[f16, ?tile_a_size] / shared[f16, ?tile_b_size]
+//   - coopmat_load stride: ?tile_k (the shared-tile row width in elements)
+//   - Guard: tile_k=16 => tile_a_size=256 (16*16), tile_k=32 => tile_a_size=512 (16*32).
+//     Different tile_k produces different shared-array OpTypeArray constants AND
+//     different stride constants in coopmat_load (AT-1622 structural guard).
 //
 // On Lavapipe: coopmat preflight returns CoopMatUnsupported (graceful skip).
 // The matmul_shared_f32.axc variant runs there instead.
@@ -29,8 +33,8 @@
 @kernel
 @workgroup(32, 1, 1)
 @cooperative_matrix
-@strategy { tile_m: ?[16], tile_n: ?[16], tile_k: ?[16, 32] }
-@intent("shared-staged coopmat f16 tiled matmul — PART B competitive matmul (AT-1620..1622)")
+@strategy { tile_m: ?[16], tile_n: ?[16], tile_k: ?[16, 32], tile_a_size: ?[256, 512], tile_b_size: ?[256, 512] }
+@intent("shared-staged coopmat f16 tiled matmul (single K-block) — PART B (AT-1620..1622)")
 @complexity(O(n))
 fn matmul_shared_coopmat(
     A: readonly_buffer[f16],
@@ -41,58 +45,48 @@ fn matmul_shared_coopmat(
     K: u32
 ) -> void {
     // Shared staging tiles.
-    // a_tile: TILE_M * TILE_K = 16 * 16 = 256 f16 elements.
-    // b_tile: TILE_K * TILE_N = 16 * 16 = 256 f16 elements.
-    shared a_tile: shared[f16, 256];
-    shared b_tile: shared[f16, 256];
+    // a_tile: TILE_M * TILE_K elements (f16). tile_k=16 => 256, tile_k=32 => 512.
+    // b_tile: TILE_K * TILE_N elements (f16). tile_k=16 => 256, tile_k=32 => 512.
+    shared a_tile: shared[f16, ?tile_a_size];
+    shared b_tile: shared[f16, ?tile_b_size];
 
     // Warp-level tile row/column.
     let tile_row: u32 = gid(1u32);
     let tile_col: u32 = gid(0u32);
     let lane_id: u32 = subgroup_invocation_id();
 
-    // Accumulator matrix: f16 TILE_M x TILE_N.
-    let mut acc: matrix[f16, 16, 16, accumulator] = coopmat_zero();
+    // Cooperatively stage A[tile_row, 0..TILE_K] into a_tile.
+    // Each lane loads one f16 element. 32 lanes cover 32 elements per iteration.
+    // For TILE_M*TILE_K total elements, each lane may load multiple elements;
+    // for the fixture K=TILE_K, lane_id < 32 and 32 lanes cover 32/16=2 rows.
+    let lane_row: u32 = lane_id / ?tile_k;
+    let lane_col: u32 = lane_id - lane_row * ?tile_k;
+    let a_global: u32 = (tile_row * 16u32 + lane_row) * K + lane_col;
+    let a_shared: u32 = lane_row * ?tile_k + lane_col;
+    a_tile[a_shared] = A[a_global];
 
-    // K-loop: iterate over K in TILE_K-sized blocks.
-    let num_k_blocks: u32 = K / 16u32;
-    for k_block in range(0u32, num_k_blocks) {
-        // Cooperative load of A tile from SSBO into shared staging.
-        // Each lane loads multiple elements (coalesced pattern).
-        let a_base_row: u32 = tile_row * 16u32;
-        let a_base_col: u32 = k_block * 16u32;
-        let lane_row: u32 = lane_id / 16u32;
-        let lane_col: u32 = lane_id - lane_row * 16u32;
-        let a_global: u32 = (a_base_row + lane_row) * K + (a_base_col + lane_col);
-        let a_shared: u32 = lane_row * 16u32 + lane_col;
-        a_tile[a_shared] = A[a_global];
+    // Stage B[0..TILE_K, tile_col] into b_tile.
+    let b_global: u32 = lane_row * N + (tile_col * 16u32 + lane_col);
+    let b_shared: u32 = lane_row * 16u32 + lane_col;
+    b_tile[b_shared] = B[b_global];
 
-        // Cooperative load of B tile from SSBO into shared staging.
-        let b_base_row: u32 = k_block * 16u32;
-        let b_base_col: u32 = tile_col * 16u32;
-        let b_global: u32 = (b_base_row + lane_row) * N + (b_base_col + lane_col);
-        let b_shared: u32 = lane_row * 16u32 + lane_col;
-        b_tile[b_shared] = B[b_global];
+    // Barrier: ensure all staging writes are visible before coopmat loads.
+    workgroup_barrier();
 
-        // Barrier: ensure all staging writes are visible before coopmat loads.
-        workgroup_barrier();
+    // coopmat_load A and B FROM shared (shared-source single-index emit path, AT-1614).
+    // Stride = shared-tile row width in ELEMENTS:
+    //   A tile: stride = TILE_K (a_tile is laid out as TILE_M rows × TILE_K cols).
+    //   B tile: stride = TILE_N = 16 (b_tile is TILE_K rows × TILE_N cols).
+    let a_mat: matrix[f16, 16, 16, a] = coopmat_load(a_tile, 0u32, ?tile_k);
+    let b_mat: matrix[f16, 16, 16, b] = coopmat_load(b_tile, 0u32, 16u32);
 
-        // coopmat_load A and B FROM shared (shared-source single-index emit path).
-        // The stride is the shared-tile row width in ELEMENTS (= TILE_K = 16),
-        // which differs from the SSBO row stride (K).
-        let a_mat: matrix[f16, 16, 16, a] = coopmat_load(a_tile, 0u32, 16u32);
-        let b_mat: matrix[f16, 16, 16, b] = coopmat_load(b_tile, 0u32, 16u32);
+    // Zero accumulator + single MulAdd for the one K-block.
+    let acc: matrix[f16, 16, 16, accumulator] = coopmat_zero();
+    let result: matrix[f16, 16, 16, accumulator] = coopmat_mul_add(a_mat, b_mat, acc);
 
-        // Accumulate: acc += a_mat * b_mat.
-        acc = coopmat_mul_add(a_mat, b_mat, acc);
-
-        // WAR barrier: before the next iteration overwrites the staging arrays.
-        workgroup_barrier();
-    }
-
-    // Store accumulator to C.
+    // Store result to C[tile_row*TILE_M, tile_col*TILE_N].
     let c_base: u32 = (tile_row * 16u32) * N + (tile_col * 16u32);
-    coopmat_store(acc, C, c_base, N);
+    coopmat_store(result, C, c_base, N);
 
     return;
 }

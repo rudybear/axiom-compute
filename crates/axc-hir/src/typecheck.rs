@@ -2636,14 +2636,15 @@ fn check_coopmat_init_expr(
                             op: CoopMatBuiltin::Zero,
                             args: vec![],
                             result_ty: matrix_key,
-                            buf_param_index: None,
+                            source: None,
                         },
                         ty: ScalarTy::U32, // sentinel
                         span,
                     })
                 }
                 Some(CoopMatBuiltin::Load) => {
-                    // coopmat_load(buf, element_offset, stride) → result type is matrix_key.
+                    // coopmat_load(src, element_offset, stride) → result type is matrix_key.
+                    // src may be a buffer param (M2.1, Buffer source) OR a shared array (M3.2, Shared source).
                     if args.len() != CoopMatBuiltin::Load.arity() {
                         tc.errors.push(TypecheckError::CoopMatArity {
                             name: "coopmat_load",
@@ -2653,8 +2654,8 @@ fn check_coopmat_init_expr(
                         });
                         return None;
                     }
-                    // Arg 0: buffer param name.
-                    let buf_ident = match &args[0].node {
+                    // Arg 0: source ident — must be a buffer param OR a shared array name.
+                    let src_ident = match &args[0].node {
                         past::Expr::Ident(ref s) => s.clone(),
                         _ => {
                             tc.errors.push(TypecheckError::CoopMatLoadArgMustBeBufferParam {
@@ -2664,41 +2665,58 @@ fn check_coopmat_init_expr(
                             return None;
                         }
                     };
-                    // Find the buffer param by name.
-                    let mut buf_slot: Option<u32> = None;
-                    let mut buf_elem: Option<ScalarTy> = None;
-                    let mut buf_access: Option<crate::buffer::BufferAccess> = None;
-                    let mut idx: u32 = 0;
-                    for p in tc.params {
-                        if let crate::param::Ty::Buffer(ref bt) = p.ty {
-                            if p.name == buf_ident {
-                                buf_slot = Some(idx);
-                                buf_elem = Some(bt.elem);
-                                buf_access = Some(bt.access);
-                                break;
-                            }
-                            idx += 1;
-                        }
-                    }
-                    let (buf_slot, buf_elem, _buf_access) = match (buf_slot, buf_elem, buf_access) {
-                        (Some(s), Some(e), Some(a)) => (s, e, a),
-                        _ => {
-                            tc.errors.push(TypecheckError::CoopMatLoadArgMustBeBufferParam {
-                                found_kind: "not a buffer parameter",
+
+                    // PART B (M3.2): check if src_ident is a shared array first.
+                    let load_source = if let Some((shared_id, shared_elem, _shared_len)) = tc.find_shared(&src_ident) {
+                        // Shared source path: element type must match the coopmat elem.
+                        if shared_elem != matrix_key.elem {
+                            tc.errors.push(TypecheckError::CoopMatLoadElementTypeMismatch {
+                                matrix_elem: matrix_key.elem.display_name(),
+                                buffer_elem: shared_elem.display_name(),
                                 span: args[0].span,
                             });
                             return None;
                         }
+                        crate::coopmat::CoopMatLoadSource::Shared(shared_id.0)
+                    } else {
+                        // Buffer source path (M2.1 default): find buffer param by name.
+                        let mut buf_slot: Option<u32> = None;
+                        let mut buf_elem: Option<ScalarTy> = None;
+                        let mut buf_access: Option<crate::buffer::BufferAccess> = None;
+                        let mut idx: u32 = 0;
+                        for p in tc.params {
+                            if let crate::param::Ty::Buffer(ref bt) = p.ty {
+                                if p.name == src_ident {
+                                    buf_slot = Some(idx);
+                                    buf_elem = Some(bt.elem);
+                                    buf_access = Some(bt.access);
+                                    break;
+                                }
+                                idx += 1;
+                            }
+                        }
+                        let (buf_slot_val, buf_elem_val, _buf_access) = match (buf_slot, buf_elem, buf_access) {
+                            (Some(s), Some(e), Some(a)) => (s, e, a),
+                            _ => {
+                                tc.errors.push(TypecheckError::CoopMatLoadArgMustBeBufferParam {
+                                    found_kind: "not a buffer parameter or shared array",
+                                    span: args[0].span,
+                                });
+                                return None;
+                            }
+                        };
+                        // Check element type matches.
+                        if buf_elem_val != matrix_key.elem {
+                            tc.errors.push(TypecheckError::CoopMatLoadElementTypeMismatch {
+                                matrix_elem: matrix_key.elem.display_name(),
+                                buffer_elem: buf_elem_val.display_name(),
+                                span: args[0].span,
+                            });
+                            return None;
+                        }
+                        crate::coopmat::CoopMatLoadSource::Buffer(buf_slot_val)
                     };
-                    // Check element type matches.
-                    if buf_elem != matrix_key.elem {
-                        tc.errors.push(TypecheckError::CoopMatLoadElementTypeMismatch {
-                            matrix_elem: matrix_key.elem.display_name(),
-                            buffer_elem: buf_elem.display_name(),
-                            span: args[0].span,
-                        });
-                        return None;
-                    }
+
                     // Arg 1: element_offset (U32).
                     let offset_hir = check_expr(tc, &args[1].node, args[1].span, Some(ScalarTy::U32))?;
                     if offset_hir.ty != ScalarTy::U32 {
@@ -2722,7 +2740,7 @@ fn check_coopmat_init_expr(
                             op: CoopMatBuiltin::Load,
                             args: vec![offset_hir, stride_hir],
                             result_ty: matrix_key,
-                            buf_param_index: Some(buf_slot),
+                            source: Some(load_source),
                         },
                         ty: ScalarTy::U32, // sentinel
                         span,
@@ -2953,7 +2971,7 @@ fn check_coopmat_expr_call(
                     op: CoopMatBuiltin::MulAdd,
                     args: vec![a_expr, b_expr, c_expr],
                     result_ty: result_key,
-                    buf_param_index: None,
+                    source: None,
                 },
                 ty: ScalarTy::U32, // sentinel: actual type is CoopMatrix(result_key)
                 span: call_span,
@@ -3015,25 +3033,39 @@ fn check_coopmat_store_stmt(
         }
     };
 
-    // Arg 1: buffer parameter (must be a writable buffer param).
-    let buf_ident = match &args[1].node {
+    // Arg 1: destination — buffer param (M2.1) OR shared array (M3.2 PART B).
+    let dst_ident = match &args[1].node {
         past::Expr::Ident(ref s) => s.clone(),
         _ => {
             tc.errors.push(TypecheckError::TypeMismatch {
-                expected: "buffer parameter name",
+                expected: "buffer parameter name or shared array name",
                 got: "expression",
                 span: args[1].span,
             });
             return None;
         }
     };
-    let (buf_slot, buf_ty) = {
+
+    // PART B (M3.2): check if dst_ident is a shared array first.
+    let store_source = if let Some((shared_id, shared_elem, _shared_len)) = tc.find_shared(&dst_ident) {
+        // Shared destination path.
+        if shared_elem != matrix_key.elem {
+            tc.errors.push(TypecheckError::CoopMatStoreElementTypeMismatch {
+                matrix_elem: matrix_key.elem.display_name(),
+                buffer_elem: shared_elem.display_name(),
+                span: args[1].span,
+            });
+            return None;
+        }
+        crate::coopmat::CoopMatLoadSource::Shared(shared_id.0)
+    } else {
+        // Buffer destination path (M2.1 default): find writable buffer param.
         let mut found_slot: Option<u32> = None;
         let mut found_ty: Option<crate::buffer::BufferTy> = None;
         let mut buf_idx: u32 = 0;
         for p in tc.params {
             if let crate::param::Ty::Buffer(ref bt) = p.ty {
-                if p.name == buf_ident {
+                if p.name == dst_ident {
                     found_slot = Some(buf_idx);
                     found_ty = Some(*bt);
                     break;
@@ -3041,37 +3073,36 @@ fn check_coopmat_store_stmt(
                 buf_idx += 1;
             }
         }
-        match (found_slot, found_ty) {
+        let (buf_slot, buf_ty) = match (found_slot, found_ty) {
             (Some(slot), Some(ty)) => (slot, ty),
             _ => {
                 tc.errors.push(TypecheckError::TypeMismatch {
-                    expected: "buffer parameter",
-                    got: "not a buffer parameter",
+                    expected: "buffer parameter or shared array",
+                    got: "not a buffer parameter or shared array",
                     span: args[1].span,
                 });
                 return None;
             }
+        };
+        // Check that buffer is writable (not readonly).
+        if buf_ty.access == crate::buffer::BufferAccess::ReadOnly {
+            tc.errors.push(TypecheckError::CoopMatStoreToReadonlyBuffer {
+                param_name: dst_ident.clone(),
+                span: args[1].span,
+            });
+            return None;
         }
+        // Check element type compatibility.
+        if buf_ty.elem != matrix_key.elem {
+            tc.errors.push(TypecheckError::CoopMatStoreElementTypeMismatch {
+                matrix_elem: matrix_key.elem.display_name(),
+                buffer_elem: buf_ty.elem.display_name(),
+                span: call_span,
+            });
+            return None;
+        }
+        crate::coopmat::CoopMatLoadSource::Buffer(buf_slot)
     };
-
-    // Check that buffer is writable (not readonly).
-    if buf_ty.access == crate::buffer::BufferAccess::ReadOnly {
-        tc.errors.push(TypecheckError::CoopMatStoreToReadonlyBuffer {
-            param_name: buf_ident.clone(),
-            span: args[1].span,
-        });
-        return None;
-    }
-
-    // Check element type compatibility.
-    if buf_ty.elem != matrix_key.elem {
-        tc.errors.push(TypecheckError::CoopMatStoreElementTypeMismatch {
-            matrix_elem: matrix_key.elem.display_name(),
-            buffer_elem: buf_ty.elem.display_name(),
-            span: call_span,
-        });
-        return None;
-    }
 
     // Arg 2: element_offset (must be U32).
     let offset_hir = check_expr(tc, &args[2].node, args[2].span, Some(ScalarTy::U32))?;
@@ -3095,7 +3126,7 @@ fn check_coopmat_store_stmt(
 
     Some(HirStmt::CoopMatStore {
         matrix_binding: matrix_bid,
-        buf_param_index: buf_slot,
+        store_source,
         element_offset: offset_hir,
         stride: stride_hir,
         span: stmt_span,

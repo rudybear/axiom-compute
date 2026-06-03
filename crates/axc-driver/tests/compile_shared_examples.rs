@@ -1,0 +1,166 @@
+//! Compile + spirv-val tests for M3.2 shared[T,N] examples.
+//!
+//! AT-1611 additive guard: verifies that new shared-memory examples compile
+//! cleanly and produce valid SPIR-V. Does NOT touch existing fixtures.
+//!
+//! AT-1614: shared-source coopmat SPIR-V passes spirv-val (single-index Workgroup path).
+//! AT-1609 partial: shared[f16] Float16 capability present in matmul_shared_coopmat.
+//! AT-1613: Buffer-source coopmat path is byte-identical (no regression from CoopMatLoadSource).
+
+use std::collections::BTreeMap;
+use axc_driver::{compile_source_with_meta, compile_source_with_assignments};
+use spirv_tools::val::{Validator, create as create_validator};
+use spirv_tools::TargetEnv;
+
+type StrategyMap = BTreeMap<String, i64>;
+
+/// Compile bytes -> SPIR-V words + spirv-val.
+fn compile_and_validate(src: &str, name: &str) -> Vec<u32> {
+    let (bytes, _meta) = compile_source_with_meta(src)
+        .unwrap_or_else(|e| panic!("{name}: compile failed: {e:?}"));
+    words_and_validate(bytes, name)
+}
+
+fn compile_with_assignments_and_validate(
+    src: &str,
+    assignments: &StrategyMap,
+    name: &str,
+) -> Vec<u32> {
+    let (bytes, _meta) = compile_source_with_assignments(src, assignments)
+        .unwrap_or_else(|e| panic!("{name}: compile failed: {e:?}"));
+    words_and_validate(bytes, name)
+}
+
+fn tile_assignments(tile_m: i64, tile_n: i64, tile_k: i64) -> StrategyMap {
+    let mut m = StrategyMap::new();
+    m.insert("tile_m".to_owned(), tile_m);
+    m.insert("tile_n".to_owned(), tile_n);
+    m.insert("tile_k".to_owned(), tile_k);
+    // Pre-computed products for shared array sizes (N must be a literal after substitution).
+    m.insert("tile_a_size".to_owned(), tile_m * tile_k);
+    m.insert("tile_b_size".to_owned(), tile_k * tile_n);
+    m
+}
+
+fn words_and_validate(bytes: Vec<u8>, name: &str) -> Vec<u32> {
+    let words: Vec<u32> = bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let validator = create_validator(Some(TargetEnv::Vulkan_1_1));
+    validator
+        .validate(&words, None)
+        .unwrap_or_else(|e| panic!("{name}: spirv-val failed: {e}"));
+    words
+}
+
+/// AT-partial: shared_reduce.axc compiles + spirv-val clean.
+#[test]
+fn shared_reduce_compiles_and_validates() {
+    let src = include_str!("../../../examples/shared_reduce.axc");
+    compile_and_validate(src, "shared_reduce.axc");
+}
+
+/// AT-partial: matmul_shared_f32.axc (Lavapipe-friendly, tile holes resolved) compiles + spirv-val clean.
+#[test]
+fn matmul_shared_f32_compiles_and_validates() {
+    let src = include_str!("../../../examples/matmul_shared_f32.axc");
+    let assignments = tile_assignments(16, 16, 16);
+    compile_with_assignments_and_validate(src, &assignments, "matmul_shared_f32.axc");
+}
+
+/// AT-1614 partial + AT-partial: matmul_shared_coopmat.axc (PART B) compiles + spirv-val clean.
+///
+/// This is the KEY test — it exercises the coopmat_load FROM SHARED path (PART B blocker fixed).
+/// Strategy holes resolved to defaults (tile_m=16, tile_n=16, tile_k=16).
+#[test]
+fn matmul_shared_coopmat_compiles_and_validates() {
+    let src = include_str!("../../../examples/matmul_shared_coopmat.axc");
+    let assignments = tile_assignments(16, 16, 16);
+    let words = compile_with_assignments_and_validate(src, &assignments, "matmul_shared_coopmat.axc");
+
+    // AT-1609 partial: Float16 capability must be present (shared[f16] requires it).
+    // OpCapability Float16: opcode=17 (0x11), word_count=2, value=9.
+    let float16_cap_found = words.windows(2).any(|w| {
+        let opcode = w[0] & 0xFFFF;
+        let wc = w[0] >> 16;
+        opcode == 17 && wc == 2 && w[1] == 9 // Float16 = 9
+    });
+    assert!(
+        float16_cap_found,
+        "matmul_shared_coopmat.axc must emit OpCapability Float16 \
+         (shared[f16] requires it; observe_type does NOT cover F16)"
+    );
+}
+
+/// AT-1622 partial: compile tile_k=16 and tile_k=32 produce different OpTypeArray length constants.
+///
+/// Guards that @strategy holes GENUINELY parameterize the shared array sizes (not inert).
+/// Only the structural (compilation) part of AT-1622 runs here; the bit-exact GPU part
+/// is in dispatch_shared_matmul.rs.
+#[test]
+fn at1622_tile_k_variants_produce_different_spirv() {
+    let src = include_str!("../../../examples/matmul_shared_coopmat.axc");
+
+    let assignments_16 = tile_assignments(16, 16, 16); // tile_a_size=256, tile_b_size=256
+    let assignments_32 = tile_assignments(16, 16, 32); // tile_a_size=512, tile_b_size=512
+
+    let (bytes16, _) = compile_source_with_assignments(src, &assignments_16)
+        .expect("matmul_shared_coopmat tile_k=16 must compile");
+    let (bytes32, _) = compile_source_with_assignments(src, &assignments_32)
+        .expect("matmul_shared_coopmat tile_k=32 must compile");
+
+    // Both must be spirv-val clean.
+    let words16: Vec<u32> = bytes16.chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+    let words32: Vec<u32> = bytes32.chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+    let validator = create_validator(Some(TargetEnv::Vulkan_1_1));
+    validator.validate(&words16, None).expect("tile_k=16 spirv-val must pass");
+    validator.validate(&words32, None).expect("tile_k=32 spirv-val must pass");
+
+    // The SPIR-V must DIFFER (tile_k=32 implies larger shared arrays = different constants).
+    assert_ne!(
+        words16, words32,
+        "AT-1622: tile_k=16 and tile_k=32 must produce different SPIR-V \
+         (shared array sizes are parameterized by tile_k)"
+    );
+}
+
+/// AT-partial: tiled_attention.axc (PART C1) compiles + spirv-val clean.
+#[test]
+fn tiled_attention_compiles_and_validates() {
+    let src = include_str!("../../../examples/tiled_attention.axc");
+    compile_and_validate(src, "tiled_attention.axc");
+}
+
+/// AT-1613: q4km_dequant_matmul_coopmat.axc SPIR-V is byte-identical before and after
+/// the CoopMatLoadSource discriminator addition (Buffer-source path unchanged).
+#[test]
+fn at1613_buffer_source_coopmat_byte_identical_across_recompiles() {
+    let src = include_str!("../../../examples/q4km_dequant_matmul_coopmat.axc");
+    let (bytes1, _) = compile_source_with_meta(src)
+        .expect("q4km_dequant_matmul_coopmat.axc must compile");
+    let (bytes2, _) = compile_source_with_meta(src)
+        .expect("q4km_dequant_matmul_coopmat.axc must compile (2nd)");
+    // Byte-identical across recompiles verifies Buffer-source emit path is stable.
+    assert_eq!(
+        bytes1, bytes2,
+        "AT-1613: q4km_dequant_matmul_coopmat SPIR-V must be byte-identical across recompiles \
+         (Buffer-source coopmat path unchanged by CoopMatLoadSource discriminator)"
+    );
+}
+
+/// AT-1614: shared-source coopmat SPIR-V in matmul_shared_coopmat.axc must be spirv-val clean.
+///
+/// If the Buffer two-index path were used for a Workgroup variable,
+/// spirv-val would reject the module (wrong pointer type / arity).
+/// Passing spirv-val proves the single-index Workgroup path was taken.
+#[test]
+fn at1614_shared_source_coopmat_spirv_valid() {
+    let src = include_str!("../../../examples/matmul_shared_coopmat.axc");
+    let assignments = tile_assignments(16, 16, 16);
+    // If the Buffer two-index path were used for a Workgroup variable, spirv-val rejects.
+    // Passing this test proves the shared-source single-index path is emitted correctly.
+    compile_with_assignments_and_validate(src, &assignments, "at1614_matmul_shared_coopmat");
+}

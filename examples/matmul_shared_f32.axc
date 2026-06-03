@@ -8,17 +8,16 @@
 // Proves shared[T,N] staging works independent of tensor cores.
 // Does NOT exercise the shared-source coopmat access-chain path.
 //
-// Strategy holes: @strategy { tile_m: ?[16], tile_n: ?[16], tile_k: ?[16, 32] }
-// These parameterize the shared array sizes and K-loop bounds via M2.3 source-text
-// substitution BEFORE the parser. Resolved tile sizes appear as literal N values.
+// Autotuner holes: tile_k and tile_a_size / tile_b_size.
+// tile_k=16 => tile_a_size=256, tile_b_size=256
+// tile_k=32 => tile_a_size=512, tile_b_size=512
 //
 // Anti-pattern #2: explicit `return;`.
 // Anti-pattern #8: no `>>` (lshr/shr for shifts).
 
 @kernel
 @workgroup(16, 16, 1)
-@cooperative_matrix
-@strategy { tile_m: ?[16], tile_n: ?[16], tile_k: ?[16, 32] }
+@strategy { tile_m: ?[16], tile_n: ?[16], tile_k: ?[16, 32], tile_a_size: ?[256, 512], tile_b_size: ?[256, 512] }
 @intent("shared-staged f32 tiled matmul — Lavapipe-friendly, no coopmat (AT-1621)")
 @complexity(O(n))
 fn matmul_shared_f32(
@@ -30,10 +29,10 @@ fn matmul_shared_f32(
     K: u32
 ) -> void {
     // Shared staging tiles for A and B.
-    // TILE_M = 16, TILE_K = 16 (or 32 for the larger variant).
-    // Each tile is a flat row-major array: a_tile[row * TILE_K + col].
-    shared a_tile: shared[f32, 256];   // 16 * 16 = 256 elements
-    shared b_tile: shared[f32, 256];   // 16 * 16 = 256 elements
+    // tile_a_size = TILE_M * TILE_K (e.g. 16*16=256 or 16*32=512).
+    // tile_b_size = TILE_K * TILE_N (e.g. 16*16=256 or 32*16=512).
+    shared a_tile: shared[f32, ?tile_a_size];
+    shared b_tile: shared[f32, ?tile_b_size];
 
     let tile_row: u32 = gid(1u32);
     let tile_col: u32 = gid(0u32);
@@ -45,21 +44,17 @@ fn matmul_shared_f32(
     let mut acc: f32 = 0.0f32;
 
     // K-loop: iterate over K in TILE_K-sized blocks.
-    // for k_block in range(0u32, num_k_blocks) { ... }
-    // NOTE: range end (K / 16) must be computed. We use a simple loop.
-    let num_k_blocks: u32 = K / 16u32;
+    let num_k_blocks: u32 = K / ?tile_k;
     for k_block in range(0u32, num_k_blocks) {
         // Cooperative load of A tile: each invocation loads one element.
-        // A[global_row, k_block * TILE_K + local_col]
         let a_global_row: u32 = tile_row * 16u32 + local_row;
-        let a_global_col: u32 = k_block * 16u32 + local_col;
+        let a_global_col: u32 = k_block * ?tile_k + local_col;
         let a_idx: u32 = a_global_row * K + a_global_col;
-        let a_tile_idx: u32 = local_row * 16u32 + local_col;
+        let a_tile_idx: u32 = local_row * ?tile_k + local_col;
         a_tile[a_tile_idx] = A[a_idx];
 
         // Cooperative load of B tile: each invocation loads one element.
-        // B[k_block * TILE_K + local_row, global_col]
-        let b_global_row: u32 = k_block * 16u32 + local_row;
+        let b_global_row: u32 = k_block * ?tile_k + local_row;
         let b_global_col: u32 = tile_col * 16u32 + local_col;
         let b_idx: u32 = b_global_row * N + b_global_col;
         let b_tile_idx: u32 = local_row * 16u32 + local_col;
@@ -69,8 +64,8 @@ fn matmul_shared_f32(
         workgroup_barrier();
 
         // Scalar inner product over the TILE_K dimension.
-        for k in range(0u32, 16u32) {
-            let a_val: f32 = a_tile[local_row * 16u32 + k];
+        for k in range(0u32, ?tile_k) {
+            let a_val: f32 = a_tile[local_row * ?tile_k + k];
             let b_val: f32 = b_tile[k * 16u32 + local_col];
             acc = acc + a_val * b_val;
         }
