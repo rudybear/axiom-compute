@@ -1,0 +1,147 @@
+{
+  "verdict": "IMPLEMENTED",
+  "agent": "coder",
+  "milestone_id": "M3.3c-matmul-perf",
+  "branch": "coder/M33c-20260604-0900/M3.3c-matmul-perf",
+
+  "at1733_pre_gate": {
+    "result": "GREEN",
+    "description": "AT-1733 PASSED: 4 loop-carried coopmat accumulators in ONE K-loop emit exactly 4 well-formed OpPhi in ONE loop header. Each phi has 7 words (2 predecessor pairs), all 4 result_ids are distinct (e.g. [%42,%43,%44,%45]), both predecessors are valid OpLabel ids, spirv-val Vulkan_1_1 clean. NO codegen change was required — the parallel pre_header_values/latch_values/carried Vec machinery in emit_for_range is N-agnostic as the architect verified. Pre-gate LOCKED.",
+    "codegen_change_required": false,
+    "escalation_required": false
+  },
+
+  "files_created": [
+    "examples/matmul_rb_coopmat.axc",
+    "crates/axc-driver/benches/resident_matmul_rb.rs"
+  ],
+
+  "files_modified": [
+    "crates/axc-codegen/tests/opphi_loop_carried.rs",
+    "crates/axc-driver/tests/compile_shared_examples.rs",
+    "crates/axc-driver/tests/dispatch_shared_m32.rs",
+    "crates/axc-driver/Cargo.toml",
+    "DESIGN.md",
+    "ROADMAP.md"
+  ],
+
+  "public_apis_implemented": [
+    "@kernel @workgroup(32,1,1) @cooperative_matrix fn matmul_rb_coopmat(A: readonly_buffer[f16], B: readonly_buffer[f16], C: buffer[f16], M: u32, N: u32, K: u32) -> void",
+    "criterion_group!(resident_matmul_rb_benches, bench_resident_matmul_rb)",
+    "criterion_main!(resident_matmul_rb_benches)"
+  ],
+
+  "tests_written": [
+    "at1733_n_coopmat_phis_single_loop_wellformed (opphi_loop_carried.rs)",
+    "at1734_matmul_rb_coopmat_spirv_val (compile_shared_examples.rs)",
+    "at1731_matmul_rb_coopmat_bit_exact_gpu (dispatch_shared_m32.rs)",
+    "at1732_matmul_rb_kblock_count_bit_exact_gpu (dispatch_shared_m32.rs)"
+  ],
+
+  "tests_retained_unchanged": [
+    "at1620_matmul_shared_coopmat_bit_exact_gpu",
+    "at1622_k_block_count_variation_bit_exact_gpu",
+    "at1707_opphi_coopmat_accumulate_bit_exact_gpu",
+    "at1606_shared_reduction_barrier_visibility_gpu",
+    "at1621_matmul_shared_f32_bit_exact_gpu",
+    "at1630_tiled_attention_bit_exact_gpu"
+  ],
+
+  "cargo_check_status": "pass",
+  "cargo_clippy_status": "pass — cargo clippy --workspace -- -D warnings exits 0",
+  "cargo_test_status": "pass — cargo test --workspace: all 0 failures across all test suites",
+  "spirv_val_status": "pass — AT-1733 (codegen unit test) and AT-1734 (driver compile anchor) both run spirv_val_check internally and pass",
+
+  "rb_kernel_design": {
+    "file": "examples/matmul_rb_coopmat.axc",
+    "workgroup": "(32, 1, 1)",
+    "block_size": "RB_M=2, RB_N=2 — 32×32 output block (4 tiles of 16×16)",
+    "accumulators": "acc_00, acc_01, acc_10, acc_11 — all in ONE K-loop",
+    "index_recovery": "block_col = gid(0u32) / 32u32; block_row = gid(1u32); lane = subgroup_invocation_id()",
+    "asymmetric": "YES — divide x by 32, do NOT divide y (same idiom as M3.3b)",
+    "shared_a": "a_tile: shared[f16, 512] — 32 rows × 16 cols (block_row*32 rows, k_block*16 cols), stride 16",
+    "shared_b": "b_tile: shared[f16, 512] — 16 rows × 32 cols (k_block*16 rows, block_col*32 cols), stride 32",
+    "staging_a": "a_iters=16; ei_a = iter*32+lane; a_row=ei_a/16; a_col=ei_a-a_row*16; A_global_row=block_row*32+a_row; A_global_col=k_block*tile_k+a_col; a_tile[ei_a]=A[A_global_row*K+A_global_col]",
+    "staging_b": "b_iters=16; ei_b = iter*32+lane; b_row=ei_b/32; b_col=ei_b-b_row*32; B_global_row=k_block*tile_k+b_row; B_global_col=block_col*32+b_col; b_tile[ei_b]=B[B_global_row*N+B_global_col]",
+    "coopmat_loads": {
+      "a_mat_0": "coopmat_load(a_tile, 0u32, 16u32) — rows 0..16 of A block",
+      "a_mat_1": "coopmat_load(a_tile, 256u32, 16u32) — rows 16..32 of A block (offset=1*16*16=256)",
+      "b_mat_0": "coopmat_load(b_tile, 0u32, 32u32) — cols 0..16 of B block",
+      "b_mat_1": "coopmat_load(b_tile, 16u32, 32u32) — cols 16..32 of B block (offset=1*16=16, stride=32)"
+    },
+    "mul_adds": [
+      "acc_00 = coopmat_mul_add(a_mat_0, b_mat_0, acc_00)",
+      "acc_01 = coopmat_mul_add(a_mat_0, b_mat_1, acc_01)",
+      "acc_10 = coopmat_mul_add(a_mat_1, b_mat_0, acc_10)",
+      "acc_11 = coopmat_mul_add(a_mat_1, b_mat_1, acc_11)"
+    ],
+    "c_base": {
+      "c_base_00": "(tile_row_0*16)*N + (tile_col_0*16) where tile_row_0=block_row*2, tile_col_0=block_col*2",
+      "c_base_01": "(tile_row_0*16)*N + (tile_col_1*16) where tile_col_1=block_col*2+1",
+      "c_base_10": "(tile_row_1*16)*N + (tile_col_0*16) where tile_row_1=block_row*2+1",
+      "c_base_11": "(tile_row_1*16)*N + (tile_col_1*16)"
+    },
+    "dispatch_grid": "(N/32, M/32, 1)",
+    "shared_memory_bytes": 2048,
+    "strategy_holes": "rb_m: ?[2], rb_n: ?[2], tile_k: ?[16], a_block_size: ?[512], b_block_size: ?[512]",
+    "comment_strategy_workaround": "Removed '@strategy' from comments to avoid strip_strategy_annotation_block matching the first comment occurrence instead of the actual annotation"
+  },
+
+  "occupancy_honesty": {
+    "issue": "At M=N=256: grid=(8,8,1)=64 WGs < ~188 SMs on RTX PRO 6000. RB may be SLOWER than M3.3b (256 WGs) at 256³ due to under-occupancy.",
+    "mitigation": "Bench measures at 256³ AND 512³ (256 WGs) AND 768³ (576 WGs). All results reported honestly. If 256³ regresses but larger sizes improve, both are reported.",
+    "design_note": "DESIGN §3.1.17 now has explicit OCCUPANCY vs ARITHMETIC INTENSITY TRADEOFF section per pessimistic reviewer mandate."
+  },
+
+  "actual_cargo_results": {
+    "cargo_check": "Finished dev profile — 0 errors, 0 warnings",
+    "cargo_clippy": "Finished dev profile — 0 warnings (clippy -D warnings)",
+    "cargo_test_workspace": "All test suites: 0 FAILED. Notable results:\n  - axc-codegen unit tests: 100 passed\n  - opphi_loop_carried.rs (AT-1700..1708 + AT-1733): 14 passed\n  - compile_shared_examples.rs (AT-1614 + AT-1734): 8 passed\n  - dispatch_shared_m32.rs: 8 passed (AT-1731/1732 graceful-skip without GPU, AT-1620/1622 graceful-skip without GPU)\n  - Full workspace: ~460 tests across all crates, 0 failures"
+  },
+
+  "what_orchestrator_measures_on_nvidia": {
+    "at1733": "cargo test -p axc-codegen at1733 — PASS without GPU (spirv-val only). 4 OpPhi in 1 loop header confirmed.",
+    "at1734": "cargo test -p axc-driver at1734 — PASS without GPU (spirv-val only). shared_memory_bytes=2048 asserted.",
+    "at1731": "cargo test -p axc-driver -- --ignored at1731 (AXC_ENABLE_GPU_TESTS=1). Max_diff==0.0 expected on NVIDIA RTX PRO 6000. Bit-exactness proof: RB tiling changes only loop structure, not numeric op sequence — same ordered coopmat_mul_add over same K-blocks → bit-identical.",
+    "at1732": "cargo test -p axc-driver -- --ignored at1732 (AXC_ENABLE_GPU_TESTS=1). K=32 AND K=48 both max_diff==0.0 expected.",
+    "at1730_bench_256": "cargo bench --bench resident_matmul_rb (AXC_ENABLE_GPU_BENCHES=1): prints TFLOPS at M=N=K=256. HONEST PREDICTION: may be ≤ 5.04 TFLOPS (64 WGs < 188 SMs; under-occupancy at 256³). QA records the ACTUAL number.",
+    "at1730_bench_512": "Same bench prints TFLOPS at M=N=K=512. HONEST PREDICTION: likely improved vs M3.3b (256 WGs, better occupancy + higher arithmetic intensity). QA records the ACTUAL number.",
+    "at1730_bench_768": "Same bench prints TFLOPS at M=N=K=768 if within 50GB (576 WGs). QA records the ACTUAL number.",
+    "at1620_retained": "cargo test -p axc-driver -- --ignored at1620 — single-tile M3.3b baseline UNCHANGED",
+    "at1622_retained": "cargo test -p axc-driver -- --ignored at1622 — single-tile K-block variation UNCHANGED"
+  },
+
+  "honesty_gate": {
+    "statement": "The bench reports the REAL measured TFLOPS at each size (256³, 512³, 768³). If RB does NOT beat 5.04 at any size, the coder.json says so. Bit-exactness (max_diff==0.0) is non-negotiable — QA must not relax this. The occupancy tradeoff is explicitly documented in DESIGN §3.1.17 and ROADMAP M3.3c.",
+    "tflops_placeholder": "QA fills in the ACTUAL measured TFLOPS after GPU run. No placeholder claim of 'competitive' is made here.",
+    "no_cherry_pick": "The bench measures at ALL three sizes and reports ALL. The 256³ result is NOT hidden if it regresses."
+  },
+
+  "known_issue_discovered": {
+    "issue": "strip_strategy_annotation_block in axc-driver/src/lib.rs finds the FIRST occurrence of '@strategy' in the source text. If '@strategy' appears in comments before the actual annotation, it matches the comment (which has no '{' after it) and returns the source UNCHANGED — leaving the @strategy annotation un-stripped, causing UnresolvedStrategyHole error.",
+    "fix_applied": "Removed '@strategy' from all comments in matmul_rb_coopmat.axc. Changed 'a @strategy hole' to 'a strategy hole' and 'The @strategy holes' to 'The strategy holes' in the file header comments.",
+    "root_cause_not_fixed": "The underlying bug in strip_strategy_annotation_block is not fixed in M3.3c (it would be a separate fix). Coder workaround: avoid '@strategy' in .axc file comments. This is safe for existing files (matmul_shared_coopmat.axc doesn't mention '@strategy' in comments)."
+  },
+
+  "self_assessment": {
+    "spec_coverage": "All items from M3.3c-architect.json implemented: AT-1733 pre-gate, RB kernel (matmul_rb_coopmat.axc), AT-1731/1732 bit-exact dispatch tests, AT-1734 compile anchor, AT-1730 honest TFLOPS bench, DESIGN §3.1.17 occupancy note, ROADMAP M3.3c entry.",
+    "known_limitations": [
+      "strip_strategy_annotation_block comment-matching bug not fixed (workaround: avoid '@strategy' in .axc comments). Filed as discovery, not blocking.",
+      "AT-1731/1732 bit-exact results not yet verified on NVIDIA (requires GPU). Correctness proven by construction: same ordered coopmat_mul_add over same K-blocks.",
+      "AT-1730 TFLOPS numbers not yet measured (requires GPU). Honest predictions: 256³ may regress vs 5.04; 512³/768³ expected to improve.",
+      "2×4 and 4×4 RB variants not shipped (optional stretch per spec, 2×2 is the required variant)."
+    ],
+    "deviations": [
+      "resident_matmul_rb.rs bench function measure_rb_tflops wraps the per-size measurement logic for 256³/512³/768³ (cleaner than copy-paste). Still uses the SAME methodology (N_WARMUP=2, N_MEASURED=10, MIN-of-N, GpuTimestamp, 50GB cap, 2D grid check) as the spec requires. The criterion bench_function iter_custom still uses the 256³ timing for criterion's duration bookkeeping."
+    ]
+  },
+
+  "git_commits": [
+    "6d5237a test(codegen): AT-1733 — N=4 coopmat phis in ONE loop header pre-gate (PASS)",
+    "371b690 feat(examples): matmul_rb_coopmat.axc — M3.3c RB 2×2 register-blocked coopmat matmul",
+    "1ba59c2 test(driver): AT-1734 — matmul_rb_coopmat.axc compile + spirv-val CI anchor",
+    "639287b test(driver): AT-1731/1732 — RB 2×2 bit-exact GPU dispatch tests",
+    "acfbe03 feat(bench): resident_matmul_rb.rs — AT-1730 honest TFLOPS bench for RB 2×2",
+    "eccc13d docs(M3.3c): DESIGN §3.1.17 occupancy tradeoff + ROADMAP M3.3c entry"
+  ]
+}
