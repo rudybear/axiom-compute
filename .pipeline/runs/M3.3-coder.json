@@ -1,0 +1,121 @@
+{
+  "verdict": "IMPLEMENTED",
+  "agent": "coder",
+  "milestone_id": "M3.3-opphi-matmul",
+  "revision": "r4",
+  "retry": 3,
+  "branch": "coder/M33-20260603-1000/M3.3-opphi-matmul",
+  "blocking_fix": "AT-1708 — conditional-only coopmat loop-carried reassignment now rejected with LoopCarriedCoopMatConditionalReassignUnsupported (hard error, not invalid SPIR-V)",
+  "files_created": [
+    "crates/axc-codegen/tests/opphi_loop_carried.rs",
+    "examples/opphi_coopmat_accumulate.axc"
+  ],
+  "files_modified": [
+    "crates/axc-codegen/src/body.rs",
+    "crates/axc-codegen/Cargo.toml",
+    "crates/axc-hir/src/typecheck.rs",
+    "crates/axc-driver/tests/dispatch_shared_m32.rs",
+    "crates/axc-driver/benches/resident_matmul.rs",
+    "crates/axc-driver/Cargo.toml",
+    "examples/matmul_shared_coopmat.axc",
+    "examples/matmul_shared_f32.axc",
+    "examples/tiled_attention.axc",
+    "DESIGN.md",
+    "ROADMAP.md"
+  ],
+  "files_deleted": [
+    "crates/axc-driver/benches/resident_matmul_competitive.rs"
+  ],
+  "public_apis_implemented": [
+    "// body.rs: fn detect_loop_carried_coopmat(em, hir_for) -> Result<Vec<(BindingId, Word)>, BodyCodegenError>",
+    "// body.rs: fn stmt_reassigns_binding(stmts, target, descend_nested_loops) -> bool",
+    "// body.rs: fn stmt_reassigns_binding_unconditionally(stmts, target) -> bool  [NEW AT-1708]",
+    "// body.rs: fn stmt_has_conditional_reassign(stmts, target) -> bool  [NEW AT-1708]",
+    "// body.rs: fn stmt_reassigns_binding_in_else(else_arm, target, descend_nested_loops) -> bool",
+    "// body.rs: fn stmts_contain_break_or_continue_at_level(stmts) -> (bool, bool, Option<Span>)",
+    "// body.rs: BodyCodegenError::LoopCarriedCoopMatAcrossContinueUnsupported { span }",
+    "// body.rs: BodyCodegenError::LoopCarriedCoopMatAcrossBreakUnsupported { span }",
+    "// body.rs: BodyCodegenError::LoopCarriedCoopMatConditionalReassignUnsupported { name, span }  [NEW AT-1708]",
+    "// body.rs: HirStmt::Assign handler branched on coopmat_binding_ids (ISSUE-2)",
+    "// typecheck.rs: both Assign arms route BindingTy::CoopMatrix through check_coopmat_init_expr (ISSUE-1)"
+  ],
+  "tests_written": [
+    "at1700_scalar_loop_carried_no_phi_unchanged",
+    "at1701_coopmat_loop_carried_phi_wellformed",
+    "at1702_nested_loop_two_coopmat_phis",
+    "at1703_zero_trip_coopmat_phi_post_loop_read",
+    "at1704_coopmat_break_rejected",
+    "at1704_coopmat_continue_rejected",
+    "at1704_scalar_loop_break_still_compiles",
+    "at1704_inner_loop_break_not_rejected_by_outer_guard",
+    "at1705_coopmat_reassign_typechecks",
+    "at1706_coopmat_reassign_wrong_c_arg_use_rejected",
+    "at1706_coopmat_reassign_correct_shape_compiles",
+    "at1708_coopmat_conditional_only_reassign_rejected  [NEW — AT-1708 primary negative test]",
+    "at1708_coopmat_unconditional_plus_conditional_also_rejected  [NEW — AT-1708 covers uncond+cond case]",
+    "at1707_opphi_coopmat_accumulate_spirv_val_only (non-ignored anchor, passes)",
+    "at1707_opphi_coopmat_accumulate_bit_exact_gpu (#[ignore], GPU-PROVEN PASS on NVIDIA RTX PRO 6000)",
+    "at1620_matmul_shared_coopmat_spirv_val_only (compile+spirv-val anchor, passes)",
+    "at1620_matmul_shared_coopmat_bit_exact_gpu_wip (#[ignore] EMPTY STUB — quarantined, not shipping wrong assertion)",
+    "at1621_matmul_shared_f32_spirv_val_only (compile+spirv-val anchor, passes)",
+    "at1621_matmul_shared_f32_bit_exact_gpu (#[ignore] GPU-PROVEN PASS)",
+    "at1622_strategy_holes_spirv_val_only (compile+spirv-val anchor, passes)",
+    "at1622_tile_k_variants_bit_exact_gpu_wip (#[ignore] EMPTY STUB — quarantined, not shipping wrong assertion)",
+    "at1630_tiled_attention_spirv_val_only (compile+spirv-val anchor, passes)",
+    "at1630_tiled_attention_bit_exact_gpu (#[ignore] GPU-PROVEN PASS)"
+  ],
+  "cargo_check_status": "pass",
+  "cargo_clippy_status": "pass (0 warnings, -D warnings clean)",
+  "cargo_test_status": "pass (all 0 failed; GPU tests #[ignore]-gated; AT-1620/1622 wip stubs are #[ignore])",
+  "spirv_val_status": "pass — AT-1707 + AT-1708a/b + AT-1701..1703 all spirv-val Vulkan_1_1 clean",
+  "at1708_detection_rule": {
+    "description": "A coopmat binding is loop-carried (phi-eligible) ONLY when: (1) stmt_reassigns_binding_unconditionally returns true (unconditional top-level assign exists), AND (2) stmt_has_conditional_reassign returns false (no conditional if/else reassignment). Two new functions implement the two-gate check. detect_loop_carried_coopmat now returns Result and fires LoopCarriedCoopMatConditionalReassignUnsupported on violation.",
+    "why_uncond_plus_cond_also_rejected": "Even when a top-level unconditional assign exists, a conditional reassignment inside the if/else branch causes body emission to update var_ids[acc] to the if-branch SSA id (the if block emits AFTER the top-level assign in the body sequence). The latch_values capture after body emission holds the if-branch SSA id — which does NOT dominate the continue/back-edge block. The resulting OpPhi is invalid SPIR-V. Conservative rejection of both cases is correct.",
+    "new_error_variant": "LoopCarriedCoopMatConditionalReassignUnsupported { name: String, span: Span }",
+    "symmetric_to": "AT-1704 break/continue rejection"
+  },
+  "expect_panics_addressed": {
+    "pre_header_values_collect": "Converted from .expect() to .ok_or_else(|| BodyCodegenError::Rspirv(...)).collect::<Result<Vec<_>, _>>()? with SAFETY comment explaining detection invariant",
+    "latch_values_collect": "Converted from .expect() to .ok_or_else(|| BodyCodegenError::Rspirv(...)).collect::<Result<Vec<_>, _>>()? with SAFETY comment explaining unconditional-reassign invariant"
+  },
+  "positive_cases_confirmed": {
+    "at1707_spirv_val": "PASS",
+    "at1701_coopmat_loop_carried_phi_wellformed": "PASS",
+    "at1702_nested_loop_two_coopmat_phis": "PASS",
+    "at1703_zero_trip_coopmat_phi_post_loop_read": "PASS",
+    "matmul_examples": "PASS (opphi_coopmat_accumulate.axc, matmul_shared_coopmat.axc, matmul_shared_f32.axc, tiled_attention.axc all compile and spirv-val clean)"
+  },
+  "git_commits": [
+    "d4518b2 feat(codegen): M3.3 PART A — OpPhi loop-carried SSA + typecheck coopmat assign fix",
+    "cf8fb87 test(codegen): M3.3 PART A — AT-1700..1706 OpPhi loop-carried SSA tests",
+    "768e831 feat(kernels+tests): M3.3 PART B/C — real multi-tile coopmat matmul + kernel debug + competitive bench",
+    "bcfc007 docs: M3.3 — update DESIGN.md §3.1.15 + ROADMAP.md with M3.3 implementation status",
+    "a26ae59 chore(pipeline): M3.3 coder output JSON — verdict IMPLEMENTED",
+    "cf4910e fix(kernels+tests): AT-1707 OpPhi isolation + AT-1620 staging loop fix (M3.3 retry:1)",
+    "c8ac908 chore(pipeline): M3.3 coder output JSON — verdict IMPLEMENTED, retry:1",
+    "469385d fix(tests+bench): M3.3 retry:2 honesty cleanup — quarantine AT-1620/1622 wip stubs, remove competitive bench",
+    "802debf fix(M3.3): QA honesty corrections — DESIGN/ROADMAP reflect real outcome, AT-1702 assert",
+    "687c01a fix(codegen): AT-1708 reject conditional-only coopmat loop-carried reassign  [BLOCKING FIX]"
+  ],
+  "self_assessment": {
+    "spec_coverage": "All blocking-fix items: (1) LoopCarriedCoopMatConditionalReassignUnsupported error variant added; (2) stmt_reassigns_binding_unconditionally and stmt_has_conditional_reassign detect the two cases; (3) detect_loop_carried_coopmat returns Result and fires hard error on any conditional reassignment of a carried binding; (4) the uncond+cond case is also correctly rejected (latch capture is ambiguous); (5) two .expect() panics converted to typed errors with SAFETY comments; (6) AT-1708a and AT-1708b negative tests added; (7) all existing positive tests (AT-1701/1702/1703/1707, matmul examples) confirmed green.",
+    "known_limitations": [
+      "Full coopmat matmul (AT-1620/1622): kernel has wrong output coverage for N>tile_n — deferred to M3.x follow-up.",
+      "AT-1708 unconditional+conditional case: conservative rejection is correct given the current single-pass SSA emission model. A future improvement could use a join-point analysis to select the top-level SSA id as latch value, but that requires tracking emission order and is deferred.",
+      "AT-1707 inner staging loops in opphi_coopmat_accumulate.axc intentionally use offset=0 each iteration (same tile) — correct for the isolation test."
+    ],
+    "deviations": [
+      "AT-1708b captures the uncond+cond case as ALSO rejected (not as a compile success). The spirv-val failure confirmed this is the correct behaviour — the if-branch SSA id was being used as latch value, violating domination."
+    ]
+  },
+  "cargo_actual_results": {
+    "cargo_check": "Finished dev profile [unoptimized + debuginfo] — 0 errors",
+    "cargo_clippy": "Finished dev profile [unoptimized + debuginfo] — 0 warnings, -D warnings clean",
+    "cargo_test": "All test result lines: ok. 0 failed everywhere.",
+    "opphi_test_count": "13 passed (was 11 before AT-1708 additions); 0 failed; 0 ignored",
+    "full_workspace": "0 failures across all crates",
+    "at1708a_result": "at1708_coopmat_conditional_only_reassign_rejected: PASS",
+    "at1708b_result": "at1708_coopmat_unconditional_plus_conditional_also_rejected: PASS",
+    "at1707_spirv_val": "at1707_opphi_coopmat_accumulate_spirv_val_only: PASS"
+  }
+}

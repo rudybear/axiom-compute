@@ -1049,10 +1049,19 @@ pub fn typecheck_kernel_body(
                                     original_span: orig_span,
                                 });
                             }
-                            // For scalar bindings, pass expected type; coopmat assignment
-                            // is not supported in M2.1 (coopmat values are immutable).
-                            let scalar_expected = binding_ty.as_scalar();
-                            let hir_value = check_expr(&mut tc, &value.node, value.span, scalar_expected);
+                            // M3.3 ISSUE-1 (FLAT Assign arm): route CoopMatrix target through
+                            // check_coopmat_init_expr (same fn as the Let arm, typecheck.rs:1002-1006)
+                            // so `acc = coopmat_mul_add(a,b,acc)` typechecks and use_==Accumulator +
+                            // K/M/N/elem shape is validated. Scalars keep check_expr with scalar expected.
+                            let hir_value = match binding_ty {
+                                BindingTy::CoopMatrix(matrix_key) => {
+                                    check_coopmat_init_expr(&mut tc, &value.node, value.span, matrix_key)
+                                }
+                                BindingTy::Scalar(_) => {
+                                    let scalar_expected = binding_ty.as_scalar();
+                                    check_expr(&mut tc, &value.node, value.span, scalar_expected)
+                                }
+                            };
                             if let Some(val_expr) = hir_value {
                                 hir_stmts.push(HirStmt::Assign {
                                     binding: bid,
@@ -1638,9 +1647,20 @@ fn typecheck_block_stmts(tc: &mut TypeChecker<'_>, stmts: &[axc_lexer::Spanned<p
                                     original_span: _orig_span,
                                 });
                             }
-                            // Coopmat values are immutable; use scalar expected or None.
-                            let scalar_expected = binding_ty.as_scalar();
-                            let hir_value = check_expr(tc, &value.node, value.span, scalar_expected);
+                            // M3.3 ISSUE-1 (NESTED Assign arm): route CoopMatrix target through
+                            // check_coopmat_init_expr (same fn as the Let arm, typecheck.rs:1002-1006)
+                            // so `acc = coopmat_mul_add(a,b,acc)` inside a loop typechecks and
+                            // use_==Accumulator + K/M/N/elem shape is validated for free.
+                            // Scalars keep check_expr with scalar expected.
+                            let hir_value = match binding_ty {
+                                BindingTy::CoopMatrix(matrix_key) => {
+                                    check_coopmat_init_expr(tc, &value.node, value.span, matrix_key)
+                                }
+                                BindingTy::Scalar(_) => {
+                                    let scalar_expected = binding_ty.as_scalar();
+                                    check_expr(tc, &value.node, value.span, scalar_expected)
+                                }
+                            };
                             if let Some(val_expr) = hir_value {
                                 hir_stmts.push(HirStmt::Assign {
                                     binding: bid,

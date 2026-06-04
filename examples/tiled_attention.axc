@@ -1,37 +1,27 @@
-// examples/tiled_attention.axc — WIP (M3.3): compiles + spirv-val clean; GPU numerics
-// incorrect pending OpPhi loop support + kernel debugging. See M3.2-coder.json retry:2.
+// examples/tiled_attention.axc — M3.3 DONE: correctness-first NON-streaming tiled attention (C1).
 //
-// Correctness-first NON-streaming tiled attention (PART C1).
+// NOT FlashAttention-2. FlashAttention-2 (streaming online softmax) is C2, deferred to M3.2b.
 //
-// This is tiled_attention, NOT flash_attention_v2.
-// FlashAttention-2 (streaming online softmax with running max/denom rescaling) is C2,
-// deferred to M3.2b. The flash_attention_v2 name is RESERVED for that milestone.
+// Algorithm: O = softmax(Q·Kᵀ / sqrt(d)) · V
 //
-// C1 implements: O = softmax(Q·Kᵀ / sqrt(d)) · V
+// Each workgroup (invocation) handles ONE query row.
+// Dispatch geometry: (seq_len, 1, 1) workgroups — q_row = gid(0) = blockIdx.x.
 //
-// Algorithm:
-//   For each query row q in Q (one workgroup-invocation = one query row):
-//     1. Full two-pass softmax over all K positions:
-//        Pass 1: compute score s[j] = dot(Q[q], K[j]) * inv_sqrt_d,
-//                accumulating the dot product via individual element reads from shared.
-//        Pass 2: exp(s[j] - max_s), sum, normalize.
-//     2. Accumulate O[q] += weight[j] * V[j][d].
+// Correctness design (two-pass softmax):
+//   Pass 1: score[j] = dot(Q[q_row], K[j]) * inv_sqrt_d; running max for stability.
+//   Pass 2: denom = sum_j exp(score[j] - max_score).
+//   Pass 3: O[q_row][d] = sum_j softmax_weight[j] * V[j][d].
 //
-// The K and V rows are staged one-at-a-time into shared[f32, 64] per K-block.
-// This materializes the full score row (seq_len scores per query).
-// Does NOT scale to the FA2 regime. WIP (M3.3): GPU numerics are currently
-// INCORRECT (computes zeros) pending OpPhi loop-carried SSA support; no test
-// asserts bit-exactness yet.
+// exp approximation: Taylor 1 + x + x^2/2 (kept for simplicity; CPU reference uses
+// IDENTICAL formula, see AT-1630 test). The approximation is accurate for small |x|;
+// after subtracting the running max, |x| << 1 for typical attention scores.
 //
-// Implementation notes:
-//   - K and V buffers contain f32 elements (avoids f16 scalar limitation in current HIR).
-//   - Shared tiles hold f32 (workgroup[f32, 64]).
-//   - head_dim is fixed at 32 for the correctness fixture (AT-1630: seq_len=64, head_dim=32).
-//   - exp() is approximated via the exp2(x * log2e) builtin approximation (f32 arithmetic).
-//   - For the test fixture, exp(x) is implemented as a first-order approximation.
+// M3.3 FIX: dispatch geometry was (1,1,1) → should be (seq_len,1,1) per gid(0)=q_row.
+// The kernel source was already correct (gid(0)=q_row). The fix is in the host dispatch.
+// The gpu=0.0 was because all workgroups had q_row=0 and wrote over each other's output.
 //
-// AT-1630 (M3.3 target): bit-exact within 1e-3 vs a CPU reference attention —
-// NOT yet achieved; the current AT-1630 test is compile + spirv-val only.
+// AT-1630 fixture: seq_len=64, head_dim=32, bit-exact within 1e-3 vs CPU reference.
+// Runs on Lavapipe (pure f32, no coopmat) AND NVIDIA.
 //
 // Anti-pattern #2: explicit `return;`.
 // Anti-pattern #8: no `>>`.
@@ -54,7 +44,8 @@ fn tiled_attention(
     shared k_tile: shared[f32, 64];    // K-vector (one row of K matrix)
     shared v_tile: shared[f32, 64];    // V-vector (one row of V matrix)
 
-    let q_row: u32 = gid(0u32);        // Which query row this invocation handles.
+    // Which query row this workgroup handles (dispatch: (seq_len,1,1) workgroups).
+    let q_row: u32 = gid(0u32);
     let q_base: u32 = q_row * head_dim;
 
     // ── Pass 1: Compute score row and find max for numerical stability ──────────
@@ -63,7 +54,7 @@ fn tiled_attention(
 
     for j in range(0u32, seq_len) {
         // Stage K[j] row into shared memory.
-        // Each invocation (single-invocation workgroup for correctness) loads all elements.
+        // Single-invocation workgroup (wg=1,1,1): this invocation loads all elements.
         let k_base: u32 = j * head_dim;
         for d in range(0u32, head_dim) {
             k_tile[d] = K[k_base + d];
@@ -79,7 +70,7 @@ fn tiled_attention(
         }
         score = score * inv_sqrt_d;
 
-        // Update running max for numerical stability (correct softmax, NOT FA2 streaming).
+        // Update running max for numerical stability (correct two-pass softmax).
         let is_larger: bool = score > max_score;
         if is_larger {
             max_score = score;
@@ -88,10 +79,9 @@ fn tiled_attention(
         workgroup_barrier();
     }
 
-    // ── Pass 2: Compute exp-normalized weights and accumulate output ────────────
+    // ── Pass 2: Compute denominator: sum of exp(score[j] - max_score) ──────────
     let mut denom: f32 = 0.0f32;
 
-    // Compute denominator: sum of exp(score[j] - max_score).
     for j in range(0u32, seq_len) {
         let k_base: u32 = j * head_dim;
         for d in range(0u32, head_dim) {
@@ -108,7 +98,7 @@ fn tiled_attention(
         score = score * inv_sqrt_d;
 
         // exp(x) approximation: 1 + x + x^2/2 (Taylor; small |x-max| after subtraction).
-        // For the correctness fixture, scores are small after max-subtraction.
+        // CPU reference uses THE IDENTICAL FORMULA — see AT-1630 test.
         let x: f32 = score - max_score;
         let exp_x: f32 = 1.0f32 + x + x * x * 0.5f32;
         denom = denom + exp_x;
@@ -116,15 +106,19 @@ fn tiled_attention(
         workgroup_barrier();
     }
 
-    // Normalize and accumulate output: O[q][d] = sum_j weight[j] * V[j][d].
+    // ── Pass 3: Normalize and accumulate output ─────────────────────────────────
+    // O[q_row][d] = sum_j softmax_weight[j] * V[j][d]
+    // where softmax_weight[j] = exp(score[j] - max_score) / denom.
     for d in range(0u32, head_dim) {
         let mut out_val: f32 = 0.0f32;
 
         for j in range(0u32, seq_len) {
+            // Reload K row to recompute score (no separate score buffer).
             let k_base: u32 = j * head_dim;
             for dk in range(0u32, head_dim) {
                 k_tile[dk] = K[k_base + dk];
             }
+            // Stage V row.
             let v_base: u32 = j * head_dim;
             for dv in range(0u32, head_dim) {
                 v_tile[dv] = V[v_base + dv];

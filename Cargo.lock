@@ -112,6 +112,7 @@ dependencies = [
  "axc-parser",
  "rspirv",
  "spirv",
+ "spirv-tools",
  "thiserror",
 ]
 

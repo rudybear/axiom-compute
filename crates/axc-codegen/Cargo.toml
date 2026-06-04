@@ -16,3 +16,6 @@ thiserror = { workspace = true }
 [dev-dependencies]
 axc-lexer = { path = "../axc-lexer" }
 axc-parser = { path = "../axc-parser" }
+# M3.3: spirv-val integration tests for OpPhi loop-carried SSA (AT-1701..1704).
+spirv-tools = "0.13"
+rspirv = { workspace = true }
