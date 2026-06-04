@@ -668,6 +668,197 @@ fn at1708_coopmat_conditional_only_reassign_rejected() {
     eprintln!("AT-1708 PASS: conditional-only coopmat reassign correctly rejected (not invalid SPIR-V)");
 }
 
+// ── AT-1733: N=4 coopmat phis in ONE single loop header — pre-gate for RB ─────
+
+/// AT-1733: A SINGLE for-range carrying 4 coopmat accumulators (acc_00, acc_01, acc_10, acc_11)
+/// emits exactly 4 well-formed OpPhi instructions in ONE loop header.
+///
+/// This is the pre-gate for M3.3c register blocking: register blocking depends on the N-phi
+/// single-loop path (4 loop-carried coopmat accumulators, all in one K-loop). AT-1702 proved
+/// the multi-phi insert mechanism for 2 phis across 2 NESTED loops (one phi per header);
+/// AT-1733 locks N=4 phis in ONE single header.
+///
+/// Assertions:
+///   1. Exactly 1 loop header block (ONE K-loop, not nested).
+///   2. Exactly 4 OpPhi at the loop header head (all phis first, per SPIR-V 2.4).
+///   3. Each phi has 7 words (type + result + 2 predecessor pairs).
+///   4. All 4 phi result_ids are DISTINCT (no cross-contamination).
+///   5. All 4 phis share the same two predecessor labels (pre_header + continue/latch).
+///   6. Both predecessors are valid OpLabel result_ids in the binary.
+///   7. spirv-val (Vulkan_1_1) exits clean.
+///
+/// NO codegen change is expected (the parallel pre_header_values/latch_values/carried Vecs
+/// are indexed by the single key i, making them N-agnostic; step-10 reverse-BeginInsert
+/// places all N phis at the header head in declaration order for any N). If this test FAILS,
+/// the 'no codegen change' claim is false and M3.3c needs a codegen fix (Architect-owned,
+/// NOT a Coder body.rs hack per HN-3).
+#[test]
+fn at1733_n_coopmat_phis_single_loop_wellformed() {
+    // A kernel with 4 coopmat accumulators, all loop-carried in ONE K-loop.
+    // Each accumulator is:
+    //   (a) coopmat-typed (let mut acc_ij: matrix[f16,16,16,accumulator] = coopmat_zero())
+    //   (b) defined BEFORE the K-loop
+    //   (c) reassigned UNCONDITIONALLY at the top level of the K-loop body (AT-1708)
+    //   (d) no break/continue (AT-1704)
+    //
+    // This is the EXACT pattern of the matmul_rb_coopmat.axc 2x2 RB kernel.
+    let src = r#"
+        @kernel @workgroup(32,1,1) @cooperative_matrix
+        @intent("4 loop-carried coopmat accumulators in ONE K-loop — AT-1733 pre-gate")
+        @complexity(O(n))
+        fn rb2x2_loop_carried_4phi(
+            A: readonly_buffer[f16],
+            B: readonly_buffer[f16],
+            C: buffer[f16],
+            K: u32,
+            N: u32
+        ) -> void {
+            shared a_tile: shared[f16, 512];
+            shared b_tile: shared[f16, 512];
+
+            let mut acc_00: matrix[f16, 16, 16, accumulator] = coopmat_zero();
+            let mut acc_01: matrix[f16, 16, 16, accumulator] = coopmat_zero();
+            let mut acc_10: matrix[f16, 16, 16, accumulator] = coopmat_zero();
+            let mut acc_11: matrix[f16, 16, 16, accumulator] = coopmat_zero();
+
+            for k_block in range(0u32, K) {
+                let a_mat_0: matrix[f16, 16, 16, a] = coopmat_load(a_tile, 0u32, 16u32);
+                let a_mat_1: matrix[f16, 16, 16, a] = coopmat_load(a_tile, 256u32, 16u32);
+                let b_mat_0: matrix[f16, 16, 16, b] = coopmat_load(b_tile, 0u32, 32u32);
+                let b_mat_1: matrix[f16, 16, 16, b] = coopmat_load(b_tile, 16u32, 32u32);
+
+                acc_00 = coopmat_mul_add(a_mat_0, b_mat_0, acc_00);
+                acc_01 = coopmat_mul_add(a_mat_0, b_mat_1, acc_01);
+                acc_10 = coopmat_mul_add(a_mat_1, b_mat_0, acc_10);
+                acc_11 = coopmat_mul_add(a_mat_1, b_mat_1, acc_11);
+            }
+
+            coopmat_store(acc_00, C, 0u32, N);
+            coopmat_store(acc_01, C, 16u32, N);
+            coopmat_store(acc_10, C, 0u32, N);
+            coopmat_store(acc_11, C, 16u32, N);
+            return;
+        }
+    "#;
+    let words = compile_ok(src);
+    spirv_val_check(&words);
+
+    // AT-1733 assertion 1: exactly ONE loop header block (single K-loop, not nested).
+    let headers = collect_loop_headers(&words);
+    assert_eq!(
+        headers.len(), 1,
+        "AT-1733: expected exactly 1 loop header block (single K-loop); got {}", headers.len()
+    );
+
+    let (header_label, phis) = &headers[0];
+
+    // AT-1733 assertion 2: exactly 4 OpPhi at the loop header head.
+    assert_eq!(
+        phis.len(), 4,
+        "AT-1733: expected exactly 4 OpPhi in ONE loop header %{header_label} \
+         (4 loop-carried coopmat accumulators in one K-loop); got {}",
+        phis.len()
+    );
+
+    // AT-1733 assertion 3: each phi has 7 words (type+result+2 predecessor pairs).
+    // AT-1733 assertion 4: all 4 phi result_ids are DISTINCT.
+    // AT-1733 assertion 5: all 4 phis share the same two predecessor labels.
+    let mut phi_result_ids: Vec<u32> = Vec::new();
+    let mut first_pred_a: Option<u32> = None;
+    let mut first_pred_b: Option<u32> = None;
+
+    for (idx, phi) in phis.iter().enumerate() {
+        assert_eq!(
+            phi.len(), 7,
+            "AT-1733: OpPhi[{idx}] in header %{header_label} must have 7 words \
+             (header + result_type + result_id + 4 operand ids = 2 predecessor pairs); \
+             got {} words", phi.len()
+        );
+
+        // phi[2] = result_id, phi[4] = pred_label_1, phi[6] = pred_label_2
+        let result_id = phi[2];
+        let pred_a = phi[4];
+        let pred_b = phi[6];
+
+        // Predecessors must be distinct (pre_header != continue/latch).
+        assert_ne!(
+            pred_a, pred_b,
+            "AT-1733: OpPhi[{idx}] predecessors must be distinct labels (pre_header != latch); \
+             got pred_a=%{pred_a} == pred_b=%{pred_b}"
+        );
+
+        // All 4 phis must share the same predecessor pair (same K-loop header).
+        match (first_pred_a, first_pred_b) {
+            (None, None) => {
+                first_pred_a = Some(pred_a);
+                first_pred_b = Some(pred_b);
+            }
+            (Some(fa), Some(fb)) => {
+                assert_eq!(
+                    pred_a, fa,
+                    "AT-1733: OpPhi[{idx}] pre_header label %{pred_a} != first phi's %{fa} \
+                     (all 4 phis must share the same predecessor pair for a single K-loop)"
+                );
+                assert_eq!(
+                    pred_b, fb,
+                    "AT-1733: OpPhi[{idx}] latch label %{pred_b} != first phi's %{fb} \
+                     (all 4 phis must share the same latch for a single K-loop)"
+                );
+            }
+            _ => unreachable!("first_pred_a and first_pred_b are always set together"),
+        }
+
+        phi_result_ids.push(result_id);
+    }
+
+    // AT-1733 assertion 4: all 4 result_ids are DISTINCT.
+    assert_eq!(phi_result_ids.len(), 4, "AT-1733: must have exactly 4 phi result ids");
+    let unique_count = {
+        let mut sorted = phi_result_ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        sorted.len()
+    };
+    assert_eq!(
+        unique_count, 4,
+        "AT-1733: all 4 OpPhi result_ids must be DISTINCT (no cross-contamination); \
+         ids={phi_result_ids:?}"
+    );
+
+    // AT-1733 assertion 6: both predecessor labels must be valid OpLabel result_ids.
+    let all_labels: Vec<u32> = iter_insts(&words[5..])
+        .filter(|(op, _)| *op == OP_LABEL)
+        .filter_map(|(_, slice)| slice.get(1).copied())
+        .collect();
+
+    let pred_a = first_pred_a.expect("pred_a must be set after processing phis");
+    let pred_b = first_pred_b.expect("pred_b must be set after processing phis");
+    assert!(
+        all_labels.contains(&pred_a),
+        "AT-1733: phi predecessor (pre_header) %{pred_a} must be a valid OpLabel result_id"
+    );
+    assert!(
+        all_labels.contains(&pred_b),
+        "AT-1733: phi predecessor (continue/latch) %{pred_b} must be a valid OpLabel result_id"
+    );
+
+    // AT-1733 assertion 7: total OpPhi count across the whole module == 4
+    // (no extra phantom phis from anywhere else).
+    let total_phis = count_op(&words, OP_PHI);
+    assert_eq!(
+        total_phis, 4,
+        "AT-1733: total OpPhi in module must be exactly 4 (one per carried accumulator); \
+         got {total_phis}"
+    );
+
+    eprintln!(
+        "AT-1733 PASS: 4 loop-carried coopmat accumulators in ONE K-loop emit \
+         exactly 4 well-formed OpPhi in ONE header %{header_label} — \
+         result_ids={phi_result_ids:?}, pre_header=%{pred_a}, latch=%{pred_b}, \
+         spirv-val clean. M3.3c RB codegen pre-gate LOCKED."
+    );
+}
+
 /// AT-1708b: A loop where acc is reassigned BOTH unconditionally at the top level AND
 /// also conditionally inside an if — must also be rejected.
 ///
