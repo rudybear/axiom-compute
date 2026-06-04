@@ -1,0 +1,88 @@
+{
+  "verdict": "PASS",
+  "agent": "qa_agent",
+  "milestone_id": "M3.3b-multitile-matmul",
+  "branch": "coder/M33b-20260603-1200/M3.3b-multitile-matmul",
+  "date": "2026-06-03",
+  "requirements_total": 6,
+  "requirements_covered": 6,
+  "requirements_missing": [],
+  "test_results": {
+    "total": 848,
+    "passed": 848,
+    "failed": 0,
+    "ignored": 38,
+    "notes": "Matches expected count of 848. axc-optimize doctest is `rust,ignore`-tagged (pre-existing on main; not a new failure — confirmed by git show main:crates/axc-optimize/src/lib.rs shows `rust,ignore` was already there)."
+  },
+  "verification_results": {
+    "clippy_check": "PASS — zero warnings, -D warnings clean on all workspace targets",
+    "diff_check": "PASS — all 5 planned modified files + 1 new bench file present: examples/matmul_shared_coopmat.axc, crates/axc-driver/tests/dispatch_shared_m32.rs, crates/axc-driver/Cargo.toml, DESIGN.md, ROADMAP.md, crates/axc-driver/benches/resident_matmul_competitive.rs",
+    "spirv_val_check": "PASS — at1620_matmul_shared_coopmat_spirv_val_only and at1622_strategy_holes_spirv_val_only both pass (confirmed by cargo test --workspace at 848/0)",
+    "codegen_unchanged": "PASS — git diff main..HEAD -- crates/axc-codegen/src/ is zero lines; no body.rs change; OpPhi/coopmat emission untouched",
+    "no_unwrap_in_lib": "PASS — zero new unwrap()/panic!/expect() in crates/*/src (lib code); new code is tests + benches only",
+    "coder_self_report_matches_reality": true
+  },
+  "check_1_tile_index_fix": {
+    "status": "PASS",
+    "tile_col": "let tile_col: u32 = gid(0u32) / 32u32;  — CONFIRMED in examples/matmul_shared_coopmat.axc line 99",
+    "tile_row": "let tile_row: u32 = gid(1u32);  — UNCHANGED, no division — CONFIRMED line 98",
+    "asymmetry": "CONFIRMED ASYMMETRIC — divide x by 32 (local_size.x=32); y NOT divided (local_size.y=1)",
+    "not_symmetrized": "CONFIRMED — tile_row is gid(1u32) with no divisor; was NOT copied from matmul_shared_f32.axc divide-both pattern",
+    "main_comparison": "Main had tile_col=gid(0u32) (bug, no division); branch has gid(0u32)/32u32 — correct fix confirmed by git show main"
+  },
+  "check_2_at1620_real_gpu_test": {
+    "status": "PASS",
+    "test_name": "at1620_matmul_shared_coopmat_bit_exact_gpu",
+    "gating": "#[ignore] + AXC_ENABLE_GPU_TESTS gated — confirmed",
+    "fixture": "M=32, N=48, K=32 — non-symmetric, integer-valued f16 (A: idx%4+1 = (i*K+k)%4+1, B: idx%3+1 = (k*N+j)%3+1)",
+    "dispatch": "(N/16, M/16, 1) = (3, 2, 1) workgroups — FULL grid over entire C(32x48), CONFIRMED in test body (wg_x=N/16, wg_y=M/16)",
+    "assertion": "max_diff == 0.0 vs cpu_f16_matmul_reference — NOT relaxed; honesty-gate comment present in assert! message",
+    "typed_skip": "CoopMatUnsupported and DeviceFeatureUnsupported both handled with return (no panic)",
+    "coopmat_preflight": "meta.coopmat.as_ref() passed to prepare_kernel_checked — CONFIRMED line 581",
+    "not_stub": "CONFIRMED real dispatch — reads VulkanContext, dispatches full grid, asserts correctness"
+  },
+  "check_3_at1622_k_block_honesty": {
+    "status": "PASS",
+    "test_name": "at1622_k_block_count_variation_bit_exact_gpu",
+    "tile_k": "FIXED at 16 (const TILE_K: usize = 16) — bound to coopmat K dimension",
+    "k_variation": "Loops over K in {32, 48}: K=32 → 2 K-blocks, K=48 → 3 K-blocks",
+    "tile_k_32_invalid": "tile_k=32 is NOT tested as passing; at1622_strategy_holes_spirv_val_only tests tile_k=16 only with doc explaining invalidity",
+    "f16_exactness_k48": "max element = 48×4×3=576 ≤ 2048 (f16 integer-exact); max_diff==0.0 asserted for both K values",
+    "assertion": "max_diff == 0.0 for BOTH K=32 and K=48 — confirmed in loop body",
+    "strategy_hole": "@strategy { tile_k: ?[16] } in kernel — single valid value, tile_k=32 removed from candidate set",
+    "docs_note": "ROADMAP.md line 125 has a stale phrase ('tile_k=32 (1 K-block) both bit-exact') that contradicts the actual fix; DESIGN.md §3.1.16 is accurate. This is a docs-only inaccuracy, not a code bug — the code correctly tests K-block count variation with tile_k=16 fixed."
+  },
+  "check_4_at1710_tflops_honesty": {
+    "status": "PASS",
+    "bench_id": "dispatch_resident_matmul_shared_coopmat",
+    "default_dims": "M=N=K=256 (full 16x16 tile grid)",
+    "dispatch_correct": "Full (N/16, M/16, 1) grid dispatched — CONFIRMED (wg_x=N/16, wg_y=M/16 in bench)",
+    "grid_precheck_2d": "Both max_compute_work_group_count()[0] (wg_x) AND [1] (wg_y) checked before dispatch — CONFIRMED lines 173-195",
+    "no_asserted_ratio": "Assert is only tflops>0 && finite — CONFIRMED (no ratio assertion in code)",
+    "competitive_omitted": "COMPETITIVE_PCT_THRESHOLD=25.0; label omits 'competitive' unless pct>=25%; at 4% it uses 'honest' label — CONFIRMED in label logic",
+    "cpu_fence_wall_honest": "CpuFenceWall path omits % and appends 'scheduling-inclusive, NOT a GPU kernel time' — CONFIRMED in timing_source_label() and label branch",
+    "50gb_cap": "total_bytes < FIFTY_GB asserted in grid-check loop before allocation — CONFIRMED",
+    "warmup": "N_WARMUP=2 discarded before MIN-of-N=10 measured — CONFIRMED",
+    "tflops_measured": "5.04 TFLOPS = 4.0% of 125-TFLOPS f32 datasheet ESTIMATE (orchestrator-confirmed on NVIDIA RTX PRO 6000 Blackwell)",
+    "design_md_recorded": "DESIGN.md §3.1.16 records '5.04 TFLOPS = 4.0%' honestly, not overclaimed"
+  },
+  "check_5_no_regression": {
+    "status": "PASS",
+    "at1606": "PASS — at1606_barrier_absent_cross_slot_hard_error_fires and at1606_barrier_absent_dynamic_index_advisory_warning both in suite and passing",
+    "at1707": "PASS — at1707_opphi_coopmat_accumulate_spirv_val_only passes; at1707_opphi_coopmat_accumulate_bit_exact_gpu is #[ignore]-gated (GPU test)",
+    "at1621": "PASS — at1621_matmul_shared_f32_spirv_val_only passes; at1621_matmul_shared_f32_bit_exact_gpu is #[ignore]-gated",
+    "at1630": "PASS — at1630_tiled_attention_spirv_val_only passes; at1630_tiled_attention_bit_exact_gpu is #[ignore]-gated",
+    "public_api_additive": "PASS — no existing API removed; new bench function and test functions are additive",
+    "codegen_body_rs": "PASS — zero diff in crates/axc-codegen/src/; OpPhi/coopmat codegen untouched as required"
+  },
+  "issues": [
+    {
+      "severity": "MINOR-DOCS",
+      "location": "ROADMAP.md line 125",
+      "description": "States 'tile_k=16 (2 K-blocks) AND tile_k=32 (1 K-block) both bit-exact' — this is stale language from the original architect spec (AT-1622 description before the tight-fix). The actual implementation tests K=32 and K=48 with tile_k=16 FIXED (K-block count variation). DESIGN.md §3.1.16 is correct. This does not affect any code, test, or assertion — documentation inaccuracy only.",
+      "verdict_impact": "None — PASS still warranted; docs-only inconsistency between ROADMAP.md and DESIGN.md; the code and tests are correct."
+    }
+  ],
+  "memory_footprint_ok": true,
+  "summary": "M3.3b implementation PASSES all 6 verification checks. Tests: 848 passed / 0 failed (exact expected count). Clippy: clean (-D warnings). The asymmetric tile index fix (tile_col=gid(0)/32u32, tile_row=gid(1) unchanged) is confirmed correct and NOT symmetrized. AT-1620 is a real GPU test dispatching the full (N/16,M/16,1)=(3,2,1) grid over M=32,N=48,K=32 with max_diff==0.0 assertion and proper coopmat preflight. AT-1622 correctly varies K-block count (K=32→2 blocks, K=48→3 blocks) with tile_k=16 FIXED — tile_k=32 is NOT tested as passing; the @strategy hole is narrowed to ?[16]. The resident_matmul_competitive bench reports honest 5.04 TFLOPS / 4.0% with no asserted ratio, no 'competitive' label at 4%, 2D grid pre-check on both axes, and CpuFenceWall path omitting the % with scheduling-inclusive qualifier. No codegen change (crates/axc-codegen/src diff is zero lines). One minor docs-only inaccuracy in ROADMAP.md line 125 (stale tile_k=32 language contradicting the implemented K-block variation) — does not affect code correctness or test behavior. DESIGN.md §3.1.16 is accurate."
+}

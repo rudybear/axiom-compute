@@ -122,7 +122,8 @@ Goal: prove the DESIGN.md §5 kill-criteria gates with publishable numbers, not 
 **AT-1620/1622 UN-STUBBED (bit-exact full matmul on NVIDIA):**
 - Non-symmetric multiple-of-16 fixture: M=32, N=48, K=32 (3x2 workgroup grid, 2 K-blocks).
 - Integer-valued f16 (A∈{1..4}, B∈{1..3}; per-element sum ≤ 384, f16-exact) → max_diff == 0.0.
-- tile_k=16 (2 K-blocks, accumulation load-bearing) AND tile_k=32 (1 K-block) both bit-exact.
+- **AT-1620 bit-exact (max_diff=0) on NVIDIA RTX PRO 6000** — the full multi-tile matmul works.
+- `tile_k` is bound to the coopmat K dimension (**16**): one `coopmat_mul_add` consumes exactly K=16, so `tile_k=32` is semantically invalid (it computed exactly HALF — a single coopmat op over a 32-wide K-block reads only K=0..15). AT-1622 therefore varies the **K-block COUNT** (K=32 → 2 blocks, K=48 → 3 blocks; tile_k=16 fixed) — both **bit-exact**, genuinely exercising the OpPhi K-loop. A `tile_k>16` sub-K-loop is a follow-up.
 - Lavapipe: typed-skip (CoopMatUnsupported); matmul_shared_f32.axc (AT-1621) unaffected.
 
 **AT-1710 honest effective-TFLOPS (resident_matmul_competitive.rs re-added):**

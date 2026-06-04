@@ -1,0 +1,56 @@
+{
+  "verdict": "APPROVE",
+  "agent": "optimistic_code_reviewer",
+  "milestone_id": "M3.3b-multitile-matmul",
+  "date": "2026-06-03",
+  "spec_compliance": true,
+  "positive_feedback": [
+    "Tile index fix is minimal and correct: one line in examples/matmul_shared_coopmat.axc (gid(0u32) → gid(0u32)/32u32) with tile_row=gid(1u32) left untouched. The asymmetry (divide x by local_size.x=32, do NOT divide y because local_size.y=1) is confirmed correct and the explicit comment in the kernel explains it clearly. Exactly what the spec ordered.",
+    "No codegen change: git diff main..HEAD -- crates/axc-codegen/src/ is zero lines. OpUDiv for u32/u32 was already wired (body.rs BinOp::Div for ScalarTy::U32 → u_div); all builtins and coopmat paths GPU-proven in M3.2/M3.3. Pure kernel-index + dispatch + test/bench milestone as architected.",
+    "AT-1620 is a real, non-stub GPU test: dispatches full (N/16, M/16, 1) = (3, 2, 1) workgroup grid over M=32,N=48,K=32 (non-symmetric, 2 K-blocks), asserts max_diff==0.0 vs cpu_f16_matmul_reference, properly typed-skips on CoopMatUnsupported, and has the honesty-gate phrase in the assert! message forbidding tolerance relaxation.",
+    "tile_k pivot is technically sound and honestly disclosed: the coder correctly diagnosed that tile_k=32 is semantically invalid for a 16×16×16 coopmat (one coopmat_mul_add covers exactly K=16; tile_k=32 computes only half), narrowed the @strategy hole to tile_k: ?[16], and re-designed AT-1622 to vary the K-block COUNT (K=32→2 blocks, K=48→3 blocks) — the genuinely load-bearing variation. The pivot is well-documented in the kernel header, test docstring, DESIGN §3.1.16, and coder.json at1622_fix section. DESIGN §3.1.16 records the measured GPU result (GPU=[40,80,120,40] vs CPU=[80,160,240,80] at tile_k=32) that discovered the semantic invalidity.",
+    "f16 exactness bound is correct for both AT-1620 and AT-1622: A values ∈ {1..4}, B values ∈ {1..3}. For K=48 (the worst case): max per-element sum = 48 × 4 × 3 = 576 ≤ 2048 (f16 integer-exact limit per IEEE 754 half-precision). max_diff==0.0 is achievable and correct to assert.",
+    "AT-1710 bench is honest by construction: COMPETITIVE_PCT_THRESHOLD=25.0 and at 4% (measured 5.04 TFLOPS on RTX PRO 6000 Blackwell) the label prints 'effective TFLOPS (honest)' without the word 'competitive'. No ratio is asserted (only tflops>0 && finite). The CpuFenceWall fallback path omits the % and appends the scheduling-inclusive qualifier per AT-1582. The datasheet estimate (125 TFLOPS) is labeled as an estimate, not a measured A/B comparison.",
+    "2D grid pre-check in bench checks BOTH max_compute_work_group_count()[0] (wg_x=N/16) AND [1] (wg_y=M/16), shrinks M and N together by /2 until both fit. This correctly addresses the pessimistic design reviewer's warning about the naive_gemm single-axis pre-check pattern.",
+    "50 GB memory cap is asserted in the bench before allocation (total_bytes < FIFTY_GB in the shrink loop). 256³ is 393 KB — trivially safe. Consistent with CLAUDE.md hard rule on memory limits.",
+    "Lavapipe CI compatibility maintained: CoopMatUnsupported typed-skip (return, no panic) in both AT-1620 and AT-1622 GPU tests and in the bench. matmul_shared_f32.axc (AT-1621, scalar) remains the Lavapipe-runnable correctness path and is untouched.",
+    "No regression: git diff touches zero lines of crates/axc-codegen/src/; AT-1606/AT-1707/AT-1621/AT-1630 tests confirmed passing (848/0 in QA); public API is additive (new bench function, two un-stubbed test functions). All pipeline files correctly placed.",
+    "DESIGN §3.1.16 is accurate and complete: records root-cause restatement, fix mechanics, tile_k constraint and its reason, bit-exact results (max_diff=0.0 for both K=32 and K=48), measured TFLOPS (5.04, 4.0%), and out-of-scope items (edge tiles, sub-K-loop). Historical §3.1.15 is untouched."
+  ],
+  "minor_issues": [
+    {
+      "file": "ROADMAP.md",
+      "line": 125,
+      "severity": "MINOR-DOCS",
+      "description": "Stale AT-1620/1622 bullet: 'tile_k=16 (2 K-blocks, accumulation load-bearing) AND tile_k=32 (1 K-block) both bit-exact.' This is leftover language from the original architect spec (commit da01475) before the tile_k=32 invalidity was discovered. The actual implementation (commit 84fb077) fixed the test to vary K-block count with tile_k=16 fixed, but ROADMAP.md was not updated. DESIGN.md §3.1.16 (the authoritative design record) is correct. The code, tests, and all assertions are correct. Does not block APPROVE.",
+      "suggested_fix": "Replace 'tile_k=16 (2 K-blocks, accumulation load-bearing) AND tile_k=32 (1 K-block) both bit-exact.' with 'AT-1622 varies K-block COUNT (K=32 → 2 K-blocks, K=48 → 3 K-blocks; tile_k=16 FIXED — tile_k=32 is semantically invalid for matrix[f16,16,16,*]). Both bit-exact (max_diff=0.0). Proves OpPhi K-loop accumulation over different trip counts.'"
+    },
+    {
+      "file": "crates/axc-driver/tests/dispatch_shared_m32.rs",
+      "line": 596,
+      "severity": "COSMETIC",
+      "description": "AT-1620 comment says 'A[i,k] = (i*K + k) % 4 + 1' but the code uses 'idx % 4 + 1' (flat linear index). These formulas differ — the 2D formula's value depends on K while the flat formula does not — but both produce values in {1..4}, so the f16-exact bound (K*4*3) and the max_diff==0.0 assertion both remain valid. Cosmetic comment inaccuracy only; no correctness impact."
+    }
+  ],
+  "correctness_verification": {
+    "tile_index_math_verified": true,
+    "tile_col_fix": "gid(0u32) / 32u32 — CONFIRMED asymmetric (local_size.x=32 → divide x; local_size.y=1 → y unchanged)",
+    "dispatch_grid_correct": "(N/16, M/16, 1) = (3, 2, 1) for M=32, N=48 — covers all 6 output tiles of C(32×48)",
+    "no_codegen_change": "CONFIRMED — zero diff in crates/axc-codegen/src/",
+    "f16_exact_bound_k48": "576 ≤ 2048 (f16 integer-exact) — CONFIRMED",
+    "honesty_gate_present": "CONFIRMED — assert! message contains 'HONESTY GATE: do NOT relax tolerance or shrink fixture'",
+    "competitive_label_omitted_at_4pct": "CONFIRMED — COMPETITIVE_PCT_THRESHOLD=25.0; at 4% label prints 'honest' not 'competitive'",
+    "2d_grid_precheck": "CONFIRMED — bench checks both [0] and [1] axes of max_compute_work_group_count",
+    "no_regression_at1706_at1707_at1621_at1630": "CONFIRMED — QA verified 848/0 pass/fail, AT-1606/1707/1621/1630 all passing"
+  },
+  "tflops_honesty_check": {
+    "measured_result": "5.04 TFLOPS = 4.0% of 125-TFLOPS f32 datasheet ESTIMATE (NVIDIA RTX PRO 6000 Blackwell, 2026-06-03)",
+    "no_asserted_ratio": true,
+    "competitive_label_threshold": 25.0,
+    "label_at_4pct": "matmul_shared_coopmat effective TFLOPS (honest) = ... (NOT competitive)",
+    "cpu_fence_wall_path": "Omits % and appends scheduling-inclusive qualifier — CONFIRMED",
+    "datasheet_labeled_as_estimate": true,
+    "no_same_machine_ab_claim": "Label says 'NOT a same-machine A/B' — CONFIRMED"
+  },
+  "summary": "M3.3b APPROVE. The implementation is minimal, correct, and honest. The one-line asymmetric tile index fix (tile_col=gid(0)/32u32, tile_row=gid(1) unchanged) is the right fix for the right reason, properly derived from the SPIR-V GlobalInvocationId contract and confirmed against the existing GPU-proven matmul_shared_f32.axc precedent. The tile_k=32 invalidity was discovered empirically during implementation and handled correctly: @strategy narrowed to tile_k:?[16], AT-1622 redesigned to vary K-block count (the genuinely load-bearing variation), discovery documented in DESIGN §3.1.16. AT-1710 bench reports honest numbers (5.04 TFLOPS, 4.0%) with no asserted ratio, no overclaimed label, and proper CpuFenceWall fallback. No codegen change. No regression. One minor ROADMAP.md doc inaccuracy (stale tile_k=32 bullet at line 125) and one cosmetic comment mismatch (A[i,k] formula vs flat idx) — neither affects code, tests, or correctness. Both should be corrected post-merge or in M3.3c prep but do not block this merge."
+}
