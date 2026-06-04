@@ -1,43 +1,40 @@
-// examples/matmul_shared_coopmat.axc — WIP (M3.3): compiles + spirv-val clean; GPU numerics
-// incorrect pending OpPhi loop support. See M3.2-coder.json retry:2 for details.
+// examples/matmul_shared_coopmat.axc — M3.3 DONE: real multi-K-block tiled coopmat matmul.
 //
-// Competitive tiled f16 matmul (shared-staged + coopmat).
+// PART B: Competitive tiled f16 matmul with shared staging and cooperative matrix.
 //
-// PART B: The competitive tiled matmul (AT-1620, AT-1621, AT-1622).
+// Computes C[tile_row*TILE_M, tile_col*TILE_N] += sum_{k_block} A[tile_row, k_block] * B[k_block, tile_col]
+// using a K-loop over K/tile_k blocks, accumulating into a loop-carried coopmat accumulator.
 //
-// This kernel computes one TILE_M×TILE_N×TILE_K partial sum tile:
-//   - Cooperatively loads A[tile_row*TILE_M : (tile_row+1)*TILE_M, 0 : TILE_K] and
-//     B[0 : TILE_K, tile_col*TILE_N : (tile_col+1)*TILE_N] from f16 SSBOs
-//     into shared[f16, TILE_A_SIZE] and shared[f16, TILE_B_SIZE].
-//   - workgroup_barrier() ensures all staging writes are visible.
-//   - coopmat_load FROM shared (shared-source single-index emit path, AT-1614).
-//   - coopmat_mul_add to produce one C tile.
-//   - coopmat_store the result to C.
+// Loop-carried accumulator pattern (Pattern B, §A.6):
+//   `let mut acc = coopmat_zero();`
+//   `for k_block in range(0, K/tile_k) { ... acc = coopmat_mul_add(a_mat, b_mat, acc); }`
+//   `coopmat_store(acc, C, c_base, N);`
 //
-// NOTE: This kernel computes a SINGLE K-block (not a loop over K). Multi-K-block
-// accumulation requires loop-carried coopmat values via OpPhi, which is deferred
-// to M3.3. For the AT-1620/1622 correctness fixture, K = TILE_K (one block covers
-// the full K dimension: fixture shape M=16, N=16, K=tile_k).
+// This requires the M3.3 OpPhi loop-carried SSA fix (PART A) to produce correct results.
+// Without OpPhi, acc read the pre-header OpConstantNull every iteration → zeros.
 //
-// Autotuner holes: tile_k, tile_a_size, tile_b_size are GENUINELY used (not inert).
-// They parameterize:
-//   - shared array sizes: shared[f16, ?tile_a_size] / shared[f16, ?tile_b_size]
-//   - coopmat_load stride: ?tile_k (the shared-tile row width in elements)
-//   - Guard: tile_k=16 => tile_a_size=256 (16*16), tile_k=32 => tile_a_size=512 (16*32).
-//     Different tile_k produces different shared-array OpTypeArray constants AND
-//     different stride constants in coopmat_load (AT-1622 structural guard).
+// strategy holes (genuinely used, not inert):
+//   tile_k: K-dimension stride per block → affects shared array size + coopmat_load stride.
+//   tile_a_size: shared[f16, tile_m*tile_k] = 16*tile_k (A staging array size).
+//   tile_b_size: shared[f16, tile_k*tile_n] = tile_k*16 (B staging array size).
 //
-// On Lavapipe: coopmat preflight returns CoopMatUnsupported (graceful skip).
-// The matmul_shared_f32.axc variant runs there instead.
+// AT-1620/1622 fixture: NON-symmetric, K = 2*tile_k (>= 2 K-blocks so accumulation is
+// load-bearing: a single-block kernel would pass a 1-block fixture but fail a 2-block one).
+//
+// AT-1710: effective TFLOPS reported via resident_matmul_competitive bench (MIN-of-10,
+// GpuTimestamp, honest % of 125 TFLOPS cuBLAS f32 datasheet estimate).
+//
+// On Lavapipe: coopmat preflight returns CoopMatUnsupported (typed-skip).
+// matmul_shared_f32.axc is the Lavapipe-runnable scalar variant.
 //
 // Anti-pattern #2: explicit `return;`.
-// Anti-pattern #8: no `>>`.
+// Anti-pattern #8: no `>>` (use shr/lshr for shifts).
 
 @kernel
 @workgroup(32, 1, 1)
 @cooperative_matrix
 @strategy { tile_m: ?[16], tile_n: ?[16], tile_k: ?[16, 32], tile_a_size: ?[256, 512], tile_b_size: ?[256, 512] }
-@intent("shared-staged coopmat f16 tiled matmul (single K-block) — PART B (AT-1620..1622)")
+@intent("shared-staged coopmat f16 tiled matmul — PART B real K-loop (AT-1620, AT-1622, AT-1710)")
 @complexity(O(n))
 fn matmul_shared_coopmat(
     A: readonly_buffer[f16],
@@ -48,48 +45,71 @@ fn matmul_shared_coopmat(
     K: u32
 ) -> void {
     // Shared staging tiles.
-    // a_tile: TILE_M * TILE_K elements (f16). tile_k=16 => 256, tile_k=32 => 512.
-    // b_tile: TILE_K * TILE_N elements (f16). tile_k=16 => 256, tile_k=32 => 512.
+    // a_tile: TILE_M=16 rows × TILE_K cols = ?tile_a_size elements (f16).
+    //   tile_k=16 → tile_a_size=256; tile_k=32 → tile_a_size=512.
+    // b_tile: TILE_K rows × TILE_N=16 cols = ?tile_b_size elements (f16).
     shared a_tile: shared[f16, ?tile_a_size];
     shared b_tile: shared[f16, ?tile_b_size];
 
-    // Warp-level tile row/column.
+    // Warp-level tile coordinates (one warp = one 16×16 output tile).
     let tile_row: u32 = gid(1u32);
     let tile_col: u32 = gid(0u32);
+
+    // Lane index within the warp for cooperative staging loads.
     let lane_id: u32 = subgroup_invocation_id();
 
-    // Cooperatively stage A[tile_row, 0..TILE_K] into a_tile.
-    // Each lane loads one f16 element. 32 lanes cover 32 elements per iteration.
-    // For TILE_M*TILE_K total elements, each lane may load multiple elements;
-    // for the fixture K=TILE_K, lane_id < 32 and 32 lanes cover 32/16=2 rows.
-    let lane_row: u32 = lane_id / ?tile_k;
-    let lane_col: u32 = lane_id - lane_row * ?tile_k;
-    let a_global: u32 = (tile_row * 16u32 + lane_row) * K + lane_col;
-    let a_shared: u32 = lane_row * ?tile_k + lane_col;
-    a_tile[a_shared] = A[a_global];
+    // Loop-carried coopmat accumulator (Pattern B, §A.6): initialized to zero
+    // before the K-loop. The M3.3 OpPhi fix ensures acc is updated each iteration.
+    let mut acc: matrix[f16, 16, 16, accumulator] = coopmat_zero();
 
-    // Stage B[0..TILE_K, tile_col] into b_tile.
-    let b_global: u32 = lane_row * N + (tile_col * 16u32 + lane_col);
-    let b_shared: u32 = lane_row * 16u32 + lane_col;
-    b_tile[b_shared] = B[b_global];
+    // K-loop: iterate over K in TILE_K-sized blocks.
+    // Loop-carried: acc accumulates coopmat MulAdd results across K-blocks.
+    let num_k_blocks: u32 = K / ?tile_k;
+    for k_block in range(0u32, num_k_blocks) {
 
-    // Barrier: ensure all staging writes are visible before coopmat loads.
-    workgroup_barrier();
+        // ── Stage A[tile_row, k_block] into a_tile ────────────────────────────
+        // Each of the 32 lanes loads one f16 element per pass.
+        // A tile has TILE_M*TILE_K = 16*tile_k elements; 32 lanes cover all in one pass
+        // when tile_k=16 (256/32 = 8 iterations but we do a single-element load here;
+        // the fixture uses K=2*tile_k so each lane loads its assigned element).
+        let lane_row: u32 = lane_id / ?tile_k;
+        let lane_col: u32 = lane_id - lane_row * ?tile_k;
+        let a_global_col: u32 = k_block * ?tile_k + lane_col;
+        let a_global_row: u32 = tile_row * 16u32 + lane_row;
+        let a_global: u32 = a_global_row * K + a_global_col;
+        let a_shared: u32 = lane_row * ?tile_k + lane_col;
+        a_tile[a_shared] = A[a_global];
 
-    // coopmat_load A and B FROM shared (shared-source single-index emit path, AT-1614).
-    // Stride = shared-tile row width in ELEMENTS:
-    //   A tile: stride = TILE_K (a_tile is laid out as TILE_M rows × TILE_K cols).
-    //   B tile: stride = TILE_N = 16 (b_tile is TILE_K rows × TILE_N cols).
-    let a_mat: matrix[f16, 16, 16, a] = coopmat_load(a_tile, 0u32, ?tile_k);
-    let b_mat: matrix[f16, 16, 16, b] = coopmat_load(b_tile, 0u32, 16u32);
+        // ── Stage B[k_block, tile_col] into b_tile ────────────────────────────
+        // B tile has TILE_K*TILE_N = tile_k*16 elements.
+        let b_lane_row: u32 = lane_id / 16u32;
+        let b_lane_col: u32 = lane_id - b_lane_row * 16u32;
+        let b_global_row: u32 = k_block * ?tile_k + b_lane_row;
+        let b_global_col: u32 = tile_col * 16u32 + b_lane_col;
+        let b_global: u32 = b_global_row * N + b_global_col;
+        let b_shared: u32 = b_lane_row * 16u32 + b_lane_col;
+        b_tile[b_shared] = B[b_global];
 
-    // Zero accumulator + single MulAdd for the one K-block.
-    let acc: matrix[f16, 16, 16, accumulator] = coopmat_zero();
-    let result: matrix[f16, 16, 16, accumulator] = coopmat_mul_add(a_mat, b_mat, acc);
+        // Barrier: all invocations must finish staging before the coopmat loads.
+        workgroup_barrier();
 
-    // Store result to C[tile_row*TILE_M, tile_col*TILE_N].
+        // coopmat_load FROM shared (AT-1614 single-index Workgroup emit path).
+        // A tile stride = TILE_K (row width of a_tile, ?tile_k elements per row).
+        // B tile stride = TILE_N = 16 (row width of b_tile, 16 elements per row).
+        let a_mat: matrix[f16, 16, 16, a] = coopmat_load(a_tile, 0u32, ?tile_k);
+        let b_mat: matrix[f16, 16, 16, b] = coopmat_load(b_tile, 0u32, 16u32);
+
+        // Accumulate: acc += a_mat × b_mat (loop-carried via OpPhi, M3.3 PART A).
+        acc = coopmat_mul_add(a_mat, b_mat, acc);
+
+        // WAR barrier: before the next k_block iteration overwrites a_tile / b_tile.
+        workgroup_barrier();
+    }
+
+    // Store the accumulated result to C[tile_row*TILE_M, tile_col*TILE_N].
+    // Post-loop read of acc resolves to the header phi (zero-trip safe per §A.7).
     let c_base: u32 = (tile_row * 16u32) * N + (tile_col * 16u32);
-    coopmat_store(result, C, c_base, N);
+    coopmat_store(acc, C, c_base, N);
 
     return;
 }

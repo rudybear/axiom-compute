@@ -47,6 +47,14 @@ name = "resident_matmul"
 path = "benches/resident_matmul.rs"
 harness = false
 
+# M3.3: Competitive coopmat matmul TFLOPS bench (AT-1710).
+# Bench id: dispatch_resident_matmul_shared_coopmat.
+# SEPARATE from resident_matmul so existing bench IDs are unchanged.
+[[bench]]
+name = "resident_matmul_competitive"
+path = "benches/resident_matmul_competitive.rs"
+harness = false
+
 [features]
 # M2.2 AT-714: fault-injection feature for regression-gate CI validation.
 # When enabled, cpu_saxpy_reference adds a 100M-iteration accumulator loop
