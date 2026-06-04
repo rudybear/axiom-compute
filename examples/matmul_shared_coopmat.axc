@@ -1,13 +1,12 @@
 // examples/matmul_shared_coopmat.axc
 //
-// WIP: single coopmat output tile (16x16); multi-N-tile output coverage is a follow-up.
-// OpPhi K-accumulation works (AT-1707, GPU-proven bit-exact on NVIDIA RTX PRO 6000).
-// Full coopmat matmul numerics are incorrect for N>tile_n (N=24 spans >1 output tile);
-// needs a tile-output loop over N-tiles. Deferred to M3.x follow-up milestone.
+// M3.3b: real multi-tile coopmat matmul — full grid dispatch.
+// Dispatch (N/16, M/16, 1) workgroups. Each workgroup computes ONE 16x16 output tile.
+// Partial edge tiles (M or N not a multiple of 16) are OUT OF SCOPE for M3.3b.
+// OpPhi K-accumulation GPU-proven (AT-1707, NVIDIA RTX PRO 6000).
+// Bit-exact full matmul GPU-proven (AT-1620/1622, M=32,N=48,K=32, 2x3 tile grid).
 //
-// M3.3 DONE: real multi-K-block tiled coopmat matmul — K-loop + OpPhi accumulation.
-//
-// PART B: Competitive tiled f16 matmul with shared staging and cooperative matrix.
+// PART B: Real multi-tile tiled f16 matmul with shared staging and cooperative matrix.
 //
 // Computes C[tile_row*TILE_M, tile_col*TILE_N] += sum_{k_block} A[tile_row, k_block] * B[k_block, tile_col]
 // using a K-loop over K/tile_k blocks, accumulating into a loop-carried coopmat accumulator.
@@ -80,9 +79,13 @@ fn matmul_shared_coopmat(
     shared a_tile: shared[f16, ?tile_a_size];
     shared b_tile: shared[f16, ?tile_b_size];
 
-    // Warp-level tile coordinates (one warp = one 16×16 output tile).
+    // Output-tile coordinates: one workgroup == one 16x16 output tile.
+    // Dispatch is (N/16, M/16, 1) workgroups with @workgroup(32,1,1) → local_size=(32,1,1).
+    // gid(0) = workgroup_id.x * 32 + local_id.x → tile_col = gid(0) / 32 (divide by local_size.x).
+    // gid(1) = workgroup_id.y * 1 + local_id.y  → tile_row = gid(1)       (NO division; local_size.y=1).
+    // ASYMMETRIC: divide x by 32, do NOT divide y (local_size.y=1, gid(1)==workgroup_id.y already).
     let tile_row: u32 = gid(1u32);
-    let tile_col: u32 = gid(0u32);
+    let tile_col: u32 = gid(0u32) / 32u32;
 
     // Lane index within the warp for cooperative staging loads.
     let lane_id: u32 = subgroup_invocation_id();
