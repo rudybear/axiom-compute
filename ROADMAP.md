@@ -137,6 +137,42 @@ Goal: prove the DESIGN.md §5 kill-criteria gates with publishable numbers, not 
 
 **Depends on:** M3.3. **Blocks:** M3.4 llama.cpp A/B (tensor-core matmul now correctly computes full outputs).
 
+### M3.3c — register-blocked coopmat matmul (bit-exact + measured TFLOPS uplift) (2026-06-04)
+
+**Root cause (M3.3b bottleneck):** ONE workgroup = ONE 16×16 output tile = ONE subgroup = ONE coopmat accumulator. Tensor cores idle on shared staging + barriers (issue/bandwidth-bound, not FLOP-bound). 5.04 TFLOPS = 4.0% of datasheet.
+
+**Register blocking (matmul_rb_coopmat.axc, 2×2, hand-unrolled):**
+- ONE workgroup (32 threads) computes a 32×32 output BLOCK (4 tiles = 4 coopmat accumulators).
+- 4 loop-carried coopmat accumulators (acc_00..acc_11) in ONE K-loop (AT-1733 pre-gate PASSED).
+- Per K-block: stage 32×16 A block + 16×32 B block to shared; load a_mat_0/a_mat_1 ONCE; load b_mat_0/b_mat_1 ONCE; reuse across 4 mul_adds → ~2× arithmetic intensity.
+- NO codegen change (detect_loop_carried_coopmat + emit_for_range N-phi path already general; AT-1733 locks N=4 phis in ONE loop, spirv-val clean).
+- Dispatch grid: (N/32, M/32, 1). Index: block_col=gid(0)/32, block_row=gid(1), lane=subgroup_invocation_id() — SAME idiom as M3.3b.
+- HAND-UNROLLED: AXIOM has no compile-time strategy-unroll and no coopmat array type (SSA). The 2×2 variant hard-codes 4 named accumulators; strategy holes drive shared sizes + bench grid.
+
+**Bit-exact (AT-1731/1732):**
+- AT-1731: M=N=64, K=32, block grid (2,2,1) = 4 workgroups → max_diff==0.0 on NVIDIA (expected).
+- AT-1732: K=32 (2 K-blocks) AND K=48 (3 K-blocks), tile_k=16 fixed → max_diff==0.0 (expected).
+- Non-symmetric fixture detects A/B index swaps. Single-tile AT-1620/1622 RETAINED unchanged.
+- Typed-skip on Lavapipe (CoopMatUnsupported).
+
+**Measured TFLOPS (AT-1730) — HONEST, no asserted ratio:**
+- Bench: resident_matmul_rb.rs, same methodology as AT-1710 (N_WARMUP=2, MIN-of-10, GpuTimestamp).
+- Measured at **256³** (64 workgroups — occupancy-constrained; may be slower than M3.3b) AND **512³** (256 workgroups — better occupancy) AND **768³** (576 workgroups). All reported honestly.
+- OCCUPANCY NOTE: At 256³ the RB grid (64 WGs) < ~188 SMs → may under-occupy vs M3.3b (256 WGs). If 256³ regresses but 512³ improves, both are reported. Larger matmuls better realize the register-blocking arithmetic-intensity gain.
+- [MEASURED RESULT: TBD by QA on NVIDIA RTX PRO 6000 — bare TFLOPS + % HONESTLY. If 256³ regresses, 512³/768³ reported. If cap is below 25%, labeled non-competitive.]
+- 'competitive' label ONLY if measured pct >= 25.0. NO ratio asserted (only tflops>0 && finite).
+
+**Deferred:**
+- Multi-subgroup blocking: needs LocalInvocationId / SubgroupId builtin (not in AXIOM; deferred to M3.3d/M3.4).
+- Double-buffered shared staging (software pipelining): deferred.
+- Partial RB-blocks / edge tiles: masked/predicated coopmat load/store, carried from M3.3b.
+- 2×4 and 4×4 RB variants: optional stretch; 2×2 ships; higher dims may spill registers.
+
+**AT-1733 (pre-gate, CI):** compile + spirv-val: 4 coopmat phis in ONE loop header — PASSED. Locked the N-phi single-loop codegen guarantee before kernel work.
+**AT-1734 (compile anchor, CI):** matmul_rb_coopmat.axc spirv-val clean with shipped assignments (shared_memory_bytes=2048 B).
+
+**Depends on:** M3.3b. **Blocks:** M3.4 (multi-subgroup blocking, LocalInvocationId builtin).
+
 ### M3.2b — FlashAttention-2 streaming softmax (C2, deferred from M3.2)
 
 **Why:** FA2's defining contribution — block-streaming ONLINE softmax (running max m_i, running denominator l_i, output rescale O_i ← O_i * exp(m_old-m_new) + P*V) — AVOIDS materializing the SxS score block. Deferred from M3.2 because its online-rescale arithmetic is a separate high-risk bit-exactness surface verified against C1 (`tiled_attention`) as the baseline. C2 earns the `flash_attention_v2` kernel name.
