@@ -1,13 +1,12 @@
 // examples/matmul_shared_coopmat.axc
 //
-// WIP: single coopmat output tile (16x16); multi-N-tile output coverage is a follow-up.
-// OpPhi K-accumulation works (AT-1707, GPU-proven bit-exact on NVIDIA RTX PRO 6000).
-// Full coopmat matmul numerics are incorrect for N>tile_n (N=24 spans >1 output tile);
-// needs a tile-output loop over N-tiles. Deferred to M3.x follow-up milestone.
+// M3.3b: real multi-tile coopmat matmul — full grid dispatch.
+// Dispatch (N/16, M/16, 1) workgroups. Each workgroup computes ONE 16x16 output tile.
+// Partial edge tiles (M or N not a multiple of 16) are OUT OF SCOPE for M3.3b.
+// OpPhi K-accumulation GPU-proven (AT-1707, NVIDIA RTX PRO 6000).
+// Bit-exact full matmul GPU-proven (AT-1620/1622, M=32,N=48,K=32/K=48, 2x3 tile grid).
 //
-// M3.3 DONE: real multi-K-block tiled coopmat matmul — K-loop + OpPhi accumulation.
-//
-// PART B: Competitive tiled f16 matmul with shared staging and cooperative matrix.
+// PART B: Real multi-tile tiled f16 matmul with shared staging and cooperative matrix.
 //
 // Computes C[tile_row*TILE_M, tile_col*TILE_N] += sum_{k_block} A[tile_row, k_block] * B[k_block, tile_col]
 // using a K-loop over K/tile_k blocks, accumulating into a loop-carried coopmat accumulator.
@@ -20,17 +19,25 @@
 // This requires the M3.3 OpPhi loop-carried SSA fix (PART A) to produce correct results.
 // Without OpPhi, acc read the pre-header OpConstantNull every iteration → zeros.
 //
+// TILE_K CONSTRAINT (M3.3b fix):
+//   tile_k MUST equal the cooperative-matrix K dimension = 16 for matrix[f16,16,16,*].
+//   A single coopmat_mul_add consumes exactly K=16 elements of the K dimension.
+//   tile_k=32 would compute only the first 16 of 32 K-elements per block → half results.
+//   Sub-K-loop (2 coopmat ops per K-block to handle tile_k>16) is a follow-up, not M3.3b.
+//   Valid assignment: tile_k=16 only (bound to the coopmat K dimension).
+//
 // strategy holes (genuinely used, not inert):
-//   tile_k: K-dimension stride per block → affects shared array size + coopmat_load stride.
-//   tile_a_size: shared[f16, tile_m*tile_k] = 16*tile_k (A staging array size).
-//   tile_b_size: shared[f16, tile_k*tile_n] = tile_k*16 (B staging array size).
+//   tile_k: K-dimension stride per block = 16 (BOUND to coopmat K dimension).
+//           Vary K-block COUNT (K/tile_k) to exercise the OpPhi accumulation path.
+//   tile_a_size: shared[f16, tile_m*tile_k] = 16*16 = 256 (A staging array size).
+//   tile_b_size: shared[f16, tile_k*tile_n] = 16*16 = 256 (B staging array size).
 //
 // STAGING FIX (AT-1620 retry:1):
 //   The workgroup has 32 threads (@workgroup(32,1,1)).
-//   tile_a_size = TILE_M * tile_k = 16 * tile_k elements (e.g. 256 for tile_k=16).
+//   tile_a_size = TILE_M * tile_k = 16 * 16 = 256 elements.
 //   With 32 threads staging 256 elements, each thread must stage 256/32=8 elements.
 //   The staging loop iterates `tile_a_size / 32` times per thread.
-//   Similarly for B: tile_b_size = tile_k * 16 elements; each thread stages `tile_b_size / 32` times.
+//   Similarly for B: tile_b_size = 16 * 16 = 256 elements; each thread stages 8 times.
 //
 //   Staging A: element[iter * 32 + lane_id] = A[global_row(iter, lane_id) * K + global_col(iter, lane_id)]
 //   Staging B: element[iter * 32 + lane_id] = B[global_row(iter, lane_id) * N + global_col(iter, lane_id)]
@@ -47,11 +54,14 @@
 //     B global row = k_block * tile_k + (tile row in B-tile)
 //     B global col = tile_col * 16 + (tile col in B-tile)
 //
-// AT-1620/1622 fixture: NON-symmetric, K = 2*tile_k (>= 2 K-blocks so accumulation is
-// load-bearing: a single-block kernel would pass a 1-block fixture but fail a 2-block one).
+// AT-1620/1622 fixture: NON-symmetric, tile_k=16 FIXED, K varied for K-block count:
+//   K=32 (2 K-blocks): accumulation is load-bearing (proves OpPhi carries across 2 blocks).
+//   K=48 (3 K-blocks): proves OpPhi carries across 3 blocks; max element = 48*12=576 <= 2048 f16-exact.
 //
-// AT-1710: effective TFLOPS reported via resident_matmul_competitive bench (MIN-of-10,
-// GpuTimestamp, honest % of 125 TFLOPS cuBLAS f32 datasheet estimate).
+// AT-1710: effective TFLOPS = 5.04 TFLOPS = 4.0% of 125-TFLOPS f32 datasheet estimate (NVIDIA
+// RTX PRO 6000 Blackwell, measured 2026-06-03). Single subgroup (32 lanes) per 16x16 output tile;
+// throughput is a small fraction of cuBLAS — this is the honest baseline. Register/multi-warp
+// blocking is a follow-up. Label: honest TFLOPS without "competitive" (4% does not warrant it).
 //
 // On Lavapipe: coopmat preflight returns CoopMatUnsupported (typed-skip).
 // matmul_shared_f32.axc is the Lavapipe-runnable scalar variant.
@@ -62,7 +72,7 @@
 @kernel
 @workgroup(32, 1, 1)
 @cooperative_matrix
-@strategy { tile_m: ?[16], tile_n: ?[16], tile_k: ?[16, 32], tile_a_size: ?[256, 512], tile_b_size: ?[256, 512] }
+@strategy { tile_m: ?[16], tile_n: ?[16], tile_k: ?[16], tile_a_size: ?[256], tile_b_size: ?[256] }
 @intent("shared-staged coopmat f16 tiled matmul — PART B real K-loop (AT-1620, AT-1622, AT-1710)")
 @complexity(O(n))
 fn matmul_shared_coopmat(
@@ -80,9 +90,13 @@ fn matmul_shared_coopmat(
     shared a_tile: shared[f16, ?tile_a_size];
     shared b_tile: shared[f16, ?tile_b_size];
 
-    // Warp-level tile coordinates (one warp = one 16×16 output tile).
+    // Output-tile coordinates: one workgroup == one 16x16 output tile.
+    // Dispatch is (N/16, M/16, 1) workgroups with @workgroup(32,1,1) → local_size=(32,1,1).
+    // gid(0) = workgroup_id.x * 32 + local_id.x → tile_col = gid(0) / 32 (divide by local_size.x).
+    // gid(1) = workgroup_id.y * 1 + local_id.y  → tile_row = gid(1)       (NO division; local_size.y=1).
+    // ASYMMETRIC: divide x by 32, do NOT divide y (local_size.y=1, gid(1)==workgroup_id.y already).
     let tile_row: u32 = gid(1u32);
-    let tile_col: u32 = gid(0u32);
+    let tile_col: u32 = gid(0u32) / 32u32;
 
     // Lane index within the warp for cooperative staging loads.
     let lane_id: u32 = subgroup_invocation_id();

@@ -1,0 +1,79 @@
+{
+  "verdict": "IMPLEMENTED",
+  "agent": "coder",
+  "milestone_id": "M3.3b-multitile-matmul",
+  "files_created": [
+    "crates/axc-driver/benches/resident_matmul_competitive.rs"
+  ],
+  "files_modified": [
+    "examples/matmul_shared_coopmat.axc",
+    "crates/axc-driver/tests/dispatch_shared_m32.rs",
+    "crates/axc-driver/Cargo.toml",
+    "DESIGN.md",
+    "ROADMAP.md"
+  ],
+  "public_apis_implemented": [
+    "fn bench_resident_matmul_competitive(c: &mut Criterion) — bench ID: dispatch_resident_matmul_shared_coopmat",
+    "criterion_group!(resident_matmul_competitive_benches, bench_resident_matmul_competitive);",
+    "criterion_main!(resident_matmul_competitive_benches);"
+  ],
+  "tests_written": [
+    "at1620_matmul_shared_coopmat_bit_exact_gpu (un-stubbed; #[ignore]+AXC_ENABLE_GPU_TESTS gated)",
+    "at1622_k_block_count_variation_bit_exact_gpu (replaces at1622_tile_k_variants_bit_exact_gpu; varies K-block count K=32/K=48, tile_k=16 fixed)",
+    "at1622_strategy_holes_spirv_val_only (updated: tile_k=16 only, with doc explaining tile_k=32 invalidity)",
+    "bench_resident_matmul_competitive / dispatch_resident_matmul_shared_coopmat (AT-1710)"
+  ],
+  "cargo_check_status": "pass",
+  "cargo_clippy_status": "pass — zero warnings, -D warnings clean on all workspace targets",
+  "cargo_test_status": "pass — all non-ignored workspace tests green (zero failures). Pre-existing doctest in axc-optimize ignored (pre-existing on baseline branch before any M3.3b changes).",
+  "spirv_val_status": "pass — at1620_matmul_shared_coopmat_spirv_val_only + at1622_strategy_holes_spirv_val_only (tile_k=16) both pass",
+  "tile_k_fix": {
+    "root_cause": "tile_k=32 is semantically invalid for matrix[f16,16,16,*]: one coopmat_mul_add covers exactly K=16 K-elements. A tile_k=32 single-call-per-block config computes only K=0..15 of each K-block → exactly half the correct output. GPU=[40,80,120,40], CPU=[80,160,240,80].",
+    "fix": "@strategy hole narrowed: tile_k: ?[16] (the coopmat K dimension = 16 is the only valid value).",
+    "follow_up": "Sub-K-loop (2 coopmat_mul_add calls per K-block for tile_k > 16) is M3.3c+ follow-up."
+  },
+  "at1622_fix": {
+    "old_test": "at1622_tile_k_variants_bit_exact_gpu — varied tile_k∈{16,32}; tile_k=32 was invalid",
+    "new_test": "at1622_k_block_count_variation_bit_exact_gpu — tile_k=16 FIXED, varies K∈{32,48}",
+    "k_blocks": "K=32 → 2 K-blocks; K=48 → 3 K-blocks; both tile_k=16",
+    "f16_exactness": "K=48 max element = 48×4×3=576 ≤ 2048 (f16 integer-exact limit); max_diff==0.0 holds",
+    "fixture": "M=32, N=48 (3×2 workgroup grid); integer-valued f16 (A∈{1..4}, B∈{1..3})"
+  },
+  "at1710_measured": {
+    "result": "5.04 TFLOPS = 4.0% of 125-TFLOPS f32 datasheet estimate",
+    "device": "NVIDIA RTX PRO 6000 Blackwell",
+    "date": "2026-06-03",
+    "label": "honest TFLOPS WITHOUT 'competitive' — 4% does not warrant that label",
+    "framing": "real bit-exact tensor-core matmul at 5 TFLOPS; single-subgroup-per-tile; register/multi-warp blocking is future work",
+    "timing_source": "GpuTimestamp",
+    "bench_id": "dispatch_resident_matmul_shared_coopmat"
+  },
+  "self_assessment": {
+    "spec_coverage": "All items from the M3.3b tight-fix brief implemented: tile_k bound to 16 in kernel + @strategy, AT-1622 rewritten to vary K-block count, DESIGN §3.1.16 updated with tile_k constraint + measured TFLOPS, M3.3b-coder.json verdict updated.",
+    "known_limitations": [
+      "Partial edge tiles (M or N not a multiple of 16) remain out of scope — M3.3c.",
+      "K not a multiple of tile_k: partial final K-block dropped — fixtures use K multiple of tile_k.",
+      "tile_k > 16 (sub-K-loop) not implemented — M3.3c+ follow-up.",
+      "Pre-existing doctest failure in axc-optimize/src/lib.rs — NOT introduced here, confirmed pre-existing."
+    ],
+    "deviations": []
+  },
+  "tile_index_fix_confirmed": {
+    "fix": "let tile_col: u32 = gid(0u32) / 32u32;  // was: gid(0u32)",
+    "tile_row": "let tile_row: u32 = gid(1u32);  // UNCHANGED — local_size.y=1, no division",
+    "asymmetry": "CONFIRMED ASYMMETRIC — divide x by 32 (local_size.x=32); do NOT divide y (local_size.y=1)."
+  },
+  "what_orchestrator_measures_on_nvidia": {
+    "AT-1620": "AXC_ENABLE_GPU_TESTS=1 cargo test -p axc-driver --test dispatch_shared_m32 -- --ignored at1620_matmul_shared_coopmat_bit_exact_gpu  → expects max_diff==0.0 (M=32,N=48,K=32, tile_k=16, 2 K-blocks)",
+    "AT-1622": "AXC_ENABLE_GPU_TESTS=1 cargo test -p axc-driver --test dispatch_shared_m32 -- --ignored at1622_k_block_count_variation_bit_exact_gpu  → expects max_diff==0.0 for K=32 (2 K-blocks) AND K=48 (3 K-blocks), tile_k=16",
+    "AT-1710": "AXC_ENABLE_GPU_BENCHES=1 cargo bench -p axc-driver --bench resident_matmul_competitive  → prints effective TFLOPS (honest, no asserted ratio); measured 5.04 TFLOPS on RTX PRO 6000"
+  },
+  "git_commits": [
+    "4e633d1 fix(kernel): ASYMMETRIC tile_col=gid(0)/32 — M3.3b multi-tile coopmat matmul",
+    "6df4157 test(dispatch): un-stub AT-1620/AT-1622 — bit-exact full-grid coopmat matmul",
+    "524dbfa bench(resident): re-add resident_matmul_competitive — AT-1710 honest TFLOPS",
+    "da01475 docs(roadmap): add M3.3b entry — bit-exact full matmul + honest TFLOPS",
+    "84fb077 fix(M3.3b): bind tile_k=16; AT-1622 varies K-block count not tile_k",
+    "c7abae2 docs(design): §3.1.16 tile_k=16 constraint + measured TFLOPS (5.04, 4.0%)"
+  ]
+}

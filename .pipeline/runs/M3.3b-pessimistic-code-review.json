@@ -1,0 +1,45 @@
+{
+  "verdict": "APPROVE",
+  "agent": "pessimistic_code_reviewer",
+  "milestone_id": "M3.3b",
+  "branch": "coder/M33b-20260603-1200/M3.3b-multitile-matmul",
+  "scope": "git diff main..HEAD",
+  "critical_bugs": [],
+  "warnings": [
+    {
+      "description": "32-lane staging math (ei = iter*32 + lane_id, a_iters/b_iters = tile_size/32) assumes subgroup_size==32. This is SAFE because prepare_kernel_checked enforces `subgroup_size != 32 -> CoopMatUnsupported` (context.rs:854), so the kernel never dispatches on wave64/SIMD16 devices. Documented as M3.3b NVIDIA scope; AMD/Intel/Apple receive a typed-skip rather than silent wrong output. Not a defect, but the staging coverage is correct ONLY under that guard.",
+      "file": "examples/matmul_shared_coopmat.axc",
+      "line": "108-152"
+    },
+    {
+      "description": "Partial edge tiles (M or N not a multiple of 16) are out of scope; the kernel performs no bounds clamping on global loads/stores. Fixtures (M=32,N=48,K=32/48; bench 256^3) are all multiples of 16 so no OOB occurs, but a future non-multiple-of-16 dispatch would read/write OOB. Documented as out of scope in both the kernel header and AT-1620/1622 comments.",
+      "file": "examples/matmul_shared_coopmat.axc",
+      "line": "5, 131-152, 172-173"
+    },
+    {
+      "description": "resident_matmul_competitive bench at 256^3 with values {1..4}x{1..3} reaches max element 256*4*3=3072 > 2048 (f16 integer-exact limit), so the f16 result is NOT bit-exact there. This is harmless: the bench asserts ONLY `tflops>0 && finite` (no correctness/ratio assertion), it is a pure timing bench. Correctness is proven separately by AT-1620/1622 where the exactness bound holds (<=576).",
+      "file": "crates/axc-driver/benches/resident_matmul_competitive.rs",
+      "line": "204-205, 283-286"
+    }
+  ],
+  "index_math_check": "PASS",
+  "staging_index_check": "PASS",
+  "tile_k_honesty_check": "PASS",
+  "honesty_gate_check": "PASS",
+  "codegen_regression_check": "PASS",
+  "spirv_val_check": "PASS",
+  "ub_check": "PASS",
+  "race_condition_check": "PASS",
+  "vendor_divergence_check": "PASS",
+  "memory_limit_check": "PASS",
+  "findings": {
+    "item1_index_and_staging": "tile_col=gid(0)/32, tile_row=gid(1) is correct for dispatch (N/16,M/16,1) with @workgroup(32,1,1): gid(0)=wg_id.x*32+local.x in [wg.x*32, wg.x*32+32) -> /32 = wg_id.x = tile_col in [0,N/16); gid(1)=wg_id.y (local_size.y=1, no division) = tile_row in [0,M/16). NOT transposed: c_base=(tile_row*16)*N + tile_col*16 maps to C[M,N] row-major correctly; the non-symmetric M=32,N=48 fixture (orchestrator-confirmed max_diff=0) catches any transpose. STAGING verified for ALL grid tiles: A: a_global_row=tile_row*16 + ei/tile_k, a_global_col=k_block*tile_k + ei%tile_k, a_global=row*K+col (row-major A[M,K]); B: b_global_row=k_block*tile_k + ei/16, b_global_col=tile_col*16 + ei%16, b_global=row*N+col (row-major B[K,N]). ei=iter*32+lane covers 0..256 exactly once over 8 iters x 32 lanes; nothing hardcoded to tile (0,0) -- every index is parametrized on (tile_row, tile_col, k_block, lane). a_tile/b_tile linear store index == coopmat_load stride (tile_k for A, 16 for B). Correct for all tiles in the grid.",
+    "item2_tile_k_binding": "tile_k=32 is genuinely invalid: one coopmat_mul_add over matrix[f16,16,16,*] consumes exactly K=16; tile_k=32 with one call per block computes only the first 16 of 32 K-elements. @strategy hole narrowed to ?[16] (line 75). NO test assigns tile_k=32 (all tile_assignments calls use 16; line 699 uses TILE_K const = 16). AT-1622 varies K-block COUNT via the matrix K dimension (K=32 -> 2 blocks, K=48 -> 3 blocks) with tile_k FIXED at 16 -- genuinely load-bearing for OpPhi accumulation. K=48 f16-exact: max element = 48*4*3 = 576 <= 2048.",
+    "item3_at1620_at1622_real": "Both are real #[ignore]+AXC_ENABLE_GPU_TESTS-gated GPU dispatches, NOT stubs. Both assert max_diff == 0.0 (exact equality, not tolerance) vs cpu_f16_matmul_reference over the FULL grid (dispatch (N/16,M/16,1)=(3,2,1), 6 output tiles). Honesty gate present in both assert messages: 'do NOT relax tolerance or shrink fixture'. CoopMatUnsupported -> typed-skip (Lavapipe). spirv-val anchors (at1620/at1622_strategy_holes spirv_val_only) PASS.",
+    "item4_at1710_honest": "Bench reports bare effective_tflops + % of 125-TFLOPS datasheet ESTIMATE (labeled estimate, not same-machine A/B). Asserts ONLY tflops>0 && finite -- NO ratio assertion. 'competitive' OMITTED unless pct>=25.0 (measured 4.0% withholds it). 2D grid pre-check verifies BOTH max_compute_work_group_count[0] (N/16) AND [1] (M/16). CpuFenceWall path omits % and appends scheduling-inclusive qualifier (AT-1582). No misleading number.",
+    "item5_no_codegen_no_regression": "git diff main..HEAD -- crates/*/src/ is EMPTY (0 lines). No codegen/library change whatsoever. All non-GPU tests pass (8 passed, 6 GPU #[ignore]-gated): AT-1606/1621/1630/1707 + spirv-val anchors unaffected. Existing bench resident_matmul.rs unchanged; new bench ID dispatch_resident_matmul_shared_coopmat is additive. No new library code, hence no unwrap/panic in lib (expect() calls are bench-only, acceptable).",
+    "item6_edge": "256^3 bench = 16x16 = 256 workgroups, both axes pre-checked against device limits and halved together until they fit; 50GB cap (2*M*K + 2*K*N + 2*M*N bytes) asserted in bench before allocation (256^3 ~ 393KB, well under). m/n shrink by /2 with m>=16 && n>=16 floor (stays multiple of 16). No 50GB risk."
+  },
+  "most_dangerous_remaining_issue": "Absence of partial-tile bounds checking: the kernel does unconditional global loads/stores assuming M and N are exact multiples of 16. It is correct and bit-exact for all in-scope fixtures, but a future caller dispatching a non-multiple-of-16 matrix (or a partial edge tile) would silently read/write out of bounds with no compile-time or runtime guard. This is documented as out-of-scope for M3.3b, so it does not block APPROVE, but it is the sharpest latent hazard and must be the first guard added before the kernel is exposed to general-dimension dispatch (M3.3c+).",
+  "summary": "M3.3b APPROVED. Multi-tile coopmat matmul index math is correct (asymmetric tile_col=gid(0)/32, tile_row=gid(1) for dispatch (N/16,M/16,1) with @workgroup(32,1,1)); not transposed; staging A/B global-index math is parametrized on (tile_row,tile_col,k_block,lane) and correct for ALL grid tiles, not just (0,0). tile_k honestly bound to 16 (?[16]), tile_k=32 excluded as semantically invalid and tested nowhere; AT-1622 varies K-block count (K=32/48, both f16-exact <=576). AT-1620/1622 are real GPU bit-exact tests (max_diff==0.0, full grid, honesty gate, no tolerance relaxation). AT-1710 is honest: bare TFLOPS + % of labeled datasheet estimate, no ratio assertion, 'competitive' withheld at 4%, 2D grid pre-check, CpuFenceWall flagged. Zero codegen/library diff -> no regression; existing tests pass, bench IDs additive. 32-lane staging assumption is guarded by prepare_kernel_checked's subgroup_size!=32 -> CoopMatUnsupported (context.rs:854), so non-32 vendors typed-skip rather than producing wrong results. 50GB cap honored. No UB/races within in-scope (multiple-of-16) dispatches. Only latent hazard is the absence of partial-tile bounds checks, explicitly out of scope for M3.3b."
+}

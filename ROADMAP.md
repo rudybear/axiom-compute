@@ -109,6 +109,34 @@ Goal: prove the DESIGN.md §5 kill-criteria gates with publishable numbers, not 
 
 **Depends on:** M3.2. **Blocks:** full competitive matmul + M3.4 llama.cpp A/B (NVIDIA half needs the working tensor-core matmul).
 
+### M3.3b — multi-tile coopmat matmul: bit-exact full matmul + honest effective-TFLOPS (2026-06-03)
+
+**Root cause (corrected from M3.3 deferral):** M3.3 misdiagnosed the multi-tile gap as "needs a multi-N-tile output loop." The actual causes were: (a) test dispatched (1,1,1) against N=24 (only tile (0,0) ran); (b) kernel recovered `tile_col = gid(0)` directly — the GLOBAL invocation id, not the output-tile index. The idiomatic GPU tiling: ONE workgroup == ONE output tile; dispatch a GRID of workgroups (the grid IS the output-tile loop). No per-kernel output loop needed.
+
+**Kernel fix (one line, ASYMMETRIC):**
+- `tile_col = gid(0) / 32` (divide by local_size.x=32; all 32 lanes of a workgroup collapse to one tile_col).
+- `tile_row = gid(1)` — UNCHANGED (local_size.y=1 so gid(1)==workgroup_id.y; NO division).
+- Dispatch: (N/16, M/16, 1) workgroups.
+- NO codegen change. OpUDiv already emitted; all builtins and coopmat paths GPU-proven in M3.2/M3.3.
+
+**AT-1620/1622 UN-STUBBED (bit-exact full matmul on NVIDIA):**
+- Non-symmetric multiple-of-16 fixture: M=32, N=48, K=32 (3x2 workgroup grid, 2 K-blocks).
+- Integer-valued f16 (A∈{1..4}, B∈{1..3}; per-element sum ≤ 384, f16-exact) → max_diff == 0.0.
+- **AT-1620 bit-exact (max_diff=0) on NVIDIA RTX PRO 6000** — the full multi-tile matmul works.
+- `tile_k` is bound to the coopmat K dimension (**16**): one `coopmat_mul_add` consumes exactly K=16, so `tile_k=32` is semantically invalid (it computed exactly HALF — a single coopmat op over a 32-wide K-block reads only K=0..15). AT-1622 therefore varies the **K-block COUNT** (K=32 → 2 blocks, K=48 → 3 blocks; tile_k=16 fixed) — both **bit-exact**, genuinely exercising the OpPhi K-loop. A `tile_k>16` sub-K-loop is a follow-up.
+- Lavapipe: typed-skip (CoopMatUnsupported); matmul_shared_f32.axc (AT-1621) unaffected.
+
+**AT-1710 honest effective-TFLOPS (resident_matmul_competitive.rs re-added):**
+- Large matmul M=N=K=256 (default), full 16x16 tile grid, upload-once/dispatch-N (MIN-of-10, GpuTimestamp).
+- Reports effective_tflops = 2·M·N·K / kernel_ns + % of 125-TFLOPS f32 datasheet ESTIMATE.
+- NO ratio asserted (only tflops>0 && finite). With single 32-lane subgroup per 16x16 tile, throughput is MODEST — that is the honest deliverable.
+- "competitive" label omitted unless measured % >= 25%. CpuFenceWall path omits % + carries scheduling-inclusive qualifier.
+- 2D grid pre-check: both max_compute_work_group_count()[0] AND [1] checked; shrink M and N together if needed.
+
+**Out of scope (follow-up M3.3c):** partial edge tiles (M or N not a multiple of 16); K not a multiple of tile_k.
+
+**Depends on:** M3.3. **Blocks:** M3.4 llama.cpp A/B (tensor-core matmul now correctly computes full outputs).
+
 ### M3.2b — FlashAttention-2 streaming softmax (C2, deferred from M3.2)
 
 **Why:** FA2's defining contribution — block-streaming ONLINE softmax (running max m_i, running denominator l_i, output rescale O_i ← O_i * exp(m_old-m_new) + P*V) — AVOIDS materializing the SxS score block. Deferred from M3.2 because its online-rescale arithmetic is a separate high-risk bit-exactness surface verified against C1 (`tiled_attention`) as the baseline. C2 earns the `flash_attention_v2` kernel name.

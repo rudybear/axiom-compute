@@ -10,22 +10,24 @@
 //!          Expected C = K_ITER × (A·B). If PASS: OpPhi accumulation is numerically correct;
 //!          the AT-1620 bug was in staging coverage (now fixed). Typed-skip on Lavapipe.
 //!
-//! AT-1620 (M3.3 retry:2 — QUARANTINED): matmul_shared_coopmat.axc — full coopmat matmul
-//!          numerics are INCORRECT for N>tile_n. The M=16, N=24, K=32 fixture spans >1
-//!          coopmat output N-tile (N=24 needs 2 N-tiles of width 16); the single-tile kernel
-//!          only computes outputs for N=0..15. Needs multi-N-tile output coverage (tile-output
-//!          loop) — deferred to follow-up milestone. NOT a compiler bug: OpPhi accumulation
-//!          is GPU-proven correct via AT-1707. Compile + spirv-val anchor retained.
-//!          GPU bit-exact test converted to empty #[ignore] stub (at1620_..._wip).
+//! AT-1620 (M3.3b — UN-STUBBED): matmul_shared_coopmat.axc — full multi-tile coopmat matmul,
+//!          bit-exact on NVIDIA over M=32, N=48, K=32 (non-symmetric multiple-of-16 fixture,
+//!          3x2 workgroup grid, 2 K-blocks). Dispatch (N/16, M/16, 1) = (3, 2, 1) workgroups.
+//!          tile_col = gid(0)/32 (M3.3b fix; ASYMMETRIC: tile_row = gid(1), no division).
+//!          max_diff == 0.0 vs cpu_f16_matmul_reference. Typed-skip on Lavapipe (CoopMatUnsupported).
+//!          Partial edge tiles (M or N not a multiple of 16) remain out of scope.
 //!
 //! AT-1621 (M3.3): matmul_shared_f32.axc — UPGRADED to bit-exact GPU dispatch on Lavapipe
 //!          and NVIDIA. Index-math bug fixed (gid(1) used for both tile_row and local_row —
 //!          corrected to derive tile_row = gid(1)/16, local_row = gid(1)%16).
 //!
-//! AT-1622 (M3.3 retry:2 — QUARANTINED): @strategy holes tile_k=16 AND tile_k=32 produce
-//!          structurally different SPIR-V (proven by spirv-val anchor). Full numeric bit-exact
-//!          verification deferred — same multi-N-tile coverage gap as AT-1620.
-//!          GPU bit-exact test converted to empty #[ignore] stub (at1622_..._wip).
+//! AT-1622 (M3.3b — FIXED): K-block-count variation bit-exact — tile_k=16 FIXED (bound to
+//!          coopmat K dimension=16; tile_k=32 is semantically invalid for matrix[f16,16,16,*]
+//!          since one coopmat_mul_add covers only K=16 → half results at tile_k=32).
+//!          Instead varies K-block COUNT: K=32 (2 K-blocks) AND K=48 (3 K-blocks), both with
+//!          tile_k=16. Proves the OpPhi K-loop accumulation is bit-exact for different trip counts
+//!          (the genuinely load-bearing variation). max_diff == 0.0 for both.
+//!          Typed-skip on Lavapipe (CoopMatUnsupported).
 //!
 //! AT-1630 (M3.3): tiled_attention.axc — UPGRADED to bit-exact within 1e-3 GPU dispatch.
 //!          Fixed dispatch geometry: (seq_len,1,1) workgroups. CPU reference uses the
@@ -542,74 +544,244 @@ fn at1620_matmul_shared_coopmat_spirv_val_only() {
     eprintln!("AT-1620: matmul_shared_coopmat.axc compiles + spirv-val clean (M3.3)");
 }
 
-/// AT-1620 GPU: M3.x WIP — full coopmat matmul numerics incorrect for N>tile_n.
+/// AT-1620 GPU (M3.3b): full multi-tile coopmat matmul bit-exact on NVIDIA.
 ///
-/// The fixture M=16, N=24, K=32 spans more than one 16-wide coopmat output N-tile
-/// (N=24 needs ceil(24/16)=2 N-tiles). The single-tile kernel only computes outputs
-/// for N=0..15; the second N-tile and the overall tiling structure are wrong.
+/// Non-symmetric multiple-of-16 fixture: M=32, N=48, K=32.
+/// Dispatch (N/16, M/16, 1) = (3, 2, 1) workgroups — 6 output tiles covering all of C(32x48).
+/// tile_k=16 → 2 K-blocks (accumulation load-bearing).
 ///
-/// DEFERRED to a follow-up milestone that adds a tile-output loop over N-tiles.
-/// OpPhi K-accumulation itself is GPU-proven correct via AT-1707 (PASS bit-exact).
+/// Integer-valued f16 fixture: A[i,k]=(i*K+k)%4+1 ∈ {1..4}, B[k,j]=(k*N+j)%3+1 ∈ {1..3}.
+/// Per-element sum ≤ 32*12 = 384, exactly representable in f16 → max_diff == 0.0.
 ///
-/// This test is intentionally REMOVED from GPU dispatch to avoid shipping a
-/// wrong-computing bit-exact assertion as passing.
-/// Compile + spirv-val anchor is retained as at1620_matmul_shared_coopmat_spirv_val_only.
+/// The tile_col=gid(0)/32 fix (M3.3b, ASYMMETRIC) is what makes the full grid correct.
+/// Typed-skip on CoopMatUnsupported (Lavapipe). #[ignore]+AXC_ENABLE_GPU_TESTS gated.
+/// Partial edge tiles (M or N not a multiple of 16) are out of scope.
 #[test]
 #[ignore]
-fn at1620_matmul_shared_coopmat_bit_exact_gpu_wip() {
-    // M3.x WIP: full coopmat matmul numerics incorrect for N>tile_n (N=24 spans >1 output tile).
-    // Needs multi-N-tile output coverage (tile-output loop); OpPhi accumulation works (AT-1707).
-    // This test body intentionally does nothing — it is quarantined, not deleted,
-    // so the AT-1620 label remains visible in the test suite as a deferred item.
+fn at1620_matmul_shared_coopmat_bit_exact_gpu() {
+    if !gpu_tests_enabled() {
+        eprintln!("AT-1620: AXC_ENABLE_GPU_TESTS not set; skipping");
+        return;
+    }
+    const M: usize = 32;
+    const N: usize = 48;
+    const K: usize = 32;
+
+    let assignments = tile_assignments(16, 16, 16);
+    let (bytes, meta) = compile_source_with_assignments(MATMUL_SHARED_COOPMAT_SRC, &assignments)
+        .expect("AT-1620: matmul_shared_coopmat.axc must compile");
+    let words: Vec<u32> = bytes.chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+
+    let ctx = VulkanContext::new().expect("AT-1620: VulkanContext must init");
+    eprintln!("AT-1620: device={}", ctx.physical_device_name());
+
+    let handle = match ctx.prepare_kernel_checked(
+        &words, &meta.binding_plan, meta.push_constant_total_bytes,
+        &meta.entry_point, meta.coopmat.as_ref(), "matmul_shared_coopmat",
+        meta.shared_memory_bytes,
+    ) {
+        Ok(h) => h,
+        Err(DispatchError::CoopMatUnsupported { reason, .. }) => {
+            eprintln!("AT-1620: CoopMatUnsupported (typed-skip on Lavapipe): {reason}");
+            return;
+        }
+        Err(DispatchError::DeviceFeatureUnsupported { feature, .. }) => {
+            eprintln!("AT-1620: DeviceFeatureUnsupported({feature}) — typed-skip");
+            return;
+        }
+        Err(e) => panic!("AT-1620: prepare_kernel_checked failed: {e}"),
+    };
+
+    // Integer-valued f16 fixture: exact in f16 (per-element sum <= 384 < 2048).
+    // A[i,k] = (i*K + k) % 4 + 1; B[k,j] = (k*N + j) % 3 + 1.
+    let a_f32: Vec<f32> = (0..M * K).map(|idx| ((idx % 4) + 1) as f32).collect();
+    let b_f32: Vec<f32> = (0..K * N).map(|idx| ((idx % 3) + 1) as f32).collect();
+    let a_bytes = f32_slice_to_f16_le_bytes(&a_f32);
+    let b_bytes = f32_slice_to_f16_le_bytes(&b_f32);
+    let c_size = M * N * 2; // f16 output
+
+    // Dispatch the FULL grid: (N/16, M/16, 1) = (3, 2, 1).
+    let wg_x = (N / 16) as u32;
+    let wg_y = (M / 16) as u32;
+    let pc = push_mnk(M as u32, N as u32, K as u32);
+
+    let outputs = ctx.dispatch_handle(
+        &handle, (wg_x, wg_y, 1),
+        &[&a_bytes, &b_bytes, &vec![0u8; c_size]],
+        &[0, 0, c_size],
+        &pc,
+    ).unwrap_or_else(|e| panic!("AT-1620: dispatch failed: {e}"));
+
+    let gpu_c = f16_le_bytes_to_f32_slice(&outputs[2]);
+    let cpu_c = cpu_f16_matmul_reference(&a_f32, &b_f32, M, N, K);
+
+    let mut max_diff = 0.0_f32;
+    for (g, c) in gpu_c.iter().zip(cpu_c.iter()) {
+        let diff = (g - c).abs();
+        if diff > max_diff { max_diff = diff; }
+    }
+
     eprintln!(
-        "AT-1620 WIP: full coopmat matmul numerics incorrect for N>tile_n — \
-         needs multi-N-tile output coverage (16x24 fixture spans >1 coopmat output tile). \
-         OpPhi K-accumulation is GPU-proven correct via AT-1707. \
-         Deferred to follow-up milestone."
+        "AT-1620: max_diff={max_diff}, dispatch=({wg_x},{wg_y},1), \
+         first4 GPU={:?}, CPU={:?}",
+        &gpu_c[..4.min(gpu_c.len())],
+        &cpu_c[..4.min(cpu_c.len())]
+    );
+
+    assert!(
+        max_diff == 0.0,
+        "AT-1620: full multi-tile coopmat matmul FAILED — max_diff={max_diff} != 0.\n\
+         HONESTY GATE: do NOT relax tolerance or shrink fixture.\n\
+         Dispatch=({wg_x},{wg_y},1), M={M} N={N} K={K}. First4 GPU: {:?}, CPU: {:?}",
+        &gpu_c[..4.min(gpu_c.len())],
+        &cpu_c[..4.min(cpu_c.len())]
+    );
+    eprintln!(
+        "AT-1620 PASS: full multi-tile coopmat matmul bit-exact (max_diff=0.0) \
+         on {} — M={M} N={N} K={K}, dispatch=({wg_x},{wg_y},1)",
+        ctx.physical_device_name()
     );
 }
 
-/// AT-1622 structural guard: tile_k=16 and tile_k=32 produce different SPIR-V (compile anchor).
+/// AT-1622 structural guard: tile_k=16 (the only valid coopmat-K assignment) compiles + spirv-val clean.
+///
+/// tile_k=32 is NOT tested here: a 16×16×16 coopmat_mul_add covers exactly K=16 per call;
+/// tile_k=32 as a single-call-per-block config is semantically invalid (computes only K=16
+/// of K=32 per block → half results). Sub-K-loop support is a follow-up (M3.3c+).
+/// The valid K-block count variation (K=32 and K=48 with tile_k=16) is tested in
+/// at1622_k_block_count_variation_bit_exact_gpu.
 #[test]
 fn at1622_strategy_holes_spirv_val_only() {
     use spirv_tools::val::{Validator, create as create_validator};
     use spirv_tools::TargetEnv;
 
-    for &tk in &[16i64, 32i64] {
-        let assignments = tile_assignments(16, 16, tk);
-        let (bytes, _meta) = compile_source_with_assignments(MATMUL_SHARED_COOPMAT_SRC, &assignments)
-            .unwrap_or_else(|e| panic!("AT-1622: tile_k={tk} compile failed: {e:?}"));
-        let words: Vec<u32> = bytes.chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-        let validator = create_validator(Some(TargetEnv::Vulkan_1_1));
-        validator.validate(&words, None)
-            .unwrap_or_else(|e| panic!("AT-1622: tile_k={tk} spirv-val must pass: {e}"));
-        eprintln!("AT-1622: tile_k={tk} compiles + spirv-val clean");
-    }
-    eprintln!("AT-1622: both tile_k variants spirv-val clean (M3.3)");
+    // tile_k=16: the only valid assignment — bound to the coopmat K dimension.
+    let assignments = tile_assignments(16, 16, 16);
+    let (bytes, _meta) = compile_source_with_assignments(MATMUL_SHARED_COOPMAT_SRC, &assignments)
+        .unwrap_or_else(|e| panic!("AT-1622: tile_k=16 compile failed: {e:?}"));
+    let words: Vec<u32> = bytes.chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let validator = create_validator(Some(TargetEnv::Vulkan_1_1));
+    validator.validate(&words, None)
+        .unwrap_or_else(|e| panic!("AT-1622: tile_k=16 spirv-val must pass: {e}"));
+    eprintln!("AT-1622: tile_k=16 compiles + spirv-val clean (the only valid coopmat-K assignment)");
 }
 
-/// AT-1622 GPU: M3.x WIP — @strategy tile_k holes produce different SPIR-V (proven via
-/// at1622_strategy_holes_spirv_val_only), but numeric correctness of each variant is
-/// deferred because the kernel has wrong output coverage for N>tile_n.
+/// AT-1622 GPU (M3.3b — FIXED): K-block-count variation bit-exact on NVIDIA.
 ///
-/// Both tile_k=16 and tile_k=32 compile to spirv-val-clean SPIR-V (see non-ignored anchor).
-/// Full numeric verification requires multi-N-tile output coverage (follow-up milestone).
-/// OpPhi K-accumulation is GPU-proven correct via AT-1707.
+/// tile_k is FIXED at 16 (bound to the coopmat K dimension: a 16×16×16 coopmat_mul_add
+/// covers exactly K=16 per call; tile_k=32 with one call per block is semantically invalid
+/// and produces GPU=[half of correct] — the original AT-1622 FAIL).
 ///
-/// This test is intentionally empty — quarantined to keep the AT-1622 label visible
-/// as a deferred item without shipping a wrong-computing bit-exact assertion.
+/// The genuinely-meaningful variation is the K-block COUNT (K / tile_k):
+///   K=32, tile_k=16 → 2 K-blocks: accumulation load-bearing (proves OpPhi carries across 2 blocks).
+///   K=48, tile_k=16 → 3 K-blocks: proves OpPhi carries across 3 blocks.
+///
+/// f16-exactness bound for K=48: max element = 48 × max(A) × max(B) = 48 × 4 × 3 = 576 ≤ 2048
+/// (f16 integer-exact limit). max_diff == 0.0 holds for both K=32 and K=48.
+///
+/// Non-symmetric fixture M=32, N=48 (3x2 workgroup grid covers all of C(32×48)).
+/// Typed-skip on CoopMatUnsupported (Lavapipe). #[ignore]+AXC_ENABLE_GPU_TESTS gated.
 #[test]
 #[ignore]
-fn at1622_tile_k_variants_bit_exact_gpu_wip() {
-    // M3.x WIP: @strategy tile_k holes emit different valid SPIR-V (proven by spirv-val anchor).
-    // Numeric correctness for N>tile_n deferred — needs multi-N-tile output loop.
-    // OpPhi accumulation works (AT-1707). Deferred to follow-up milestone.
+fn at1622_k_block_count_variation_bit_exact_gpu() {
+    if !gpu_tests_enabled() {
+        eprintln!("AT-1622: AXC_ENABLE_GPU_TESTS not set; skipping");
+        return;
+    }
+    const M: usize = 32;
+    const N: usize = 48;
+    // tile_k is fixed at 16 — bound to the coopmat K dimension.
+    const TILE_K: usize = 16;
+
+    // Compile once: tile_k=16 is the only valid assignment.
+    let assignments = tile_assignments(16, 16, TILE_K as i64);
+    let (bytes, meta) = compile_source_with_assignments(MATMUL_SHARED_COOPMAT_SRC, &assignments)
+        .expect("AT-1622: tile_k=16 compile must succeed");
+    let words: Vec<u32> = bytes.chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+
+    let ctx = VulkanContext::new().expect("AT-1622: VulkanContext must init");
+    eprintln!("AT-1622: device={}", ctx.physical_device_name());
+
+    let handle = match ctx.prepare_kernel_checked(
+        &words, &meta.binding_plan, meta.push_constant_total_bytes,
+        &meta.entry_point, meta.coopmat.as_ref(), "matmul_shared_coopmat",
+        meta.shared_memory_bytes,
+    ) {
+        Ok(h) => h,
+        Err(DispatchError::CoopMatUnsupported { reason, .. }) => {
+            eprintln!("AT-1622: CoopMatUnsupported (typed-skip on Lavapipe): {reason}");
+            return;
+        }
+        Err(DispatchError::DeviceFeatureUnsupported { feature, .. }) => {
+            eprintln!("AT-1622: DeviceFeatureUnsupported({feature}) — typed-skip");
+            return;
+        }
+        Err(e) => panic!("AT-1622: prepare_kernel_checked failed: {e}"),
+    };
+
+    // Full dispatch grid: (N/16, M/16, 1) = (3, 2, 1).
+    let wg_x = (N / 16) as u32;
+    let wg_y = (M / 16) as u32;
+
+    // Vary K to exercise different K-block counts (K / TILE_K).
+    // K=32 → 2 K-blocks (load-bearing accumulation over 2 blocks).
+    // K=48 → 3 K-blocks (proves OpPhi carries correctly over 3 blocks).
+    // f16-exactness: max element = K × 4 × 3 ≤ 48 × 12 = 576 ≤ 2048 (f16 integer-exact limit).
+    for &k in &[32_usize, 48_usize] {
+        let k_blocks = k / TILE_K;
+        // Integer-valued f16 fixture: A[idx]=(idx%4)+1 ∈ {1..4}, B[idx]=(idx%3)+1 ∈ {1..3}.
+        let a_f32: Vec<f32> = (0..M * k).map(|idx| ((idx % 4) + 1) as f32).collect();
+        let b_f32: Vec<f32> = (0..k * N).map(|idx| ((idx % 3) + 1) as f32).collect();
+        let a_bytes = f32_slice_to_f16_le_bytes(&a_f32);
+        let b_bytes = f32_slice_to_f16_le_bytes(&b_f32);
+        let c_size = M * N * 2; // f16 output
+        let cpu_c = cpu_f16_matmul_reference(&a_f32, &b_f32, M, N, k);
+        let pc = push_mnk(M as u32, N as u32, k as u32);
+
+        let outputs = ctx.dispatch_handle(
+            &handle, (wg_x, wg_y, 1),
+            &[&a_bytes, &b_bytes, &vec![0u8; c_size]],
+            &[0, 0, c_size],
+            &pc,
+        ).unwrap_or_else(|e| panic!("AT-1622: K={k}: dispatch failed: {e}"));
+
+        let gpu_c = f16_le_bytes_to_f32_slice(&outputs[2]);
+
+        let mut max_diff = 0.0_f32;
+        for (g, c) in gpu_c.iter().zip(cpu_c.iter()) {
+            let diff = (g - c).abs();
+            if diff > max_diff { max_diff = diff; }
+        }
+
+        eprintln!(
+            "AT-1622: K={k} ({k_blocks} K-blocks), max_diff={max_diff}, \
+             first4 GPU={:?}, CPU={:?}",
+            &gpu_c[..4.min(gpu_c.len())],
+            &cpu_c[..4.min(cpu_c.len())]
+        );
+
+        assert!(
+            max_diff == 0.0,
+            "AT-1622: K={k} ({k_blocks} K-blocks) FAILED — max_diff={max_diff} != 0.\n\
+             HONESTY GATE: do NOT relax tolerance or shrink fixture.\n\
+             tile_k={TILE_K} (fixed), M={M} N={N}, dispatch=({wg_x},{wg_y},1).\n\
+             First4 GPU: {:?}, CPU: {:?}",
+            &gpu_c[..4.min(gpu_c.len())],
+            &cpu_c[..4.min(cpu_c.len())]
+        );
+        eprintln!(
+            "AT-1622 K={k} ({k_blocks} K-blocks) PASS: bit-exact (max_diff=0.0) \
+             on {} — M={M} N={N} tile_k={TILE_K}",
+            ctx.physical_device_name()
+        );
+    }
     eprintln!(
-        "AT-1622 WIP: tile_k @strategy holes produce structurally different SPIR-V (spirv-val-proven). \
-         Numeric bit-exact verification deferred — kernel has wrong output coverage for N>tile_n. \
-         OpPhi K-accumulation is GPU-proven correct via AT-1707. \
-         Follow-up: add multi-N-tile output loop."
+        "AT-1622 PASS: K-block-count variation (K=32/2-blocks, K=48/3-blocks) \
+         both bit-exact on {} — tile_k={TILE_K} fixed (coopmat K dimension)",
+        ctx.physical_device_name()
     );
 }
 
