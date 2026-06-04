@@ -1,0 +1,71 @@
+{
+  "verdict": "IMPLEMENTED",
+  "agent": "coder",
+  "milestone_id": "M3.3b-multitile-matmul",
+  "files_created": [
+    "crates/axc-driver/benches/resident_matmul_competitive.rs"
+  ],
+  "files_modified": [
+    "examples/matmul_shared_coopmat.axc",
+    "crates/axc-driver/tests/dispatch_shared_m32.rs",
+    "crates/axc-driver/Cargo.toml",
+    "ROADMAP.md"
+  ],
+  "public_apis_implemented": [
+    "fn bench_resident_matmul_competitive(c: &mut Criterion) — bench ID: dispatch_resident_matmul_shared_coopmat",
+    "criterion_group!(resident_matmul_competitive_benches, bench_resident_matmul_competitive);",
+    "criterion_main!(resident_matmul_competitive_benches);"
+  ],
+  "tests_written": [
+    "at1620_matmul_shared_coopmat_bit_exact_gpu (un-stubbed from _wip; #[ignore]+AXC_ENABLE_GPU_TESTS gated)",
+    "at1622_tile_k_variants_bit_exact_gpu (un-stubbed from _wip; #[ignore]+AXC_ENABLE_GPU_TESTS gated)",
+    "bench_resident_matmul_competitive / dispatch_resident_matmul_shared_coopmat (AT-1710)"
+  ],
+  "cargo_check_status": "pass",
+  "cargo_clippy_status": "pass — zero warnings, -D warnings clean on all workspace targets",
+  "spirv_val_status": "pass — at1620_matmul_shared_coopmat_spirv_val_only + at1622_strategy_holes_spirv_val_only both pass (AT-1720)",
+  "cargo_test_status": "pass — all non-ignored workspace tests green (zero failures). Pre-existing doctest failure in axc-optimize (doc example uses unbound `kernel` variable) confirmed pre-existing on the baseline branch before any M3.3b changes.",
+  "self_assessment": {
+    "spec_coverage": "All items from M3.3b-architect.json implemented: kernel tile_col fix (1 line, ASYMMETRIC), AT-1620/AT-1622 un-stubbed with real bit-exact GPU dispatch, AT-1710 TFLOPS bench re-added, DESIGN §3.1.16 (already present from prior architect pass), ROADMAP M3.3b entry added.",
+    "known_limitations": [
+      "Partial edge tiles (M or N not a multiple of 16) remain out of scope — documented in kernel header and ROADMAP. Follow-up M3.3c.",
+      "K not a multiple of tile_k drops the partial final K-block — documented as precondition. Fixtures use K multiple of tile_k.",
+      "Pre-existing doctest failure in axc-optimize/src/lib.rs (doc example uses unbound `kernel` symbol) — NOT introduced by M3.3b, confirmed pre-existing on baseline branch."
+    ],
+    "deviations": [
+      "DESIGN §3.1.16 was already present in DESIGN.md from the prior architect run (ebca99e). No re-write was needed; this is not a deviation but an observation."
+    ],
+    "honesty_gate": "HONESTY GATE ACKNOWLEDGED. AT-1620/AT-1622 are compiled correctly by construction (tile_col=gid(0)/32 is the mathematically correct fix, verified by the pessimistic reviewer against the actual builtins). The orchestrator will measure max_diff==0.0 on NVIDIA. If max_diff != 0.0 on NVIDIA, the assert will surface the blocker rather than relax tolerance or shrink fixture. The test explicitly carries the HONESTY GATE message in its panic string."
+  },
+  "tile_index_fix_confirmed": {
+    "fix": "let tile_col: u32 = gid(0u32) / 32u32;  // was: gid(0u32)",
+    "tile_row": "let tile_row: u32 = gid(1u32);  // UNCHANGED — local_size.y=1, no division",
+    "asymmetry": "CONFIRMED ASYMMETRIC — divide x by 32 (local_size.x=32); do NOT divide y (local_size.y=1). Derivation: @workgroup(32,1,1) + dispatch (N/16,M/16,1): gid(0)=wx*32+lx so gid(0)/32=wx=tile_col; gid(1)=wy*1+0=wy=tile_row. All 32 lanes of a workgroup compute tile_col=(wx*32+lane)/32==wx since lane<32. NOT symmetrized with the matmul_shared_f32.axc pattern (@workgroup(16,16,1) divides BOTH axes by 16 — that is a DISTRACTOR; not copied here)."
+  },
+  "at1620_at1622_dispatch_grid": {
+    "fixture": "M=32, N=48, K=32 (non-symmetric, multiple-of-16)",
+    "workgroups": "(N/16, M/16, 1) = (3, 2, 1) — 6 output tiles covering all of C(32x48)",
+    "oracle": "max_diff == 0.0 (integer-valued f16: A in {1..4}, B in {1..3}; per-element sum <= 384 < 2048 = f16 integer-exact limit)",
+    "at1622_variants": "tile_k=16 → 2 K-blocks (accumulation load-bearing); tile_k=32 → 1 K-block. Both max_diff==0.0"
+  },
+  "at1710_tflops_bench": {
+    "bench_id": "dispatch_resident_matmul_shared_coopmat",
+    "default_dims": "M=N=K=256 (shrinks by /2 if grid exceeds device limits or 50GB cap)",
+    "dispatch": "(N/16, M/16, 1) = (16, 16, 1) for default 256x256",
+    "grid_precheck": "2D: checks BOTH max_compute_work_group_count()[0] AND [1]; shrinks M and N together",
+    "timing": "N_WARMUP=2 discarded, MIN-of-10, GpuTimestamp (CpuFenceWall fallback omits %)",
+    "label_policy": "'competitive' omitted unless pct >= 25.0% (COMPETITIVE_PCT_THRESHOLD); default label: 'effective TFLOPS (honest)'",
+    "assertion": "tflops > 0.0 && tflops.is_finite() only; NO ratio asserted"
+  },
+  "what_orchestrator_measures_on_nvidia": {
+    "AT-1620": "AXC_ENABLE_GPU_TESTS=1 cargo test -p axc-driver --test dispatch_shared_m32 -- --ignored at1620_matmul_shared_coopmat_bit_exact_gpu  → expects max_diff == 0.0",
+    "AT-1622": "AXC_ENABLE_GPU_TESTS=1 cargo test -p axc-driver --test dispatch_shared_m32 -- --ignored at1622_tile_k_variants_bit_exact_gpu  → expects max_diff == 0.0 for tile_k=16 AND tile_k=32",
+    "AT-1710": "AXC_ENABLE_GPU_BENCHES=1 cargo bench -p axc-driver --bench resident_matmul_competitive  → prints effective TFLOPS + % (honest number, no asserted ratio)"
+  },
+  "git_commits": [
+    "4e633d1 fix(kernel): ASYMMETRIC tile_col=gid(0)/32 — M3.3b multi-tile coopmat matmul",
+    "6df4157 test(dispatch): un-stub AT-1620/AT-1622 — bit-exact full-grid coopmat matmul",
+    "524dbfa bench(resident): re-add resident_matmul_competitive — AT-1710 honest TFLOPS",
+    "da01475 docs(roadmap): add M3.3b entry — bit-exact full matmul + honest TFLOPS"
+  ]
+}
