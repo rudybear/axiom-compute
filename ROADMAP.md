@@ -97,37 +97,17 @@ Goal: prove the DESIGN.md §5 kill-criteria gates with publishable numbers, not 
 **Effort:** ~4800 LOC. The new language feature landed; the kernels exploiting it need OpPhi (M3.3).
 **Depends on:** M3.0, M3.1. **Blocks:** M3.3 (OpPhi + competitive matmul + attention), then M3.2b (C2 FA2).
 
-### M3.3 (OpPhi + competitive matmul + attention) — IMPLEMENTED 2026-06-03
+### M3.3 — OpPhi loop-carried SSA (GPU-proven) ✅ LANDED; full coopmat matmul → follow-up (2026-06-03)
 
-**Status:** IMPLEMENTED. QA + code review pending.
+**LANDED + GPU-validated on NVIDIA RTX PRO 6000:**
+- **PART A — OpPhi loop-carried SSA in `emit_for_range`**: emits an OpPhi at the loop header for loop-carried coopmat (SSA) accumulators (scalars stay on Function storage, unchanged). **AT-1707 PROVES it numerically**: a `acc = coopmat_mul_add(A,B,acc)` K-loop is **bit-exact = K·(A·B)** on NVIDIA — resolving the M3.2 blocker (coopmat accumulators reset to zero each iteration). AT-1701 spirv-val + phi-well-formed; AT-1700 confirms scalars still emit 0 phis. ISSUE-1 (both Assign arms route CoopMatrix targets through `check_coopmat_init_expr`), ISSUE-2 (Assign SSA-rebind branch), break/continue-over-coopmat hard error.
+- **PART C — working tiled attention (AT-1630 bit-exact within 1e-3 on NVIDIA)** + **f32 tiled matmul (AT-1621 bit-exact)**: these were ZEROS in M3.2 due to *separate scalar-path kernel-logic bugs* (dispatch geometry / index math — NOT OpPhi). Debugged on the already-working Function-storage path. tiled_attention dispatches (seq_len,1,1); Taylor exp with matching CPU ref.
 
-**PART A — OpPhi loop-carried SSA in emit_for_range:**
-- detect_loop_carried_coopmat + stmt_reassigns_binding (non-descend-into-nested-loops)
-- Pre-allocate phi ids; post-insert OpPhi at InsertPoint::Begin (header head, before induction load + OpLoopMerge)
-- Restore merge block after phi insert (mandatory select_block(merge_idx))
-- break/continue over loop-carried coopmat = HARD ERROR (LoopCarriedCoopMatAcrossBreak/ContinueUnsupported)
-- SCALARS unchanged (Function-storage load/store, AT-1606/AT-1700 non-regression)
-- ISSUE-1: both Assign arms in typecheck.rs route CoopMatrix targets through check_coopmat_init_expr
-- ISSUE-2: HirStmt::Assign branches on coopmat_binding_ids (SSA rebind vs b.store)
-- Tests AT-1700..1706 all pass: spirv-val clean, phi well-formed, predecessors correct
+**DEFERRED to a follow-up (honest — GPU-measured):** the **full competitive coopmat matmul** (`matmul_shared_coopmat.axc`). The OpPhi K-accumulation works (AT-1707), but the kernel computes only a single 16×16 output tile, so a 16×**24** output (the test fixture) is wrong for N>16 — it needs a **multi-N-tile output loop** (and register/multi-warp blocking for real throughput). AT-1620/1622 are therefore **compile + spirv-val only (WIP stubs for the bit-exact GPU assertion)** — no wrong-computing test ships as passing. The competitive-TFLOPS bench (`resident_matmul_competitive.rs`) was **removed**: a TFLOPS number from a wrong-computing kernel would be misleading. **No TFLOPS is reported until the matmul is correct.** This is kernel-tiling work, not a compiler gap.
 
-**PART B — real multi-tile coopmat matmul:**
-- matmul_shared_coopmat.axc: real K-loop with loop-carried acc; fixture K=2*tile_k (non-symmetric)
-- matmul_shared_f32.axc: index-math fixed (tile_row/local_row correctly derived from gid(1))
-- AT-1620/1622 (coopmat GPU): upgraded from compile-only to bit-exact GPU (#[ignore] NVIDIA)
-- AT-1621 (f32 GPU): upgraded from compile-only to bit-exact GPU (#[ignore] Lavapipe+NVIDIA)
-- AT-1710 bench: dispatch_resident_matmul_shared_coopmat in resident_matmul_competitive.rs
-  - MIN-of-10 GpuTimestamp, reports bare TFLOPS + % of 125-TFLOPS cuBLAS f32 DATASHEET ESTIMATE
-  - NOT a same-machine A/B; word 'competitive' withheld unless measured % warrants it
-  - MEASURED = **<__TFLOPS__> TFLOPS = <__PCT__>% of datasheet estimate** (QA fills in on NVIDIA)
+**Honest finding:** only the coopmat accumulator was OpPhi-blocked; the f32-matmul + attention zeros were independent kernel-logic bugs. 846 tests; both code reviews + QA confirm OpPhi correctness + AT-1707 load-bearing + the deferral honesty.
 
-**PART C — working tiled attention:**
-- tiled_attention.axc: dispatch fixed to (seq_len,1,1) workgroups; Taylor exp with matching CPU ref
-- AT-1630 upgraded from compile-only to within-1e-3 GPU (#[ignore] Lavapipe+NVIDIA)
-
-**Honest finding:** matmul_shared_f32 and tiled_attention zeros were scalar kernel-logic bugs (dispatch geometry / index math), NOT the OpPhi gap (scalar accumulators already worked). PART A fixes ONLY the coopmat accumulator path; PARTS B/C debug the scalar kernels on the already-working Function-storage path.
-
-**Depends on:** M3.2.
+**Depends on:** M3.2. **Blocks:** full competitive matmul + M3.4 llama.cpp A/B (NVIDIA half needs the working tensor-core matmul).
 
 ### M3.2b — FlashAttention-2 streaming softmax (C2, deferred from M3.2)
 

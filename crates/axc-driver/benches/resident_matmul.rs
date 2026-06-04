@@ -581,13 +581,14 @@ fn bench_dispatch_resident_matmul_tile(c: &mut Criterion) {
 
 // AT-1623 (dispatch_matmul_shared_coopmat bench) was REMOVED in M3.2 retry:2.
 //
-// M3.3 UPDATE: The matmul_shared_coopmat.axc kernel now computes correct results via
-// OpPhi loop-carried SSA (AT-1701/AT-1703). The competitive TFLOPS measurement is now
-// in a SEPARATE bench file to avoid changing existing bench IDs:
-//   → crates/axc-driver/benches/resident_matmul_competitive.rs
-//   → bench id: dispatch_resident_matmul_shared_coopmat
-// This preserves resident_timing_kernels, naive_gemm_harness_validation, and
-// dispatch_resident_matmul_tile IDs unchanged (AT-1711).
+// M3.3 UPDATE: OpPhi loop-carried SSA accumulation is GPU-proven (AT-1707), but the
+// FULL coopmat matmul kernel (matmul_shared_coopmat.axc) does NOT yet compute correct
+// numerics for outputs wider than one 16x16 coopmat tile (needs a multi-N-tile output
+// loop). So NO competitive-TFLOPS bench exists yet — a TFLOPS number from a wrong-
+// computing kernel would be misleading. The `resident_matmul_competitive.rs` bench was
+// REMOVED; it returns once the matmul is bit-exact (kernel-tiling follow-up, not a
+// compiler gap). resident_timing_kernels / naive_gemm_harness_validation /
+// dispatch_resident_matmul_tile bench IDs are unchanged (AT-1711).
 
 criterion_group!(
     resident_matmul_benches,

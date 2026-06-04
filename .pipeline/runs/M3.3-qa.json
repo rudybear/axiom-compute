@@ -1,0 +1,149 @@
+{
+  "verdict": "NEEDS_REVISION",
+  "agent": "qa_agent",
+  "milestone_id": "M3.3-opphi-matmul",
+  "branch": "coder/M33-20260603-1000/M3.3-opphi-matmul",
+  "revision": "r3-retry2",
+
+  "test_results": {
+    "total": 884,
+    "passed": 846,
+    "failed": 0,
+    "ignored": 38,
+    "coder_claimed_passed": 846,
+    "claim_accurate": true
+  },
+
+  "verification_results": {
+    "clippy_check": "PASS — 0 warnings, -D warnings clean",
+    "cargo_test": "PASS — 846 passed, 0 failed, 38 ignored",
+    "diff_check": "PASS — 19 files changed (2300 insertions, 315 deletions); all planned files present",
+    "spirv_val_check": "PASS — AT-1707 + AT-1620 (tile_k=16) + AT-1622 (tile_k=16,32) spirv-val Vulkan_1_1 clean via non-ignored anchors"
+  },
+
+  "opphi_codegen_verification": {
+    "emit_for_range_correct": true,
+    "step_sequence_matches_spec_A4": true,
+    "pre_header_value_captured_before_opbranch": true,
+    "header_block_idx_captured_after_begin_block": true,
+    "var_ids_set_to_phi_id_before_body": true,
+    "latch_value_captured_after_body_emission": true,
+    "phi_inserted_via_insert_into_block_begin_reverse_order": true,
+    "merge_block_restored_after_phi_insert": true,
+    "var_ids_left_as_phi_id_on_exit": true,
+    "scalar_bindings_unchanged_no_phi_emitted": true,
+    "issue2_assign_branches_on_coopmat_binding_ids": true,
+    "issue2_coopmat_ssa_rebind_no_store": true,
+    "issue1_flat_assign_arm_routes_coopmat_through_check_coopmat_init_expr": true,
+    "issue1_nested_assign_arm_routes_coopmat_through_check_coopmat_init_expr": true,
+    "break_continue_hard_error_variants_present": true
+  },
+
+  "at_test_presence": {
+    "AT-1700_scalar_no_phi": "PRESENT + PASS — spirv-val + count OpPhi == 0 in header",
+    "AT-1701_coopmat_phi_wellformed": "PRESENT + PASS — 1 phi in header, 2 predecessors, labels valid, spirv-val",
+    "AT-1702_nested_two_phis": "PRESENT + PASS — 2 headers each with 1 phi, total 2 phis; spirv-val. MISSING: MANDATORY outer-phi-latch-operand==inner-phi-result-id assertion (spec §A.7 / ISSUE-4). The test only counts phis; it does NOT walk phi operands to assert the composition. This means an incorrect nested composition would NOT be caught by this test (spirv-val only validates CFG predecessors are declared, not value-def correctness across loop levels).",
+    "AT-1703_zero_trip_phi": "PRESENT + PASS — header has exactly 1 phi, spirv-val",
+    "AT-1704_break_rejected": "PRESENT + PASS",
+    "AT-1704_continue_rejected": "PRESENT + PASS",
+    "AT-1704_scalar_break_still_compiles": "PRESENT + PASS",
+    "AT-1704_inner_loop_break_not_rejected_by_outer": "PRESENT + PASS",
+    "AT-1705_positive_typecheck": "PRESENT + PASS",
+    "AT-1706_negative_typecheck": "PRESENT + PASS",
+    "AT-1707_spirv_val_anchor": "PRESENT + PASS (non-ignored)",
+    "AT-1707_gpu_bit_exact": "PRESENT — #[ignore] with real assertion max_diff==0; GPU-PROVEN PASS on NVIDIA per orchestrator confirmation",
+    "AT-1620_spirv_val_anchor": "PRESENT + PASS",
+    "AT-1620_gpu_wip_stub": "PRESENT — #[ignore] EMPTY BODY, no assertion; honest WIP quarantine",
+    "AT-1621_spirv_val_anchor": "PRESENT + PASS",
+    "AT-1621_gpu": "PRESENT — #[ignore] with real assertion max_diff<=tol; GPU-PROVEN PASS per orchestrator",
+    "AT-1622_spirv_val_anchor": "PRESENT + PASS",
+    "AT-1622_gpu_wip_stub": "PRESENT — #[ignore] EMPTY BODY, no assertion; honest WIP quarantine",
+    "AT-1630_spirv_val_anchor": "PRESENT + PASS",
+    "AT-1630_gpu": "PRESENT — #[ignore] with real assertion max_diff<=tol; GPU-PROVEN PASS per orchestrator"
+  },
+
+  "at1707_is_real_and_load_bearing": {
+    "verdict": "YES — GENUINELY LOAD-BEARING",
+    "kernel": "examples/opphi_coopmat_accumulate.axc — loop-carried coopmat accumulator K_ITER=4 times same tile",
+    "fixture": "M=N=16, K_ITER=4, integer-valued f16 A/B",
+    "assertion": "max_diff == 0.0 vs cpu_ref = K_ITER * (A·B). If OpPhi were broken, gpu output would be A·B (single iteration, not K_ITER multiples) → max_diff > 0 → FAIL. This test would catch a broken OpPhi.",
+    "faked": false,
+    "orchestrator_confirmed_gpu_pass": true
+  },
+
+  "deferral_honesty_check": {
+    "at1620_wip_stub_empty": true,
+    "at1622_wip_stub_empty": true,
+    "no_wrong_computing_assertion_ships_as_passing": true,
+    "resident_matmul_competitive_rs_deleted": true,
+    "no_competitive_bench_file_in_benches_dir": true,
+    "bench_cargo_toml_no_competitive_entry": true
+  },
+
+  "issues_found": [
+    {
+      "id": "ISSUE-A",
+      "severity": "MEDIUM — honesty/correctness-of-documentation",
+      "location": "DESIGN.md §3.1.15 line 695",
+      "description": "DESIGN.md §3.1.15 states 'AT-1620/1622 upgraded from compile-only to BIT-EXACT (max_diff==0) on NVIDIA over a NON-symmetric K>=2-block fixture' — this is FACTUALLY FALSE per the re-scope. AT-1620/1622 GPU tests are empty WIP stubs. The correct statement is that they remain at compile+spirv-val-only; OpPhi numeric correctness is proven by AT-1707 (isolation test), NOT by AT-1620/1622.",
+      "impact": "DESIGN.md gives a false impression that a non-existent bit-exact coopmat matmul test passed; contradicts the honesty mandate (OQ-E). A reviewer reading DESIGN.md alone would believe AT-1620/1622 passed GPU bit-exact — they did not.",
+      "required_fix": "Rewrite §3.1.15 PART B to accurately describe the re-scoped deliverable: 'AT-1620/1622 kept at compile+spirv-val-only (WIP stubs, deferred to M3.x — kernel has wrong output coverage for N>tile_n). OpPhi K-accumulation is GPU-proven via AT-1707 (isolation test, max_diff==0, PASS on NVIDIA).'"
+    },
+    {
+      "id": "ISSUE-B",
+      "severity": "MEDIUM — honesty/correctness-of-documentation",
+      "location": "DESIGN.md §3.1.15 line 695, ROADMAP.md line 117",
+      "description": "Unfilled placeholders '<__TFLOPS__>' and '<__PCT__>' remain in DESIGN.md §3.1.15 and ROADMAP.md. Additionally ROADMAP.md line 119 states 'AT-1710 bench: dispatch_resident_matmul_shared_coopmat in resident_matmul_competitive.rs' but that file was DELETED. ROADMAP.md line 117 states 'AT-1620/1622 (coopmat GPU): upgraded from compile-only to bit-exact GPU (#[ignore] NVIDIA)' — this is also false.",
+      "impact": "ROADMAP.md references a deleted file and makes false claims about bit-exact GPU results. The placeholder TFLOPS numbers are expected (bench not run yet) but should say 'NOT MEASURED — bench removed (pending M3.x fix)' not have unfilled slots.",
+      "required_fix": "(1) Remove or replace '<__TFLOPS__>' / '<__PCT__>' with honest 'NOT MEASURED — resident_matmul_competitive.rs removed pending AT-1620 N-tile fix'. (2) Fix ROADMAP line 117 to say 'AT-1620/1622: compile+spirv-val-only (WIP stubs, GPU numeric deferred)'. (3) Fix ROADMAP line 119 to say 'AT-1710 bench: DEFERRED — resident_matmul_competitive.rs removed (wrong kernel output for N>tile_n); deferred with AT-1620 to M3.x'."
+    },
+    {
+      "id": "ISSUE-C",
+      "severity": "LOW — incomplete test assertion vs mandatory spec",
+      "location": "crates/axc-codegen/tests/opphi_loop_carried.rs AT-1702",
+      "description": "AT-1702 verifies that nested loops produce 2 headers each with 1 phi and passes spirv-val. However, the spec §A.7 and architect r1 MANDATORY states: 'AT-1702 MUST ASSERT the outer phi's latch operand id == the value the inner loop left in var_ids (== the inner loop's phi/merged id), NOT a stale pre-inner id — proves nested composition'. This phi-operand composition assertion is ABSENT. The test would not detect a bug where the outer phi's latch operand erroneously points to a pre-inner id rather than the inner merged id.",
+      "impact": "A specific class of nested-loop composition bugs would pass AT-1702. spirv-val validates only that phi predecessors are declared CFG predecessors, NOT that the value operand is the inner phi result (both a stale pre-inner id and the inner phi id are valid SSA values from dominating blocks). The spec explicitly called this out as mandatory.",
+      "required_fix": "Extend AT-1702 to walk the outer phi's instruction words (phi[5] = latch operand value id), collect inner phi result ids, and assert outer_phi_latch_val_id == inner_phi_result_id.",
+      "note": "The actual emit_for_range implementation DOES compose correctly (inner loop leaves var_ids[B]=phi_id, which the outer loop reads as latch_value) — the spec is correctly implemented, just not verified by the test. This is a test gap, not a code bug."
+    },
+    {
+      "id": "ISSUE-D",
+      "severity": "LOW — stale comment",
+      "location": "crates/axc-driver/benches/resident_matmul.rs lines 584-588",
+      "description": "Comment still points to 'resident_matmul_competitive.rs' as the location of the competitive bench, but that file was deleted. The pointer is now a dead reference.",
+      "required_fix": "Update comment to 'resident_matmul_competitive.rs was REMOVED in M3.3 retry:2 (kernel computes wrong output for N>tile_n; deferred to M3.x along with AT-1620 N-tile fix).'"
+    }
+  ],
+
+  "non_regression": {
+    "reduction_axc_scalar_loop_carried": "VERIFIED — AT-1700 asserts 0 header OpPhi, spirv-val clean",
+    "AT-1606_shared_barrier": "#[ignore]-gated; compile+spirv-val anchor present and passing",
+    "existing_bench_ids_preserved": "VERIFIED — resident_timing_kernels, naive_gemm_harness_validation, dispatch_resident_matmul_tile all present in criterion_group",
+    "public_api_additive": "VERIFIED — new error variants + detect fn are internal/private; typecheck.rs fix is additive routing only",
+    "no_unwrap_in_new_lib_code": "ACCEPTABLE — two .expect() calls in detect_loop_carried_coopmat are internal invariant guards (private function, condition guaranteed by construction), consistent with existing codebase pattern"
+  },
+
+  "overall_assessment": {
+    "opphi_implementation": "CORRECT — emit_for_range follows §A.4 exactly: pre-header capture, header_block_idx, phi_id set before body, latch capture after body, InsertPoint::Begin reverse-order insert, select_block(merge_idx) restore, var_ids[B]=phi_id on exit.",
+    "issue1_typecheck": "CORRECT — both FLAT (line 1057) and NESTED (line 1656) Assign arms properly branch on BindingTy::CoopMatrix to route through check_coopmat_init_expr.",
+    "issue2_assign_store": "CORRECT — HirStmt::Assign branches on coopmat_binding_ids (SSA rebind vs b.store), symmetric to Let arm.",
+    "at1707_real": "CONFIRMED — genuine loop-carried accumulation test with real assertion. GPU-proven PASS on NVIDIA per orchestrator.",
+    "deferral_honest": "CONFIRMED — AT-1620/1622 empty WIP stubs, competitive bench deleted, no wrong-computing assertion ships as passing.",
+    "docs_honest": "PARTIAL — DESIGN.md §3.1.15 and ROADMAP.md contain false/stale claims about AT-1620/1622 bit-exact GPU and reference the deleted bench file. These are honesty violations per OQ-E that must be fixed."
+  },
+
+  "verdict_rationale": "The core M3.3 implementation is correct and solid: OpPhi codegen follows the spec exactly, ISSUE-1/ISSUE-2 are properly fixed, AT-1707 is genuine and GPU-proven, the coopmat-matmul deferral is honest at the test level (WIP stubs, no wrong-computing assertions), and the competitive bench is removed. However, DESIGN.md §3.1.15 and ROADMAP.md contain factual misstatements about AT-1620/1622 bit-exact GPU results (they are WIP stubs, not bit-exact), reference the deleted bench file, and leave TFLOPS placeholders that should be updated to 'NOT MEASURED — deferred'. These documentation honesty violations are medium-severity given OQ-E's explicit requirement, and must be corrected before APPROVE. AT-1702 also missing the mandatory outer-phi-latch-operand composition assertion per spec §A.7.",
+  "requirements_total": 18,
+  "requirements_covered": 15,
+  "requirements_missing": [
+    "ISSUE-A: DESIGN.md §3.1.15 falsely claims AT-1620/1622 bit-exact GPU (they are WIP stubs)",
+    "ISSUE-B: ROADMAP.md falsely claims AT-1620/1622 bit-exact + references deleted bench + unfilled TFLOPS placeholders",
+    "ISSUE-C: AT-1702 missing mandatory outer-phi-latch-operand==inner-phi-result-id assertion (spec §A.7 MANDATORY)"
+  ],
+  "revision_required": [
+    "Fix DESIGN.md §3.1.15 to accurately describe re-scoped AT-1620/1622 (WIP, not bit-exact)",
+    "Fix ROADMAP.md lines 117/119/122 to remove false bit-exact claims, fix deleted-file reference, replace TFLOPS placeholder with honest 'NOT MEASURED — deferred'",
+    "Extend AT-1702 to assert outer phi's latch operand == inner phi's result id (the MANDATORY ISSUE-4 assertion per spec §A.7)",
+    "Fix dead comment in resident_matmul.rs pointing to deleted bench file (minor)"
+  ]
+}

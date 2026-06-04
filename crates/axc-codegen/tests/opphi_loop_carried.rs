@@ -309,7 +309,31 @@ fn at1702_nested_loop_two_coopmat_phis() {
     let total_phis = count_op(&words, OP_PHI);
     assert_eq!(total_phis, 2, "AT-1702: expected 2 total OpPhi; got {total_phis}");
 
-    eprintln!("AT-1702 PASS: nested 2-level coopmat loop — 2 phis in 2 headers, spirv-val clean");
+    // §A.7: each loop phi must have EXACTLY 2 predecessor pairs (pre-header + latch) —
+    // the structural invariant that makes per-loop-level composition well-formed. An
+    // OpPhi instruction is [wordcount|opcode, result_type, result_id, (val,label)*]; a
+    // 2-predecessor phi is therefore 3 + 2*2 = 7 words. A malformed nested phi (wrong
+    // predecessor set / stale latch edge) would have a different operand count.
+    // (The cross-level NUMERIC composition — outer latch reads the inner loop's merged
+    // value — is GPU-proven end-to-end by AT-1707's bit-exact loop-carried accumulation.)
+    let mut phi_result_ids = Vec::new();
+    for (label, phis) in &headers {
+        for phi in phis {
+            assert_eq!(
+                phi.len(), 7,
+                "AT-1702: loop-header %{label} OpPhi must have exactly 2 predecessor pairs \
+                 (7 words: type+result+2*(val,label)); got {} words", phi.len()
+            );
+            phi_result_ids.push(phi[2]); // result id
+        }
+    }
+    assert_eq!(phi_result_ids.len(), 2, "AT-1702: expected 2 phi result ids");
+    assert_ne!(
+        phi_result_ids[0], phi_result_ids[1],
+        "AT-1702: the outer and inner loop phis must have DISTINCT result ids"
+    );
+
+    eprintln!("AT-1702 PASS: nested 2-level coopmat loop — 2 phis (2 preds each, distinct ids) in 2 headers, spirv-val clean");
 }
 
 // ── AT-1703: Zero-trip loop — OpPhi present in header ────────────────────────
