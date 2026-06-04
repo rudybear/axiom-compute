@@ -97,6 +97,38 @@ Goal: prove the DESIGN.md §5 kill-criteria gates with publishable numbers, not 
 **Effort:** ~4800 LOC. The new language feature landed; the kernels exploiting it need OpPhi (M3.3).
 **Depends on:** M3.0, M3.1. **Blocks:** M3.3 (OpPhi + competitive matmul + attention), then M3.2b (C2 FA2).
 
+### M3.3 (OpPhi + competitive matmul + attention) — IMPLEMENTED 2026-06-03
+
+**Status:** IMPLEMENTED. QA + code review pending.
+
+**PART A — OpPhi loop-carried SSA in emit_for_range:**
+- detect_loop_carried_coopmat + stmt_reassigns_binding (non-descend-into-nested-loops)
+- Pre-allocate phi ids; post-insert OpPhi at InsertPoint::Begin (header head, before induction load + OpLoopMerge)
+- Restore merge block after phi insert (mandatory select_block(merge_idx))
+- break/continue over loop-carried coopmat = HARD ERROR (LoopCarriedCoopMatAcrossBreak/ContinueUnsupported)
+- SCALARS unchanged (Function-storage load/store, AT-1606/AT-1700 non-regression)
+- ISSUE-1: both Assign arms in typecheck.rs route CoopMatrix targets through check_coopmat_init_expr
+- ISSUE-2: HirStmt::Assign branches on coopmat_binding_ids (SSA rebind vs b.store)
+- Tests AT-1700..1706 all pass: spirv-val clean, phi well-formed, predecessors correct
+
+**PART B — real multi-tile coopmat matmul:**
+- matmul_shared_coopmat.axc: real K-loop with loop-carried acc; fixture K=2*tile_k (non-symmetric)
+- matmul_shared_f32.axc: index-math fixed (tile_row/local_row correctly derived from gid(1))
+- AT-1620/1622 (coopmat GPU): upgraded from compile-only to bit-exact GPU (#[ignore] NVIDIA)
+- AT-1621 (f32 GPU): upgraded from compile-only to bit-exact GPU (#[ignore] Lavapipe+NVIDIA)
+- AT-1710 bench: dispatch_resident_matmul_shared_coopmat in resident_matmul_competitive.rs
+  - MIN-of-10 GpuTimestamp, reports bare TFLOPS + % of 125-TFLOPS cuBLAS f32 DATASHEET ESTIMATE
+  - NOT a same-machine A/B; word 'competitive' withheld unless measured % warrants it
+  - MEASURED = **<__TFLOPS__> TFLOPS = <__PCT__>% of datasheet estimate** (QA fills in on NVIDIA)
+
+**PART C — working tiled attention:**
+- tiled_attention.axc: dispatch fixed to (seq_len,1,1) workgroups; Taylor exp with matching CPU ref
+- AT-1630 upgraded from compile-only to within-1e-3 GPU (#[ignore] Lavapipe+NVIDIA)
+
+**Honest finding:** matmul_shared_f32 and tiled_attention zeros were scalar kernel-logic bugs (dispatch geometry / index math), NOT the OpPhi gap (scalar accumulators already worked). PART A fixes ONLY the coopmat accumulator path; PARTS B/C debug the scalar kernels on the already-working Function-storage path.
+
+**Depends on:** M3.2.
+
 ### M3.2b — FlashAttention-2 streaming softmax (C2, deferred from M3.2)
 
 **Why:** FA2's defining contribution — block-streaming ONLINE softmax (running max m_i, running denominator l_i, output rescale O_i ← O_i * exp(m_old-m_new) + P*V) — AVOIDS materializing the SxS score block. Deferred from M3.2 because its online-rescale arithmetic is a separate high-risk bit-exactness surface verified against C1 (`tiled_attention`) as the baseline. C2 earns the `flash_attention_v2` kernel name.
