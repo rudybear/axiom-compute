@@ -702,6 +702,24 @@ M3.2 shipped shared[T,N] (AT-1606 bit-exact on real GPU) but the multi-tile coop
 
 ---
 
+### 3.1.16 M3.3b — multi-tile coopmat matmul (bit-exact full matmul + honest effective-TFLOPS)
+
+M3.3 (§3.1.15) shipped OpPhi loop-carried SSA (GPU-proven, AT-1707) but DEFERRED the full coopmat matmul: matmul_shared_coopmat.axc computed correct numerics only for one 16x16 output tile. The deferral root cause was misdiagnosed as 'needs a multi-N-tile output loop' — the actual cause was (a) the test dispatched a single (1,1,1) workgroup against an N=24 fixture (so only output tile (0,0) ran), and (b) the kernel recovered tile_col = gid(0) directly, which is the GLOBAL invocation id, not the output-tile index. The idiomatic GPU tiling is ONE workgroup == ONE output tile, dispatched as a GRID of workgroups (the grid IS the output-tile loop); no per-kernel output loop is needed.
+
+**The fix (kernel: one line; the rest is dispatch).** With @workgroup(32,1,1) and dispatch (N/16, M/16, 1) workgroups: GlobalInvocationId = workgroup_id*local_size + local_id. AXIOM exposes only gid(axis)=GlobalInvocationId and subgroup_invocation_id()=SubgroupLocalInvocationId (no WorkgroupId/NumWorkgroups builtin), so the output-tile index is recovered by integer division:
+- tile_col = gid(0) / 32  (local_size.x=32; all 32 lanes of a workgroup collapse to one tile_col).
+- tile_row = gid(1)        (local_size.y=1, so gid(1)==workgroup_id.y; NO division).
+- lane = subgroup_invocation_id() == gid(0)%32 (canonical coopmat lane source).
+The per-tile body (shared staging of A[tile_row,k_block] + B[k_block,tile_col], barrier, coopmat_load from shared, acc = coopmat_mul_add(a,b,acc) over K/tile_k blocks with the OpPhi accumulator, coopmat_store at c_base=(tile_row*16)*N+(tile_col*16) stride N) is UNCHANGED from M3.3 and per-tile-correct. NO codegen change, NO new builtin/capability — pure kernel-index + dispatch.
+
+**Bit-exact (AT-1620/1622 un-stubbed).** Non-symmetric multiple-of-16 fixture M=32,N=48,K=32 (3x2 workgroup grid, 2 K-blocks). Integer-valued f16 inputs (A in {1..4}, B in {1..3}; per-element sum <= 384, exactly representable in f16) → f16 GPU accumulation equals the f32 CPU reference EXACTLY: max_diff == 0.0. Both tile_k=16 (2 K-blocks, accumulation load-bearing) and tile_k=32 (1 K-block) are bit-exact, proving the @strategy hole produces correct numerics (not just structurally different SPIR-V). Typed-skip on Lavapipe (CoopMatUnsupported); matmul_shared_f32.axc remains the Lavapipe-runnable scalar correctness path (AT-1621, unaffected).
+
+**Honest effective-TFLOPS (AT-1710).** resident_matmul_competitive.rs (re-added) dispatches a LARGE multiple-of-16 matmul (default 256x256x256, full 16x16 tile grid) via the resident upload-once/dispatch-N path (N_WARMUP=2 discarded, MIN-of-10, GpuTimestamp) and reports effective_tflops = 2·M·N·K / kernel_ns as the bare number plus % of the 125-TFLOPS f32 datasheet ESTIMATE. NO ratio is asserted (only tflops>0 && finite). With a single 32-lane subgroup per 16x16 output tile the throughput is expected to be MODEST (low % of peak) — that is the honest deliverable: a real bit-exact tiled matmul with an honestly-measured number. The label does not claim 'competitive' unless the measured % warrants it; the CpuFenceWall path omits the % and carries the scheduling-inclusive qualifier. Multi-warp / register blocking for real throughput is future work.
+
+**Out of scope (follow-up M3.3c).** Partial edge tiles (M or N not a multiple of 16) require masked/predicated coopmat load/store; M3.3b restricts to multiples of 16. K not a multiple of tile_k drops the partial final K-block (fixtures use K multiple of tile_k).
+
+---
+
 ### 3.1 Types
 
 ```
