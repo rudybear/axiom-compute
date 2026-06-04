@@ -725,6 +725,24 @@ Typed-skip on Lavapipe (CoopMatUnsupported); matmul_shared_f32.axc remains the L
 
 ---
 
+### 3.1.17 M3.3c — register-blocked coopmat matmul (bit-exact + measured TFLOPS uplift)
+
+M3.3b (§3.1.16) shipped a bit-exact multi-tile coopmat matmul at 5.04 TFLOPS = 4.0% of the 125-TFLOPS f32 datasheet estimate (NVIDIA RTX PRO 6000 Blackwell). The bottleneck is arithmetic intensity: ONE workgroup = ONE 16x16 output tile = ONE subgroup = ONE coopmat accumulator, so the tensor cores idle on shared staging + barriers (issue/bandwidth-bound, not FLOP-bound).
+
+**Register blocking (matmul_rb_coopmat.axc).** Keep ONE workgroup = ONE subgroup (32 lanes), but compute an RB_M x RB_N BLOCK of 16x16 output tiles, holding RB_M*RB_N loop-carried coopmat accumulators in ONE K-loop. The win: each K-block loads RB_M A row-tiles + RB_N B col-tiles from shared ONCE and REUSES them across the RB_M*RB_N MMAs (acc[i][j] += A[i]*B[j]), raising arithmetic intensity ~RB-fold. Dispatch grid shrinks to (N/(RB_N*16), M/(RB_M*16), 1); index recovery is the SAME gid + integer-division idiom as M3.3b (block_col=gid(0)/32, block_row=gid(1), lane=subgroup_invocation_id()) — NO new builtin, NO new capability.
+
+**N loop-carried coopmat accumulators — no codegen change.** detect_loop_carried_coopmat (body.rs) collects the WHOLE SET of carried coopmat bindings and emits N OpPhis in ONE loop header via parallel pre_header_values/latch_values/carried Vecs (reverse-order step-10 insert keeps all N phis first per SPIR-V 2.4). AT-1702 proved the multi-phi insert mechanism (2 phis across 2 nested loops); AT-1733 (new) LOCKS N=4 phis in ONE loop. Register blocking therefore needs NO codegen change. Each accumulator must be coopmat-typed, zero-initialized before the loop, and reassigned UNCONDITIONALLY at top level (AT-1708), with no break/continue (AT-1704) — the unrolled body satisfies all four.
+
+**Hand-unrolled, not a runtime RB loop.** AXIOM has no compile-time unroll over a @strategy hole and no coopmat array type (coopmats are SSA, not addressable), so the shipped example HARD-CODES RB_M=RB_N=2 (4 named accumulators, fully unrolled). The @strategy holes (rb_m, rb_n, a_block_size, b_block_size) genuinely drive the shared-tile sizes + the bench dispatch grid; sweeping RB dims selects among PRE-WRITTEN unrolled variant files. This is the honest expressibility boundary; a strategy-unroll / coopmat-array language feature is future work.
+
+**Bit-exact (AT-1731/1732).** Non-symmetric integer-f16 fixture (A in {1..4}, B in {1..3}, K-sum <= 2048, f16-integer-exact). RB tiling changes ONLY loop structure, not the numeric op sequence: each acc_ij accumulates the SAME ordered coopmat_mul_add over the SAME K-blocks as a single-tile kernel for tile (i,j) -> bit-identical. AT-1731 (2x2, K=32, max_diff==0) + AT-1732 (2x2, K=32 vs K=48, max_diff==0). The single-tile AT-1620/1622 are RETAINED unchanged. Typed-skip on Lavapipe (CoopMatUnsupported); matmul_shared_f32.axc remains the Lavapipe scalar path.
+
+**Measured TFLOPS (AT-1730).** resident_matmul_rb.rs, same resident upload-once/N_WARMUP=2/MIN-of-10/GpuTimestamp methodology, M=N=K=256, grid (N/32,M/32,1). Reports the BARE effective_tflops + % of the 125-TFLOPS estimate HONESTLY; NO ratio asserted (only tflops>0 && finite); 'competitive' label ONLY if pct>=25.0. [MEASURED RESULT FILLED IN BY QA after GPU run — bare number + % HONESTLY; if register pressure caps it below 25%, labeled non-competitive.] Register pressure is the cap: 2x2 (4 acc + ~4 transient coopmats) is safe; 4x4 (16 acc) may spill the warp register file (collapsing throughput) — the bench measures and the HONEST best wins. Shared is NOT the cap (2x2 = 2048 B, 4x4 = 4096 B, both << maxComputeSharedMemorySize).
+
+**Deferred (follow-up M3.3d / M3.4).** (1) Multi-subgroup blocking (multiple warps per workgroup sharing the staged A/B) needs a LocalInvocationId / SubgroupId-within-workgroup builtin — AXIOM exposes only GlobalInvocationId + SubgroupLocalInvocationId + SubgroupSize (grep-confirmed). Adding local_invocation_id() (SPIR-V BuiltIn LocalInvocationId, lowering identical to the existing GlobalInvocationId Input var) is a bounded but separate language addition, deferred to keep M3.3c low-risk. (2) Double-buffered shared staging (software pipelining the next K-block) — higher complexity, dominant win is register blocking, deferred. (3) Partial RB-blocks / edge tiles (M,N not multiples of RB*16) — masked/predicated coopmat load/store, carried from M3.3b.
+
+---
+
 ### 3.1 Types
 
 ```
