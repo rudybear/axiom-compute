@@ -159,7 +159,7 @@ fn measure_rb_tflops(
     }
 
     // M and N must be multiples of 32 (RB_M*16 = 2*16 = 32).
-    if m % 32 != 0 || n % 32 != 0 {
+    if !m.is_multiple_of(32) || !n.is_multiple_of(32) {
         eprintln!("resident_matmul_rb: M={m} and/or N={n} not multiples of 32 — skipping");
         return false;
     }
@@ -327,16 +327,16 @@ fn bench_resident_matmul_rb(c: &mut Criterion) {
                 let (ns_256, _) = resident_min_of_n(
                     &ctx, &handle,
                     &[
-                        &(0..256_usize*256).map(|i| {
+                        &(0..256_usize*256).flat_map(|i| {
                             use half::f16;
                             let h = f16::from_f32(((i % 4) + 1) as f32);
                             h.to_le_bytes()
-                        }).flatten().collect::<Vec<u8>>(),
-                        &(0..256_usize*256).map(|i| {
+                        }).collect::<Vec<u8>>(),
+                        &(0..256_usize*256).flat_map(|i| {
                             use half::f16;
                             let h = f16::from_f32(((i % 3) + 1) as f32);
                             h.to_le_bytes()
-                        }).flatten().collect::<Vec<u8>>(),
+                        }).collect::<Vec<u8>>(),
                         &vec![0u8; 256*256*2],
                     ],
                     &[0, 0, (256*256*2) as u64],

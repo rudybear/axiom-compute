@@ -159,7 +159,7 @@ Goal: prove the DESIGN.md §5 kill-criteria gates with publishable numbers, not 
 - Bench: resident_matmul_rb.rs, same methodology as AT-1710 (N_WARMUP=2, MIN-of-10, GpuTimestamp).
 - Measured at **256³** (64 workgroups — occupancy-constrained; may be slower than M3.3b) AND **512³** (256 workgroups — better occupancy) AND **768³** (576 workgroups). All reported honestly.
 - OCCUPANCY NOTE: At 256³ the RB grid (64 WGs) < ~188 SMs → may under-occupy vs M3.3b (256 WGs). If 256³ regresses but 512³ improves, both are reported. Larger matmuls better realize the register-blocking arithmetic-intensity gain.
-- [MEASURED RESULT: TBD by QA on NVIDIA RTX PRO 6000 — bare TFLOPS + % HONESTLY. If 256³ regresses, 512³/768³ reported. If cap is below 25%, labeled non-competitive.]
+- **MEASURED on NVIDIA RTX PRO 6000 Blackwell (QA run, 2026-06-04):** 256³ = **3.1 TFLOPS (2.5%) — REGRESSES** vs M3.3b 5.04 TFLOPS (under-occupied: 64 WGs < 188 SMs, as predicted); 512³ = **14.6 TFLOPS (11.7%)**; 768³ = **31.2 TFLOPS (24.96% of the datasheet estimate; 6.2× over the M3.3b 5.04-TFLOPS baseline)**. 24.96% is *just under* the project's 25% "competitive" threshold, so it is honestly reported as ~25% and NOT labeled competitive (the bench requires pct ≥ 25.0). The 256³ regression is reported honestly (not hidden or cherry-picked).
 - 'competitive' label ONLY if measured pct >= 25.0. NO ratio asserted (only tflops>0 && finite).
 
 **Deferred:**

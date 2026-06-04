@@ -1,0 +1,45 @@
+{
+  "verdict": "REQUEST_CHANGES",
+  "agent": "pessimistic_code_reviewer",
+  "milestone_id": "M3.3c-matmul-perf",
+  "branch": "coder/M33c-20260604-0900/M3.3c-matmul-perf",
+  "scope": "git diff main..HEAD — examples/matmul_rb_coopmat.axc, opphi_loop_carried.rs (AT-1733), dispatch_shared_m32.rs (AT-1731/1732), resident_matmul_rb.rs (AT-1730), compile_shared_examples.rs (AT-1734), DESIGN.md/ROADMAP.md. crates/*/src diff = 0 (confirmed).",
+  "critical_bugs": [
+    {
+      "description": "DOC OVERCLAIM (rounding-up): DESIGN.md §3.1.17 and ROADMAP.md M3.3c assert the 768³ result is '31.2 TFLOPS (25.0%) — competitive (≥25% threshold, labeled \"competitive\" by bench)'. But the bench gates the 'competitive' label on raw `pct >= COMPETITIVE_PCT_THRESHOLD(25.0)`, and 31.2/125*100 = 24.96% < 25.0 — so the bench's OWN code would print the HONEST (non-competitive) label at 31.2 TFLOPS, not 'competitive'. The doc's '25.0%' is a {pct:.1} display-rounding of 24.96; the threshold genuinely requires >=31.25 TFLOPS. Either the true measured value was >=31.25 (then record that, not 31.2) or 'competitive' must be dropped at 768³. As written the doc contradicts the bench's gating arithmetic.",
+      "file": "DESIGN.md / ROADMAP.md",
+      "line": "DESIGN.md §3.1.17 'Measured TFLOPS' para; ROADMAP.md M3.3c measured line",
+      "severity": "high-honesty"
+    }
+  ],
+  "warnings": [
+    {
+      "description": "AT-1731/1732 fixture has a row-axis blind spot. A[idx]=(idx%4)+1 with K a multiple of 4 (K=32 and K=48) makes EVERY A row identical (i*K % 4 == 0). Therefore A row-tile 0 (rows 0..15) == A row-tile 1 (rows 16..31) byte-for-byte, and acc_00==acc_10, acc_01==acc_11. A swap of a_mat_0<->a_mat_1, or a swap of the acc_00/acc_10 store offsets (the row axis), would STILL produce max_diff==0 and pass. The docstring/DESIGN claim 'non-symmetric fixture detects A/B index swaps' is only TRUE for the B/column axis (b_mat_0!=b_mat_1, acc_00!=acc_01 verified distinct). The kernel's row indices are correct by code review, but the test provides ZERO mutation-detection power on the A-row / row-store axis. Recommend a fixture where A rows differ (e.g. A[idx]=(idx%7)+1 or include the row index) so a row-tile swap is caught.",
+      "file": "crates/axc-driver/tests/dispatch_shared_m32.rs",
+      "line": "943-946 (AT-1731), 1056-1057 (AT-1732)"
+    },
+    {
+      "description": "Uncommitted working-tree changes present at review time (DESIGN.md, ROADMAP.md, resident_matmul_rb.rs) carrying the QA clippy fixes (is_multiple_of, flat_map) and the measured-results fill-in. These are correct and clippy-clean, but must be COMMITTED before merge — the branch tip does not yet contain them.",
+      "file": "working tree",
+      "line": "DESIGN.md / ROADMAP.md / resident_matmul_rb.rs"
+    }
+  ],
+  "verified_correct": [
+    "crates/axc-codegen/src diff == 0 (confirmed: no codegen change; the N-phi path was already general).",
+    "AT-1733 genuinely asserts 4 DISTINCT well-formed phis: exactly 1 loop header, exactly 4 OpPhi at head, each 7 words (2 predecessor pairs), all 4 result_ids distinct (dedup==4), all share the same pre_header+latch labels, both labels valid OpLabels, total module phi==4, spirv-val Vulkan_1_1 clean. Ran locally: PASS.",
+    "Kernel A/B reuse indices correct by code review: a_mat_0@offset0/stride16=rows0..15, a_mat_1@offset256/stride16=rows16..31; b_mat_0@offset0/stride32=cols0..15, b_mat_1@offset16/stride32=cols16..31. The 4 mul_adds (acc_00=a0*b0, acc_01=a0*b1, acc_10=a1*b0, acc_11=a1*b1) map consistently to the 4 store offsets c_base_ij=(block_row*32+i*16)*N+(block_col*32+j*16). a_mat_0/256 slab math (i*16*16=256) and b_mat_j (j*16) bands check out.",
+    "TFLOPS FLOP count correct: effective_tflops = 2*M*N*K / kernel_seconds / 1e12 (standard GEMM 2MNK). kernel_ns is the GpuTimestamp MIN-of-10 resident dispatch span (N_WARMUP=2 discarded). 125 TFLOPS labeled 'datasheet ESTIMATE — NOT a same-machine A/B'. NO ratio asserted (only tflops>0 && finite).",
+    "256³ regression (3.1 < 5.04, 2.5%) is REPORTED, not hidden, in both DESIGN and ROADMAP; predicted by the occupancy note (64 WGs < 188 SMs).",
+    "6× claim genuine: 31.2/5.04 = 6.19×. 5.04 M3.3b baseline is genuine (DESIGN §3.1.16, measured).",
+    "Retained tests pass: AT-1620/1622/1707/1606/1621/1630 compile-only + barrier-oracle ran locally (8 passed); 8 GPU tests correctly #[ignore]-gated. Single-tile kernel matmul_shared_coopmat.axc + its bench retained (not replaced).",
+    "768³ edge: 3.375 MB << 50GB cap; (24,24,1)=576 workgroups << device wg-count limits. 50GB cap + 2D grid pre-check on BOTH axes present before alloc.",
+    "768³ bench is correctly TIMING-ONLY (K=768 makes A·B sum 9216 > 2048, NOT f16-exact, so no correctness assertion there — bit-exactness is covered by the small AT-1731/1732, K<=48). This division of labor is honest; the bench does not claim 768³ correctness.",
+    "Clippy clean on benches+tests for axc-driver and axc-codegen (exit 0). No unwrap/panic in lib src (no lib src changed); bench/test .expect/.unwrap_or_else acceptable in those contexts.",
+    "Docs honestly state the occupancy/arithmetic-intensity tradeoff and do NOT claim 'competitive matmul' generally — only the 768³ point, explicitly single-subgroup-per-block; multi-warp/LocalInvocationId deferred to M3.3d/M3.4."
+  ],
+  "spirv_val_check": "PASS",
+  "ub_check": "PASS",
+  "race_condition_check": "PASS",
+  "vendor_divergence_check": "PASS",
+  "summary": "Code is correct and the milestone is honestly framed in almost every respect: zero codegen diff, AT-1733 proves 4 distinct well-formed phis, AT-1731/1732 prove RB bit-exact (max_diff==0) end-to-end, kernel A/B reuse indices match the store offsets, FLOP count and GpuTimestamp methodology are sound, the 256³ regression is reported not hidden, and the occupancy tradeoff is stated without overclaiming. ONE blocking honesty defect: at the recorded 768³ = 31.2 TFLOPS the raw pct is 24.96%, which FAILS the bench's own `pct >= 25.0` 'competitive' gate, yet DESIGN.md/ROADMAP.md label it 'competitive (≥25% threshold, labeled by bench)' — a {pct:.1}-rounding overclaim. Fix: either record the genuine >=31.25 measurement or drop the 'competitive' label at 768³. Secondary: the bit-exact fixtures have an A-row blind spot (A rows are degenerate-identical for K multiple of 4), so they cannot catch an a_mat / row-store swap — the 'detects A/B swaps' claim holds only for the column axis. REQUEST_CHANGES on the doc honesty defect; the code itself is mergeable once the label is corrected and the working-tree fixes are committed."
+}
