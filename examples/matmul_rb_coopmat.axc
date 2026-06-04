@@ -1,0 +1,219 @@
+// examples/matmul_rb_coopmat.axc
+//
+// M3.3c: Register-blocked coopmat matmul — 2×2 block, 4 loop-carried accumulators.
+//
+// ONE workgroup (32 threads = 1 subgroup, @workgroup(32,1,1)) computes a 2×2 BLOCK
+// of 16×16 output tiles = a 32×32 C sub-matrix. Dispatch grid: (N/32, M/32, 1).
+//
+// Compared to matmul_shared_coopmat.axc (M3.3b, 1 tile/workgroup):
+//   M3.3b: 1 workgroup → 1 tile (16×16), 1 coopmat accumulator, 1 coopmat_load A + 1 B per K-block.
+//   M3.3c: 1 workgroup → 4 tiles (32×32 block), 4 coopmat accumulators, 2 A loads + 2 B loads
+//          REUSED across 4 coopmat_mul_adds per K-block → ~2× arithmetic-intensity amortization.
+//
+// HAND-UNROLLED (not a runtime RB loop):
+//   AXIOM has no compile-time unroll over a strategy hole and no coopmat array type
+//   (coopmats are SSA, not addressable). The example hard-codes RB_M=RB_N=2 with 4 named
+//   accumulators: acc_00, acc_01, acc_10, acc_11. The strategy holes (rb_m, rb_n,
+//   a_block_size, b_block_size) are GENUINELY used: they drive the shared-tile sizes
+//   (shared a_tile: shared[f16, ?a_block_size]) and the dispatch grid / bench selection.
+//   See open_question OQ-1 in the architect spec; strategy-unroll / coopmat-array is
+//   future language work.
+//
+// INDEX RECOVERY (same idiom as M3.3b, gid + integer division):
+//   @workgroup(32,1,1): local_size=(32,1,1).
+//   gid(0) = workgroup_id.x * 32 + local_id.x → block_col = gid(0) / 32  (divide by local_size.x).
+//   gid(1) = workgroup_id.y * 1  + local_id.y → block_row = gid(1)        (NO division; local_size.y=1).
+//   ASYMMETRIC: divide x by 32, do NOT divide y.
+//   lane = subgroup_invocation_id().
+//
+// SHARED STAGING (2×2 block):
+//   A block: RB_M*16 rows × 16 cols = 32×16 = 512 f16 elements = 1024 bytes.
+//   B block: 16 rows × RB_N*16 cols = 16×32 = 512 f16 elements = 1024 bytes.
+//   Total shared per workgroup = 2048 bytes << maxComputeSharedMemorySize (≥16 KB).
+//   A-tile shared stride = 16 (= tile_k, width of A block).
+//   B-tile shared stride = RB_N*16 = 32 (width of B block).
+//
+//   Each thread (of 32) stages a_block_size/32 = 16 A elements and b_block_size/32 = 16 B elements.
+//   Staging A: ei = iter*32 + lane; a_row = ei/16; a_col = ei - a_row*16;
+//              A_global_row = block_row*32 + a_row; A_global_col = k_block*16 + a_col;
+//              a_tile[ei] = A[A_global_row * K + A_global_col].
+//   Staging B: ei = iter*32 + lane; b_row = ei/32; b_col = ei - b_row*32;
+//              B_global_row = k_block*16 + b_row; B_global_col = block_col*32 + b_col;
+//              b_tile[ei] = B[B_global_row * N + B_global_col].
+//
+// COOPMAT LOADS (after staging + barrier):
+//   a_mat_0: A row-tile 0 at shared offset 0,    stride 16 (covers rows 0..16 of A block).
+//   a_mat_1: A row-tile 1 at shared offset 256,  stride 16 (covers rows 16..32 of A block).
+//   b_mat_0: B col-tile 0 at shared offset 0,    stride 32 (covers cols 0..16 of B block).
+//   b_mat_1: B col-tile 1 at shared offset 16,   stride 32 (covers cols 16..32 of B block).
+//   a_mat_0 and a_mat_1 are each loaded ONCE and REUSED across 2 coopmat_mul_adds → A-reuse.
+//   b_mat_0 and b_mat_1 are each loaded ONCE and REUSED across 2 coopmat_mul_adds → B-reuse.
+//
+// 4 LOOP-CARRIED ACCUMULATORS (acc_00..acc_11 in ONE K-loop):
+//   Requires the M3.3 N-phi codegen path (AT-1733 pre-gate: 4 phis in 1 loop header).
+//   Each acc_ij is reassigned UNCONDITIONALLY at the top level of the K-loop (AT-1708).
+//   No break/continue (AT-1704).
+//
+// OUTPUT STORAGE (post K-loop):
+//   tile_row_0 = block_row*2 + 0; tile_row_1 = block_row*2 + 1.
+//   tile_col_0 = block_col*2 + 0; tile_col_1 = block_col*2 + 1.
+//   c_base_00 = (tile_row_0*16)*N + (tile_col_0*16); store acc_00 stride N.
+//   c_base_01 = (tile_row_0*16)*N + (tile_col_1*16); store acc_01 stride N.
+//   c_base_10 = (tile_row_1*16)*N + (tile_col_0*16); store acc_10 stride N.
+//   c_base_11 = (tile_row_1*16)*N + (tile_col_1*16); store acc_11 stride N.
+//
+// TILE_K CONSTRAINT (carried from M3.3b):
+//   tile_k MUST equal 16 (coopmat K dimension for matrix[f16,16,16,*]).
+//   Assigning tile_k=32 would cover only K=16 of K=32 per block → wrong.
+//
+// OCCUPANCY NOTE (pessimistic reviewer §WARNING):
+//   Grid = (N/32, M/32, 1). At M=N=256: 8×8=64 workgroups < ~188 SMs on RTX PRO 6000.
+//   The grid shrinks vs M3.3b (which had 16×16=256 workgroups at M=N=256). This may cause
+//   RB to be SLOWER than M3.3b at 256³ despite higher arithmetic intensity per workgroup.
+//   The bench measures HONESTLY at 256³ and ≥512³; if 256³ regresses but 512³ improves,
+//   both are reported (AT-1730). See DESIGN §3.1.17.
+//
+// BENCHMARKED BY: crates/axc-driver/benches/resident_matmul_rb.rs (AT-1730).
+// BIT-EXACT TESTS: AT-1731 (M=N=64, K=32, block grid 2×2), AT-1732 (K=32 vs K=48).
+// COMPILE ANCHOR: AT-1734 in compile_shared_examples.rs (CI, no GPU).
+// RETAINED: matmul_shared_coopmat.axc (M3.3b, 1 tile/workgroup) — NOT replaced.
+//
+// Anti-pattern #2: explicit `return;`.
+// Anti-pattern #8: no `>>` (use shr/lshr for shifts).
+
+@kernel
+@workgroup(32, 1, 1)
+@cooperative_matrix
+@strategy { rb_m: ?[2], rb_n: ?[2], tile_k: ?[16], a_block_size: ?[512], b_block_size: ?[512] }
+@intent("register-blocked 2×2 coopmat f16 matmul — 4 loop-carried accumulators (AT-1731, AT-1732, AT-1730)")
+@complexity(O(n))
+fn matmul_rb_coopmat(
+    A: readonly_buffer[f16],
+    B: readonly_buffer[f16],
+    C: buffer[f16],
+    M: u32,
+    N: u32,
+    K: u32
+) -> void {
+    // Shared staging tiles for the 2×2 block.
+    // a_tile: 2*16 rows × 16 cols = ?a_block_size f16 elements (rb_m*tile_k*tile_m = 2*16*16 = 512).
+    // b_tile: 16 rows × 2*16 cols = ?b_block_size f16 elements (tile_k*rb_n*tile_n = 16*2*16 = 512).
+    shared a_tile: shared[f16, ?a_block_size];
+    shared b_tile: shared[f16, ?b_block_size];
+
+    // Block coordinates.
+    // block_col = gid(0)/32: DIVIDE by local_size.x=32 (global x threads span the block cols).
+    // block_row = gid(1):    NO division (local_size.y=1; gid(1)==workgroup_id.y already).
+    // ASYMMETRIC — do NOT symmetrize.
+    let block_col: u32 = gid(0u32) / 32u32;
+    let block_row: u32 = gid(1u32);
+
+    // Lane index within the subgroup for cooperative staging loads.
+    let lane: u32 = subgroup_invocation_id();
+
+    // Output tile coordinates within the 2×2 block.
+    let tile_row_0: u32 = block_row * 2u32;
+    let tile_row_1: u32 = block_row * 2u32 + 1u32;
+    let tile_col_0: u32 = block_col * 2u32;
+    let tile_col_1: u32 = block_col * 2u32 + 1u32;
+
+    // 4 loop-carried coopmat accumulators (acc_ij: row tile i, col tile j of the 2×2 block).
+    // All 4 must be defined BEFORE the K-loop for the N-phi OpPhi path (AT-1733).
+    let mut acc_00: matrix[f16, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_01: matrix[f16, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_10: matrix[f16, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_11: matrix[f16, 16, 16, accumulator] = coopmat_zero();
+
+    // Staging iterations per thread:
+    //   a_iters = a_block_size / 32 = 512 / 32 = 16 (each thread stages 16 A elements)
+    //   b_iters = b_block_size / 32 = 512 / 32 = 16 (each thread stages 16 B elements)
+    let a_iters: u32 = ?a_block_size / 32u32;
+    let b_iters: u32 = ?b_block_size / 32u32;
+
+    // Number of K-blocks.
+    let num_k_blocks: u32 = K / ?tile_k;
+
+    // K-loop: 4 coopmat accumulators are loop-carried (AT-1733 N-phi path).
+    for k_block in range(0u32, num_k_blocks) {
+
+        // ── Stage A[block_row*32..+32, k_block*16..+16] into a_tile ─────────────
+        // A block spans RB_M*16 = 32 rows and tile_k = 16 cols.
+        // Element linear index: ei = iter * 32 + lane
+        //   a_row = ei / 16           (row in the 32-row A block, 0..31)
+        //   a_col = ei - a_row * 16   (col in the tile, 0..15 = the K-dimension col)
+        //   A global row = block_row * 32 + a_row
+        //   A global col = k_block * tile_k + a_col
+        for a_iter in range(0u32, a_iters) {
+            let ei_a: u32 = a_iter * 32u32 + lane;
+            let a_row: u32 = ei_a / 16u32;
+            let a_col: u32 = ei_a - a_row * 16u32;
+            let a_global_row: u32 = block_row * 32u32 + a_row;
+            let a_global_col: u32 = k_block * ?tile_k + a_col;
+            let a_global: u32 = a_global_row * K + a_global_col;
+            a_tile[ei_a] = A[a_global];
+        }
+
+        // ── Stage B[k_block*16..+16, block_col*32..+32] into b_tile ─────────────
+        // B block spans tile_k = 16 rows and RB_N*16 = 32 cols.
+        // Element linear index: ei = iter * 32 + lane
+        //   b_row = ei / 32           (row in the 16-row K-block, 0..15)
+        //   b_col = ei - b_row * 32   (col in the 32-col B block, 0..31)
+        //   B global row = k_block * tile_k + b_row
+        //   B global col = block_col * 32 + b_col
+        for b_iter in range(0u32, b_iters) {
+            let ei_b: u32 = b_iter * 32u32 + lane;
+            let b_row: u32 = ei_b / 32u32;
+            let b_col: u32 = ei_b - b_row * 32u32;
+            let b_global_row: u32 = k_block * ?tile_k + b_row;
+            let b_global_col: u32 = block_col * 32u32 + b_col;
+            let b_global: u32 = b_global_row * N + b_global_col;
+            b_tile[ei_b] = B[b_global];
+        }
+
+        // Barrier: all invocations must finish staging before the coopmat loads.
+        workgroup_barrier();
+
+        // ── Load A row-tiles from shared — LOADED ONCE, REUSED across 2 col-tiles ─
+        // a_mat_0: row-tile 0 (rows 0..16 of A block), shared offset=0,      stride=16.
+        // a_mat_1: row-tile 1 (rows 16..32 of A block), shared offset=256,   stride=16.
+        //   offset = i * 16 * 16 = i * 256 (i-th slab of 16 rows, each row 16 elements wide).
+        let a_mat_0: matrix[f16, 16, 16, a] = coopmat_load(a_tile, 0u32, 16u32);
+        let a_mat_1: matrix[f16, 16, 16, a] = coopmat_load(a_tile, 256u32, 16u32);
+
+        // ── Load B col-tiles from shared — LOADED ONCE, REUSED across 2 row-tiles ─
+        // b_mat_0: col-tile 0 (cols 0..16 of B block), shared offset=0,  stride=32.
+        // b_mat_1: col-tile 1 (cols 16..32 of B block), shared offset=16, stride=32.
+        //   offset = j * 16 (j-th band of 16 cols; stride=32 = RB_N*16 = full B block width).
+        let b_mat_0: matrix[f16, 16, 16, b] = coopmat_load(b_tile, 0u32, 32u32);
+        let b_mat_1: matrix[f16, 16, 16, b] = coopmat_load(b_tile, 16u32, 32u32);
+
+        // ── 4 coopmat MulAdds: reuse a_mat_0/a_mat_1 and b_mat_0/b_mat_1 ────────
+        // acc_00 += A[tile_row_0, k_block] × B[k_block, tile_col_0]
+        // acc_01 += A[tile_row_0, k_block] × B[k_block, tile_col_1]  (A row reuse)
+        // acc_10 += A[tile_row_1, k_block] × B[k_block, tile_col_0]  (B col reuse)
+        // acc_11 += A[tile_row_1, k_block] × B[k_block, tile_col_1]  (both reuse)
+        // Each acc_ij is reassigned UNCONDITIONALLY at the top level (AT-1708).
+        acc_00 = coopmat_mul_add(a_mat_0, b_mat_0, acc_00);
+        acc_01 = coopmat_mul_add(a_mat_0, b_mat_1, acc_01);
+        acc_10 = coopmat_mul_add(a_mat_1, b_mat_0, acc_10);
+        acc_11 = coopmat_mul_add(a_mat_1, b_mat_1, acc_11);
+
+        // WAR barrier: before the next k_block iteration overwrites a_tile / b_tile.
+        workgroup_barrier();
+    }
+
+    // ── Store the 4 accumulated tiles to C ───────────────────────────────────────
+    // c_base_ij = (tile_row_i * 16) * N + (tile_col_j * 16), store stride N.
+    // Post-loop reads resolve to the header phi (zero-trip safe per §A.7).
+    let c_base_00: u32 = (tile_row_0 * 16u32) * N + (tile_col_0 * 16u32);
+    let c_base_01: u32 = (tile_row_0 * 16u32) * N + (tile_col_1 * 16u32);
+    let c_base_10: u32 = (tile_row_1 * 16u32) * N + (tile_col_0 * 16u32);
+    let c_base_11: u32 = (tile_row_1 * 16u32) * N + (tile_col_1 * 16u32);
+
+    coopmat_store(acc_00, C, c_base_00, N);
+    coopmat_store(acc_01, C, c_base_01, N);
+    coopmat_store(acc_10, C, c_base_10, N);
+    coopmat_store(acc_11, C, c_base_11, N);
+
+    return;
+}
