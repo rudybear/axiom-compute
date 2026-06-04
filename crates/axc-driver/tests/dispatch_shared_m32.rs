@@ -49,6 +49,7 @@ const MATMUL_SHARED_COOPMAT_SRC: &str = include_str!("../../../examples/matmul_s
 const MATMUL_SHARED_F32_SRC: &str = include_str!("../../../examples/matmul_shared_f32.axc");
 const TILED_ATTENTION_SRC: &str = include_str!("../../../examples/tiled_attention.axc");
 const OPPHI_COOPMAT_ACCUMULATE_SRC: &str = include_str!("../../../examples/opphi_coopmat_accumulate.axc");
+const MATMUL_RB_COOPMAT_SRC: &str = include_str!("../../../examples/matmul_rb_coopmat.axc");
 
 // ── Helper: tile strategy assignments ────────────────────────────────────────
 
@@ -866,4 +867,240 @@ fn at1630_tiled_attention_bit_exact_gpu() {
         "AT-1630: attention max_diff={max_diff} > tol={tol}; first GPU: {:?}, CPU: {:?}",
         &gpu_o[..4.min(gpu_o.len())], &cpu_o[..4.min(cpu_o.len())]);
     eprintln!("AT-1630 PASS: attention within-tol (max_diff={max_diff}) on {}", ctx.physical_device_name());
+}
+
+// ── Helpers for RB 2×2 tests (AT-1731, AT-1732) ──────────────────────────────
+
+/// Build RB 2×2 strategy assignments for matmul_rb_coopmat.axc.
+///
+/// rb_m=2, rb_n=2, tile_k=16, a_block_size=512, b_block_size=512.
+/// These are the ONLY valid shipped assignments for the 2×2 hand-unrolled variant.
+fn rb2x2_assignments() -> BTreeMap<String, i64> {
+    let mut m = BTreeMap::new();
+    m.insert("rb_m".to_owned(), 2_i64);
+    m.insert("rb_n".to_owned(), 2_i64);
+    m.insert("tile_k".to_owned(), 16_i64);
+    m.insert("a_block_size".to_owned(), 512_i64);
+    m.insert("b_block_size".to_owned(), 512_i64);
+    m
+}
+
+// ── AT-1731: RB 2×2 bit-exact GPU dispatch ────────────────────────────────────
+
+/// AT-1731: matmul_rb_coopmat.axc (M3.3c, RB 2×2) is BIT-EXACT (max_diff==0.0)
+/// on the non-symmetric integer-f16 fixture, dispatched as the RB block grid.
+///
+/// Fixture: M=N=64, K=32. Block grid: (N/32, M/32, 1) = (2, 2, 1) workgroups.
+/// Each workgroup computes a 32×32 sub-matrix (4 output tiles of 16×16 each).
+/// This exercises BOTH the inter-block grid dispatch (4 workgroups) AND the
+/// intra-block multi-accumulator accumulation (4 acc × 2 K-blocks = 8 OpPhi carries).
+///
+/// Integer-valued f16 fixture: A[idx]=(idx%4)+1 ∈ {1..4}, B[idx]=(idx%3)+1 ∈ {1..3}.
+/// Per-element max = K × max(A) × max(B) = 32 × 4 × 3 = 384 ≤ 2048 (f16-integer-exact).
+///
+/// The non-symmetric fixture (distinct per-tile input) detects A/B load index swaps:
+/// if a_mat_0 and a_mat_1 are swapped, or b_mat_0 and b_mat_1 are swapped,
+/// the non-symmetric inputs produce different (wrong) results.
+///
+/// Typed-skip on CoopMatUnsupported (Lavapipe). #[ignore]+AXC_ENABLE_GPU_TESTS gated.
+#[test]
+#[ignore]
+fn at1731_matmul_rb_coopmat_bit_exact_gpu() {
+    if !gpu_tests_enabled() {
+        eprintln!("AT-1731: AXC_ENABLE_GPU_TESTS not set; skipping");
+        return;
+    }
+    const M: usize = 64;
+    const N: usize = 64;
+    const K: usize = 32;
+
+    let assignments = rb2x2_assignments();
+    let (bytes, meta) = compile_source_with_assignments(MATMUL_RB_COOPMAT_SRC, &assignments)
+        .expect("AT-1731: matmul_rb_coopmat.axc must compile");
+    let words: Vec<u32> = bytes.chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+
+    let ctx = VulkanContext::new().expect("AT-1731: VulkanContext must init");
+    eprintln!("AT-1731: device={}", ctx.physical_device_name());
+
+    let handle = match ctx.prepare_kernel_checked(
+        &words, &meta.binding_plan, meta.push_constant_total_bytes,
+        &meta.entry_point, meta.coopmat.as_ref(), "matmul_rb_coopmat",
+        meta.shared_memory_bytes,
+    ) {
+        Ok(h) => h,
+        Err(DispatchError::CoopMatUnsupported { reason, .. }) => {
+            eprintln!("AT-1731: CoopMatUnsupported (typed-skip on Lavapipe): {reason}");
+            return;
+        }
+        Err(DispatchError::DeviceFeatureUnsupported { feature, .. }) => {
+            eprintln!("AT-1731: DeviceFeatureUnsupported({feature}) — typed-skip");
+            return;
+        }
+        Err(e) => panic!("AT-1731: prepare_kernel_checked failed: {e}"),
+    };
+
+    // Integer-valued f16 fixture (non-symmetric, distinct per-row/col pattern).
+    // A[idx] = (idx % 4) + 1 ∈ {1,2,3,4}; B[idx] = (idx % 3) + 1 ∈ {1,2,3}.
+    let a_f32: Vec<f32> = (0..M * K).map(|idx| ((idx % 4) + 1) as f32).collect();
+    let b_f32: Vec<f32> = (0..K * N).map(|idx| ((idx % 3) + 1) as f32).collect();
+    let a_bytes = f32_slice_to_f16_le_bytes(&a_f32);
+    let b_bytes = f32_slice_to_f16_le_bytes(&b_f32);
+    let c_size = M * N * 2; // f16 output
+
+    // RB block grid: (N/32, M/32, 1) = (2, 2, 1) workgroups.
+    let wg_x: u32 = (N / 32) as u32;
+    let wg_y: u32 = (M / 32) as u32;
+    let pc = push_mnk(M as u32, N as u32, K as u32);
+
+    let outputs = ctx.dispatch_handle(
+        &handle, (wg_x, wg_y, 1),
+        &[&a_bytes, &b_bytes, &vec![0u8; c_size]],
+        &[0, 0, c_size],
+        &pc,
+    ).unwrap_or_else(|e| panic!("AT-1731: dispatch failed: {e}"));
+
+    let gpu_c = f16_le_bytes_to_f32_slice(&outputs[2]);
+    let cpu_c = cpu_f16_matmul_reference(&a_f32, &b_f32, M, N, K);
+
+    let mut max_diff = 0.0_f32;
+    for (g, c) in gpu_c.iter().zip(cpu_c.iter()) {
+        let diff = (g - c).abs();
+        if diff > max_diff { max_diff = diff; }
+    }
+
+    eprintln!(
+        "AT-1731: M={M} N={N} K={K}, block grid=({wg_x},{wg_y},1), \
+         max_diff={max_diff}, first4 GPU={:?}, CPU={:?}",
+        &gpu_c[..4.min(gpu_c.len())],
+        &cpu_c[..4.min(cpu_c.len())]
+    );
+
+    assert!(
+        max_diff == 0.0,
+        "AT-1731: RB 2×2 matmul FAILED — max_diff={max_diff} != 0.\n\
+         HONESTY GATE: do NOT relax tolerance or shrink fixture.\n\
+         Dispatch=({wg_x},{wg_y},1), M={M} N={N} K={K}. First4 GPU: {:?}, CPU: {:?}",
+        &gpu_c[..4.min(gpu_c.len())],
+        &cpu_c[..4.min(cpu_c.len())]
+    );
+    eprintln!(
+        "AT-1731 PASS: RB 2×2 matmul bit-exact (max_diff=0.0) on {} — \
+         M={M} N={N} K={K}, block grid=({wg_x},{wg_y},1)",
+        ctx.physical_device_name()
+    );
+}
+
+// ── AT-1732: RB 2×2 K-block-count variation bit-exact ────────────────────────
+
+/// AT-1732: RB 2×2 K-block-count variation is bit-exact for K=32 (2 K-blocks)
+/// AND K=48 (3 K-blocks), both with tile_k=16 FIXED.
+///
+/// This proves the 4-coopmat OpPhi accumulation is bit-exact for different trip counts:
+/// 2 K-blocks = 2 OpPhi carries; 3 K-blocks = 3 OpPhi carries.
+/// Directly parallels AT-1622 (single-tile K-block variation) for the RB variant.
+///
+/// f16-exactness bound:
+///   K=32: max element = 32 × 4 × 3 = 384 ≤ 2048 (exact).
+///   K=48: max element = 48 × 4 × 3 = 576 ≤ 2048 (exact).
+///
+/// Fixture: M=N=64 (block grid (2,2,1) = 4 workgroups; exercises multiple RB blocks).
+/// Typed-skip on CoopMatUnsupported (Lavapipe). #[ignore]+AXC_ENABLE_GPU_TESTS gated.
+#[test]
+#[ignore]
+fn at1732_matmul_rb_kblock_count_bit_exact_gpu() {
+    if !gpu_tests_enabled() {
+        eprintln!("AT-1732: AXC_ENABLE_GPU_TESTS not set; skipping");
+        return;
+    }
+    const M: usize = 64;
+    const N: usize = 64;
+    // tile_k is fixed at 16 (bound to the coopmat K dimension).
+    const TILE_K: usize = 16;
+
+    let assignments = rb2x2_assignments();
+    let (bytes, meta) = compile_source_with_assignments(MATMUL_RB_COOPMAT_SRC, &assignments)
+        .expect("AT-1732: matmul_rb_coopmat.axc must compile");
+    let words: Vec<u32> = bytes.chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+
+    let ctx = VulkanContext::new().expect("AT-1732: VulkanContext must init");
+    eprintln!("AT-1732: device={}", ctx.physical_device_name());
+
+    let handle = match ctx.prepare_kernel_checked(
+        &words, &meta.binding_plan, meta.push_constant_total_bytes,
+        &meta.entry_point, meta.coopmat.as_ref(), "matmul_rb_coopmat",
+        meta.shared_memory_bytes,
+    ) {
+        Ok(h) => h,
+        Err(DispatchError::CoopMatUnsupported { reason, .. }) => {
+            eprintln!("AT-1732: CoopMatUnsupported (typed-skip on Lavapipe): {reason}");
+            return;
+        }
+        Err(DispatchError::DeviceFeatureUnsupported { feature, .. }) => {
+            eprintln!("AT-1732: DeviceFeatureUnsupported({feature}) — typed-skip");
+            return;
+        }
+        Err(e) => panic!("AT-1732: prepare_kernel_checked failed: {e}"),
+    };
+
+    // RB block grid: (N/32, M/32, 1) = (2, 2, 1) workgroups.
+    let wg_x: u32 = (N / 32) as u32;
+    let wg_y: u32 = (M / 32) as u32;
+
+    // Vary K to exercise different K-block counts.
+    // K=32 → 2 K-blocks (load-bearing: proves OpPhi carries across 2 blocks).
+    // K=48 → 3 K-blocks (proves OpPhi carries across 3 blocks).
+    for &k in &[32_usize, 48_usize] {
+        let k_blocks = k / TILE_K;
+        let a_f32: Vec<f32> = (0..M * k).map(|idx| ((idx % 4) + 1) as f32).collect();
+        let b_f32: Vec<f32> = (0..k * N).map(|idx| ((idx % 3) + 1) as f32).collect();
+        let a_bytes = f32_slice_to_f16_le_bytes(&a_f32);
+        let b_bytes = f32_slice_to_f16_le_bytes(&b_f32);
+        let c_size = M * N * 2; // f16 output
+        let cpu_c = cpu_f16_matmul_reference(&a_f32, &b_f32, M, N, k);
+        let pc = push_mnk(M as u32, N as u32, k as u32);
+
+        let outputs = ctx.dispatch_handle(
+            &handle, (wg_x, wg_y, 1),
+            &[&a_bytes, &b_bytes, &vec![0u8; c_size]],
+            &[0, 0, c_size],
+            &pc,
+        ).unwrap_or_else(|e| panic!("AT-1732: K={k}: dispatch failed: {e}"));
+
+        let gpu_c = f16_le_bytes_to_f32_slice(&outputs[2]);
+
+        let mut max_diff = 0.0_f32;
+        for (g, c) in gpu_c.iter().zip(cpu_c.iter()) {
+            let diff = (g - c).abs();
+            if diff > max_diff { max_diff = diff; }
+        }
+
+        eprintln!(
+            "AT-1732: K={k} ({k_blocks} K-blocks), max_diff={max_diff}, \
+             block grid=({wg_x},{wg_y},1), first4 GPU={:?}, CPU={:?}",
+            &gpu_c[..4.min(gpu_c.len())],
+            &cpu_c[..4.min(cpu_c.len())]
+        );
+
+        assert!(
+            max_diff == 0.0,
+            "AT-1732: RB 2×2 K={k} ({k_blocks} K-blocks) FAILED — max_diff={max_diff} != 0.\n\
+             HONESTY GATE: do NOT relax tolerance or shrink fixture.\n\
+             tile_k={TILE_K} (fixed), M={M} N={N}, block grid=({wg_x},{wg_y},1).\n\
+             First4 GPU: {:?}, CPU: {:?}",
+            &gpu_c[..4.min(gpu_c.len())],
+            &cpu_c[..4.min(cpu_c.len())]
+        );
+        eprintln!(
+            "AT-1732 K={k} ({k_blocks} K-blocks) PASS: bit-exact (max_diff=0.0) \
+             on {} — M={M} N={N} tile_k={TILE_K} block grid=({wg_x},{wg_y},1)",
+            ctx.physical_device_name()
+        );
+    }
+    eprintln!(
+        "AT-1732 PASS: RB 2×2 K-block-count variation (K=32/2-blocks, K=48/3-blocks) \
+         both bit-exact on {} — tile_k={TILE_K} fixed (coopmat K dimension)",
+        ctx.physical_device_name()
+    );
 }
