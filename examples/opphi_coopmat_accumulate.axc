@@ -1,0 +1,55 @@
+// examples/opphi_coopmat_accumulate.axc — AT-1707 minimal OpPhi numeric isolation.
+//
+// PURPOSE: Isolate OpPhi loop-carried accumulation from shared-memory staging.
+// This kernel loads A and B directly from global buffers (no shared staging),
+// loops K_ITER times loading the SAME 16×16 tile each iteration, and accumulates
+// acc = coopmat_mul_add(A_mat, B_mat, acc).
+//
+// Expected result: C = K_ITER × (A · B).
+//
+// If this PASSES (AT-1707): OpPhi accumulation is numerically correct; the bug
+// in AT-1620 is in the shared-staging loop (coverage), not OpPhi.
+// If this FAILS (AT-1707): OpPhi accumulation itself is broken; fix OpPhi first.
+//
+// Fixture: M=N=K=16 (single 16×16 coopmat tile), K_ITER=4 (push constant).
+// A[i,j] = small integer-valued f16 (exact accumulation).
+// B[i,j] = small integer-valued f16.
+// Expected C[i,j] = K_ITER * sum_k(A[i,k] * B[k,j]) — exact in f16 for small inputs.
+//
+// dispatch: (1, 1, 1) — one workgroup of 32 threads handles one 16×16 tile.
+//
+// Anti-pattern #2: explicit `return;`.
+// Anti-pattern #8: no `>>`.
+
+@kernel
+@workgroup(32, 1, 1)
+@cooperative_matrix
+@intent("minimal OpPhi numeric isolation — K_ITER accumulations of fixed A*B tile (AT-1707)")
+@complexity(O(n))
+fn opphi_coopmat_accumulate(
+    A: readonly_buffer[f16],
+    B: readonly_buffer[f16],
+    C: buffer[f16],
+    N: u32,
+    K_ITER: u32
+) -> void {
+    // Loop-carried coopmat accumulator: starts at zero, accumulates K_ITER times.
+    // No shared staging — A and B loaded directly from global buffers.
+    let mut acc: matrix[f16, 16, 16, accumulator] = coopmat_zero();
+
+    // K_ITER-loop: accumulate the SAME A/B tile K_ITER times.
+    // Expected result: acc = K_ITER * (A · B).
+    for iter in range(0u32, K_ITER) {
+        // Load A tile directly from global buffer: 16x16 f16, row-major, stride=N.
+        let a_mat: matrix[f16, 16, 16, a] = coopmat_load(A, 0u32, N);
+        // Load B tile directly from global buffer: 16x16 f16, row-major, stride=N.
+        let b_mat: matrix[f16, 16, 16, b] = coopmat_load(B, 0u32, N);
+        // Accumulate: acc += a_mat * b_mat.
+        acc = coopmat_mul_add(a_mat, b_mat, acc);
+    }
+
+    // Store result: C[0, 0] tile (one 16x16 block).
+    coopmat_store(acc, C, 0u32, N);
+
+    return;
+}

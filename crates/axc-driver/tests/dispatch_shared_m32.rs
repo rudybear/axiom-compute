@@ -4,15 +4,22 @@
 //!          WITH barrier. Barrier-absent OQ1 hard-error test (compile-time).
 //!          STATUS: PASSES on NVIDIA RTX PRO 6000 (measured).
 //!
-//! AT-1620 (M3.3): matmul_shared_coopmat.axc — UPGRADED to bit-exact GPU dispatch on NVIDIA.
-//!          NON-symmetric K=2*tile_k fixture; typed-skip on Lavapipe (CoopMatUnsupported).
-//!          Compile + spirv-val anchor retained.
+//! AT-1707 (M3.3 retry:1): opphi_coopmat_accumulate.axc — MINIMAL OpPhi numeric isolation.
+//!          Loads A and B directly from global buffers (NO shared staging), loops K_ITER
+//!          times loading the same tile each iteration, accumulates acc += A*B each time.
+//!          Expected C = K_ITER × (A·B). If PASS: OpPhi accumulation is numerically correct;
+//!          the AT-1620 bug was in staging coverage (now fixed). Typed-skip on Lavapipe.
+//!
+//! AT-1620 (M3.3 retry:1): matmul_shared_coopmat.axc — STAGING FIX: staging loop now
+//!          covers all tile_a_size elements (was: 1 element/thread, now: tile_a_size/32
+//!          elements/thread via inner staging for-loop). NON-symmetric K=2*tile_k fixture.
+//!          Typed-skip on Lavapipe (CoopMatUnsupported). Compile + spirv-val anchor retained.
 //!
 //! AT-1621 (M3.3): matmul_shared_f32.axc — UPGRADED to bit-exact GPU dispatch on Lavapipe
 //!          and NVIDIA. Index-math bug fixed (gid(1) used for both tile_row and local_row —
 //!          corrected to derive tile_row = gid(1)/16, local_row = gid(1)%16).
 //!
-//! AT-1622 (M3.3): @strategy holes tile_k=16 AND tile_k=32 each produce a CORRECT
+//! AT-1622 (M3.3 retry:1): @strategy holes tile_k=16 AND tile_k=32 each produce a CORRECT
 //!          bit-exact kernel (not just different SPIR-V). NVIDIA-only (coopmat).
 //!          Structural SPIR-V difference assert retained.
 //!
@@ -35,6 +42,7 @@ const SHARED_REDUCE_SRC: &str = include_str!("../../../examples/shared_reduce.ax
 const MATMUL_SHARED_COOPMAT_SRC: &str = include_str!("../../../examples/matmul_shared_coopmat.axc");
 const MATMUL_SHARED_F32_SRC: &str = include_str!("../../../examples/matmul_shared_f32.axc");
 const TILED_ATTENTION_SRC: &str = include_str!("../../../examples/tiled_attention.axc");
+const OPPHI_COOPMAT_ACCUMULATE_SRC: &str = include_str!("../../../examples/opphi_coopmat_accumulate.axc");
 
 // ── Helper: tile strategy assignments ────────────────────────────────────────
 
@@ -310,6 +318,123 @@ fn at1606_shared_reduction_barrier_visibility_gpu() {
     assert!((gpu_result - cpu_result).abs() <= tol,
         "at1606: shared reduction mismatch: gpu={gpu_result}, cpu={cpu_result} (tol={tol})");
     eprintln!("at1606: PASS — shared[f32,256] + workgroup_barrier() is bit-exact on {}", ctx.physical_device_name());
+}
+
+// ── AT-1707: OpPhi numeric isolation — no staging, same tile each K_ITER ──────
+
+/// AT-1707: opphi_coopmat_accumulate.axc compile + spirv-val clean (anchor).
+#[test]
+fn at1707_opphi_coopmat_accumulate_spirv_val_only() {
+    use spirv_tools::val::{Validator, create as create_validator};
+    use spirv_tools::TargetEnv;
+
+    let (bytes, _meta) = compile_source_with_meta(OPPHI_COOPMAT_ACCUMULATE_SRC)
+        .expect("AT-1707: opphi_coopmat_accumulate.axc must compile");
+    let words: Vec<u32> = bytes.chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let validator = create_validator(Some(TargetEnv::Vulkan_1_1));
+    validator.validate(&words, None).expect("AT-1707: opphi_coopmat_accumulate.axc spirv-val must pass");
+    eprintln!("AT-1707: opphi_coopmat_accumulate.axc compiles + spirv-val clean (M3.3 retry:1)");
+}
+
+/// AT-1707 GPU: OpPhi numeric isolation — no staging, same 16×16 f16 tile accumulated K_ITER=4 times.
+///
+/// Completely bypasses shared-memory staging: A and B are loaded directly from global buffers
+/// at offset=0 each iteration. Expected result: C = K_ITER × (A · B).
+///
+/// If PASS: OpPhi loop-carried accumulation is numerically correct; the AT-1620 bug was
+/// ONLY in staging coverage (the old kernel staged 2 of 16 rows per iteration).
+/// If FAIL: OpPhi accumulation itself is broken; fix OpPhi emission before fixing AT-1620.
+///
+/// Typed-skip on Lavapipe (CoopMatUnsupported).
+#[test]
+#[ignore]
+fn at1707_opphi_coopmat_accumulate_bit_exact_gpu() {
+    if !gpu_tests_enabled() {
+        eprintln!("at1707_gpu: AXC_ENABLE_GPU_TESTS not set; skipping");
+        return;
+    }
+    const M_SIZE: usize = 16;
+    const N_SIZE: usize = 16;
+    const K_ITER: u32 = 4; // accumulate same tile K_ITER times
+
+    let (bytes, meta) = compile_source_with_meta(OPPHI_COOPMAT_ACCUMULATE_SRC)
+        .expect("AT-1707: opphi_coopmat_accumulate.axc must compile");
+    let words: Vec<u32> = bytes.chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+
+    let ctx = VulkanContext::new().expect("VulkanContext must init");
+    eprintln!("AT-1707 GPU: device={}", ctx.physical_device_name());
+
+    let handle = match ctx.prepare_kernel_checked(
+        &words, &meta.binding_plan, meta.push_constant_total_bytes,
+        &meta.entry_point, None, "opphi_coopmat_accumulate",
+        meta.shared_memory_bytes,
+    ) {
+        Ok(h) => h,
+        Err(DispatchError::CoopMatUnsupported { .. }) => {
+            eprintln!("AT-1707 GPU: CoopMatUnsupported — typed-skip (Lavapipe)");
+            return;
+        }
+        Err(DispatchError::DeviceFeatureUnsupported { feature, .. }) => {
+            eprintln!("AT-1707 GPU: DeviceFeatureUnsupported({feature}) — typed-skip");
+            return;
+        }
+        Err(e) => panic!("AT-1707: prepare_kernel_checked failed: {e}"),
+    };
+
+    // Integer-valued f16 fixture: small values so K_ITER=4 accumulations stay exact.
+    // A[i,k] = ((i*N_SIZE + k) % 4 + 1): values 1,2,3,4 repeating.
+    // B[k,j] = ((k*N_SIZE + j) % 3 + 1): values 1,2,3 repeating.
+    let a_f32: Vec<f32> = (0..M_SIZE * N_SIZE).map(|i| (i % 4 + 1) as f32).collect();
+    let b_f32: Vec<f32> = (0..N_SIZE * N_SIZE).map(|i| (i % 3 + 1) as f32).collect();
+    let a_bytes = f32_slice_to_f16_le_bytes(&a_f32);
+    let b_bytes = f32_slice_to_f16_le_bytes(&b_f32);
+    let c_size = M_SIZE * N_SIZE * 2; // f16 output
+
+    // Push constants: N=16, K_ITER=4.
+    let mut pc = Vec::with_capacity(8);
+    pc.extend_from_slice(&(N_SIZE as u32).to_le_bytes());
+    pc.extend_from_slice(&K_ITER.to_le_bytes());
+
+    let outputs = ctx.dispatch_handle(
+        &handle, (1, 1, 1), // one workgroup handles the 16×16 tile
+        &[&a_bytes, &b_bytes, &vec![0u8; c_size]],
+        &[0, 0, c_size],
+        &pc,
+    ).unwrap_or_else(|e| panic!("AT-1707: dispatch failed: {e}"));
+
+    let gpu_c = f16_le_bytes_to_f32_slice(&outputs[2]);
+
+    // CPU reference: C_ref = K_ITER × (A · B).
+    let single_matmul = cpu_f16_matmul_reference(&a_f32, &b_f32, M_SIZE, N_SIZE, N_SIZE);
+    let cpu_c: Vec<f32> = single_matmul.iter().map(|&v| v * K_ITER as f32).collect();
+
+    let mut max_diff = 0.0_f32;
+    for (g, c) in gpu_c.iter().zip(cpu_c.iter()) {
+        let diff = (g - c).abs();
+        if diff > max_diff { max_diff = diff; }
+    }
+
+    eprintln!(
+        "AT-1707 GPU: max_diff={max_diff}, first4 GPU={:?}, CPU={:?}",
+        &gpu_c[..4.min(gpu_c.len())],
+        &cpu_c[..4.min(cpu_c.len())]
+    );
+
+    assert!(
+        max_diff == 0.0,
+        "AT-1707: OpPhi numeric isolation FAILED — max_diff={max_diff} != 0.\n\
+         This means OpPhi accumulation itself is broken (not a staging issue).\n\
+         First4 GPU: {:?}, CPU: {:?}",
+        &gpu_c[..4.min(gpu_c.len())],
+        &cpu_c[..4.min(cpu_c.len())]
+    );
+    eprintln!(
+        "AT-1707 PASS: OpPhi numeric accumulation correct — no staging, \
+         K_ITER={K_ITER} accumulations of same 16×16 tile, max_diff=0 on {}",
+        ctx.physical_device_name()
+    );
 }
 
 // ── AT-1621: shared-staged f32 matmul — compile-only anchor + GPU dispatch ───

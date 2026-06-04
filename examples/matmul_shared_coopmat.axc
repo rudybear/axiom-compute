@@ -18,6 +18,28 @@
 //   tile_a_size: shared[f16, tile_m*tile_k] = 16*tile_k (A staging array size).
 //   tile_b_size: shared[f16, tile_k*tile_n] = tile_k*16 (B staging array size).
 //
+// STAGING FIX (AT-1620 retry:1):
+//   The workgroup has 32 threads (@workgroup(32,1,1)).
+//   tile_a_size = TILE_M * tile_k = 16 * tile_k elements (e.g. 256 for tile_k=16).
+//   With 32 threads staging 256 elements, each thread must stage 256/32=8 elements.
+//   The staging loop iterates `tile_a_size / 32` times per thread.
+//   Similarly for B: tile_b_size = tile_k * 16 elements; each thread stages `tile_b_size / 32` times.
+//
+//   Staging A: element[iter * 32 + lane_id] = A[global_row(iter, lane_id) * K + global_col(iter, lane_id)]
+//   Staging B: element[iter * 32 + lane_id] = B[global_row(iter, lane_id) * N + global_col(iter, lane_id)]
+//
+//   A-tile element linear index `ei = iter*32 + lane_id`:
+//     row in tile = ei / tile_k
+//     col in tile = ei - (ei/tile_k)*tile_k
+//     A global row = tile_row * 16 + (tile row in A-tile)
+//     A global col = k_block * tile_k + (tile col in A-tile)
+//
+//   B-tile element linear index `ei = iter*32 + lane_id`:
+//     row in tile = ei / 16
+//     col in tile = ei - (ei/16)*16
+//     B global row = k_block * tile_k + (tile row in B-tile)
+//     B global col = tile_col * 16 + (tile col in B-tile)
+//
 // AT-1620/1622 fixture: NON-symmetric, K = 2*tile_k (>= 2 K-blocks so accumulation is
 // load-bearing: a single-block kernel would pass a 1-block fixture but fail a 2-block one).
 //
@@ -62,33 +84,51 @@ fn matmul_shared_coopmat(
     // before the K-loop. The M3.3 OpPhi fix ensures acc is updated each iteration.
     let mut acc: matrix[f16, 16, 16, accumulator] = coopmat_zero();
 
+    // Staging iterations per thread:
+    //   a_iters = tile_a_size / 32 (= tile_m * tile_k / 32 = 16 * tile_k / 32)
+    //   b_iters = tile_b_size / 32 (= tile_k * tile_n / 32 = tile_k * 16 / 32)
+    // Both equal tile_k / 2. For tile_k=16 → 8 iters; tile_k=32 → 16 iters.
+    let a_iters: u32 = ?tile_a_size / 32u32;
+    let b_iters: u32 = ?tile_b_size / 32u32;
+
     // K-loop: iterate over K in TILE_K-sized blocks.
     // Loop-carried: acc accumulates coopmat MulAdd results across K-blocks.
     let num_k_blocks: u32 = K / ?tile_k;
     for k_block in range(0u32, num_k_blocks) {
 
         // ── Stage A[tile_row, k_block] into a_tile ────────────────────────────
-        // Each of the 32 lanes loads one f16 element per pass.
-        // A tile has TILE_M*TILE_K = 16*tile_k elements; 32 lanes cover all in one pass
-        // when tile_k=16 (256/32 = 8 iterations but we do a single-element load here;
-        // the fixture uses K=2*tile_k so each lane loads its assigned element).
-        let lane_row: u32 = lane_id / ?tile_k;
-        let lane_col: u32 = lane_id - lane_row * ?tile_k;
-        let a_global_col: u32 = k_block * ?tile_k + lane_col;
-        let a_global_row: u32 = tile_row * 16u32 + lane_row;
-        let a_global: u32 = a_global_row * K + a_global_col;
-        let a_shared: u32 = lane_row * ?tile_k + lane_col;
-        a_tile[a_shared] = A[a_global];
+        // Each thread covers a_iters = tile_a_size/32 elements.
+        // Element linear index: ei = iter * 32 + lane_id
+        //   Row in A-tile: a_row = ei / tile_k
+        //   Col in A-tile: a_col = ei - a_row * tile_k
+        //   A global row: tile_row * 16 + a_row
+        //   A global col: k_block * tile_k + a_col
+        for a_iter in range(0u32, a_iters) {
+            let ei_a: u32 = a_iter * 32u32 + lane_id;
+            let a_row: u32 = ei_a / ?tile_k;
+            let a_col: u32 = ei_a - a_row * ?tile_k;
+            let a_global_row: u32 = tile_row * 16u32 + a_row;
+            let a_global_col: u32 = k_block * ?tile_k + a_col;
+            let a_global: u32 = a_global_row * K + a_global_col;
+            a_tile[ei_a] = A[a_global];
+        }
 
         // ── Stage B[k_block, tile_col] into b_tile ────────────────────────────
-        // B tile has TILE_K*TILE_N = tile_k*16 elements.
-        let b_lane_row: u32 = lane_id / 16u32;
-        let b_lane_col: u32 = lane_id - b_lane_row * 16u32;
-        let b_global_row: u32 = k_block * ?tile_k + b_lane_row;
-        let b_global_col: u32 = tile_col * 16u32 + b_lane_col;
-        let b_global: u32 = b_global_row * N + b_global_col;
-        let b_shared: u32 = b_lane_row * 16u32 + b_lane_col;
-        b_tile[b_shared] = B[b_global];
+        // Each thread covers b_iters = tile_b_size/32 elements.
+        // Element linear index: ei = iter * 32 + lane_id
+        //   Row in B-tile: b_row = ei / 16
+        //   Col in B-tile: b_col = ei - b_row * 16
+        //   B global row: k_block * tile_k + b_row
+        //   B global col: tile_col * 16 + b_col
+        for b_iter in range(0u32, b_iters) {
+            let ei_b: u32 = b_iter * 32u32 + lane_id;
+            let b_row: u32 = ei_b / 16u32;
+            let b_col: u32 = ei_b - b_row * 16u32;
+            let b_global_row: u32 = k_block * ?tile_k + b_row;
+            let b_global_col: u32 = tile_col * 16u32 + b_col;
+            let b_global: u32 = b_global_row * N + b_global_col;
+            b_tile[ei_b] = B[b_global];
+        }
 
         // Barrier: all invocations must finish staging before the coopmat loads.
         workgroup_barrier();
