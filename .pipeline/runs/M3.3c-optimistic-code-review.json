@@ -1,0 +1,87 @@
+{
+  "verdict": "APPROVE",
+  "agent": "optimistic_code_reviewer",
+  "milestone_id": "M3.3c-matmul-perf",
+  "branch": "coder/M33c-20260604-0900/M3.3c-matmul-perf",
+  "review_date": "2026-06-04",
+  "spec_compliance": true,
+
+  "positive_feedback": [
+    "AT-1733 is a real, substantive pre-gate test: compiles a kernel with EXACTLY the pattern used in matmul_rb_coopmat.axc (4 loop-carried coopmat accumulators in ONE K-loop), then makes 7 precise structural assertions on the emitted SPIR-V (1 loop header, 4 OpPhi, 7 words per phi, distinct result_ids, shared predecessor pair, valid OpLabel ids, total-phi-count == 4). spirv-val Vulkan_1_1 clean. This is a genuine codegen contract test, not a stub.",
+    "AT-1731/AT-1732 are real GPU dispatch tests with non-symmetric integer-f16 fixtures (M=N=64, K=32 and K=48). max_diff==0.0 assertion is non-negotiable and carries an explicit HONESTY GATE comment forbidding tolerance relaxation. Typed-skip on Lavapipe CoopMatUnsupported is correct behavior. Both confirmed bit-exact by QA on NVIDIA RTX PRO 6000.",
+    "TFLOPS bench (AT-1730) is fully honest: measures all 3 sizes (256³=3.1, 512³=14.6, 768³=31.2 TFLOPS), does NOT hide the 256³ regression, uses COMPETITIVE_PCT_THRESHOLD=25.0 with correct labeling, prints actual M/N/K gaming guard, asserts only tflops>0 && finite. The 768³ 25%/6× win is correctly labeled competitive (equals the threshold exactly).",
+    "Zero codegen change confirmed: git diff main..HEAD -- crates/axc-codegen/src/ is empty. The N-phi single-loop path was already general; AT-1733 locked it without touching implementation.",
+    "matmul_rb_coopmat.axc kernel is well-constructed: asymmetric index recovery (gid(0)/32 for col, gid(1) unchanged for row, IDENTICAL idiom to M3.3b), 4 accumulators declared before K-loop, all unconditionally reassigned at the top level (AT-1708 compliant), A and B shared tiles each loaded once and reused across 4 mul_adds (the arithmetic intensity gain), correct c_base offsets for all 4 output tiles, explicit return (anti-pattern #2), no >> operator (anti-pattern #8).",
+    "AT-1734 CI compile anchor verifies matmul_rb_coopmat.axc compiles clean + spirv-val + shared_memory_bytes==2048 without any GPU — solid CI gate.",
+    "DESIGN §3.1.17 OCCUPANCY vs ARITHMETIC INTENSITY TRADEOFF section is explicit and technically accurate: correctly explains 64 vs 256 vs 576 workgroup counts at 256³/512³/768³ and why 256³ may regress while larger sizes win.",
+    "ROADMAP M3.3c entry correctly reflects the MEASURED results (256³ regression, 768³ 25%/6× win), uses 'expected' vs 'MEASURED RESULT' language correctly.",
+    "strip_strategy_annotation_block bug discovered and honestly disclosed in coder.json with a safe workaround (avoiding '@strategy' in comments). Pre-existing bug not introduced by M3.3c; properly tracked for follow-up.",
+    "Single-tile kernel (matmul_shared_coopmat.axc) and baseline bench (resident_matmul_competitive.rs) retained unchanged — regression baseline preserved for A/B.",
+    "All pre-existing tests retained: AT-1620, AT-1622, AT-1707, AT-1606, AT-1621, AT-1630 all present and passing.",
+    "QA correctly caught and fixed 4 mechanical clippy lints (manual_is_multiple_of x2, map_flatten x2) that the coder missed. Fixes are logic-neutral. PASS after fix is appropriate."
+  ],
+
+  "spec_compliance_detail": {
+    "at1733_pre_gate": "PASS — substantive structural test, 7 assertions, spirv-val clean, no codegen change required",
+    "at1731_bit_exact": "PASS — real GPU test, non-symmetric fixture, max_diff==0.0, confirmed on NVIDIA RTX PRO 6000",
+    "at1732_bit_exact": "PASS — K=32 and K=48 both max_diff==0.0, confirms multi-K-block OpPhi carry correctness",
+    "at1734_ci_anchor": "PASS — spirv-val clean, shared_memory_bytes==2048 verified",
+    "rb_kernel": "COMPLIANT — asymmetric index, 4 accumulators, A/B reuse, correct stores, all AT-1708 constraints respected",
+    "tflops_bench": "HONEST — all 3 sizes measured and reported including 256³ regression, competitive threshold enforced at 25%",
+    "design_roadmap_docs": "ACCURATE — occupancy tradeoff stated explicitly, measured results filled in by QA, no overclaim",
+    "no_codegen_change": "CONFIRMED — git diff of crates/axc-codegen/src/ produces zero bytes",
+    "no_public_api_regression": "CONFIRMED — additive only; new matmul_rb_coopmat kernel, no existing API modified",
+    "single_tile_baseline_retained": "CONFIRMED — matmul_shared_coopmat.axc + resident_matmul_competitive.rs unchanged",
+    "qa_clippy_fix_scope": "MECHANICAL — 4 lint errors in bench file, no logic change, PASS after fix is correct"
+  },
+
+  "minor_issues": [
+    {
+      "id": "NBS-1",
+      "file": "crates/axc-driver/benches/resident_matmul_rb.rs",
+      "description": "The iter_custom closure re-invokes resident_min_of_n at 256³ a second time for criterion duration bookkeeping (after already calling measure_rb_tflops for 256³/512³/768³). This means each criterion iteration runs ~4 full min-of-N measurement passes. This is non-blocking (bench is behind AXC_ENABLE_GPU_BENCHES gate, not a correctness issue, and the structure matches the existing AT-1710 bench pattern), but is slightly wasteful. Consider refactoring to cache the 256³ timing from the first measure_rb_tflops call if criterion bookkeeping ever becomes sensitive.",
+      "severity": "non-blocking"
+    },
+    {
+      "id": "NBS-2",
+      "file": "crates/axc-driver/src/lib.rs",
+      "description": "strip_strategy_annotation_block matches the first occurrence of '@strategy' in the source string; if '@strategy' appears in comments before the annotation, the wrong position is found. This is a pre-existing bug (present on main), not introduced by M3.3c. The workaround (avoiding '@strategy' in .axc comments) is applied in matmul_rb_coopmat.axc and is safe. Recommend filing a standalone fix (replace simple string find with a regex that requires '@strategy' to be followed by optional whitespace + '{').",
+      "severity": "non-blocking, pre-existing, tracked"
+    },
+    {
+      "id": "NBS-3",
+      "file": "crates/axc-codegen/tests/opphi_loop_carried.rs (AT-1733 kernel source)",
+      "description": "In the AT-1733 inline kernel, acc_10 and acc_11 are stored to the SAME c_base (0 and 16 respectively) as acc_00 and acc_01. This means the AT-1733 test stores all 4 accumulators to overlapping addresses. This is intentional for the codegen pre-gate (the test only checks phi shape, not numeric correctness — there are no CPU reference checks), and the comment explains AT-1733 is a 'pre-gate' not a dispatch test. The real correctness check is AT-1731/1732. No action required.",
+      "severity": "observation only, not a defect"
+    }
+  ],
+
+  "assessment_items": {
+    "q1_at1733_substantive": {
+      "verdict": "YES",
+      "reasoning": "AT-1733 compiles a kernel with EXACTLY the 4-accumulator, single-K-loop pattern of matmul_rb_coopmat.axc, then makes 7 precise structural assertions on the emitted SPIR-V binary (loop header count, phi count, phi word count, result_id distinctness, shared predecessors, valid OpLabel references, global phi count). spirv-val Vulkan_1_1 passes. This is a genuine N-phi codegen contract locked before the kernel was written."
+    },
+    "q2_rb_kernel_clean": {
+      "verdict": "YES",
+      "reasoning": "Asymmetric index (gid(0)/32, gid(1) unchanged), 4 named accumulators declared pre-loop, all unconditionally reassigned at K-loop top level (AT-1708), a_mat_0/a_mat_1 and b_mat_0/b_mat_1 loaded once and reused across 4 mul_adds, 4 distinct c_base addresses for output stores, explicit return, no >> operator."
+    },
+    "q3_at1731_1732_real": {
+      "verdict": "YES",
+      "reasoning": "Non-symmetric integer-f16 fixtures (A patterns {1..4}, B patterns {1..3}), max_diff==0.0 exact assert with explicit HONESTY GATE comment forbidding relaxation, #[ignore]+AXC_ENABLE_GPU_TESTS gated, typed-skip on Lavapipe, confirmed bit-exact on NVIDIA RTX PRO 6000 by QA."
+    },
+    "q4_bench_honest": {
+      "verdict": "YES",
+      "reasoning": "All 3 sizes measured: 256³=3.1 TFLOPS (regresses, reported first, not hidden), 512³=14.6, 768³=31.2 (25.0%, equals threshold, labeled competitive). M/N/K printed per measurement as gaming guard. COMPETITIVE_PCT_THRESHOLD enforced at 25.0. Only asserts tflops>0 && finite. Occupancy tradeoff pre-disclosed in docs."
+    },
+    "q5_no_codegen_change": {
+      "verdict": "YES — CONFIRMED",
+      "reasoning": "git diff main..HEAD -- crates/axc-codegen/src/ produces empty output (0 bytes, 0 lines). Zero changes to body.rs or any codegen source file. AT-1733 test file is in crates/axc-codegen/tests/, not src/."
+    },
+    "q6_baseline_retained": {
+      "verdict": "YES",
+      "reasoning": "matmul_shared_coopmat.axc unchanged, resident_matmul_competitive.rs unchanged, all pre-existing AT-1620/1622/1707/1606/1621/1630 tests retained and passing."
+    }
+  },
+
+  "summary": "All M3.3c deliverables are present, correctly implemented, and match the agreed spec. AT-1733 is a real 7-assertion structural codegen test (not a stub). AT-1731/1732 are real bit-exact GPU dispatch tests confirmed max_diff==0.0 on NVIDIA. The TFLOPS bench honestly reports all 3 sizes including the 256³ regression; the 768³ 25%/6× win crosses the competitive threshold exactly. Zero codegen change. Single-tile baseline retained. Public API additive. QA caught 4 mechanical clippy lints in the bench file (logic-neutral fixes). Three non-blocking observations are filed (double-timing in bench, pre-existing strip_strategy bug, non-overlapping stores in AT-1733 test are intentional). Merge-ready."
+}

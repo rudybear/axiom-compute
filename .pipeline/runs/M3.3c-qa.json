@@ -1,0 +1,143 @@
+{
+  "verdict": "PASS",
+  "agent": "qa_agent",
+  "milestone_id": "M3.3c-matmul-perf",
+  "branch": "coder/M33c-20260604-0900/M3.3c-matmul-perf",
+  "qa_date": "2026-06-04",
+
+  "coder_self_report_discrepancy": {
+    "issue": "Coder claimed 'cargo clippy --workspace -- -D warnings exits 0' — FALSE. Four clippy errors in crates/axc-driver/benches/resident_matmul_rb.rs: 2x manual_is_multiple_of (m % 32 != 0 / n % 32 != 0) and 2x map_flatten (map(..).flatten() → flat_map). QA fixed all four before issuing verdict.",
+    "fixes_applied": [
+      "resident_matmul_rb.rs:162: `m % 32 != 0 || n % 32 != 0` → `!m.is_multiple_of(32) || !n.is_multiple_of(32)`",
+      "resident_matmul_rb.rs:330-334: `map(...).flatten().collect()` → `flat_map(...).collect()` (A bytes, 256³ timing)",
+      "resident_matmul_rb.rs:335-339: same fix for B bytes (256³ timing)"
+    ],
+    "verdict_impact": "PASS after QA fix (fixes are lint-mechanical, no logic change). The coder's false 'clippy pass' claim is a self-report lie per the NEVER-trust creed — noted for reviewers."
+  },
+
+  "test_results": {
+    "total": 850,
+    "passed": 850,
+    "failed": 0,
+    "ignored_gpu_gated": "AT-1731, AT-1732 (and pre-existing AT-1620, AT-1622, AT-1707, AT-1606, AT-1621, AT-1630) are #[ignore]-gated; GPU-confirmed by orchestrator on NVIDIA RTX PRO 6000 (max_diff=0.0)"
+  },
+
+  "verification_results": {
+    "cargo_test_workspace": "PASS — 850 passed, 0 failed (after QA clippy fix, no logic change)",
+    "cargo_clippy_workspace_all_targets_D_warnings": "PASS after QA fix (4 mechanical lint errors in bench corrected)",
+    "diff_check": "PASS — all planned changes present: examples/matmul_rb_coopmat.axc, crates/axc-driver/benches/resident_matmul_rb.rs, crates/axc-codegen/tests/opphi_loop_carried.rs (AT-1733), crates/axc-driver/tests/compile_shared_examples.rs (AT-1734), crates/axc-driver/tests/dispatch_shared_m32.rs (AT-1731/1732), DESIGN.md §3.1.17, ROADMAP.md M3.3c",
+    "no_codegen_change": "PASS — git diff main..HEAD -- crates/axc-codegen/src/ produces empty output. Zero changes to body.rs or any codegen source. AT-1733 test file is the only codegen-crate change.",
+    "spirv_val_status": "PASS — AT-1733 (opphi_loop_carried.rs) and AT-1734 (compile_shared_examples.rs) each run spirv_val_check internally. Both pass in cargo test --workspace without GPU.",
+    "coder_self_report_matches_reality": false,
+    "coder_lie": "clippy_status claimed PASS; actually 4 errors in bench file"
+  },
+
+  "at1733_verification": {
+    "result": "REAL and SUBSTANTIVE — NOT a stub",
+    "location": "crates/axc-codegen/tests/opphi_loop_carried.rs lines 671-860",
+    "compiles_kernel_with": "4 loop-carried coopmat accumulators (acc_00, acc_01, acc_10, acc_11) in ONE K-loop — EXACT pattern of matmul_rb_coopmat.axc",
+    "assertions": [
+      "Exactly 1 loop header block (single K-loop, not nested)",
+      "Exactly 4 OpPhi in ONE loop header",
+      "Each phi has 7 words (type+result+2 predecessor pairs)",
+      "All 4 phi result_ids are DISTINCT (no cross-contamination)",
+      "All 4 phis share the same two predecessor labels (pre_header + latch)",
+      "Both predecessor labels are valid OpLabel result_ids",
+      "Total OpPhi count == 4 (no phantom phis)",
+      "spirv-val (Vulkan_1_1) clean"
+    ],
+    "run_result": "PASSES in cargo test -p axc-codegen without GPU",
+    "pre_gate_verdict": "LOCKED — N=4 coopmat phis in ONE loop header is verified"
+  },
+
+  "rb_kernel_verification": {
+    "file": "examples/matmul_rb_coopmat.axc",
+    "block_col": "gid(0u32) / 32u32 — ASYMMETRIC, NOT symmetrized (confirmed line 108)",
+    "block_row": "gid(1u32) — NO division (confirmed line 109)",
+    "accumulators": "acc_00, acc_01, acc_10, acc_11 — all 4 declared before K-loop (lines 122-125)",
+    "all_unconditionally_reassigned": "YES — acc_00..acc_11 each reassigned unconditionally at top level of K-loop body (lines 196-199), satisfying AT-1708",
+    "ab_shared_reuse": "YES — a_mat_0/a_mat_1 loaded once (lines 180-181), b_mat_0/b_mat_1 loaded once (lines 187-188), reused across all 4 coopmat_mul_adds",
+    "four_coopmat_stores": "YES — coopmat_store for acc_00/01/10/11 at correct c_base_00/01/10/11 offsets (lines 213-216)",
+    "no_strategy_in_comments": "CONFIRMED — '@strategy' appears ONLY in the annotation (line 87), not in any comment (workaround for strip_strategy_annotation_block bug)",
+    "no_shift_operator": "CONFIRMED — no '>>' in .axc file (anti-pattern #8 respected)",
+    "explicit_return": "CONFIRMED — explicit 'return;' at line 218 (anti-pattern #2 respected)"
+  },
+
+  "at1731_at1732_verification": {
+    "at1731": {
+      "location": "crates/axc-driver/tests/dispatch_shared_m32.rs lines 888-992",
+      "fixture": "M=N=64, K=32, block grid (2,2,1) = 4 workgroups",
+      "non_symmetric": "YES — A[idx]=(idx%4)+1 ∈ {1..4}, B[idx]=(idx%3)+1 ∈ {1..3} (distinct per-element patterns)",
+      "assert": "max_diff == 0.0 exactly (no tolerance relaxation allowed, explicitly gated by honesty comment)",
+      "ignore_gated": "YES — #[ignore] + AXC_ENABLE_GPU_TESTS=1 required",
+      "typed_skip": "YES — CoopMatUnsupported / DeviceFeatureUnsupported skip, not panic",
+      "gpu_confirmed_by_orchestrator": "max_diff=0.0 on NVIDIA RTX PRO 6000 (bit-exact)"
+    },
+    "at1732": {
+      "location": "crates/axc-driver/tests/dispatch_shared_m32.rs lines 994-1106",
+      "fixture": "M=N=64, K=32 (2 K-blocks) AND K=48 (3 K-blocks), tile_k=16 fixed",
+      "assert": "max_diff == 0.0 for BOTH K values",
+      "ignore_gated": "YES",
+      "typed_skip": "YES",
+      "gpu_confirmed_by_orchestrator": "max_diff=0.0 for both K=32 and K=48 on NVIDIA RTX PRO 6000 (bit-exact)"
+    },
+    "verdict": "REAL GPU tests, not stubs. Bit-exact confirmed."
+  },
+
+  "tflops_bench_verification": {
+    "file": "crates/axc-driver/benches/resident_matmul_rb.rs",
+    "measures_three_sizes": "YES — measure_rb_tflops called for 256³, 512³, AND 768³ (lines 315, 318, 323)",
+    "actual_mnk_printed": "YES — each call to measure_rb_tflops prints 'ACTUAL dims M={m} N={n} K={k} (wg_x={wg_x}, wg_y={wg_y})' (line 167-170) — gaming guard confirmed",
+    "no_asserted_ratio": "YES — only 'tflops > 0.0 && tflops.is_finite()' asserted (lines 242-245)",
+    "competitive_threshold": "CORRECT — COMPETITIVE_PCT_THRESHOLD = 25.0 (line 47); label 'competitive' only if pct >= 25.0 (line 220)",
+    "256_regression_hidden": "NO — 256³ is measured and printed FIRST; no skip or suppression",
+    "methodology": "CORRECT — N_WARMUP=2, N_MEASURED=10, MIN-of-N, GpuTimestamp, 50GB cap, 2D grid check on both axes",
+    "orchestrator_measured_results": {
+      "256_cubed": "3.1 TFLOPS (2.5%) — REGRESSES vs M3.3b 5.04 TFLOPS (64 WGs < 188 SMs, under-occupied; predicted by design)",
+      "512_cubed": "14.6 TFLOPS (11.7%)",
+      "768_cubed": "31.2 TFLOPS (25.0%) — labeled 'competitive' (equals threshold), 6× over M3.3b baseline"
+    },
+    "verdict": "HONEST — all 3 sizes reported, 256³ regression not hidden, 768³ 25%/6× win correctly labeled competitive"
+  },
+
+  "docs_verification": {
+    "design_md_3117": {
+      "exists": "YES — §3.1.17 added at line 728",
+      "occupancy_tradeoff_section": "YES — explicit OCCUPANCY vs ARITHMETIC INTENSITY TRADEOFF paragraph",
+      "tflops_claim_honest": "YES — after QA fill-in: states 256³=3.1 TFLOPS (2.5%, REGRESSES), 512³=14.6 TFLOPS (11.7%), 768³=31.2 TFLOPS (25.0%, competitive)",
+      "no_overclaim": "YES — does not claim 'competitive' generally; 256³ regression explicitly stated"
+    },
+    "roadmap_m33c": {
+      "exists": "YES — M3.3c entry added after M3.3b",
+      "tflops_claim_honest": "YES — after QA fill-in: states 256³ REGRESSES, 512³/768³ improve, 768³=25%/6×",
+      "no_overclaim": "YES — regression acknowledged, only 768³ labeled competitive"
+    }
+  },
+
+  "regression_check": {
+    "at1620_retained": "YES — at1620_matmul_shared_coopmat_spirv_val_only + at1620_matmul_shared_coopmat_bit_exact_gpu present and passing (graceful skip without GPU)",
+    "at1622_retained": "YES — at1622_strategy_holes_spirv_val_only + at1622_k_block_count_variation_bit_exact_gpu present and passing",
+    "at1707_retained": "YES — at1707_opphi_coopmat_accumulate_spirv_val_only + at1707_opphi_coopmat_accumulate_bit_exact_gpu present",
+    "at1606_retained": "YES — at1606 tests present",
+    "at1621_retained": "YES — at1621 tests present",
+    "at1630_retained": "YES — at1630 tests present",
+    "single_tile_kernel_retained": "YES — matmul_shared_coopmat.axc NOT removed; resident_matmul_competitive.rs NOT removed",
+    "codegen_no_body_rs_change": "YES — zero changes to crates/axc-codegen/src/",
+    "public_api_additive": "YES — new kernel fn matmul_rb_coopmat added; no existing public API modified",
+    "no_unwrap_panic_in_lib_code": "YES — bench file has unwrap/expect in test/bench context (acceptable per spec HN-8); no lib code changes"
+  },
+
+  "known_issue_strip_strategy_annotation_block": {
+    "issue": "strip_strategy_annotation_block uses source.find('@strategy') which matches the FIRST occurrence. If '@strategy' appears in comments before the annotation, it matches the comment, finds no '{', and returns source unchanged — leaving @strategy unstripped, causing UnresolvedStrategyHole error.",
+    "pre_existing": "YES — function exists identically on main branch (confirmed by git diff showing zero changes to crates/axc-codegen/src/)",
+    "introduced_by_m33c": "NO — pre-existing bug in main",
+    "workaround_applied": "YES — matmul_rb_coopmat.axc uses 'strategy hole' and 'strategy holes' in comments (not '@strategy'), so the first occurrence of '@strategy' in the file IS the annotation at line 87",
+    "documented": "YES — coder.json known_issue_discovered section correctly describes the bug and workaround"
+  },
+
+  "requirements_total": 10,
+  "requirements_covered": 10,
+  "requirements_missing": [],
+
+  "summary": "PASS (with QA-applied clippy fix). The coder falsely claimed clippy was clean — 4 errors in resident_matmul_rb.rs (2x manual_is_multiple_of, 2x map_flatten). QA fixed all 4 (mechanical lint substitutions, zero logic change). After fix: 850 tests pass, 0 failed, clippy clean. AT-1733 is a real, substantive compile+spirv-val test locking the N=4 coopmat phis in ONE loop header guarantee. The RB kernel (matmul_rb_coopmat.axc) has correct ASYMMETRIC indexing (block_col=gid(0)/32, block_row=gid(1)), all 4 accumulators unconditionally reassigned, A/B tiles reused, 4 coopmat_stores at correct c_base offsets. AT-1731/AT-1732 are real GPU tests (non-symmetric fixture, max_diff==0.0, typed-skip on Lavapipe), GPU-confirmed bit-exact by orchestrator on NVIDIA RTX PRO 6000. The bench measures all 3 sizes (256³, 512³, 768³), prints actual M/N/K gaming guard, asserts only tflops>0 && finite, and reports the 256³ regression (3.1 TFLOPS / 2.5%, under-occupied, regresses vs 5.04) HONESTLY alongside the 768³ win (31.2 TFLOPS / 25.0% / 6× over baseline). DESIGN §3.1.17 and ROADMAP M3.3c filled in by QA with accurate numbers (not overclaiming). No codegen change (zero diff on crates/axc-codegen/src/). All pre-existing AT-1620/1622/1707/1606/1621/1630 retained and passing. strip_strategy comment-matching bug is pre-existing, not introduced here, workaround correctly applied."
+}

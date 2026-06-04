@@ -164,3 +164,58 @@ fn at1614_shared_source_coopmat_spirv_valid() {
     // Passing this test proves the shared-source single-index path is emitted correctly.
     compile_with_assignments_and_validate(src, &assignments, "at1614_matmul_shared_coopmat");
 }
+
+/// AT-1734: matmul_rb_coopmat.axc (M3.3c register-blocked 2×2) compiles + spirv-val clean
+/// with the shipped RB strategy assignments (rb_m=2, rb_n=2, tile_k=16, a_block_size=512,
+/// b_block_size=512). Runs in CI without a coopmat GPU — CI compile anchor.
+///
+/// Also verifies:
+///   - shared_memory_bytes = (a_block_size + b_block_size) * sizeof(f16) = (512+512)*2 = 2048 bytes.
+///   - The SPIR-V binary is non-empty (codegen produced real instructions).
+///   - No regression on the matmul_shared_coopmat.axc anchor (retained).
+#[test]
+fn at1734_matmul_rb_coopmat_spirv_val() {
+    let src = include_str!("../../../examples/matmul_rb_coopmat.axc");
+
+    // Shipped RB assignments: rb_m=2, rb_n=2, tile_k=16, a_block_size=512, b_block_size=512.
+    // a_block_size = RB_M * tile_m * tile_k = 2 * 16 * 16 = 512 f16 elements.
+    // b_block_size = tile_k * RB_N * tile_n = 16 * 2 * 16 = 512 f16 elements.
+    let mut assignments = StrategyMap::new();
+    assignments.insert("rb_m".to_owned(), 2_i64);
+    assignments.insert("rb_n".to_owned(), 2_i64);
+    assignments.insert("tile_k".to_owned(), 16_i64);
+    assignments.insert("a_block_size".to_owned(), 512_i64);
+    assignments.insert("b_block_size".to_owned(), 512_i64);
+
+    let (bytes, meta) = axc_driver::compile_source_with_assignments(src, &assignments)
+        .unwrap_or_else(|e| panic!("AT-1734: matmul_rb_coopmat.axc compile failed: {e:?}"));
+
+    // SPIR-V must be non-empty.
+    assert!(!bytes.is_empty(), "AT-1734: matmul_rb_coopmat.axc produced empty SPIR-V");
+
+    let words: Vec<u32> = bytes.chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    // spirv-val must pass.
+    let validator = create_validator(Some(TargetEnv::Vulkan_1_1));
+    validator.validate(&words, None)
+        .unwrap_or_else(|e| panic!("AT-1734: matmul_rb_coopmat.axc spirv-val FAILED: {e}"));
+
+    // Verify shared_memory_bytes = (a_block_size + b_block_size) * sizeof(f16) = 2048 bytes.
+    // a_block_size=512 f16 elements + b_block_size=512 f16 elements = 1024 f16 = 2048 bytes.
+    let expected_shared_bytes: u32 = (512 + 512) * 2; // 2048 bytes
+    assert_eq!(
+        meta.shared_memory_bytes, expected_shared_bytes,
+        "AT-1734: shared_memory_bytes must be {expected_shared_bytes} \
+         (= (a_block_size=512 + b_block_size=512) * 2 bytes/f16); \
+         got {}", meta.shared_memory_bytes
+    );
+
+    eprintln!(
+        "AT-1734 PASS: matmul_rb_coopmat.axc compiles + spirv-val clean \
+         (rb_m=2, rb_n=2, tile_k=16, a_block_size=512, b_block_size=512, \
+         shared_memory_bytes={}, entry_point={})",
+        meta.shared_memory_bytes, meta.entry_point
+    );
+}
