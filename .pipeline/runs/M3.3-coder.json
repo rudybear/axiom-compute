@@ -2,9 +2,10 @@
   "verdict": "IMPLEMENTED",
   "agent": "coder",
   "milestone_id": "M3.3-opphi-matmul",
-  "revision": "r3",
-  "retry": 2,
+  "revision": "r4",
+  "retry": 3,
   "branch": "coder/M33-20260603-1000/M3.3-opphi-matmul",
+  "blocking_fix": "AT-1708 — conditional-only coopmat loop-carried reassignment now rejected with LoopCarriedCoopMatConditionalReassignUnsupported (hard error, not invalid SPIR-V)",
   "files_created": [
     "crates/axc-codegen/tests/opphi_loop_carried.rs",
     "examples/opphi_coopmat_accumulate.axc"
@@ -26,12 +27,15 @@
     "crates/axc-driver/benches/resident_matmul_competitive.rs"
   ],
   "public_apis_implemented": [
-    "// body.rs: fn detect_loop_carried_coopmat(em, hir_for) -> Vec<(BindingId, Word)>",
+    "// body.rs: fn detect_loop_carried_coopmat(em, hir_for) -> Result<Vec<(BindingId, Word)>, BodyCodegenError>",
     "// body.rs: fn stmt_reassigns_binding(stmts, target, descend_nested_loops) -> bool",
+    "// body.rs: fn stmt_reassigns_binding_unconditionally(stmts, target) -> bool  [NEW AT-1708]",
+    "// body.rs: fn stmt_has_conditional_reassign(stmts, target) -> bool  [NEW AT-1708]",
     "// body.rs: fn stmt_reassigns_binding_in_else(else_arm, target, descend_nested_loops) -> bool",
     "// body.rs: fn stmts_contain_break_or_continue_at_level(stmts) -> (bool, bool, Option<Span>)",
     "// body.rs: BodyCodegenError::LoopCarriedCoopMatAcrossContinueUnsupported { span }",
     "// body.rs: BodyCodegenError::LoopCarriedCoopMatAcrossBreakUnsupported { span }",
+    "// body.rs: BodyCodegenError::LoopCarriedCoopMatConditionalReassignUnsupported { name, span }  [NEW AT-1708]",
     "// body.rs: HirStmt::Assign handler branched on coopmat_binding_ids (ISSUE-2)",
     "// typecheck.rs: both Assign arms route BindingTy::CoopMatrix through check_coopmat_init_expr (ISSUE-1)"
   ],
@@ -47,6 +51,8 @@
     "at1705_coopmat_reassign_typechecks",
     "at1706_coopmat_reassign_wrong_c_arg_use_rejected",
     "at1706_coopmat_reassign_correct_shape_compiles",
+    "at1708_coopmat_conditional_only_reassign_rejected  [NEW — AT-1708 primary negative test]",
+    "at1708_coopmat_unconditional_plus_conditional_also_rejected  [NEW — AT-1708 covers uncond+cond case]",
     "at1707_opphi_coopmat_accumulate_spirv_val_only (non-ignored anchor, passes)",
     "at1707_opphi_coopmat_accumulate_bit_exact_gpu (#[ignore], GPU-PROVEN PASS on NVIDIA RTX PRO 6000)",
     "at1620_matmul_shared_coopmat_spirv_val_only (compile+spirv-val anchor, passes)",
@@ -61,22 +67,24 @@
   "cargo_check_status": "pass",
   "cargo_clippy_status": "pass (0 warnings, -D warnings clean)",
   "cargo_test_status": "pass (all 0 failed; GPU tests #[ignore]-gated; AT-1620/1622 wip stubs are #[ignore])",
-  "spirv_val_status": "pass — AT-1707 + AT-1620 (tile_k=16) + AT-1622 (tile_k=16 AND tile_k=32) spirv-val Vulkan_1_1 clean",
-  "m33_honest_status": "OpPhi loop-carried SSA GPU-proven (AT-1707 PASS bit-exact on NVIDIA RTX PRO 6000) + f32 tiled matmul (AT-1621 PASS) + tiled attention (AT-1630 PASS) + shared reduction (AT-1606 PASS) ship. Full coopmat matmul (AT-1620/1622) numerics + TFLOPS bench DEFERRED — kernel has wrong output coverage for N>tile_n (multi-N-tile output loop needed).",
-  "at1707_result": {
-    "status": "GPU PASS bit-exact on NVIDIA RTX PRO 6000 (measured by orchestrator)",
-    "meaning": "OpPhi loop-carried coopmat accumulation is numerically correct. AT-1620 failure was a staging coverage bug, not a compiler bug.",
-    "kernel": "examples/opphi_coopmat_accumulate.axc",
-    "fixture": "M=N=16, K_ITER=4, A/B integer-valued f16, expected C = 4 × (A·B)",
-    "assertion": "max_diff == 0.0 (exact for small integer f16 inputs)"
+  "spirv_val_status": "pass — AT-1707 + AT-1708a/b + AT-1701..1703 all spirv-val Vulkan_1_1 clean",
+  "at1708_detection_rule": {
+    "description": "A coopmat binding is loop-carried (phi-eligible) ONLY when: (1) stmt_reassigns_binding_unconditionally returns true (unconditional top-level assign exists), AND (2) stmt_has_conditional_reassign returns false (no conditional if/else reassignment). Two new functions implement the two-gate check. detect_loop_carried_coopmat now returns Result and fires LoopCarriedCoopMatConditionalReassignUnsupported on violation.",
+    "why_uncond_plus_cond_also_rejected": "Even when a top-level unconditional assign exists, a conditional reassignment inside the if/else branch causes body emission to update var_ids[acc] to the if-branch SSA id (the if block emits AFTER the top-level assign in the body sequence). The latch_values capture after body emission holds the if-branch SSA id — which does NOT dominate the continue/back-edge block. The resulting OpPhi is invalid SPIR-V. Conservative rejection of both cases is correct.",
+    "new_error_variant": "LoopCarriedCoopMatConditionalReassignUnsupported { name: String, span: Span }",
+    "symmetric_to": "AT-1704 break/continue rejection"
   },
-  "at1620_root_cause": {
-    "found": true,
-    "description": "KERNEL OUTPUT COVERAGE: the M=16, N=24, K=32 fixture spans >1 coopmat output N-tile (N=24 needs ceil(24/16)=2 N-tiles of width 16). The single-tile kernel only computes the N=0..15 output tile; outputs at N>=16 are wrong. This is NOT an OpPhi or compiler bug (proven by AT-1707). GPU=[96,126,0,0] vs CPU=[80,160,240,80] is consistent with partial N-column coverage.",
-    "fix_needed": "A tile-output loop over N-tiles in the kernel dispatch geometry. Deferred to M3.x follow-up.",
-    "opphi_status": "NOT BROKEN — OpPhi is correct (AT-1707 GPU PASS). AT-1620 failure is a kernel tiling issue only."
+  "expect_panics_addressed": {
+    "pre_header_values_collect": "Converted from .expect() to .ok_or_else(|| BodyCodegenError::Rspirv(...)).collect::<Result<Vec<_>, _>>()? with SAFETY comment explaining detection invariant",
+    "latch_values_collect": "Converted from .expect() to .ok_or_else(|| BodyCodegenError::Rspirv(...)).collect::<Result<Vec<_>, _>>()? with SAFETY comment explaining unconditional-reassign invariant"
   },
-  "competitive_bench_status": "REMOVED: resident_matmul_competitive.rs deleted and [[bench]] entry removed from Cargo.toml. A TFLOPS number from a wrong-computing kernel is misleading; deferred until AT-1620 is fixed.",
+  "positive_cases_confirmed": {
+    "at1707_spirv_val": "PASS",
+    "at1701_coopmat_loop_carried_phi_wellformed": "PASS",
+    "at1702_nested_loop_two_coopmat_phis": "PASS",
+    "at1703_zero_trip_coopmat_phi_post_loop_read": "PASS",
+    "matmul_examples": "PASS (opphi_coopmat_accumulate.axc, matmul_shared_coopmat.axc, matmul_shared_f32.axc, tiled_attention.axc all compile and spirv-val clean)"
+  },
   "git_commits": [
     "d4518b2 feat(codegen): M3.3 PART A — OpPhi loop-carried SSA + typecheck coopmat assign fix",
     "cf8fb87 test(codegen): M3.3 PART A — AT-1700..1706 OpPhi loop-carried SSA tests",
@@ -85,26 +93,29 @@
     "a26ae59 chore(pipeline): M3.3 coder output JSON — verdict IMPLEMENTED",
     "cf4910e fix(kernels+tests): AT-1707 OpPhi isolation + AT-1620 staging loop fix (M3.3 retry:1)",
     "c8ac908 chore(pipeline): M3.3 coder output JSON — verdict IMPLEMENTED, retry:1",
-    "(retry:2 commit — honesty cleanup): quarantine AT-1620/1622 wip stubs + remove competitive bench + WIP comment on matmul_shared_coopmat.axc"
+    "469385d fix(tests+bench): M3.3 retry:2 honesty cleanup — quarantine AT-1620/1622 wip stubs, remove competitive bench",
+    "802debf fix(M3.3): QA honesty corrections — DESIGN/ROADMAP reflect real outcome, AT-1702 assert",
+    "687c01a fix(codegen): AT-1708 reject conditional-only coopmat loop-carried reassign  [BLOCKING FIX]"
   ],
   "self_assessment": {
-    "spec_coverage": "All retry:2 honesty-cleanup tasks: (1) AT-1620/1622 GPU tests converted to empty #[ignore] stubs with honest WIP comments — no wrong-computing assertion ships; (2) compile+spirv-val anchors for AT-1620/1622 retained; (3) matmul_shared_coopmat.axc WIP header added; (4) resident_matmul_competitive.rs deleted + Cargo.toml entry removed; (5) pipeline JSON updated with honest self-assessment.",
+    "spec_coverage": "All blocking-fix items: (1) LoopCarriedCoopMatConditionalReassignUnsupported error variant added; (2) stmt_reassigns_binding_unconditionally and stmt_has_conditional_reassign detect the two cases; (3) detect_loop_carried_coopmat returns Result and fires hard error on any conditional reassignment of a carried binding; (4) the uncond+cond case is also correctly rejected (latch capture is ambiguous); (5) two .expect() panics converted to typed errors with SAFETY comments; (6) AT-1708a and AT-1708b negative tests added; (7) all existing positive tests (AT-1701/1702/1703/1707, matmul examples) confirmed green.",
     "known_limitations": [
       "Full coopmat matmul (AT-1620/1622): kernel has wrong output coverage for N>tile_n — deferred to M3.x follow-up.",
-      "TFLOPS competitive bench: removed because kernel computes wrong values for the 256×256 fixture; deferred with the fix.",
-      "AT-1707 inner staging loops in opphi_coopmat_accumulate.axc intentionally use offset=0 each iteration (same tile) — this is correct for the isolation test (K_ITER accumulations of same tile)."
+      "AT-1708 unconditional+conditional case: conservative rejection is correct given the current single-pass SSA emission model. A future improvement could use a join-point analysis to select the top-level SSA id as latch value, but that requires tracking emission order and is deferred.",
+      "AT-1707 inner staging loops in opphi_coopmat_accumulate.axc intentionally use offset=0 each iteration (same tile) — correct for the isolation test."
     ],
     "deviations": [
-      "AT-1620/1622 GPU tests renamed to _wip suffix so the AT number label is preserved in the test suite as a visible deferred item."
+      "AT-1708b captures the uncond+cond case as ALSO rejected (not as a compile success). The spirv-val failure confirmed this is the correct behaviour — the if-branch SSA id was being used as latch value, violating domination."
     ]
   },
   "cargo_actual_results": {
     "cargo_check": "Finished dev profile [unoptimized + debuginfo] — 0 errors",
     "cargo_clippy": "Finished dev profile [unoptimized + debuginfo] — 0 warnings, -D warnings clean",
-    "cargo_test": "All test result lines: ok. 0 failed everywhere. AT-1620/1622 wip stubs: ignored (not failing).",
-    "dispatch_shared_m32_summary": "8 passed; 0 failed; 6 ignored (AT-1606 gpu, AT-1620 wip, AT-1621 gpu, AT-1622 wip, AT-1630 gpu, AT-1707 gpu)",
-    "at1707_spirv_val": "at1707_opphi_coopmat_accumulate_spirv_val_only: PASS",
-    "at1620_spirv_val": "at1620_matmul_shared_coopmat_spirv_val_only: PASS (tile_k=16)",
-    "at1622_spirv_val": "at1622_strategy_holes_spirv_val_only: PASS (tile_k=16 AND tile_k=32)"
+    "cargo_test": "All test result lines: ok. 0 failed everywhere.",
+    "opphi_test_count": "13 passed (was 11 before AT-1708 additions); 0 failed; 0 ignored",
+    "full_workspace": "0 failures across all crates",
+    "at1708a_result": "at1708_coopmat_conditional_only_reassign_rejected: PASS",
+    "at1708b_result": "at1708_coopmat_unconditional_plus_conditional_also_rejected: PASS",
+    "at1707_spirv_val": "at1707_opphi_coopmat_accumulate_spirv_val_only: PASS"
   }
 }
