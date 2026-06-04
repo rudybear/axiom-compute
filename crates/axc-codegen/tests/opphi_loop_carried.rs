@@ -620,3 +620,93 @@ fn at1706_coopmat_reassign_correct_shape_compiles() {
     );
     eprintln!("AT-1706b PASS: correct coopmat reassign compiles");
 }
+
+// ── AT-1708: Conditional-only coopmat reassign → HARD ERROR ──────────────────
+
+/// AT-1708 (BLOCKING FIX): A loop where the coopmat accumulator is reassigned ONLY
+/// inside an `if` body (not unconditionally at the top level of the loop body) must
+/// produce `LoopCarriedCoopMatConditionalReassignUnsupported` — NOT invalid SPIR-V.
+///
+/// Without this guard, `detect_loop_carried_coopmat` would detect `acc` as loop-carried
+/// (because `stmt_reassigns_binding` descends into if/else), and `emit_for_range` would
+/// emit an OpPhi whose latch operand is the SSA id produced inside the `if` block. That
+/// id does NOT dominate the loop's continue/back-edge block → spirv-val rejects it with
+/// "ID definition does not dominate its parent" (invalid SPIR-V, latent GPU UB).
+///
+/// The fix (symmetric to the break/continue rejection in AT-1704): require an unconditional
+/// top-level reassignment. If the only reassignment is conditional, it is a hard error.
+#[test]
+fn at1708_coopmat_conditional_only_reassign_rejected() {
+    // acc is only reassigned inside `if cond { acc = coopmat_mul_add(...); }`.
+    // There is NO unconditional top-level reassignment in the loop body.
+    // This must produce a hard error (not silently emit invalid SPIR-V).
+    let src = r#"
+        @kernel @workgroup(32,1,1) @cooperative_matrix @intent("conditional coopmat reassign") @complexity(O(n))
+        fn coopmat_conditional_only(
+            A: readonly_buffer[f16],
+            B: readonly_buffer[f16],
+            C: buffer[f16],
+            K: u32,
+            N: u32,
+            cond_val: u32
+        ) -> void {
+            shared a_tile: shared[f16, 256];
+            shared b_tile: shared[f16, 256];
+            let mut acc: matrix[f16, 16, 16, accumulator] = coopmat_zero();
+            for k in range(0u32, K) {
+                let a_mat: matrix[f16, 16, 16, a] = coopmat_load(a_tile, 0u32, 16u32);
+                let b_mat: matrix[f16, 16, 16, b] = coopmat_load(b_tile, 0u32, 16u32);
+                if k < cond_val {
+                    acc = coopmat_mul_add(a_mat, b_mat, acc);
+                }
+            }
+            coopmat_store(acc, C, 0u32, N);
+            return;
+        }
+    "#;
+    compile_expect_codegen_error(src, "conditional reassignment");
+    eprintln!("AT-1708 PASS: conditional-only coopmat reassign correctly rejected (not invalid SPIR-V)");
+}
+
+/// AT-1708b: A loop where acc is reassigned BOTH unconditionally at the top level AND
+/// also conditionally inside an if — must also be rejected.
+///
+/// Even though a top-level assign exists, a conditional reassignment inside the loop
+/// causes the body-emission SSA rebind to update var_ids[acc] to the if-branch SSA id
+/// (which emits AFTER the top-level assign). The latch value captured after body emission
+/// is therefore the if-branch SSA id — which does NOT dominate the back-edge block.
+/// The OpPhi would be invalid SPIR-V. Conservative rejection is correct here.
+#[test]
+fn at1708_coopmat_unconditional_plus_conditional_also_rejected() {
+    let src = r#"
+        @kernel @workgroup(32,1,1) @cooperative_matrix @intent("unconditional plus conditional") @complexity(O(n))
+        fn coopmat_uncond_plus_cond(
+            A: readonly_buffer[f16],
+            B: readonly_buffer[f16],
+            C: buffer[f16],
+            K: u32,
+            N: u32,
+            cond_val: u32
+        ) -> void {
+            shared a_tile: shared[f16, 256];
+            shared b_tile: shared[f16, 256];
+            let mut acc: matrix[f16, 16, 16, accumulator] = coopmat_zero();
+            for k in range(0u32, K) {
+                let a_mat: matrix[f16, 16, 16, a] = coopmat_load(a_tile, 0u32, 16u32);
+                let b_mat: matrix[f16, 16, 16, b] = coopmat_load(b_tile, 0u32, 16u32);
+                acc = coopmat_mul_add(a_mat, b_mat, acc);
+                if k < cond_val {
+                    let a2: matrix[f16, 16, 16, a] = coopmat_load(a_tile, 0u32, 16u32);
+                    let b2: matrix[f16, 16, 16, b] = coopmat_load(b_tile, 0u32, 16u32);
+                    acc = coopmat_mul_add(a2, b2, acc);
+                }
+            }
+            coopmat_store(acc, C, 0u32, N);
+            return;
+        }
+    "#;
+    // Must be rejected: a conditional reassignment makes the latch SSA id ambiguous.
+    // The compiler cannot safely emit a valid OpPhi for this pattern.
+    compile_expect_codegen_error(src, "conditional reassignment");
+    eprintln!("AT-1708b PASS: unconditional+conditional coopmat loop correctly rejected (ambiguous latch)");
+}

@@ -104,6 +104,18 @@ pub enum BodyCodegenError {
     #[error("break inside a loop carrying a loop-carried coopmat accumulator is not supported \
              in M3.3 (AT-1704); restructure using a result binding after the loop")]
     LoopCarriedCoopMatAcrossBreakUnsupported { span: Span },
+    /// M3.3 blocking fix (AT-1708): a coopmat accumulator that is only reassigned inside
+    /// a conditional (if/else) body — but NOT unconditionally at the loop-body top level —
+    /// cannot produce a valid OpPhi latch operand. The latch SSA id would come from a
+    /// then-branch that may not dominate the continue/back-edge block, which is invalid
+    /// SPIR-V ("ID definition does not dominate its parent").
+    ///
+    /// The fix is a hard error: require an unconditional top-level reassignment so the
+    /// latch value always dominates the back edge. This mirrors the break/continue rejection.
+    #[error("a cooperative-matrix accumulator '{name}' carried across a loop must be \
+             reassigned unconditionally in the loop body; conditional reassignment \
+             (only inside an if/else) is not yet supported (AT-1708)")]
+    LoopCarriedCoopMatConditionalReassignUnsupported { name: String, span: Span },
 }
 
 /// Cache of SPIR-V type IDs, keyed by `ScalarTy`.
@@ -781,6 +793,56 @@ fn stmt_reassigns_binding(stmts: &[HirStmt], target: BindingId, descend_nested_l
     false
 }
 
+/// Scan `stmts` for an **unconditional** top-level `HirStmt::Assign { binding == target }`.
+///
+/// "Unconditional" means the assignment appears directly in `stmts`, NOT inside an
+/// `HirStmt::If` branch. This is the soundness gate for loop-carried coopmat OpPhi:
+/// only a top-level assign dominates the loop's continue/back-edge block, so only
+/// such an assign can safely serve as the phi's latch operand.
+///
+/// Does NOT descend into `HirStmt::If`, `HirStmt::ForRange`, or `HirStmt::While`.
+/// Does NOT consider nested-loop assigns (each loop level manages its own carried
+/// bindings per the non-descend discipline, consistent with `stmt_reassigns_binding`).
+fn stmt_reassigns_binding_unconditionally(stmts: &[HirStmt], target: BindingId) -> bool {
+    for stmt in stmts {
+        if let HirStmt::Assign { binding, .. } = stmt {
+            if *binding == target {
+                return true;
+            }
+        }
+        // Intentionally NOT descending into If/ForRange/While:
+        // an assign inside a conditional branch does NOT dominate the back-edge.
+    }
+    false
+}
+
+/// Check whether `stmts` (at the current loop level) contain a `HirStmt::Assign`
+/// for `target` inside an `HirStmt::If` body (i.e., a CONDITIONAL reassignment).
+///
+/// This detects the AT-1708 case: even when a top-level unconditional assign also exists,
+/// a conditional reassignment makes the latch SSA id ambiguous (the if-branch SSA id does
+/// not dominate the back-edge). Emitting an OpPhi with that id produces invalid SPIR-V.
+///
+/// Does NOT descend into nested ForRange/While (per the non-descend discipline).
+fn stmt_has_conditional_reassign(stmts: &[HirStmt], target: BindingId) -> bool {
+    for stmt in stmts {
+        if let HirStmt::If(hir_if) = stmt {
+            // Any reassignment inside an if/else body is conditional.
+            if stmt_reassigns_binding(&hir_if.then_block, target, false) {
+                return true;
+            }
+            if let Some(else_arm) = &hir_if.else_arm {
+                if stmt_reassigns_binding_in_else(else_arm, target, false) {
+                    return true;
+                }
+            }
+        }
+        // Top-level assigns are unconditional — not counted here.
+        // Nested loops are skipped per non-descend discipline.
+    }
+    false
+}
+
 /// Helper for scanning HirElse branches (used by stmt_reassigns_binding).
 fn stmt_reassigns_binding_in_else(
     else_arm: &axc_hir::control_flow::HirElse,
@@ -854,18 +916,24 @@ fn break_continue_in_else(else_arm: &axc_hir::control_flow::HirElse) -> (bool, b
 
 /// Detect loop-carried coopmat bindings for this for-range loop (§A.3).
 ///
-/// Returns a `Vec<(BindingId, Word)>` of `(binding, pre_allocated_phi_result_id)`
+/// Returns `Ok(Vec<(BindingId, Word)>)` of `(binding, pre_allocated_phi_result_id)`
 /// in source order (declaration order). Only includes bindings that are:
 ///   (a) in `em.coopmat_binding_ids` (SSA/coopmat, not scalar),
 ///   (b) already have a defined SSA id in `em.var_ids` at loop entry (defined before loop),
 ///   (c) reassigned via `HirStmt::Assign { binding }` at the CURRENT loop level
 ///       (does NOT descend into nested ForRange/While).
+///
+/// Returns `Err(LoopCarriedCoopMatConditionalReassignUnsupported)` when a coopmat binding
+/// satisfies (a)+(b)+(c) via a conditional-only reassignment (i.e., `stmt_reassigns_binding`
+/// returns `true` but `stmt_reassigns_binding_unconditionally` returns `false`). Such a
+/// binding is loop-carried in value but its latch SSA id is produced inside an if/else
+/// branch, which means it does NOT dominate the continue/back-edge block — invalid SPIR-V.
+/// This error is symmetric to the break/continue rejection (AT-1704).
 fn detect_loop_carried_coopmat(
     em: &mut BodyEmitter<'_>,
     hir_for: &HirForRange,
-) -> Vec<(BindingId, Word)> {
+) -> Result<Vec<(BindingId, Word)>, BodyCodegenError> {
     // Collect candidates: coopmat bindings that have a pre-loop SSA id (criteria a + b).
-    // Use the body's KernelBodyTyped.bindings (declaration order) for determinism.
     // We access the coopmat_binding_ids set to filter.
     let mut candidates: Vec<BindingId> = Vec::new();
     for bid in &em.coopmat_binding_ids {
@@ -876,15 +944,50 @@ fn detect_loop_carried_coopmat(
     // Sort by BindingId value for deterministic order (BTreeMap-equivalent).
     candidates.sort_by_key(|b| b.0);
 
-    // Filter by criterion (c): reassigned at current loop level.
+    // Filter by criterion (c): reassigned anywhere at the current loop level.
+    // For each such binding, also enforce the unconditional discipline (AT-1708):
+    //
+    // A loop-carried coopmat binding is phi-eligible ONLY when it is assigned EXACTLY
+    // at the top level (unconditionally) AND has NO conditional (if/else) reassignment.
+    // Reason: after body emission, var_ids[bid] holds the SSA id of the LAST emitted
+    // Assign for that binding. If any conditional reassignment exists, that SSA id comes
+    // from an if/else branch which does NOT dominate the continue/back-edge block, producing
+    // invalid SPIR-V ("ID definition does not dominate its parent"). Even when a top-level
+    // assign also exists, the if-branch SSA id would be last in emission order (because the
+    // if block emits after the top-level assign), so the latch capture is always wrong.
+    //
+    // Sound rule: unconditional top-level assign exists AND no conditional reassignment.
     let mut result: Vec<(BindingId, Word)> = Vec::new();
     for bid in candidates {
-        if stmt_reassigns_binding(&hir_for.body, bid, false) {
+        let has_any_reassign = stmt_reassigns_binding(&hir_for.body, bid, false);
+        if has_any_reassign {
+            let has_unconditional = stmt_reassigns_binding_unconditionally(&hir_for.body, bid);
+            // Check if there is also a conditional (if/else) reassignment.
+            // This is true when stmt_reassigns_binding descends into if/else and finds a hit,
+            // but NOT via a top-level assign. Detect by: there exists an if-arm that reassigns.
+            let has_conditional = stmt_has_conditional_reassign(&hir_for.body, bid);
+            if has_conditional {
+                // Any conditional reassignment makes the latch capture ambiguous: the SSA id
+                // from the if-branch does not dominate the back-edge. Reject unconditionally.
+                return Err(BodyCodegenError::LoopCarriedCoopMatConditionalReassignUnsupported {
+                    name: format!("binding({})", bid.0),
+                    span: hir_for.span,
+                });
+            }
+            if !has_unconditional {
+                // Defensive: has_any_reassign=true but has_unconditional=false and
+                // has_conditional=false is impossible given the two-function design, but
+                // guard it anyway to keep the invariants explicit.
+                return Err(BodyCodegenError::LoopCarriedCoopMatConditionalReassignUnsupported {
+                    name: format!("binding({})", bid.0),
+                    span: hir_for.span,
+                });
+            }
             let phi_id: Word = em.b.id();
             result.push((bid, phi_id));
         }
     }
-    result
+    Ok(result)
 }
 
 
@@ -928,10 +1031,12 @@ fn emit_for_range(em: &mut BodyEmitter<'_>, hir_for: &HirForRange) -> Result<(),
     let merge_label:    Word = em.b.id();
 
     // ── Step 1: Detect loop-carried coopmat bindings + pre-allocate phi ids ──
-    // detect_loop_carried_coopmat returns Vec<(bid, phi_id)> in deterministic order.
+    // detect_loop_carried_coopmat returns Ok(Vec<(bid, phi_id)>) in deterministic order,
+    // or Err(LoopCarriedCoopMatConditionalReassignUnsupported) if a carried coopmat binding
+    // is only reassigned inside a conditional branch (AT-1708 hard error).
     // Pre-allocate phi_id BEFORE capturing pre_header_value so var_ids[B] still holds
     // the pre-header SSA id at this point.
-    let carried: Vec<(BindingId, Word)> = detect_loop_carried_coopmat(em, hir_for);
+    let carried: Vec<(BindingId, Word)> = detect_loop_carried_coopmat(em, hir_for)?;
 
     // ── Step 2: Guard — reject break/continue when coopmat accumulators are carried ──
     // (Conservative reject per ISSUE-4 / §A.7; AT-1704.)
@@ -951,12 +1056,17 @@ fn emit_for_range(em: &mut BodyEmitter<'_>, hir_for: &HirForRange) -> Result<(),
 
     // ── Step 3: Capture pre_header values and pre_header label ───────────────
     // Must capture BEFORE the OpBranch into the header (the branch closes the pre-header block).
+    // SAFETY: detect_loop_carried_coopmat only includes bindings that have an SSA id in
+    // var_ids at loop entry (criterion b). If this unwrap fires, the detection invariant is broken.
     let pre_header_values: Vec<Word> = carried.iter()
         .map(|(bid, _phi_id)| {
             em.var_ids.get(bid).copied()
-                .expect("loop-carried coopmat binding must have a pre-header value in var_ids")
+                .ok_or_else(|| BodyCodegenError::Rspirv(
+                    format!("loop-carried coopmat binding {:?} has no pre-header value in var_ids \
+                             (detection invariant violated)", bid)
+                ))
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     let pre_header_label: Word = em.current_block_label()?;
 
     // Induction variable's OpVariable slot (allocated in prelude).
@@ -1015,12 +1125,17 @@ fn emit_for_range(em: &mut BodyEmitter<'_>, hir_for: &HirForRange) -> Result<(),
     // Capture latch values: after the body has executed, var_ids[B] holds the value
     // produced by the in-loop `acc = coopmat_mul_add(...)` Assign (SSA rebind, ISSUE-2).
     // These are the second phi operands.
+    // SAFETY: the unconditional top-level reassign was verified by detect_loop_carried_coopmat
+    // (AT-1708 guard). The body SSA rebind must have updated var_ids[bid] during body emission.
     let latch_values: Vec<Word> = carried.iter()
         .map(|(bid, _phi_id)| {
             em.var_ids.get(bid).copied()
-                .expect("loop-carried coopmat binding must have a latch value after body emission")
+                .ok_or_else(|| BodyCodegenError::Rspirv(
+                    format!("loop-carried coopmat binding {:?} has no latch value after body \
+                             emission (unconditional reassign invariant violated)", bid)
+                ))
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     if !em.current_block_terminated {
         em.b.branch(continue_label)
