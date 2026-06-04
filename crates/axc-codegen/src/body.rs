@@ -27,9 +27,9 @@
 //!   `BodyCodegenError::ReturnInsideLoopDeferred`.
 
 use std::collections::{BTreeMap, HashMap};
-use rspirv::dr::Builder;
+use rspirv::dr::{Builder, Instruction, InsertPoint};
 use rspirv::spirv::{
-    Word, StorageClass, SelectionControl, LoopControl,
+    Word, StorageClass, SelectionControl, LoopControl, Op,
 };
 use axc_hir::expr::{
     KernelBodyTyped, HirExpr, HirExprKind, HirStmt, BinOp, UnaryOp,
@@ -92,6 +92,18 @@ pub enum BodyCodegenError {
     /// M1.4: subgroup operation codegen error.
     #[error("subgroup codegen error: {0}")]
     Subgroup(#[from] crate::subgroup::SubgroupCodegenError),
+    /// M3.3: `continue` on a path that skips the loop-carried coopmat accumulator
+    /// reassignment is not supported. This would leave the phi's latch operand
+    /// without a valid value — conservatively rejected to prevent silent miscompile.
+    #[error("continue on a path that skips a loop-carried coopmat accumulator update is not \
+             supported in M3.3 (AT-1704); restructure to ensure all paths update the accumulator")]
+    LoopCarriedCoopMatAcrossContinueUnsupported { span: Span },
+    /// M3.3: `break` inside a loop carrying a coopmat accumulator is not supported.
+    /// The merged value after a break-exit path is ambiguous for the phi's latch operand
+    /// — conservatively rejected to prevent silent miscompile.
+    #[error("break inside a loop carrying a loop-carried coopmat accumulator is not supported \
+             in M3.3 (AT-1704); restructure using a result binding after the loop")]
+    LoopCarriedCoopMatAcrossBreakUnsupported { span: Span },
 }
 
 /// Cache of SPIR-V type IDs, keyed by `ScalarTy`.
@@ -495,10 +507,19 @@ fn emit_stmt(em: &mut BodyEmitter<'_>, stmt: &HirStmt) -> Result<(), BodyCodegen
         }
         HirStmt::Assign { binding, value, .. } => {
             let val_id = emit_expr(em, value)?;
-            let var_id = em.var_ids.get(binding).copied()
-                .ok_or(BodyCodegenError::UnexpectedHir("Assign binding not in var_ids"))?;
-            em.b.store(var_id, val_id, None, None)
-                .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+            if em.coopmat_binding_ids.contains(binding) {
+                // M3.3 ISSUE-2: CoopMatrix binding uses pure SSA (no OpVariable pointer).
+                // SSA rebind: update var_ids to the new value id, no OpStore.
+                // Symmetric to the Let coopmat branch at body.rs:481-484.
+                // This latch_value is read by emit_for_range after body emission (§A.4 step 7).
+                em.var_ids.insert(*binding, val_id);
+            } else {
+                // Scalar binding: write through the pre-allocated OpVariable.
+                let var_id = em.var_ids.get(binding).copied()
+                    .ok_or(BodyCodegenError::UnexpectedHir("Assign binding not in var_ids"))?;
+                em.b.store(var_id, val_id, None, None)
+                    .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+            }
             Ok(())
         }
         HirStmt::Return { span } => {
@@ -712,29 +733,193 @@ fn emit_if(em: &mut BodyEmitter<'_>, hir_if: &HirIf) -> Result<(), BodyCodegenEr
     Ok(())
 }
 
+// ── Loop-carried coopmat OpPhi helpers (M3.3 PART A) ─────────────────────────
+
+/// Scan `stmts` for `HirStmt::Assign { binding }` where `binding == target`.
+///
+/// `descend_nested_loops`: when `false` (the production rule), do NOT recurse
+/// into `HirStmt::ForRange` or `HirStmt::While` bodies. This ensures each loop
+/// level is responsible for its own carried bindings (§A.3 detection rule).
+/// When `true`, recursion is unrestricted (only used internally for if/else descent).
+///
+/// Recurses freely into `HirStmt::If` branches at the current loop level,
+/// because an `if` inside the loop body is still at this loop level.
+fn stmt_reassigns_binding(stmts: &[HirStmt], target: BindingId, descend_nested_loops: bool) -> bool {
+    for stmt in stmts {
+        match stmt {
+            HirStmt::Assign { binding, .. } => {
+                if *binding == target {
+                    return true;
+                }
+            }
+            HirStmt::If(hir_if) => {
+                // Recurse into then/else branches at THIS loop level (not a nested loop).
+                if stmt_reassigns_binding(&hir_if.then_block, target, descend_nested_loops) {
+                    return true;
+                }
+                if let Some(else_arm) = &hir_if.else_arm {
+                    if stmt_reassigns_binding_in_else(else_arm, target, descend_nested_loops) {
+                        return true;
+                    }
+                }
+            }
+            HirStmt::ForRange(inner_for) if descend_nested_loops => {
+                // Only descend if explicitly requested.
+                if stmt_reassigns_binding(&inner_for.body, target, descend_nested_loops) {
+                    return true;
+                }
+            }
+            HirStmt::While(inner_while) if descend_nested_loops => {
+                if stmt_reassigns_binding(&inner_while.body, target, descend_nested_loops) {
+                    return true;
+                }
+            }
+            // All other variants (ForRange/While when !descend, Let, Return, etc.) — skip.
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Helper for scanning HirElse branches (used by stmt_reassigns_binding).
+fn stmt_reassigns_binding_in_else(
+    else_arm: &axc_hir::control_flow::HirElse,
+    target: BindingId,
+    descend_nested_loops: bool,
+) -> bool {
+    match else_arm {
+        axc_hir::control_flow::HirElse::Block(stmts) => {
+            stmt_reassigns_binding(stmts, target, descend_nested_loops)
+        }
+        axc_hir::control_flow::HirElse::If(nested_if) => {
+            if stmt_reassigns_binding(&nested_if.then_block, target, descend_nested_loops) {
+                return true;
+            }
+            if let Some(inner_else) = &nested_if.else_arm {
+                return stmt_reassigns_binding_in_else(inner_else, target, descend_nested_loops);
+            }
+            false
+        }
+    }
+}
+
+/// Detect whether `stmts` (at the current loop level, NOT descending into
+/// nested loops) contain a `HirStmt::Break` or `HirStmt::Continue`.
+///
+/// Per reviewer note (b): the scan must NOT descend into nested ForRange/While
+/// because an inner loop's break/continue targets the INNER loop, not the outer
+/// loop being tested.
+///
+/// Does recurse into if/else at the current level.
+fn stmts_contain_break_or_continue_at_level(stmts: &[HirStmt]) -> (bool, bool, Option<Span>) {
+    for stmt in stmts {
+        match stmt {
+            HirStmt::Break { span } => {
+                return (true, false, Some(*span));
+            }
+            HirStmt::Continue { span } => {
+                return (false, true, Some(*span));
+            }
+            HirStmt::If(hir_if) => {
+                let (b, c, s) = stmts_contain_break_or_continue_at_level(&hir_if.then_block);
+                if b || c { return (b, c, s); }
+                if let Some(else_arm) = &hir_if.else_arm {
+                    let (b, c, s) = break_continue_in_else(else_arm);
+                    if b || c { return (b, c, s); }
+                }
+            }
+            // Do NOT descend into ForRange/While (per non-descend discipline).
+            _ => {}
+        }
+    }
+    (false, false, None)
+}
+
+/// Helper for scanning break/continue in HirElse.
+fn break_continue_in_else(else_arm: &axc_hir::control_flow::HirElse) -> (bool, bool, Option<Span>) {
+    match else_arm {
+        axc_hir::control_flow::HirElse::Block(stmts) => {
+            stmts_contain_break_or_continue_at_level(stmts)
+        }
+        axc_hir::control_flow::HirElse::If(nested_if) => {
+            let (b, c, s) = stmts_contain_break_or_continue_at_level(&nested_if.then_block);
+            if b || c { return (b, c, s); }
+            if let Some(inner_else) = &nested_if.else_arm {
+                return break_continue_in_else(inner_else);
+            }
+            (false, false, None)
+        }
+    }
+}
+
+/// Detect loop-carried coopmat bindings for this for-range loop (§A.3).
+///
+/// Returns a `Vec<(BindingId, Word)>` of `(binding, pre_allocated_phi_result_id)`
+/// in source order (declaration order). Only includes bindings that are:
+///   (a) in `em.coopmat_binding_ids` (SSA/coopmat, not scalar),
+///   (b) already have a defined SSA id in `em.var_ids` at loop entry (defined before loop),
+///   (c) reassigned via `HirStmt::Assign { binding }` at the CURRENT loop level
+///       (does NOT descend into nested ForRange/While).
+fn detect_loop_carried_coopmat(
+    em: &mut BodyEmitter<'_>,
+    hir_for: &HirForRange,
+) -> Vec<(BindingId, Word)> {
+    // Collect candidates: coopmat bindings that have a pre-loop SSA id (criteria a + b).
+    // Use the body's KernelBodyTyped.bindings (declaration order) for determinism.
+    // We access the coopmat_binding_ids set to filter.
+    let mut candidates: Vec<BindingId> = Vec::new();
+    for bid in &em.coopmat_binding_ids {
+        if em.var_ids.contains_key(bid) {
+            candidates.push(*bid);
+        }
+    }
+    // Sort by BindingId value for deterministic order (BTreeMap-equivalent).
+    candidates.sort_by_key(|b| b.0);
+
+    // Filter by criterion (c): reassigned at current loop level.
+    let mut result: Vec<(BindingId, Word)> = Vec::new();
+    for bid in candidates {
+        if stmt_reassigns_binding(&hir_for.body, bid, false) {
+            let phi_id: Word = em.b.id();
+            result.push((bid, phi_id));
+        }
+    }
+    result
+}
+
+
 /// Emit `for i in range(start, end [, step]) { body }`.
 ///
-/// Pattern:
+/// M3.3 PART A: if any coopmat (SSA) bindings are loop-carried (defined before the loop
+/// and reassigned inside the body at THIS level), emit an OpPhi at the header block head
+/// for each such binding. This is the fix for the ZEROS bug: without a phi, the coopmat
+/// accumulator reads its pre-header OpConstantNull on every iteration.
+///
+/// Pattern (with coopmat phi):
 /// ```text
-///   ; In current block:
+///   ; In current block (pre-header):
 ///   OpStore %i_var %start_id
 ///   OpBranch %header
 /// %header:
-///   OpLoopMerge %merge %continue None
+///   ; First non-label instructions — all OpPhi(s) MUST appear here (SPIR-V 2.4):
+///   %phi_acc = OpPhi %mat_type %pre_header_acc %pre_header_label %latch_acc %continue_label
 ///   %i_cur = OpLoad u32 %i_var
 ///   %cond = OpULessThan bool %i_cur %end_id
+///   OpLoopMerge %merge %continue None
 ///   OpBranchConditional %cond %body %merge
 /// %body:
-///   ... body ...
-///   OpBranch %continue       ; if not terminated
+///   ... body (reads %phi_acc, writes via SSA rebind → latch value) ...
+///   OpBranch %continue
 /// %continue:
 ///   %i_cur2 = OpLoad u32 %i_var
 ///   %i_next = OpIAdd u32 %i_cur2 %step_const
 ///   OpStore %i_var %i_next
-///   OpBranch %header
+///   OpBranch %header        ; back-edge → latch_label = continue_label
 /// %merge:
-///   ...
+///   ... post-loop (reads %phi_acc as the merged value) ...
 /// ```
+///
+/// Scalars keep Function-storage load/store — NO phi is emitted for scalar bindings.
 fn emit_for_range(em: &mut BodyEmitter<'_>, hir_for: &HirForRange) -> Result<(), BodyCodegenError> {
     // Pre-allocate block label IDs before any instruction emission.
     let header_label:   Word = em.b.id();
@@ -742,26 +927,69 @@ fn emit_for_range(em: &mut BodyEmitter<'_>, hir_for: &HirForRange) -> Result<(),
     let continue_label: Word = em.b.id();
     let merge_label:    Word = em.b.id();
 
+    // ── Step 1: Detect loop-carried coopmat bindings + pre-allocate phi ids ──
+    // detect_loop_carried_coopmat returns Vec<(bid, phi_id)> in deterministic order.
+    // Pre-allocate phi_id BEFORE capturing pre_header_value so var_ids[B] still holds
+    // the pre-header SSA id at this point.
+    let carried: Vec<(BindingId, Word)> = detect_loop_carried_coopmat(em, hir_for);
+
+    // ── Step 2: Guard — reject break/continue when coopmat accumulators are carried ──
+    // (Conservative reject per ISSUE-4 / §A.7; AT-1704.)
+    if !carried.is_empty() {
+        let (has_break, has_continue, span) = stmts_contain_break_or_continue_at_level(&hir_for.body);
+        if has_break {
+            return Err(BodyCodegenError::LoopCarriedCoopMatAcrossBreakUnsupported {
+                span: span.unwrap_or(hir_for.span),
+            });
+        }
+        if has_continue {
+            return Err(BodyCodegenError::LoopCarriedCoopMatAcrossContinueUnsupported {
+                span: span.unwrap_or(hir_for.span),
+            });
+        }
+    }
+
+    // ── Step 3: Capture pre_header values and pre_header label ───────────────
+    // Must capture BEFORE the OpBranch into the header (the branch closes the pre-header block).
+    let pre_header_values: Vec<Word> = carried.iter()
+        .map(|(bid, _phi_id)| {
+            em.var_ids.get(bid).copied()
+                .expect("loop-carried coopmat binding must have a pre-header value in var_ids")
+        })
+        .collect();
+    let pre_header_label: Word = em.current_block_label()?;
+
     // Induction variable's OpVariable slot (allocated in prelude).
     let i_var_id = em.var_ids.get(&hir_for.induction).copied()
         .ok_or(BodyCodegenError::UnexpectedHir("ForRange induction binding not in var_ids"))?;
 
-    // Emit start store and branch to header.
+    // Emit start store and branch to header (closes the pre-header block).
     let start_id = emit_expr(em, &hir_for.start)?;
     em.b.store(i_var_id, start_id, None, None)
         .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
     em.b.branch(header_label)
         .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
 
-    // ── header block ──────────────────────────────────────────────────────────
+    // ── Step 4: Open header block and capture its rspirv block index ─────────
+    // The block index is used to restore the selected block after the phi dr-insert (§A.4 step 9).
     em.b.begin_block(Some(header_label))
         .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
     em.current_block_terminated = false;
 
-    // Load induction var and check condition first.
-    // OpLoopMerge MUST immediately precede the branch terminator (i.e., be second-to-last
-    // in the header block). SPIR-V §2.11 / §3.32.17: "OpLoopMerge must immediately precede
-    // either an OpBranch or OpBranchConditional instruction."
+    let _func_idx = em.b.selected_function()
+        .ok_or_else(|| BodyCodegenError::Rspirv("no function selected after begin_block".to_owned()))?;
+    let header_block_idx: usize = em.b.selected_block()
+        .ok_or_else(|| BodyCodegenError::Rspirv("no block selected after begin_block header".to_owned()))?;
+
+    // ── Step 5: Set var_ids[B] = phi_id BEFORE emitting body ─────────────────
+    // This ensures the induction condition AND the body read the phi id, not the stale pre-header id.
+    for (bid, phi_id) in &carried {
+        em.var_ids.insert(*bid, *phi_id);
+    }
+
+    // ── Step 6: Emit header condition + OpLoopMerge + branch ─────────────────
+    // OpLoopMerge MUST immediately precede the branch terminator (SPIR-V §2.11 / §3.32.17).
+    // OpPhi instructions are NOT emitted here; they are post-inserted at the header head in step 9.
     let u32_ty_id = em.type_id(ScalarTy::U32);
     let bool_ty_id = em.type_id(ScalarTy::Bool);
     let i_cur = em.b.load(u32_ty_id, None, i_var_id, None, None)
@@ -774,27 +1002,36 @@ fn emit_for_range(em: &mut BodyEmitter<'_>, hir_for: &HirForRange) -> Result<(),
     em.b.branch_conditional(cond_id, body_label, merge_label, [])
         .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
 
-    // ── body block ────────────────────────────────────────────────────────────
+    // ── Step 7: Open body block, emit body, capture latch values ─────────────
     em.b.begin_block(Some(body_label))
         .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
     em.current_block_terminated = false;
 
-    // Push loop context so break/continue work correctly.
+    // Push loop context so break/continue resolve correctly.
     em.loop_stack.push(LoopCodegenCtx { merge: merge_label, continue_target: continue_label });
     emit_stmts(em, &hir_for.body)?;
     em.loop_stack.pop();
+
+    // Capture latch values: after the body has executed, var_ids[B] holds the value
+    // produced by the in-loop `acc = coopmat_mul_add(...)` Assign (SSA rebind, ISSUE-2).
+    // These are the second phi operands.
+    let latch_values: Vec<Word> = carried.iter()
+        .map(|(bid, _phi_id)| {
+            em.var_ids.get(bid).copied()
+                .expect("loop-carried coopmat binding must have a latch value after body emission")
+        })
+        .collect();
 
     if !em.current_block_terminated {
         em.b.branch(continue_label)
             .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
     }
 
-    // ── continue block ────────────────────────────────────────────────────────
+    // ── Step 8: Open continue/latch block, emit increment + back-edge ─────────
     em.b.begin_block(Some(continue_label))
         .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
     em.current_block_terminated = false;
 
-    // Increment: load i, add step, store.
     let i_cur2 = em.b.load(u32_ty_id, None, i_var_id, None, None)
         .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
     let step_const = em.get_const_int(ScalarTy::U32, hir_for.step.value as u64);
@@ -804,11 +1041,102 @@ fn emit_for_range(em: &mut BodyEmitter<'_>, hir_for: &HirForRange) -> Result<(),
         .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
     em.b.branch(header_label)
         .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    // latch_label = continue_label (the back-edge block).
 
-    // ── merge block ───────────────────────────────────────────────────────────
+    // ── Step 9: Open merge block and capture its index ─────────────────────────
     em.b.begin_block(Some(merge_label))
         .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
     em.current_block_terminated = false;
+    let merge_block_idx: usize = em.b.selected_block()
+        .ok_or_else(|| BodyCodegenError::Rspirv("no block selected after begin_block merge".to_owned()))?;
+
+    // ── Step 10: Post-insert OpPhi instructions at the header block head ──────
+    // SPIR-V 2.4: all OpPhi instructions must be the FIRST non-label instructions in a block.
+    // We insert them via dr-level access AFTER the body is emitted (so we have latch_values).
+    // Inserted in REVERSE declaration order so that after all inserts, phis are in declaration
+    // order at indices 0..k (each InsertPoint::Begin inserts at position 0).
+    if !carried.is_empty() {
+        // Switch to the header block for dr-level insertion.
+        em.b.select_block(Some(header_block_idx))
+            .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+
+        for (i, (bid, phi_id)) in carried.iter().enumerate().rev() {
+            // Get the coopmat type for this binding from the coopmat_type_cache.
+            // The binding is guaranteed to be a CoopMatrix (it's in coopmat_binding_ids).
+            // We need to look up the binding type from the body's binding table — it was
+            // stored in coopmat_type_cache when the zero/load/mul_add was emitted.
+            // Fetch the pre_header SSA id to get the coopmat type via the module.
+            // The type of the phi result == the type of the pre_header_value operand.
+            let pre_header_val_id = pre_header_values[i];
+            let latch_val_id = latch_values[i];
+
+            // Get the result type of the pre_header value from the module.
+            // Both operands must have the same type (coopmat type), so we use the pre-header
+            // value's result type. Walk the module's function instructions to find it.
+            let mat_type_id: Word = {
+                let module = em.b.module_ref();
+                // Search all functions' blocks for an instruction with result_id == pre_header_val_id.
+                let mut found_type: Option<Word> = None;
+                'outer: for func in &module.functions {
+                    for block in &func.blocks {
+                        for instr in &block.instructions {
+                            if instr.result_id == Some(pre_header_val_id) {
+                                found_type = instr.result_type;
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+                // Also check global_variables and types_global_values.
+                if found_type.is_none() {
+                    for instr in &module.types_global_values {
+                        if instr.result_id == Some(pre_header_val_id) {
+                            found_type = instr.result_type;
+                            break;
+                        }
+                    }
+                }
+                found_type.ok_or_else(|| BodyCodegenError::Rspirv(
+                    format!("cannot find result type for pre_header_value %{pre_header_val_id} in OpPhi emission for binding {:?}", bid)
+                ))?
+            };
+
+            // Build OpPhi instruction: operands are pairs of (value, predecessor-label).
+            // Predecessor 1: pre-header block (the block that branches into the header).
+            // Predecessor 2: latch/continue block (the back-edge).
+            use rspirv::dr::Operand;
+            let phi_operands = vec![
+                Operand::IdRef(pre_header_val_id),
+                Operand::IdRef(pre_header_label),
+                Operand::IdRef(latch_val_id),
+                Operand::IdRef(continue_label),
+            ];
+            let phi_instr = Instruction::new(
+                Op::Phi,
+                Some(mat_type_id),
+                Some(*phi_id),
+                phi_operands,
+            );
+            // Insert at the beginning (index 0) of the header block's instructions.
+            // Because we insert in REVERSE order, the final arrangement is declaration order.
+            em.b.insert_into_block(InsertPoint::Begin, phi_instr)
+                .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+        }
+
+        // MANDATORY §A.4 step 10: restore the merge block as the selected block
+        // so that post-loop emission (post-for-range statements) goes into the merge block,
+        // not the header.
+        em.b.select_block(Some(merge_block_idx))
+            .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    }
+
+    // ── Step 11: On exit, leave var_ids[B] = phi_id (the merged value) ────────
+    // This ensures a post-loop coopmat_store reads the correct merged value (zero-trip safe).
+    // Already set in step 5 (phi_id); the SSA rebind in the body sets it to latch_value.
+    // We must restore it to phi_id now so post-loop code reads the phi (not the latch).
+    for (bid, phi_id) in &carried {
+        em.var_ids.insert(*bid, *phi_id);
+    }
 
     Ok(())
 }
