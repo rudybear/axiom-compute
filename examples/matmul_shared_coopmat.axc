@@ -1,4 +1,11 @@
-// examples/matmul_shared_coopmat.axc — M3.3 DONE: real multi-K-block tiled coopmat matmul.
+// examples/matmul_shared_coopmat.axc
+//
+// WIP: single coopmat output tile (16x16); multi-N-tile output coverage is a follow-up.
+// OpPhi K-accumulation works (AT-1707, GPU-proven bit-exact on NVIDIA RTX PRO 6000).
+// Full coopmat matmul numerics are incorrect for N>tile_n (N=24 spans >1 output tile);
+// needs a tile-output loop over N-tiles. Deferred to M3.x follow-up milestone.
+//
+// M3.3 DONE: real multi-K-block tiled coopmat matmul — K-loop + OpPhi accumulation.
 //
 // PART B: Competitive tiled f16 matmul with shared staging and cooperative matrix.
 //
