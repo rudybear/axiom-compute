@@ -1,0 +1,35 @@
+{
+  "verdict": "APPROVE",
+  "agent": "pessimistic_code_reviewer",
+  "milestone_id": "M3.3d-multiwarp",
+  "branch": "coder/M33d-20260605-0900/M3.3d-multiwarp",
+  "critical_bugs": [],
+  "warnings": [
+    {
+      "description": "DESIGN.md and ROADMAP.md carry UNCOMMITTED working-tree edits that fill in the measured 24.0 TFLOPS / 19.2% regression numbers. HEAD still has the '[QA fills measured numbers here.]' / '[MEASURED numbers will be filled in...]' placeholders. The honest regression text is present in the working tree (what I reviewed) but MUST be committed before merge or the merged docs will ship placeholders, not the honest negative result.",
+      "file": "DESIGN.md / ROADMAP.md",
+      "line": "DESIGN.md:758, ROADMAP.md:199-200"
+    },
+    {
+      "description": "Cosmetic only: check_local_invocation_id_call reports the out-of-range axis via `*value as u32` on a possibly-negative i64 (e.g. -1 prints as 4294967295). The call still returns None and rejects the program, so no codegen impact; same pattern as the existing gid path.",
+      "file": "crates/axc-hir/src/typecheck.rs",
+      "line": "3925"
+    }
+  ],
+  "spirv_val_check": "PASS",
+  "ub_check": "PASS",
+  "race_condition_check": "PASS",
+  "vendor_divergence_check": "PASS",
+  "item_findings": {
+    "1_builtin_codegen": "CORRECT. LocalInvocationIdVar = vec3 u32 Input OpVariable, OpDecorate BuiltIn LocalInvocationId, no new OpCapability (core Shader), OpCompositeExtract by LITERAL axis. Scanner (body_uses/stmt_uses/expr_uses_local_invocation_id) is a fully-explicit (no wildcard) match over every HirStmt and every HirExprKind variant — covers ForRange start/end, SharedWrite index AND value, BufferWrite index+value, CoopMatStore offset+stride, If/else, While, and all binary/unary/coopmat/subgroup/bitwise/q4_0 arg positions. The MSG kernel's local_invocation_id uses (Let inits at lines 102/106) are covered. AT-1745 asserts the var IS emitted for the MSG kernel (scanner-coverage proof); spirv-val clean.",
+    "2_sg_size_guard": "PRESENT IN ALL 3, CORRECT SENSE. AT-1743 (dispatch_shared_m32.rs:1159), AT-1744 (:1266), AT-1750 (resident_matmul_msg.rs:264) each have `if ctx.subgroup_size() != 32 { eprintln; return; }` BEFORE prepare_kernel_checked/upload/dispatch. subgroup_size() returns 0 when props unavailable, so the guard also skips that case (0 != 32).",
+    "3_msg_correctness": "CORRECT. sg_id = local_invocation_id(0)/subgroup_size() is uniform per 32-lane subgroup. workgroup_barrier() between staging and coopmat reads is Workgroup-scope (emit_workgroup_barrier; syncs both subgroups). Each subgroup writes distinct C cols [block_col*64 + sg_id*32 .. +32): sg_id=0 -> [+0,+32), sg_id=1 -> [+32,+64); no overlap, no gap. 4 accumulators reassigned unconditionally at loop top level (AT-1708 satisfied). K-loop is uniform; no subgroup-divergent control flow around coopmat/barrier. Non-symmetric fixture (A in {1..4}, B in {1..3}) catches a swapped sg_id offset. GPU-confirmed bit-exact (max_diff==0) per orchestrator on NVIDIA.",
+    "4_honesty": "HONEST, NO SPIN. DESIGN §3.1.18 + ROADMAP M3.3d report 768³ = 24.0 TFLOPS (19.2%) explicitly as a 'REGRESSION vs M3.3c single-subgroup RB (31.2 TFLOPS = 24.96%)', state 'multi-subgroup is NOT faster than single-subgroup RB at any measured size', 'honest negative performance result', 'Single-subgroup RB (M3.3c) remains the best matmul', builtin framed as the durable deliverable. Bench prints actual M/N/K, asserts only tflops>0 && finite (no ratio), and gates the 'competitive' label on pct>=25.0 so 19.2% never gets it. No 'win'/'faster'/'beats' claim found for MSG.",
+    "5_no_codegen_change_no_regression": "CONFIRMED. The ONLY codegen change is the new builtin (var emit + component extract + scanner + interface-list entry). The MSG matmul reuses the M3.3c N-phi coopmat path (no matmul codegen change). gid-only kernel emits NO LocalInvocationId (no-regression test). All axc-codegen (100+5+14+6+1) and axc-hir tests pass; driver compile_shared_examples (9) pass. No unwrap/expect/panic/unreachable introduced in new lib code.",
+    "6_edge": "CORRECT. axis bounds 0..=2 enforced (value<0 || value>2 rejected -> LocalInvocationIdAxisOutOfRange; axis 3 and negatives rejected). Non-literal axis rejected (LocalInvocationIdAxisMustBeConstant) so OpCompositeExtract always gets a literal. Arity != 1 rejected. subgroup_size()==0 (props unavailable) skips via the != 32 guard."
+  },
+  "guards_confirmed": "All 3 sg_size==32 guards present with correct sense (AT-1743, AT-1744, AT-1750) before allocation/dispatch.",
+  "scanner_complete": true,
+  "regression_honestly_reported": true,
+  "summary": "APPROVE. The local_invocation_id builtin is correct: vec3 u32 Input var, BuiltIn LocalInvocationId, NO new OpCapability (core Shader), OpCompositeExtract by literal axis; the emit-when-used scanner is an exhaustive (wildcard-free) walk over every stmt/expr position the builtin can occupy (incl. ForRange bounds and SharedWrite index+value, which the MSG kernel uses). All three sg_size==32 guards are genuinely in the code (AT-1743/1744/1750) with correct sense and 0-on-unavailable skip. The MSG matmul is bit-exact by construction (Workgroup-scope barrier) + GPU-confirmed (max_diff==0), with distinct non-overlapping per-subgroup C columns and unconditional accumulator reassign. The 19.2%/24.0-TFLOPS result is reported as an honest REGRESSION with no spin; only codegen change is the builtin; no test/lib regression; no new unwrap/panic. The single remaining issue is non-blocking: the honest regression numbers in DESIGN.md/ROADMAP.md are in the working tree but NOT yet committed (HEAD has placeholders) — they must be committed before merge so the shipped docs carry the honest negative result rather than placeholders."
+}

@@ -236,8 +236,8 @@ fn at1745_compile_matmul_msg_coopmat() {
     //
     // SPIR-V BuiltIn LocalInvocationId = 27 (spirv crate autogen_spirv.rs).
     // We search the raw word stream for value 27 appearing as the BuiltIn decoration operand
-    // in an OpDecorate instruction: [word_count<<16 | 71, var_id, 33(BuiltIn), 27(LocalId)].
-    // OpDecorate=71, BuiltIn=33.
+    // in an OpDecorate instruction: [word_count<<16 | 71, var_id, 11(BuiltIn), 27(LocalId)].
+    // OpDecorate=71, BuiltIn=11.
     // SPIR-V BuiltIn LocalInvocationId = 27 (spirv crate autogen_spirv.rs).
     // SPIR-V Decoration::BuiltIn = 11 (verified from spirv autogen: BuiltIn = 11u32).
     // We search the raw word stream for OpDecorate %var BuiltIn LocalInvocationId(27):

@@ -196,9 +196,10 @@ Goal: prove the DESIGN.md §5 kill-criteria gates with publishable numbers, not 
 **Measured TFLOPS (AT-1750) — HONEST, no asserted ratio:**
 - Bench: resident_matmul_msg.rs (same methodology as AT-1730, N_WARMUP=2, MIN-of-10, GpuTimestamp).
 - Grid: (N/64, M/32, 1). sg_size==32 guard before allocation.
-- **[MEASURED numbers will be filled in by QA/NVIDIA run]** — to be updated.
-- Single-subgroup RB bench (resident_matmul_rb.rs) RETAINED for A/B.
-- 'competitive' label ONLY if pct >= 25.0. NO ratio asserted.
+- **MEASURED on NVIDIA RTX PRO 6000 Blackwell (QA run, 2026-06-05):** 256³ = **2.5 TFLOPS (2.0%)**; 768³ = **24.0 TFLOPS (19.2% of the 125-TFLOPS datasheet estimate)**.
+- **REGRESSION vs M3.3c single-subgroup RB** (31.2 TFLOPS = 24.96% at 768³): halved workgroup count (288 vs 576 at 768³) + cross-subgroup barrier overhead outweigh staging amortization. 19.2% < 25.0% — NOT labeled competitive. Multi-subgroup is SLOWER than single-subgroup RB at every measured size.
+- Single-subgroup RB bench (resident_matmul_rb.rs) RETAINED for A/B. **Single-subgroup RB (M3.3c) remains best.**
+- 'competitive' label ONLY if pct >= 25.0. NO ratio asserted. Multi-subgroup is an honest negative performance result; the local_invocation_id() builtin is the durable deliverable.
 
 **Deferred to M3.4+.** Double-buffered shared staging; partial/edge tiles; N_SG=4 / strategy-unroll.
 

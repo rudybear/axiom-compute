@@ -1,0 +1,110 @@
+{
+  "verdict": "PASS",
+  "agent": "qa_agent",
+  "milestone_id": "M3.3d-multiwarp",
+  "branch": "coder/M33d-20260605-0900/M3.3d-multiwarp",
+  "revision": "r1",
+  "qa_date": "2026-06-05",
+
+  "requirements_total": 14,
+  "requirements_covered": 14,
+  "requirements_missing": [],
+
+  "test_results": {
+    "total": 868,
+    "passed": 868,
+    "failed": 0,
+    "ignored": 43,
+    "command": "cargo test --workspace"
+  },
+
+  "verification_results": {
+    "clippy_check": "PASS — cargo clippy --workspace --all-targets -- -D warnings: no warnings, no errors. All workspace crates clean.",
+    "diff_check": "PASS — 23 files changed, 2295 insertions(+), 4 deletions(-). All planned files created/modified.",
+    "spirv_val_check": "PASS — AT-1741 (codegen unit test, emit_module direct) + AT-1745 (CI driver integration test, spirv-tools Vulkan_1_1) both pass.",
+    "coder_self_report_matches_reality": true
+  },
+
+  "check_1_test_and_clippy": {
+    "verdict": "PASS",
+    "test_count": 868,
+    "failed_count": 0,
+    "clippy": "clean — no warnings with -D warnings"
+  },
+
+  "check_2_builtin_lowering": {
+    "verdict": "PASS",
+    "buffers_rs_LocalInvocationIdVar": "CONFIRMED — struct LocalInvocationIdVar { var_id: Word, vec3_u32_type_id: Word } at buffers.rs:283; emit_local_invocation_id_variable() at buffers.rs:303 uses BuiltIn::LocalInvocationId; NO caps flag set; exact mirror of GlobalInvocationIdVar/emit_gid_variable.",
+    "decoration_value_11": "CONFIRMED — b.decorate(var_id, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::LocalInvocationId)]) — Decoration::BuiltIn = 11, BuiltIn::LocalInvocationId = 27. AT-1745 raw-word-stream search uses BUILTIN_DECORATION=11 + LOCAL_INVOCATION_ID_VALUE=27 (correct). Note: stale comment at line 239 says '33(BuiltIn)' but the code constants at lines 246-250 are correct (11). Test passes confirming correctness.",
+    "no_new_OpCapability": "CONFIRMED — no caps.* flag set in emit_local_invocation_id_variable(); AT-1741 asserts no OpCapability beyond Shader.",
+    "body_uses_local_invocation_id_full_traversal": "CONFIRMED — emit.rs:556-645 traverses ALL statement positions: Let/Assign init, BufferWrite index+value, If cond+then+else, ForRange start+end+body (loop-bound exprs), While cond+body, CoopMatStore element_offset+stride, SharedWrite index+value (critical: MSG kernel uses local_invocation_id inside staging-loop bounds and shared-write indices). Full expr traversal covers Binary/Unary/BufferRead/SharedRead/SubgroupBuiltin/CoopMatBuiltin/Q4_0Builtin.",
+    "emitted_only_when_used": "CONFIRMED — emit.rs:230-232: `let local_id_var = if body_uses_local_invocation_id(typed_body) { Some(...) } else { None }`. Does NOT copy gid's emit-on-buffer-presence shortcut.",
+    "interface_list": "CONFIRMED — emit.rs:418-421: local_id_var added to interface list when emitted.",
+    "AT_1740_present": "CONFIRMED — 7 tc_local_invocation_id_* tests in typecheck.rs (axis 0/1/2 ok; axis 3 rejected; arity 0/2 rejected; variable axis rejected; gid+local_invocation_id both distinct).",
+    "AT_1741_present": "CONFIRMED — codegen_local_id.rs: codegen_local_invocation_id_emits_builtin_var_spirv_val_clean + codegen_gid_only_kernel_unchanged_no_local_invocation_id + codegen_gid_and_local_invocation_id_both_emitted + codegen_local_invocation_id_not_emitted_when_unused.",
+    "AT_1742_GPU_confirmed": "GPU-VALIDATED by orchestrator on NVIDIA RTX PRO 6000 — out[g*64+l]==l, max_error=0; also runs on Lavapipe (no coopmat dependency). Test is #[ignore]-gated; present at dispatch_local_id.rs.",
+    "gid_no_regression": "CONFIRMED — codegen_gid_only_kernel_unchanged_no_local_invocation_id asserts gid-only kernel has NO LocalInvocationId var."
+  },
+
+  "check_3_sg_size_32_guard": {
+    "verdict": "PASS",
+    "guard_in_all_3_places": true,
+    "AT_1743_dispatch_shared_m32_rs": "CONFIRMED — dispatch_shared_m32.rs:1158-1164: `if ctx.subgroup_size() != 32 { eprintln!(\"AT-1743: subgroup_size={} != 32; skipping (wave64 guard — kernel REQUIRES sg_size==32)\", ctx.subgroup_size()); return; }` BEFORE prepare_kernel_checked.",
+    "AT_1744_dispatch_shared_m32_rs": "CONFIRMED — dispatch_shared_m32.rs:1265-1271: identical guard for AT-1744 BEFORE prepare_kernel_checked.",
+    "AT_1750_resident_matmul_msg_rs": "CONFIRMED — resident_matmul_msg.rs:261-271: `if ctx.subgroup_size() != 32 { eprintln!(\"resident_matmul_msg: subgroup_size={} != 32; skipping bench (wave64 guard)...\"); return; }` BEFORE allocation (before compile+prepare_kernel, at line 264 after VulkanContext::new() succeeds). Guard is correctly BEFORE any allocation or dispatch.",
+    "sense_correct": "CONFIRMED — all three use `!= 32` (not `== 32`), skipping when NOT 32. On NVIDIA wave32 the guard passes and tests run. On wave64/SIMD16/other the tests skip cleanly.",
+    "mirror_AT_1510": "CONFIRMED — all three cite dispatch_matmul_tile.rs:231 AT-1510 as the precedent and use the same eprintln pattern."
+  },
+
+  "check_4_MSG_matmul_correct": {
+    "verdict": "PASS",
+    "axc_file_present": "CONFIRMED — examples/matmul_msg_coopmat.axc present, @workgroup(64,1,1).",
+    "header_precondition_comment": "CONFIRMED — file header documents sg_size==32 hard precondition, wave64/SIMD16 failure modes.",
+    "sg_id_derivation": "CONFIRMED — sg_id = local_invocation_id(0u32)/subgroup_size() (NOT hardcoded 32).",
+    "workgroup_barrier_one": "CONFIRMED — one workgroup_barrier (scope Workgroup) in staging path.",
+    "per_subgroup_2x2_RB": "CONFIRMED — 4 loop-carried accumulators per subgroup (M3.3c N-phi path, AT-1733), distinct C columns per subgroup.",
+    "AT_1743_GPU_confirmed": "GPU-VALIDATED by orchestrator — M=32,N=64,K=32, grid (1,1,1), max_diff=0.0. Test present in dispatch_shared_m32.rs. Non-symmetric fixture (A in {1..4}, B in {1..3}). sg_size==32 guard + CoopMatUnsupported typed-skip both present.",
+    "AT_1744_GPU_confirmed": "GPU-VALIDATED by orchestrator — M=64,N=128,K=48, grid (2,2,1), 3 K-blocks, max_diff=0.0. Non-symmetric fixture retained. sg_size==32 guard present.",
+    "AT_1745_compile_anchor": "CONFIRMED — at1745_compile_matmul_msg_coopmat() in compile_shared_examples.rs PASSES (part of the 868 tests). Asserts: a_block_size(512)%wg_threads(64)==0; b_block_size(1024)%wg_threads(64)==0; shared_memory_bytes==3072 and <=16384; OpDecorate BuiltIn LocalInvocationId(27) present in SPIR-V word stream (body-scanner coverage proof). spirv-val Vulkan_1_1 clean."
+  },
+
+  "check_5_honesty": {
+    "verdict": "PASS",
+    "pre_edit_state": "ROADMAP.md and DESIGN.md §3.1.18 had placeholder '[MEASURED numbers will be filled in by QA/NVIDIA run]' / '[QA fills measured numbers here.]' — NOT false claims. The coder did not write false TFLOPS numbers.",
+    "no_false_faster_claim": "CONFIRMED — neither doc claimed multi-subgroup was faster or competitive before QA edits.",
+    "qa_filled_numbers": "QA filled in the orchestrator-confirmed actual measurements in DESIGN.md §3.1.18 and ROADMAP.md M3.3d:",
+    "actual_numbers": {
+      "256_cubed": "2.5 TFLOPS (2.0% of 125-TFLOPS estimate)",
+      "768_cubed": "24.0 TFLOPS (19.2% of 125-TFLOPS estimate)",
+      "vs_M3_3c": "REGRESSION — 19.2% < 24.96% (M3.3c single-subgroup RB at 768³). NOT faster. NOT competitive (19.2% < 25.0% threshold).",
+      "root_cause": "Halved workgroup count at 768³ (288 MSG vs 576 single-subgroup RB) + cross-subgroup barrier overhead outweigh staging amortization."
+    },
+    "competitive_label_not_applied": "CONFIRMED — 19.2% < 25.0% threshold. Bench code only applies 'competitive' if pct >= 25.0; it is NOT applied here.",
+    "durable_deliverable_framing": "CONFIRMED — both docs frame local_invocation_id() builtin as the durable deliverable regardless of TFLOPS outcome; multi-subgroup is an honest negative perf result.",
+    "single_subgroup_RB_still_best": "CONFIRMED — explicitly stated in both updated docs."
+  },
+
+  "check_6_no_regression": {
+    "verdict": "PASS",
+    "M3_0_through_M3_3c_tests_pass": "CONFIRMED — all 868 tests pass, 0 failed. No prior milestone tests broken.",
+    "single_subgroup_RB_kernel_retained": "CONFIRMED — examples/matmul_rb_coopmat.axc + resident_matmul_rb.rs retained (both in diff, untouched).",
+    "gid_regression": "NONE — gid-only kernel test confirms no LocalInvocationId var leaked in.",
+    "no_unwrap_panic_in_lib": "CONFIRMED — clippy -D warnings clean; no unwrap in emit_local_invocation_id_variable or emit_local_invocation_id_component (uses ok_or + ?); coder acknowledged test unwraps are allowed.",
+    "Cargo_toml_bench_registered": "CONFIRMED — axc-driver/Cargo.toml has [[bench]] name = 'resident_matmul_msg' harness = false, alongside resident_matmul_rb."
+  },
+
+  "minor_findings": [
+    "STALE COMMENT (non-blocking): compile_shared_examples.rs lines 239-240 contain a stale comment saying '33(BuiltIn)' from an earlier iteration before the coder debugged the correct value. The actual code constants at lines 246-250 use BUILTIN_DECORATION=11 (correct per SPIR-V spec). The test passes, confirming the code is correct. The stale comment is cosmetic only."
+  ],
+
+  "memory_footprint_ok": true,
+
+  "gpu_validation_summary": {
+    "AT_1742": "PASS (orchestrator-confirmed) — local_invocation_id() returns within-WG local id 0..63, max_error=0. GPU-validated on NVIDIA RTX PRO 6000 Blackwell.",
+    "AT_1743": "PASS (orchestrator-confirmed) — multi-subgroup matmul M=32,N=64,K=32 bit-exact, max_diff=0.0. GPU-validated on NVIDIA RTX PRO 6000 Blackwell.",
+    "AT_1744": "PASS (orchestrator-confirmed) — multi-subgroup matmul M=64,N=128,K=48 bit-exact, max_diff=0.0. GPU-validated on NVIDIA RTX PRO 6000 Blackwell.",
+    "AT_1750": "MEASURED (orchestrator) — 256³=2.5 TFLOPS (2.0%), 768³=24.0 TFLOPS (19.2%). REGRESSION vs M3.3c 31.2 TFLOPS (24.96%). NOT competitive (19.2% < 25.0%)."
+  },
+
+  "summary": "M3.3d PASSES QA. The local_invocation_id() builtin is correctly implemented through all layers (lexer → parser → HIR → typecheck → codegen): LocalInvocationIdVar struct in buffers.rs with BuiltIn::LocalInvocationId decoration and NO new OpCapability (core Shader); emit_local_invocation_id_component in body.rs with OpLoad vec3u32 + OpCompositeExtract literal axis; body_uses_local_invocation_id full traversal in emit.rs covering all stmt/expr positions including ForRange bounds and SharedWrite indices; emitted only when used (not on buffer presence). The sg_size==32 guard is present in all 3 required places (AT-1743, AT-1744, AT-1750) BEFORE allocation/dispatch, with correct '!= 32' sense. MSG matmul is bit-exact GPU-confirmed on NVIDIA (AT-1743/1744 max_diff=0.0, non-symmetric fixture, sg_size==32 guard + CoopMatUnsupported typed-skip both present). AT-1745 CI compile anchor passes (shared_memory_bytes=3072, staging coverage invariants, LocalInvocationId var emitted). 868 tests pass, 0 failed. Clippy clean with -D warnings. The docs HONESTLY report the regression: 768³=24.0 TFLOPS (19.2%) vs M3.3c's 31.2 TFLOPS (24.96%) — NOT faster, NOT competitive. QA filled in the actual measured numbers (placeholder → concrete numbers). The local_invocation_id() builtin is the durable deliverable; multi-subgroup is an honest negative performance result. Single-subgroup RB (M3.3c) remains the best matmul."
+}
