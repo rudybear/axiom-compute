@@ -605,6 +605,8 @@ fn find_mul_add_in_expr(expr: &crate::expr::HirExpr) -> Option<&HirExprKind> {
         | HirExprKind::BoolLit(_)
         | HirExprKind::LocalRead(_)
         | HirExprKind::GidBuiltin { .. }
+        // M3.3d: LocalInvocationIdBuiltin is a leaf — no coopmat ops nested in it.
+        | HirExprKind::LocalInvocationIdBuiltin { .. }
         // M3.2: SharedRead carries an index expression; scan it for completeness (unlikely
         // to contain coopmat_mul_add but must be exhaustive).
         | HirExprKind::SharedRead { .. } => None,

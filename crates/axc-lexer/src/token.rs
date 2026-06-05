@@ -421,6 +421,26 @@ pub fn is_reserved_coopmat_builtin(name: &str) -> bool {
     RESERVED_COOPMAT_BUILTIN_NAMES.binary_search(&name).is_ok()
 }
 
+/// Sorted-for-binary-search list of M3.3d invocation builtin call names.
+///
+/// `local_invocation_id` is a plain identifier (not a keyword) recognized by the
+/// HIR typechecker's Call arm.  It is listed here as a collision guard so user-defined
+/// functions named `local_invocation_id` are flagged as reserved.
+///
+/// Sorted lexicographically so `binary_search` works correctly.
+/// `gid` is intentionally NOT in this list — it is dispatched purely by name in the
+/// typechecker's Call arm; keeping separate lists avoids over-reserving.
+pub const RESERVED_BUILTIN_INVOCATION_NAMES: &[&str] = &[
+    "local_invocation_id",
+];
+
+/// Returns `true` if `name` is a reserved invocation builtin identifier (M3.3d).
+///
+/// Uses binary search on the sorted `RESERVED_BUILTIN_INVOCATION_NAMES` slice.
+pub fn is_reserved_invocation_builtin(name: &str) -> bool {
+    RESERVED_BUILTIN_INVOCATION_NAMES.binary_search(&name).is_ok()
+}
+
 /// Lookup table mapping byte offsets to (line, column) positions.
 ///
 /// Built on demand for diagnostic rendering; not part of the hot tokenize path.
@@ -667,6 +687,30 @@ mod tests {
         assert_eq!(
             RESERVED_SUBGROUP_BUILTIN_NAMES, sorted.as_slice(),
             "RESERVED_SUBGROUP_BUILTIN_NAMES must be sorted lexicographically for binary_search to work"
+        );
+    }
+
+    // ── M3.3d: reserved invocation builtin names ─────────────────────────────
+
+    #[test]
+    fn reserved_invocation_builtin_names_contains_local_invocation_id() {
+        assert!(is_reserved_invocation_builtin("local_invocation_id"));
+    }
+
+    #[test]
+    fn reserved_invocation_builtin_gid_is_not_in_invocation_list() {
+        // gid is dispatched by its own typechecker arm; it must NOT appear here.
+        assert!(!is_reserved_invocation_builtin("gid"), "gid must not be in invocation reserved list");
+    }
+
+    #[test]
+    fn reserved_invocation_builtin_names_sorted_invariant() {
+        // RESERVED_BUILTIN_INVOCATION_NAMES must be sorted lexicographically for binary_search.
+        let mut sorted = RESERVED_BUILTIN_INVOCATION_NAMES.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(
+            RESERVED_BUILTIN_INVOCATION_NAMES, sorted.as_slice(),
+            "RESERVED_BUILTIN_INVOCATION_NAMES must be sorted lexicographically for binary_search to work"
         );
     }
 

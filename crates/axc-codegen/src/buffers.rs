@@ -277,6 +277,56 @@ pub fn emit_gid_variable(
     GlobalInvocationIdVar { var_id, vec3_u32_type_id }
 }
 
+// ── gl_LocalInvocationID ─────────────────────────────────────────────────────
+
+/// The emitted `gl_LocalInvocationID` variable and its type support (M3.3d).
+pub struct LocalInvocationIdVar {
+    /// The global OpVariable id for the Input vector.
+    pub var_id: Word,
+    /// The `uvec3` type id (OpTypeVector u32 3).
+    pub vec3_u32_type_id: Word,
+}
+
+/// Emit the `gl_LocalInvocationID` Input variable (M3.3d).
+///
+/// Must be called BEFORE `begin_function`, and the returned `var_id` MUST be
+/// included in the OpEntryPoint interface list (SPIR-V 1.4+ requirement; also
+/// correct for 1.3 Input/Output variables).
+///
+/// `LocalInvocationId` is a **core Shader** builtin (SPIR-V spec §3.21 BuiltIn table —
+/// Enabled by Capability Shader, already present in every AXIOM-Compute compute module).
+/// NO additional `OpCapability` or `OpExtension` is added.  This satisfies anti-pattern #7
+/// (no silent capability).
+///
+/// This function is the **exact mirror** of `emit_gid_variable`, with `GlobalInvocationId`
+/// replaced by `LocalInvocationId`.
+pub fn emit_local_invocation_id_variable(
+    b: &mut Builder,
+    type_cache: &mut ScalarTypeCache,
+) -> LocalInvocationIdVar {
+    use rspirv::spirv::Decoration;
+    use rspirv::dr::Operand;
+    use axc_hir::ty::ScalarTy;
+
+    // 1. u32 type
+    let u32_type_id: Word = type_cache.scalar_id(b, ScalarTy::U32);
+
+    // 2. vec3 u32 type
+    let vec3_u32_type_id: Word = b.type_vector(u32_type_id, 3);
+
+    // 3. Pointer to vec3 u32 in Input storage class.
+    let ptr_to_vec3: Word = b.type_pointer(None, StorageClass::Input, vec3_u32_type_id);
+
+    // 4. OpVariable Input
+    let var_id: Word = b.variable(ptr_to_vec3, None, StorageClass::Input, None);
+
+    // 5. OpDecorate var BuiltIn LocalInvocationId
+    // NO capability flag: LocalInvocationId is core Shader — no new OpCapability.
+    b.decorate(var_id, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::LocalInvocationId)]);
+
+    LocalInvocationIdVar { var_id, vec3_u32_type_id }
+}
+
 // ── Scan helpers ─────────────────────────────────────────────────────────────
 
 /// Returns `true` if the kernel uses any `gid()` builtin expression.

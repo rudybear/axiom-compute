@@ -39,7 +39,7 @@ use axc_hir::ty::ScalarTy;
 use axc_hir::subgroup::{SubgroupOp, SubgroupReduceKind, BarrierKind};
 use axc_hir::control_flow::{HirIf, HirElse, HirForRange, HirWhile};
 use axc_lexer::Span;
-use crate::buffers::{BufferBindings, PushConstantBlock, GlobalInvocationIdVar};
+use crate::buffers::{BufferBindings, PushConstantBlock, GlobalInvocationIdVar, LocalInvocationIdVar};
 use crate::subgroup::{
     SubgroupBuiltinVars, SubgroupVote, SubgroupReduceOp,
     emit_subgroup_elect, emit_subgroup_vote, emit_subgroup_reduce,
@@ -60,6 +60,11 @@ pub struct KernelResources<'r> {
     pub push_constant: Option<&'r PushConstantBlock>,
     /// gl_GlobalInvocationID Input variable.
     pub gid_var: Option<&'r GlobalInvocationIdVar>,
+    /// gl_LocalInvocationID Input variable (M3.3d).
+    ///
+    /// `Some` only when the kernel body calls `local_invocation_id()`.
+    /// Unlike `gid_var`, this is **not** emitted on buffer-presence alone.
+    pub local_id_var: Option<&'r LocalInvocationIdVar>,
     /// Scalar param info: maps position → (member_index, ScalarTy) for load-from-PC.
     pub scalar_params: &'r [(u32, u32, ScalarTy)],  // (position, member_index, ty)
     /// Subgroup builtin variables (SubgroupLocalInvocationId, SubgroupSize) emitted before fn.
@@ -1388,6 +1393,9 @@ fn emit_expr(em: &mut BodyEmitter<'_>, expr: &HirExpr) -> Result<Word, BodyCodeg
         HirExprKind::GidBuiltin { axis } => {
             emit_gid_component(em, *axis)
         }
+        HirExprKind::LocalInvocationIdBuiltin { axis } => {
+            emit_local_invocation_id_component(em, *axis)
+        }
         HirExprKind::SubgroupBuiltin { op, args } => {
             emit_subgroup_builtin(em, *op, args, expr.ty)
         }
@@ -2005,6 +2013,39 @@ fn emit_gid_component(
     // Step 2: OpCompositeExtract u32 %loaded_vec <axis_literal>
     // The axis is a LITERAL u32 operand (not an id); rspirv composite_extract
     // takes a slice of literal u32 indices.
+    let axis_val = em.b.composite_extract(u32_ty_id, None, loaded_vec, [axis])
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+
+    Ok(axis_val)
+}
+
+/// Emit extraction of one component from `gl_LocalInvocationID` (M3.3d).
+///
+/// Mirrors `emit_gid_component` exactly, using `LocalInvocationIdVar` instead of
+/// `GlobalInvocationIdVar`.
+///
+/// Pattern:
+///   `%vec = OpLoad uvec3 %localid_var`
+///   `%val = OpCompositeExtract u32 %vec <axis_literal>`
+///
+/// `axis_literal` is a SPIR-V LITERAL u32 operand (0, 1, or 2), NOT a dynamic id.
+fn emit_local_invocation_id_component(
+    em: &mut BodyEmitter<'_>,
+    axis: u32,
+) -> Result<Word, BodyCodegenError> {
+    let local_id = em.res.local_id_var
+        .ok_or(BodyCodegenError::UnexpectedHir(
+            "LocalInvocationIdBuiltin with no local_id_var in resources"
+        ))?;
+    let var_id = local_id.var_id;
+    let vec3_u32_ty = local_id.vec3_u32_type_id;
+
+    // Step 1: OpLoad uvec3 from the Input variable.
+    let u32_ty_id = em.type_id(ScalarTy::U32);
+    let loaded_vec = em.b.load(vec3_u32_ty, None, var_id, None, None)
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+
+    // Step 2: OpCompositeExtract u32 %loaded_vec <axis_literal>
     let axis_val = em.b.composite_extract(u32_ty_id, None, loaded_vec, [axis])
         .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
 

@@ -24,7 +24,8 @@ use axc_hir::subgroup::SubgroupOp;
 use crate::body::{ScalarTypeCache, CapabilitiesRequired, KernelResources, emit_kernel_body};
 use crate::buffers::{
     emit_buffer_globals, emit_push_constant_block, emit_gid_variable,
-    BufferBindings, PushConstantBlock, GlobalInvocationIdVar,
+    emit_local_invocation_id_variable,
+    BufferBindings, PushConstantBlock, GlobalInvocationIdVar, LocalInvocationIdVar,
 };
 use crate::subgroup::{SubgroupBuiltinVars, emit_subgroup_scalar_builtin_var};
 use crate::shared::{SharedBindings, emit_shared_globals};
@@ -223,6 +224,16 @@ pub fn emit_module(hir: &HirModule, opts: &CodegenOptions) -> Result<Vec<u32>, C
             }
             let subgroup_vars_emitted = subgroup_vars.any_emitted();
 
+            // (a5-local) M3.3d: gl_LocalInvocationID Input variable.
+            // Emitted ONLY when the body calls local_invocation_id() — NOT on buffer presence.
+            // (Unlike gid, this is opt-in; see coder_handoff_notes.)
+            let local_id_var: Option<LocalInvocationIdVar> =
+                if body_uses_local_invocation_id(typed_body) {
+                    Some(emit_local_invocation_id_variable(&mut b, &mut type_cache))
+                } else {
+                    None
+                };
+
             // Build scalar_params table: (position, member_index, ty) for push-constant reads.
             let scalar_params_table: Vec<(u32, u32, axc_hir::ty::ScalarTy)> = kernel
                 .binding_plan
@@ -287,6 +298,8 @@ pub fn emit_module(hir: &HirModule, opts: &CodegenOptions) -> Result<Vec<u32>, C
                 buffer_bindings: buffer_bindings.as_ref(),
                 push_constant: push_constant.as_ref(),
                 gid_var: gid_var.as_ref(),
+                // M3.3d: local_invocation_id() var; None when not used.
+                local_id_var: local_id_var.as_ref(),
                 scalar_params: &scalar_params_table,
                 subgroup_vars: subgroup_vars_ref,
                 // M3.2: shared-array bindings (None for kernels without shared arrays).
@@ -378,6 +391,7 @@ pub fn emit_module(hir: &HirModule, opts: &CodegenOptions) -> Result<Vec<u32>, C
 
             // Save for entry_point call below.
             let gid_var_id_for_ep: Option<u32> = gid_var.as_ref().map(|g| g.var_id);
+            let local_id_var_id_for_ep: Option<u32> = local_id_var.as_ref().map(|v| v.var_id);
 
             b.end_function().expect("rspirv: end_function should not fail after a complete block");
 
@@ -400,6 +414,10 @@ pub fn emit_module(hir: &HirModule, opts: &CodegenOptions) -> Result<Vec<u32>, C
             // buffer_bindings (StorageBuffer) and push_constant (PushConstant) → exclude.
             if let Some(gid_id) = gid_var_id_for_ep {
                 interface.push(gid_id);
+            }
+            // M3.3d: LocalInvocationId Input var (emitted only when used).
+            if let Some(local_id) = local_id_var_id_for_ep {
+                interface.push(local_id);
             }
             // M1.4: subgroup Input variables also go in the interface list.
             if let Some(invoc_id) = subgroup_vars.invocation_id_var {
@@ -517,9 +535,112 @@ fn expr_uses_gid(expr: &axc_hir::expr::HirExpr) -> bool {
         HirExprKind::IntLit { .. }
         | HirExprKind::FloatLit { .. }
         | HirExprKind::BoolLit(_)
-        | HirExprKind::LocalRead(_) => false,
+        | HirExprKind::LocalRead(_)
+        // M3.3d: LocalInvocationIdBuiltin is NOT a gid use.
+        | HirExprKind::LocalInvocationIdBuiltin { .. } => false,
         // M3.2: SharedRead's index expression may use gid.
         HirExprKind::SharedRead { index, .. } => expr_uses_gid(index),
+    }
+}
+
+// ── M3.3d: LocalInvocationId builtin usage walkers ───────────────────────────
+
+/// Scan a typed kernel body for any `LocalInvocationIdBuiltin` expression.
+///
+/// Used to decide whether to emit the `gl_LocalInvocationID` Input variable.
+/// This is a **full traversal** mirroring `body_uses_gid` — it recurses into
+/// loop-bound expressions, shared-write index expressions, and nested binops
+/// (the MSG kernel uses `local_invocation_id(0u32)` inside staging-loop index/bound
+/// expressions AND as the `sg_id` numerator; missing those positions → var not emitted
+/// → `emit_local_invocation_id_component` hits the `None` branch → BodyCodegenError).
+fn body_uses_local_invocation_id(body: &KernelBodyTyped) -> bool {
+    body.stmts.iter().any(stmt_uses_local_invocation_id)
+}
+
+fn stmt_uses_local_invocation_id(stmt: &HirStmt) -> bool {
+    match stmt {
+        HirStmt::Let { init, .. } => expr_uses_local_invocation_id(init),
+        HirStmt::Assign { value, .. } => expr_uses_local_invocation_id(value),
+        HirStmt::Return { .. } => false,
+        HirStmt::BufferWrite { index, value, .. } => {
+            expr_uses_local_invocation_id(index) || expr_uses_local_invocation_id(value)
+        }
+        HirStmt::Break { .. } | HirStmt::Continue { .. } => false,
+        HirStmt::Barrier { .. } => false,
+        HirStmt::If(hir_if) => {
+            expr_uses_local_invocation_id(&hir_if.cond)
+                || hir_if.then_block.iter().any(stmt_uses_local_invocation_id)
+                || hir_if.else_arm.as_ref().is_some_and(|arm| else_uses_local_invocation_id(arm))
+        }
+        HirStmt::ForRange(hir_for) => {
+            // Recurse into LOOP-BOUND expressions (start/end) and body.
+            // Critical: the MSG kernel uses local_invocation_id inside loop-bound exprs.
+            expr_uses_local_invocation_id(&hir_for.start)
+                || expr_uses_local_invocation_id(&hir_for.end)
+                || hir_for.body.iter().any(stmt_uses_local_invocation_id)
+        }
+        HirStmt::While(hir_while) => {
+            expr_uses_local_invocation_id(&hir_while.cond)
+                || hir_while.body.iter().any(stmt_uses_local_invocation_id)
+        }
+        HirStmt::CoopMatStore { element_offset, stride, .. } => {
+            expr_uses_local_invocation_id(element_offset)
+                || expr_uses_local_invocation_id(stride)
+        }
+        // M3.2: SharedWrite index/value may use local_invocation_id.
+        // Critical: the MSG kernel uses local_invocation_id as the staging thread index
+        // inside shared-write index expressions.
+        HirStmt::SharedWrite { index, value, .. } => {
+            expr_uses_local_invocation_id(index) || expr_uses_local_invocation_id(value)
+        }
+        // SharedDeclMarker is a no-op with no expressions.
+        HirStmt::SharedDeclMarker { .. } => false,
+    }
+}
+
+fn else_uses_local_invocation_id(arm: &axc_hir::control_flow::HirElse) -> bool {
+    match arm {
+        axc_hir::control_flow::HirElse::Block(stmts) => {
+            stmts.iter().any(stmt_uses_local_invocation_id)
+        }
+        axc_hir::control_flow::HirElse::If(hir_if) => {
+            expr_uses_local_invocation_id(&hir_if.cond)
+                || hir_if.then_block.iter().any(stmt_uses_local_invocation_id)
+                || hir_if.else_arm.as_ref().is_some_and(|arm| else_uses_local_invocation_id(arm))
+        }
+    }
+}
+
+fn expr_uses_local_invocation_id(expr: &axc_hir::expr::HirExpr) -> bool {
+    match &expr.kind {
+        HirExprKind::LocalInvocationIdBuiltin { .. } => true,
+        HirExprKind::BufferRead { index, .. } => expr_uses_local_invocation_id(index),
+        HirExprKind::Unary { operand, .. } => expr_uses_local_invocation_id(operand),
+        HirExprKind::Binary { lhs, rhs, .. } => {
+            expr_uses_local_invocation_id(lhs) || expr_uses_local_invocation_id(rhs)
+        }
+        HirExprKind::ShortCircuit { lhs, rhs, .. } => {
+            expr_uses_local_invocation_id(lhs) || expr_uses_local_invocation_id(rhs)
+        }
+        HirExprKind::BitwiseBuiltin { args, .. } => {
+            args.iter().any(expr_uses_local_invocation_id)
+        }
+        HirExprKind::SubgroupBuiltin { args, .. } => {
+            args.iter().any(expr_uses_local_invocation_id)
+        }
+        HirExprKind::CoopMatBuiltin { args, .. } => {
+            args.iter().any(expr_uses_local_invocation_id)
+        }
+        HirExprKind::Q4_0Builtin { args, .. } => {
+            args.iter().any(expr_uses_local_invocation_id)
+        }
+        HirExprKind::GidBuiltin { .. }
+        | HirExprKind::IntLit { .. }
+        | HirExprKind::FloatLit { .. }
+        | HirExprKind::BoolLit(_)
+        | HirExprKind::LocalRead(_) => false,
+        // M3.2: SharedRead index expression may use local_invocation_id.
+        HirExprKind::SharedRead { index, .. } => expr_uses_local_invocation_id(index),
     }
 }
 
@@ -613,6 +734,8 @@ fn expr_uses_subgroup_op(expr: &axc_hir::expr::HirExpr, target: SubgroupOp) -> b
             args.iter().any(|a| expr_uses_subgroup_op(a, target))
         }
         HirExprKind::GidBuiltin { .. }
+        // M3.3d: LocalInvocationIdBuiltin is a leaf — no subgroup op nested in it.
+        | HirExprKind::LocalInvocationIdBuiltin { .. }
         | HirExprKind::IntLit { .. }
         | HirExprKind::FloatLit { .. }
         | HirExprKind::BoolLit(_)
@@ -693,6 +816,8 @@ fn expr_uses_coopmat(expr: &axc_hir::expr::HirExpr) -> bool {
         // M2.5: Q4_0 builtins are not coopmat; no cooperative-matrix ops inside.
         HirExprKind::Q4_0Builtin { .. } => false,
         HirExprKind::GidBuiltin { .. }
+        // M3.3d: LocalInvocationIdBuiltin is a leaf — no coopmat nested in it.
+        | HirExprKind::LocalInvocationIdBuiltin { .. }
         | HirExprKind::IntLit { .. }
         | HirExprKind::FloatLit { .. }
         | HirExprKind::BoolLit(_)
