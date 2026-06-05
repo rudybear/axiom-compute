@@ -173,3 +173,34 @@ fn codegen_local_invocation_id_not_emitted_when_unused() {
     );
     eprintln!("AT-1741 PASS: LocalInvocationId omitted when unused (opt-in confirmed)");
 }
+
+/// Debug test: compile a coopmat kernel using local_invocation_id() and verify
+/// the LocalInvocationId decoration appears in the SPIR-V.
+/// This simulates the AT-1745 issue with a simpler kernel.
+#[test]
+fn codegen_local_invocation_id_in_coopmat_kernel() {
+    // Simple kernel that uses local_invocation_id alongside subgroup ops
+    // (mirrors the MSG kernel's basic structure)
+    let src = r#"
+        @kernel @workgroup(64,1,1)
+        @cooperative_matrix
+        @intent("local_invocation_id in coopmat kernel AT-1741-debug")
+        @complexity(O(n))
+        fn lid_coopmat_test(out: buffer[u32]) -> void {
+            let sg_sz: u32 = subgroup_size();
+            let local_x: u32 = local_invocation_id(0u32);
+            let sg_id: u32 = local_x / sg_sz;
+            let gx: u32 = gid(0u32);
+            out[gx] = sg_id;
+            return;
+        }
+    "#;
+    let words = compile(src);
+    let asm = disasm(&words);
+    
+    assert!(
+        asm.contains("LocalInvocationId"),
+        "must have LocalInvocationId when used alongside subgroup ops; asm:\n{asm}"
+    );
+    eprintln!("codegen_local_invocation_id_in_coopmat_kernel PASS");
+}
