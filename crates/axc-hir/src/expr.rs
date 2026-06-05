@@ -132,6 +132,20 @@ pub enum HirExprKind {
     GidBuiltin {
         axis: u32,
     },
+    /// `local_invocation_id(axis)` — extract one component of `gl_LocalInvocationID` (M3.3d).
+    ///
+    /// Lowers to SPIR-V BuiltIn `LocalInvocationId` (a `uvec3` Input `OpVariable` +
+    /// `OpLoad` + `OpCompositeExtract` by literal `axis`).
+    ///
+    /// `axis` must be 0, 1, or 2 and is a compile-time constant (identical restriction to `gid`).
+    /// Result type is always `U32`.
+    ///
+    /// `LocalInvocationId` is a **core Shader** builtin: no new `OpCapability` is added.
+    /// The var is emitted **only when this builtin is used** (unlike `gid` which is emitted
+    /// whenever buffers are present).
+    LocalInvocationIdBuiltin {
+        axis: u32,
+    },
     /// Subgroup builtin call (M1.4).
     ///
     /// Covers all subgroup operations except `workgroup_barrier`, which is a

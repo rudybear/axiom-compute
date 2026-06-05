@@ -1,0 +1,80 @@
+{
+  "verdict": "APPROVE",
+  "agent": "optimistic_design_reviewer",
+  "milestone_id": "M3.3d-multiwarp",
+  "date": "2026-06-05",
+
+  "strengths": [
+    "PART A — local_invocation_id builtin design is provably minimal: confirmed in buffers.rs that GlobalInvocationIdVar / emit_gid_variable follow exactly the struct+fn pattern the spec calls for. The proposed LocalInvocationIdVar / emit_local_invocation_id_variable is a direct structural mirror; the only parameter that changes is BuiltIn::LocalInvocationId vs BuiltIn::GlobalInvocationId. This is the lowest-risk possible addition: one new struct, one new fn, one new HirExprKind variant, mirrored at every layer.",
+    "No new SPIR-V capability confirmed correct: SPIR-V Unified spec §3.21 (BuiltIn table) lists LocalInvocationId as 'Capability: Shader' — the same capability already required by every existing kernel. The codegen's no-capability-flag guarantee for this builtin is spec-correct. AT-1741 assertion (no new OpCapability) is the right enforcement gate.",
+    "emit.rs interface-list wiring design is correct for SPIR-V 1.3: reading emit.rs lines 397-411, the existing gid and subgroup Input vars are pushed to the interface vec and passed to b.entry_point. The spec requires LocalInvocationId Input var to appear in the interface list (SPIR-V §2.17 for 1.3, Input class). The plan mirrors this pattern exactly, and AT-1741 checks for the var in the interface list.",
+    "Emit-only-when-used design (EC-7) is better than gid's always-on-buffers policy: reading emit.rs lines 201-209, gid is emitted whenever buffers are present even without explicit use. The plan correctly makes local_invocation_id opt-in (body_uses_local_invocation_id scanner) — keeps the interface list minimal and avoids unused Input variables that could confuse validators.",
+    "PART B — multi-subgroup matmul design correctly applies OpControlBarrier with Workgroup execution scope: subgroup.rs confirms BarrierKind::Workgroup exists and the spec (Vulkan Memory Model extension, VkSpec §15.8) requires execution scope Workgroup for a barrier that synchronizes all invocations in the workgroup across subgroup boundaries. The plan's 'barrier in uniform control flow, no divergent branch around it' requirement is exactly the SPIR-V §2.11 structured-control-flow requirement — correctly stated.",
+    "Per-subgroup coopmat scope confirmed sound: VK_KHR_cooperative_matrix (Khronos extension spec, §2.2) defines cooperative matrix operations as subgroup-scoped. 64 threads in one workgroup forming 2 independent wave32 subgroups EACH running scope-Subgroup coopmat ops is the documented multi-warp usage pattern — it does NOT require cross-subgroup coopmat sharing. The plan correctly identifies this and defers GPU proof to AT-1743/1744 (anti-pattern #9 compliance).",
+    "4 loop-carried coopmat accumulators per subgroup reuse the locked N-phi codegen path (AT-1733): because each subgroup independently executes the K-loop with the same trip count and all 64 threads share the same top-level control flow, the existing single-loop N-phi path emits 4 OpPhis in the loop header for EACH invocation's coopmat accumulators. No codegen change for the matmul is correctly justified.",
+    "A-reuse amortization is theoretically sound: stacking subgroups along N (both share the same A row-block) maximizes A reuse across subgroups. Only B tiles differ per subgroup — subgroup s reads b_tile cols [s*32..+32) via the sg_id*32 offset, which is purely index arithmetic with no divergent branching. This is the canonical tiling strategy (cf. Horace He's 'Making Deep Learning Go Brrrr' analysis of shared-memory tiling, and CUTLASS 3.x multi-stage TMA designs).",
+    "Shared memory well within limits: a_tile(1024 B) + b_tile(2048 B) = 3072 B is well under Vulkan's minComputeSharedMemorySize guarantee of 16 KB (VkSpec §31.2 limits table), and the RTX PRO 6000 provides 48-128 KB per SM. AT-1745 asserts 3072 <= 16384 as a CI gate.",
+    "Benchmark methodology is honest clone of M3.3c resident_matmul_rb: MIN-of-10 / N_WARMUP=2 / GpuTimestamp / resident upload-once methodology eliminates PCIe amortization artifacts. Reporting bare TFLOPS + pct of 125-TFLOPS estimate with NO asserted ratio, 'competitive' label only if pct>=25.0, and retaining single-subgroup RB bench for A/B is exemplary honesty. Matches the project hard rule.",
+    "50 GB cap + 2D grid pre-check: both dimensions of the msg grid (N/64 and M/32) need divisibility assertions. The plan calls these out explicitly and the 50 GB cap mirrors the M3.3c methodology exactly.",
+    "AT-1742 runs on Lavapipe: the local_id_probe.axc kernel has no coopmat -> it is NOT typed-skipped, making it the first builtin test exercisable in CI without special hardware. This is a significant CI coverage gain — local_invocation_id correctness proven on Lavapipe before any NVIDIA-only AT-1743/1744 run.",
+    "Portability on non-wave32 hardware (EC-2): using subgroup_size() (NOT hardcoded 32) to derive sg_id means that on AMD wave64 or Intel Arc (wave8/wave16 depending on workload) the math remains correct — the subgroup simply covers a different fraction of the 64-thread workgroup. The bench result will differ by device, but correctness holds. This is the right approach per SPIR-V GL_KHR_shader_subgroup portability guidelines.",
+    "Dependency graph is linear and correct: axc-lexer -> axc-parser -> axc-hir -> axc-codegen -> axc-driver mirrors the existing crate topology. No circular deps introduced."
+  ],
+
+  "concerns": [
+    "Minor: The spec says 'emit local_id_var ONLY when body_uses_local_invocation_id', but gid deviates from this (gid is also emitted when buffers are present). The Coder must be careful NOT to add a 'buffers present -> emit local_id_var' shortcut (it would add an unused Input var that AT-1741 would catch). The spec is explicit on this but it is a divergence from the gid pattern worth highlighting to prevent copy-paste error.",
+    "Minor: OQ-2 (per-subgroup coopmat correctness) is theoretically resolved by spec but requires AT-1743/1744 as the real-GPU gate. The plan correctly withholds any TFLOPS or bit-exact claim until those tests pass on NVIDIA. This is well-stated but the Coder must NOT proceed to the bench run without AT-1743 passing first.",
+    "Minor: The b_tile stride in the shared coopmat_load is 64 (the full b_tile width = N_SG*RB_N*16). For subgroup 1, b_off1 = sg_id*32 + 16 = 48; the 16-wide coopmat B tile at stride 64 starting at col 48 reads positions [48+r*64 .. 48+r*64+16) which stays within the 1024-element b_tile only if 48+15*64 < 1024 (= 1008 < 1024, correct). The indexing is tight but valid. No action needed — just document.",
+    "Minor: AT-1744's K=48 fixture (3 K-blocks of 16) exercises the WAR barrier path between k_blocks. The plan references WAR barrier placement in the coder_handoff_notes ('WAR barrier before next k_block'). The plan should confirm the Coder places this barrier at the BOTTOM of the k_block loop body (same as matmul_rb_coopmat.axc line 202: workgroup_barrier() before the next iteration overwrites shared). The M3.3c .axc example is the correct template — just confirm the WAR barrier is NOT omitted."
+  ],
+
+  "validation_against_existing": [
+    "buffers.rs lines 241-278: GlobalInvocationIdVar struct + emit_gid_variable function are the exact pattern to mirror. The proposed LocalInvocationIdVar is identical in structure. BuiltIn::LocalInvocationId is present in rspirv::spirv::BuiltIn (rspirv 0.12, generated from spirv-headers — same set as GlobalInvocationId).",
+    "emit.rs lines 201-209 confirm gid conditional emission; lines 397-411 confirm interface list construction. Both patterns apply directly to local_id_var.",
+    "body.rs lines 1388-1389 + 1991-2012 show the GidBuiltin match arm + emit_gid_component function body. The proposed emit_local_invocation_id_component is a verbatim copy with local_id_var substituted. The OpLoad + OpCompositeExtract LITERAL axis pattern is already proven by existing tests (AT-214 family).",
+    "subgroup.rs BarrierKind::Workgroup confirms the workgroup_barrier() already emits execution scope Workgroup — the linchpin for cross-subgroup synchronization. No new lowering needed for Part B.",
+    "matmul_rb_coopmat.axc (M3.3c reference) shows the working 4-accumulator N-phi K-loop pattern. matmul_msg_coopmat.axc extends this by (a) replacing lane=subgroup_invocation_id() with a dual-index (t=local_invocation_id(0) for staging, lane for coopmat), and (b) adding the sg_id derivation and per-subgroup offsets. The K-loop structure is otherwise identical — no codegen change justified.",
+    "DESIGN.md §3.1.17 (lines 728-744) documents M3.3c measured results: 31.2 TFLOPS = 24.96% at 768. The M3.3d design correctly references this as the honest baseline and makes no asserted improvement claim — matching the design document's own honesty requirement.",
+    "SPIRV-Tools spirv-val with --target-env vulkan1.1 validates LocalInvocationId Input variables in compute shaders — confirmed by Khronos spirv-val test suite (tests/val/val_builtins_test.cpp, ValidateComputeBuiltins). AT-1741 gates on spirv-val exit 0."
+  ],
+
+  "external_references": [
+    "SPIR-V Unified Spec §3.21 BuiltIn table — LocalInvocationId: Capability Shader, Execution Model GLCompute, no extension required: https://registry.khronos.org/SPIR-V/specs/unified1/SPIRV.html#_a_id_built_in_table_a_built_in",
+    "SPIR-V Unified Spec §2.17 Universal Validation Rules — Input/Output variables must appear in OpEntryPoint interface list for SPIR-V 1.3: https://registry.khronos.org/SPIR-V/specs/unified1/SPIRV.html#_universal_validation_rules",
+    "VK_KHR_cooperative_matrix §2.2 — scope operand is Subgroup; each subgroup independently executes its cooperative matrix operations: https://htmlpreview.github.io/?https://github.com/KhronosGroup/SPIRV-Registry/blob/main/extensions/KHR/SPV_KHR_cooperative_matrix.html",
+    "Vulkan Memory Model §15.8 OpControlBarrier — Execution scope Workgroup synchronizes all invocations in the workgroup including across subgroup boundaries; WorkgroupMemory memory semantics make workgroup-scope shared writes visible: https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#memory-model-vk-ext-vulkan-memory-model",
+    "Vulkan Spec §31.2 Limits — minComputeSharedMemorySize >= 16384 bytes guaranteed: https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#limits",
+    "rspirv 0.12 BuiltIn enum (generated from spirv-headers) — BuiltIn::LocalInvocationId present in the same enum as BuiltIn::GlobalInvocationId: https://github.com/gfx-rs/rspirv/blob/master/rspirv/spirv/autogen_spirv.rs",
+    "Khronos spirv-val test suite ValidateComputeBuiltins — LocalInvocationId validated in compute shader context: https://github.com/KhronosGroup/SPIRV-Tools/blob/main/test/val/val_builtins_test.cpp",
+    "GLSL GL_KHR_shader_subgroup portability guidelines — subgroup_size() preferred over hardcoded warp width for cross-vendor kernels: https://github.com/KhronosGroup/GLSL/blob/main/extensions/khr/GL_KHR_shader_subgroup.txt"
+  ],
+
+  "oq_positions": {
+    "OQ-2_per_subgroup_coopmat_correctness": "RESOLVED BY SPEC with mandatory GPU gate. VK_KHR_cooperative_matrix scope=Subgroup is unambiguous: each 32-lane subgroup runs an independent coopmat block. The design is sound per spec. AT-1743 (single workgroup, 2 subgroups, grid (1,1,1)) and AT-1744 (multi-workgroup, multi-K-block) are necessary and sufficient GPU confirmation (anti-pattern #9). No TFLOPS or bit-exact claim should ship before AT-1743 passes on NVIDIA hardware.",
+    "OQ-3_does_multi_subgroup_beat_single_subgroup": "HONEST OPEN QUESTION, correctly handled. The design's prediction of 'modest gain at >=512, possible regression at 256' is well-reasoned: the msg grid at 256 is (4,8,1)=32 workgroups vs RB's (8,8,1)=64 — fewer warps at 256 reinforces the hypothesis that occupancy loss may offset staging amortization at small sizes. At 768 the msg grid is (12,24,1)=288 WGs of 64 threads, launching 288*2=576 warps total — same as RB's (24,24,1)=576 single-warp workgroups. At 768 the staging amortization benefit (A block loaded once for 2 subgroups) is unambiguous. The honest expectation is AT-1750 shows improvement at 768, possibly crossing 25%. The no-asserted-ratio gate is correct.",
+    "OQ-4_n_stacking_vs_m_stacking": "N-stacking chosen for max A-reuse is the right call. Both subgroups share the same 32 A-rows, amortizing the most expensive staging (A is read K times, B is read once in the outer loop). M-stacking would share B but split A — A is larger in the degenerate case (K >> N) so N-stacking is the dominant choice. This is consistent with CUTLASS 3.x and IREE codegen's tiling heuristics for shared-memory reuse (IREE HAL backend GEMM decomposition favors N-major tiling when A is the larger operand)."
+  },
+
+  "test_adequacy": "SUFFICIENT",
+  "test_suggestions": [
+    "No new tests required: AT-1740 through AT-1745 and AT-1750 cover all layers. AT-1742 on Lavapipe (no coopmat skip) is particularly valuable for CI — it is the first builtin in this project that can be GPU-verified on software drivers. Recommend explicitly calling out Lavapipe run in CI job definition for AT-1742.",
+    "Optional enhancement: AT-1741 could additionally assert that when local_invocation_id() is NOT used, NO LocalInvocationId Input variable appears in the module (the 'emit only when used' guarantee). This is the inverse of the EC-7 guarantee and mirrors the existing cg_gid_var_not_emitted_if_unused test in buffers.rs. Low priority but consistent with the existing test family."
+  ],
+
+  "summary": "M3.3d is a clean, well-scoped, two-part design. PART A (local_invocation_id builtin) is the minimal possible language addition: one new struct/fn in buffers.rs, one new HirExprKind variant, one new typecheck dispatch arm — each an exact structural mirror of the proven GlobalInvocationId/GidBuiltin path. The no-new-capability justification is spec-correct (SPIR-V §3.21). The emit-only-when-used policy is superior to gid's emit-on-buffer-presence policy and AT-1741 enforces it. AT-1742 on Lavapipe provides CI-gated GPU proof without NVIDIA hardware. PART B (multi-subgroup matmul) correctly leverages the existing workgroup_barrier() Workgroup-scope lowering (subgroup.rs BarrierKind::Workgroup) as the cross-subgroup synchronization primitive — this is the design linchpin and it maps to the correct SPIR-V execution scope. Per-subgroup coopmat execution is sound per VK_KHR_cooperative_matrix scope=Subgroup semantics; AT-1743/1744 are the mandatory GPU confirmation. The 4-accumulator N-phi K-loop codegen is unchanged from M3.3c (AT-1733 locked). Shared memory (3072 B) is well within Vulkan's guaranteed 16 KB minimum. The TFLOPS reporting is honest: no asserted ratio, competitive label only if pct>=25.0, single-subgroup RB bench retained for A/B, results reported at multiple sizes. The spec correctly anticipates a 256 regression and honest gain at >=512. This plan is sound and ready for Coder.",
+
+  "validation_completeness_check": {
+    "part_a_builtin_complete": true,
+    "part_b_matmul_complete": true,
+    "spir_v_lowering_specified_for_every_path": true,
+    "no_new_capability_confirmed": true,
+    "barrier_cross_subgroup_specified": true,
+    "per_subgroup_coopmat_scope_confirmed": true,
+    "honest_tflops_no_asserted_ratio": true,
+    "at_ids_covered": "AT-1740 .. AT-1745, AT-1750",
+    "50gb_cap_asserted": true,
+    "shared_limit_checked": true,
+    "single_subgroup_rb_retained": true,
+    "lavapipe_ci_coverage": "AT-1742 runs on Lavapipe (no coopmat skip); AT-1743/1744 typed-skipped on Lavapipe (correct)"
+  }
+}

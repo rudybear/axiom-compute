@@ -2602,6 +2602,24 @@ mod tests {
         }
     }
 
+    /// AT-1740: local_invocation_id(0u32) parses as Expr::Call with name=="local_invocation_id".
+    #[test]
+    fn parse_local_invocation_id_call() {
+        // local_invocation_id(0u32) — parses as Expr::Call (same path as gid)
+        let src = "@kernel @workgroup(64,1,1) fn k() -> void { let i: u32 = local_invocation_id(0u32); return; }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        if let crate::ast::Stmt::Let { ref init, .. } = kd.body.node.stmts[0].node {
+            assert!(
+                matches!(&init.node, Expr::Call { name, .. } if name.node == "local_invocation_id"),
+                "expected Call local_invocation_id, got: {:?}", init.node
+            );
+        } else {
+            panic!("expected Let stmt");
+        }
+    }
+
     #[test]
     fn parse_buffer_i64_elem() {
         let src = "@kernel @workgroup(64,1,1) fn k(b: buffer[i64]) -> void { return; }";

@@ -1,0 +1,123 @@
+{
+  "verdict": "IMPLEMENTED",
+  "agent": "coder",
+  "milestone_id": "M3.3d-multiwarp",
+  "revision": "r1",
+
+  "files_created": [
+    "examples/local_id_probe.axc",
+    "examples/matmul_msg_coopmat.axc",
+    "crates/axc-codegen/tests/codegen_local_id.rs",
+    "crates/axc-driver/tests/dispatch_local_id.rs",
+    "crates/axc-driver/benches/resident_matmul_msg.rs"
+  ],
+
+  "files_modified": [
+    "crates/axc-lexer/src/token.rs",
+    "crates/axc-parser/src/parser.rs",
+    "crates/axc-hir/src/expr.rs",
+    "crates/axc-hir/src/typecheck.rs",
+    "crates/axc-hir/src/lower.rs",
+    "crates/axc-codegen/src/buffers.rs",
+    "crates/axc-codegen/src/body.rs",
+    "crates/axc-codegen/src/emit.rs",
+    "crates/axc-codegen/tests/codegen_local_id.rs",
+    "crates/axc-driver/tests/compile_shared_examples.rs",
+    "crates/axc-driver/tests/dispatch_shared_m32.rs",
+    "crates/axc-driver/Cargo.toml",
+    "DESIGN.md",
+    "ROADMAP.md"
+  ],
+
+  "public_apis_implemented": [
+    "pub struct LocalInvocationIdVar { var_id: Word, vec3_u32_type_id: Word }",
+    "pub fn emit_local_invocation_id_variable(b: &mut Builder, type_cache: &mut ScalarTypeCache) -> LocalInvocationIdVar",
+    "HirExprKind::LocalInvocationIdBuiltin { axis: u32 }",
+    "TypecheckError::LocalInvocationIdArity { got: usize, span: Span }",
+    "TypecheckError::LocalInvocationIdAxisOutOfRange { got: u32, span: Span }",
+    "TypecheckError::LocalInvocationIdAxisMustBeConstant { span: Span }"
+  ],
+
+  "tests_written": [
+    "reserved_invocation_builtin_names_contains_local_invocation_id (axc-lexer)",
+    "reserved_invocation_builtin_gid_is_not_in_invocation_list (axc-lexer)",
+    "reserved_invocation_builtin_names_sorted_invariant (axc-lexer)",
+    "parse_local_invocation_id_call (axc-parser)",
+    "tc_local_invocation_id_axis_0_ok (axc-hir AT-1740)",
+    "tc_local_invocation_id_axis_1_ok (axc-hir AT-1740)",
+    "tc_local_invocation_id_axis_2_ok (axc-hir AT-1740)",
+    "tc_local_invocation_id_axis_3_rejected (axc-hir AT-1740)",
+    "tc_local_invocation_id_arity_0_rejected (axc-hir AT-1740)",
+    "tc_local_invocation_id_arity_2_rejected (axc-hir AT-1740)",
+    "tc_local_invocation_id_variable_axis_rejected (axc-hir AT-1740)",
+    "tc_gid_and_local_invocation_id_both_distinct (axc-hir AT-1740 NO-REGRESSION)",
+    "codegen_local_invocation_id_emits_builtin_var_spirv_val_clean (axc-codegen AT-1741)",
+    "codegen_gid_only_kernel_unchanged_no_local_invocation_id (axc-codegen AT-1741 NO-REGRESSION)",
+    "codegen_gid_and_local_invocation_id_both_emitted (axc-codegen AT-1741)",
+    "codegen_local_invocation_id_not_emitted_when_unused (axc-codegen AT-1741)",
+    "codegen_local_invocation_id_in_coopmat_kernel (axc-codegen debug)",
+    "at1742_local_invocation_id_gpu_bit_exact (axc-driver GPU #[ignore] AT-1742)",
+    "at1743_matmul_msg_coopmat_bit_exact (axc-driver GPU #[ignore] AT-1743)",
+    "at1744_matmul_msg_coopmat_bit_exact_multiblock (axc-driver GPU #[ignore] AT-1744)",
+    "at1745_compile_matmul_msg_coopmat (axc-driver CI AT-1745)",
+    "dispatch_resident_matmul_msg_coopmat (axc-driver bench AT-1750)"
+  ],
+
+  "cargo_check_status": "pass",
+  "cargo_clippy_status": "pass — -D warnings, all workspace crates clean",
+  "spirv_val_status": "pass — AT-1741 (codegen unit test), AT-1745 (driver integration test, spirv-tools Vulkan_1_1)",
+
+  "implementation_summary": {
+    "PART_A_builtin_lowering": {
+      "lexer": "RESERVED_BUILTIN_INVOCATION_NAMES collision guard added with 'local_invocation_id'; is_reserved_invocation_builtin() function; unit tests verify sort invariant + gid not in list",
+      "parser": "No grammar change; parse_local_invocation_id_call test confirms Expr::Call parses correctly",
+      "HIR_expr": "HirExprKind::LocalInvocationIdBuiltin{axis: u32} added (mirror GidBuiltin); all exhaustive matches updated in lower.rs, typecheck.rs",
+      "HIR_typecheck": "check_local_invocation_id_call() added (mirror check_gid_call); arity=1, axis 0..=2 literal-only; LocalInvocationIdArity/AxisOutOfRange/AxisMustBeConstant errors; Call arm dispatch added",
+      "codegen_buffers": "LocalInvocationIdVar struct + emit_local_invocation_id_variable() (mirror emit_gid_variable; BuiltIn LocalInvocationId; NO capability flag set)",
+      "codegen_body": "local_id_var: Option<&LocalInvocationIdVar> in KernelResources; emit_local_invocation_id_component() (OpLoad vec3u32 + OpCompositeExtract literal axis); LocalInvocationIdBuiltin arm in emit_expr dispatch",
+      "codegen_emit": "body_uses_local_invocation_id FULL traversal (all HirStmt and HirExpr positions including ForRange start/end loop-bounds, SharedWrite index, nested Binary/Unary etc.); emit ONLY when used (not on buffer presence); local_id_var added to interface list; LocalInvocationIdBuiltin added to all existing scanner leaf patterns (expr_uses_gid, expr_uses_subgroup_op, expr_uses_coopmat)",
+      "no_new_capability": "CONFIRMED — LocalInvocationId is core Shader; no OpCapability or OpExtension added; AT-1741 codegen test asserts only Shader capability present"
+    },
+    "PART_B_multi_subgroup_kernel": {
+      "axc_file": "examples/matmul_msg_coopmat.axc — @workgroup(64,1,1); sg_id = local_invocation_id(0u32)/subgroup_size(); all 64 threads stage a_tile[512]+b_tile[1024]; ONE workgroup_barrier; per-subgroup 2x2 RB coopmat; 4 loop-carried accumulators (M3.3c N-phi path, AT-1733); @strategy holes genuinely parameterize; header documents sg_size==32 hard precondition; no @strategy in comments (strip_strategy bug avoided)",
+      "sg_size_32_guard": "IN ALL 3 REQUIRED PLACES: (1) AT-1743 test — before prepare_kernel_checked; (2) AT-1744 test — before prepare_kernel_checked; (3) AT-1750 bench (resident_matmul_msg.rs) — before allocation/dispatch. All use the exact pattern `if ctx.subgroup_size() != 32 { eprintln!(... wave64 guard ...); return; }` mirroring dispatch_matmul_tile.rs:231 AT-1510.",
+      "bit_exactness": "GUARANTEED BY CONSTRUCTION from workgroup-scope OpControlBarrier (subgroup.rs:285-301, unit-tested subgroup.rs:476); no subgroup-scope barrier path exists to weaken it.",
+      "non_symmetric_fixture": "AT-1743/1744 use A[idx]=(idx%4)+1 in {1..4}, B[idx]=(idx%3)+1 in {1..3} — NON-SYMMETRIC (distinct per-row/col pattern); symmetric fixture NOT substituted; the 64-wide stride-64 b_tile means a swapped sg_id offset MUST produce max_diff != 0.",
+      "staging_coverage_invariant": "AT-1745 asserts a_block_size%wg_threads==0 (512%64==0→8 iters) AND b_block_size%wg_threads==0 (1024%64==0→16 iters).",
+      "shared_memory_bytes": "AT-1745 asserts shared_memory_bytes==3072 (=(512+1024)*2) and <=16384.",
+      "body_scanner_coverage_proof": "AT-1745 asserts LocalInvocationId decoration (OpDecorate BuiltIn=11 LocalInvocationId=27) in raw SPIR-V word stream — proves body_uses_local_invocation_id detected the staging-loop usage."
+    }
+  },
+
+  "key_implementation_notes": {
+    "decoration_constant": "SPIR-V Decoration::BuiltIn = 11 (NOT 33 — discovered during AT-1745 debugging; confirmed from spirv crate autogen_spirv.rs). The word-stream search in AT-1745 uses `BUILTIN_DECORATION: u32 = 11` and `LOCAL_INVOCATION_ID_VALUE: u32 = 27`.",
+    "rspirv_disassembly_limitation": "rspirv 0.12's Loader::disassemble fails on CooperativeMatrixKHR instructions (DetachedInstruction error). AT-1745 uses raw word-stream search instead of disassembly. AT-1741 codegen tests CAN use disassembly because they use emit_module directly without the full driver pipeline.",
+    "strip_strategy_bug": "The @strategy block strip in substitute_strategy_holes uses text search for '@strategy'. ANY occurrence of '@strategy' in comments triggers premature stripping. The matmul_msg_coopmat.axc header comment originally contained '@strategy' in a comment line; this caused compile failure. Fixed by removing '@strategy' from the comment text."
+  },
+
+  "what_orchestrator_measures_on_nvidia": {
+    "AT-1742_builtin_gpu": "AXC_ENABLE_GPU_TESTS=1 cargo test -p axc-driver -- --ignored at1742. Dispatches local_id_probe.axc G=4 WGs x 64 threads. Expected: out[g*64+l]==l for all g,l (max_error==0). Runs on Lavapipe too.",
+    "AT-1743_msg_bit_exact": "AXC_ENABLE_GPU_TESTS=1 cargo test -p axc-driver -- --ignored at1743. M=32,N=64,K=32, grid (1,1,1). Guard: subgroup_size()!=32 → typed-skip. Expected on NVIDIA wave32: max_diff==0.0.",
+    "AT-1744_msg_multiblock": "AXC_ENABLE_GPU_TESTS=1 cargo test -p axc-driver -- --ignored at1744. M=64,N=128,K=48, grid (2,2,1), 3 K-blocks. Guard: subgroup_size()!=32 → typed-skip. Expected on NVIDIA wave32: max_diff==0.0.",
+    "AT-1750_tflops": "AXC_ENABLE_GPU_BENCHES=1 cargo bench -p axc-driver --bench resident_matmul_msg. Guard: subgroup_size()!=32 → typed-skip. Measures 256/512/768/1024³. Reports bare tflops + pct of 125-TFLOPS estimate. 'competitive' label only if pct>=25.0. ACTUAL numbers unknown until NVIDIA run — reported HONESTLY. Single-subgroup RB bench (resident_matmul_rb.rs) retained for A/B.",
+    "honesty_gate": "If multi-subgroup does NOT beat M3.3c's 31.2 TFLOPS (24.96%), reported honestly. The local_invocation_id builtin (PART A) is the durable deliverable regardless of TFLOPS outcome."
+  },
+
+  "git_commits": [
+    "feat(M3.3d-A): local_invocation_id(axis) builtin — lexer through codegen",
+    "feat(M3.3d-B-examples): local_id_probe.axc + matmul_msg_coopmat.axc + AT-1745 compile anchor",
+    "feat(M3.3d-B-tests): AT-1742/1743/1744 GPU tests + AT-1750 TFLOPS bench"
+  ],
+
+  "self_assessment": {
+    "spec_coverage": "All items from M3.3d-architect.json r1 implemented. AT-1740 through AT-1745 + AT-1750 fully wired. All 3 sg_size==32 guards in correct locations. Non-symmetric fixture retained. body_uses_local_invocation_id full traversal confirmed functional.",
+    "known_limitations": [
+      "AT-1742/1743/1744/AT-1750 are #[ignore]-gated GPU tests not run in CI (requires AXC_ENABLE_GPU_TESTS=1 + real GPU). TFLOPS for AT-1750 not measured — requires NVIDIA hardware run by orchestrator.",
+      "AT-1745 LocalInvocationId check uses raw word-stream search (OpDecorate BuiltIn=11, LocalInvocationId=27) rather than rspirv disassembly, because rspirv 0.12 Loader fails on CooperativeMatrixKHR instructions. The raw search is correct and simpler.",
+      "DESIGN.md section 3.1.18 was pre-populated by the architect; the coder verified it matches the implementation and did not duplicate it."
+    ],
+    "deviations": [
+      "Decoration constant in AT-1745 test: used BUILTIN_DECORATION=11 (correct SPIR-V value) not 33 (which appeared in initial implementation attempt before being corrected via raw SPIR-V debug). The test now correctly finds the decoration."
+    ]
+  }
+}

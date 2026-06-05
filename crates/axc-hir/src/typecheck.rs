@@ -226,6 +226,28 @@ pub enum TypecheckError {
         span: Span,
     },
 
+    // ── M3.3d: local_invocation_id errors ──────────────────────────────────────
+
+    #[error("`local_invocation_id()` axis must be an integer literal (0, 1, or 2); got a non-literal expression")]
+    LocalInvocationIdAxisMustBeConstant {
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("`local_invocation_id()` axis {got} is out of range; must be 0, 1, or 2")]
+    LocalInvocationIdAxisOutOfRange {
+        got: u32,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("`local_invocation_id()` requires exactly 1 argument; got {got}")]
+    LocalInvocationIdArity {
+        got: usize,
+        #[label("here")]
+        span: Span,
+    },
+
     #[error("unsupported buffer element type `{ty_name}` in M1.2 (only i32, u32, i64, u64, f32, f64 are supported)")]
     UnsupportedBufferElem {
         ty_name: &'static str,
@@ -671,6 +693,10 @@ fn index_relation(w: &HirExprKind, r: &HirExprKind) -> IndexRelation {
         (HirExprKind::GidBuiltin { axis: wa }, HirExprKind::GidBuiltin { axis: ra }) => {
             if wa == ra { IndexRelation::ProvablyEqual } else { IndexRelation::ProvablyDisequal }
         }
+        // M3.3d: LocalInvocationIdBuiltin is a leaf — two calls with the same axis are equal.
+        (HirExprKind::LocalInvocationIdBuiltin { axis: wa }, HirExprKind::LocalInvocationIdBuiltin { axis: ra }) => {
+            if wa == ra { IndexRelation::ProvablyEqual } else { IndexRelation::ProvablyDisequal }
+        }
         _ => IndexRelation::Unknown,
     }
 }
@@ -950,6 +976,7 @@ fn format_index_kind(k: &HirExprKind) -> String {
         }
         HirExprKind::LocalRead(BindingId(id)) => format!("binding#{id}"),
         HirExprKind::GidBuiltin { axis } => format!("gid({axis})"),
+        HirExprKind::LocalInvocationIdBuiltin { axis } => format!("local_invocation_id({axis})"),
         _ => "<dynamic>".to_owned(),
     }
 }
@@ -1947,10 +1974,12 @@ fn check_expr(
             check_short_circuit(tc, *op, lhs, rhs, span)
         }
 
-        // ── Call (bitwise builtins + gid) ────────────────────────────────────
+        // ── Call (bitwise builtins + gid + local_invocation_id) ─────────────
         past::Expr::Call { name, args } => {
             if name.node == "gid" {
                 check_gid_call(tc, args, span)
+            } else if name.node == "local_invocation_id" {
+                check_local_invocation_id_call(tc, args, span)
             } else {
                 check_call(tc, &name.node, name.span, args, span, expected)
             }
@@ -3872,6 +3901,49 @@ fn check_gid_call(
     })
 }
 
+/// Check a `local_invocation_id(axis)` call (M3.3d).
+///
+/// Mirrors `check_gid_call` exactly.  Lowers to `LocalInvocationIdBuiltin { axis }`.
+fn check_local_invocation_id_call(
+    tc: &mut TypeChecker<'_>,
+    args: &[axc_lexer::Spanned<past::Expr>],
+    call_span: Span,
+) -> Option<HirExpr> {
+    if args.len() != 1 {
+        tc.errors.push(TypecheckError::LocalInvocationIdArity {
+            got: args.len(),
+            span: call_span,
+        });
+        return None;
+    }
+
+    let arg: &axc_lexer::Spanned<past::Expr> = &args[0];
+    let axis: u32 = match &arg.node {
+        past::Expr::IntLit { value, .. } => {
+            if *value < 0 || *value > 2 {
+                tc.errors.push(TypecheckError::LocalInvocationIdAxisOutOfRange {
+                    got: *value as u32,
+                    span: arg.span,
+                });
+                return None;
+            }
+            *value as u32
+        }
+        _ => {
+            tc.errors.push(TypecheckError::LocalInvocationIdAxisMustBeConstant {
+                span: arg.span,
+            });
+            return None;
+        }
+    };
+
+    Some(HirExpr {
+        kind: HirExprKind::LocalInvocationIdBuiltin { axis },
+        ty: ScalarTy::U32,
+        span: call_span,
+    })
+}
+
 fn builtin_name(op: BitwiseOp) -> &'static str {
     match op {
         BitwiseOp::Band => "band",
@@ -4380,6 +4452,109 @@ mod tests {
             } else { false }
         });
         assert!(has_gid, "expected GidBuiltin{{axis:2}} in body");
+    }
+
+    // ── AT-1740: local_invocation_id() builtin typecheck ─────────────────────────
+
+    /// AT-1740: local_invocation_id(0u32) typechecks to u32, lowers to LocalInvocationIdBuiltin{axis:0}.
+    #[test]
+    fn tc_local_invocation_id_axis_0_ok() {
+        let (body, errors) = tc_body("let i: u32 = local_invocation_id(0u32); return;");
+        assert!(errors.is_empty(), "local_invocation_id(0u32) should succeed: {errors:?}");
+        let has_lid = body.stmts.iter().any(|s| {
+            if let HirStmt::Let { init, .. } = s {
+                matches!(init.kind, HirExprKind::LocalInvocationIdBuiltin { axis: 0 })
+            } else { false }
+        });
+        assert!(has_lid, "expected LocalInvocationIdBuiltin{{axis:0}} in body");
+    }
+
+    /// AT-1740: local_invocation_id(1u32) — axis 1 valid.
+    #[test]
+    fn tc_local_invocation_id_axis_1_ok() {
+        let (body, errors) = tc_body("let i: u32 = local_invocation_id(1u32); return;");
+        assert!(errors.is_empty(), "local_invocation_id(1u32) should succeed: {errors:?}");
+        let has_lid = body.stmts.iter().any(|s| {
+            if let HirStmt::Let { init, .. } = s {
+                matches!(init.kind, HirExprKind::LocalInvocationIdBuiltin { axis: 1 })
+            } else { false }
+        });
+        assert!(has_lid, "expected LocalInvocationIdBuiltin{{axis:1}} in body");
+    }
+
+    /// AT-1740: local_invocation_id(2u32) — axis 2 valid.
+    #[test]
+    fn tc_local_invocation_id_axis_2_ok() {
+        let (body, errors) = tc_body("let i: u32 = local_invocation_id(2u32); return;");
+        assert!(errors.is_empty(), "local_invocation_id(2u32) should succeed: {errors:?}");
+        let has_lid = body.stmts.iter().any(|s| {
+            if let HirStmt::Let { init, .. } = s {
+                matches!(init.kind, HirExprKind::LocalInvocationIdBuiltin { axis: 2 })
+            } else { false }
+        });
+        assert!(has_lid, "expected LocalInvocationIdBuiltin{{axis:2}} in body");
+    }
+
+    /// AT-1740: local_invocation_id(3u32) — axis 3 out of range.
+    #[test]
+    fn tc_local_invocation_id_axis_3_rejected() {
+        let (_, errors) = tc_body("let i: u32 = local_invocation_id(3u32); return;");
+        assert!(
+            errors.iter().any(|e| matches!(e, TypecheckError::LocalInvocationIdAxisOutOfRange { got: 3, .. })),
+            "expected LocalInvocationIdAxisOutOfRange{{got:3}}: {errors:?}"
+        );
+    }
+
+    /// AT-1740: local_invocation_id() — arity 0 rejected.
+    #[test]
+    fn tc_local_invocation_id_arity_0_rejected() {
+        let (_, errors) = tc_body("let i: u32 = local_invocation_id(); return;");
+        assert!(
+            errors.iter().any(|e| matches!(e, TypecheckError::LocalInvocationIdArity { got: 0, .. })),
+            "expected LocalInvocationIdArity{{got:0}}: {errors:?}"
+        );
+    }
+
+    /// AT-1740: local_invocation_id(0u32, 1u32) — arity 2 rejected.
+    #[test]
+    fn tc_local_invocation_id_arity_2_rejected() {
+        let (_, errors) = tc_body("let i: u32 = local_invocation_id(0u32, 1u32); return;");
+        assert!(
+            errors.iter().any(|e| matches!(e, TypecheckError::LocalInvocationIdArity { got: 2, .. })),
+            "expected LocalInvocationIdArity{{got:2}}: {errors:?}"
+        );
+    }
+
+    /// AT-1740: non-literal axis rejected.
+    #[test]
+    fn tc_local_invocation_id_variable_axis_rejected() {
+        let (_, errors) = tc_body("let k: u32 = 0u32; let i: u32 = local_invocation_id(k); return;");
+        assert!(
+            errors.iter().any(|e| matches!(e, TypecheckError::LocalInvocationIdAxisMustBeConstant { .. })),
+            "expected LocalInvocationIdAxisMustBeConstant: {errors:?}"
+        );
+    }
+
+    /// AT-1740 NO-REGRESSION: a kernel using BOTH gid() and local_invocation_id()
+    /// typechecks both to distinct builtins (GidBuiltin + LocalInvocationIdBuiltin).
+    #[test]
+    fn tc_gid_and_local_invocation_id_both_distinct() {
+        let (body, errors) = tc_body(
+            "let x: u32 = gid(0u32); let y: u32 = local_invocation_id(0u32); return;"
+        );
+        assert!(errors.is_empty(), "gid+local_invocation_id should both succeed: {errors:?}");
+        let has_gid = body.stmts.iter().any(|s| {
+            if let HirStmt::Let { init, .. } = s {
+                matches!(init.kind, HirExprKind::GidBuiltin { .. })
+            } else { false }
+        });
+        let has_lid = body.stmts.iter().any(|s| {
+            if let HirStmt::Let { init, .. } = s {
+                matches!(init.kind, HirExprKind::LocalInvocationIdBuiltin { .. })
+            } else { false }
+        });
+        assert!(has_gid, "expected GidBuiltin in body");
+        assert!(has_lid, "expected LocalInvocationIdBuiltin in body");
     }
 
     // BufferAsValue

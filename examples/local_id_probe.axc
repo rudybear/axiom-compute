@@ -1,0 +1,25 @@
+// examples/local_id_probe.axc
+//
+// M3.3d AT-1742: Minimal GPU bit-exact probe kernel for local_invocation_id().
+//
+// Writes out[gid(0u32)] = local_invocation_id(0u32).
+//
+// With a 1-D dispatch of G workgroups of 64 threads each:
+//   out[g*64 + l] MUST equal l (the within-workgroup local id along x, 0..63)
+//
+// This proves local_invocation_id() returns the correct per-invocation LocalInvocationId
+// on real GPU, independent of any coopmat path — so it runs on Lavapipe too.
+// NOT typed-skipped on Lavapipe.
+//
+// Anti-pattern #2: explicit return;
+
+@kernel
+@workgroup(64, 1, 1)
+@intent("local_invocation_id probe: out[global_id] = local_invocation_id (AT-1742)")
+@complexity(O(1))
+fn local_id_probe(out: buffer[u32]) -> void {
+    let global_idx: u32 = gid(0u32);
+    let local_x: u32 = local_invocation_id(0u32);
+    out[global_idx] = local_x;
+    return;
+}

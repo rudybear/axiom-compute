@@ -165,6 +165,107 @@ fn at1614_shared_source_coopmat_spirv_valid() {
     compile_with_assignments_and_validate(src, &assignments, "at1614_matmul_shared_coopmat");
 }
 
+/// AT-1745: matmul_msg_coopmat.axc (M3.3d multi-subgroup) compiles + spirv-val clean
+/// with the shipped strategy assignments. CI compile anchor, no GPU.
+///
+/// ASSERTS:
+///   - staging-coverage invariant: a_block_size % wg_threads == 0 AND b_block_size % wg_threads == 0
+///     (AT-1620 staging-bug class: 512%64==0 -> 8 iters, 1024%64==0 -> 16 iters).
+///   - shared_memory_bytes == 3072 and <= 16384.
+///   - The compiled module EMITS the LocalInvocationId Input var (body-scanner coverage proof).
+#[test]
+fn at1745_compile_matmul_msg_coopmat() {
+    let src = include_str!("../../../examples/matmul_msg_coopmat.axc");
+
+    // Shipped MSG assignments.
+    let wg_threads: i64 = 64;
+    let a_block_size: i64 = 512;
+    let b_block_size: i64 = 1024;
+    let mut assignments = StrategyMap::new();
+    assignments.insert("wg_threads".to_owned(), wg_threads);
+    assignments.insert("n_sg".to_owned(), 2_i64);
+    assignments.insert("rb_m".to_owned(), 2_i64);
+    assignments.insert("rb_n".to_owned(), 2_i64);
+    assignments.insert("tile_k".to_owned(), 16_i64);
+    assignments.insert("a_block_size".to_owned(), a_block_size);
+    assignments.insert("b_block_size".to_owned(), b_block_size);
+
+    // Staging-coverage invariant (AT-1620 staging-bug class).
+    assert_eq!(
+        a_block_size % wg_threads, 0,
+        "AT-1745: a_block_size({a_block_size}) % wg_threads({wg_threads}) must == 0 \
+         (every shared A element covered exactly once by {wg_threads} threads)"
+    );
+    assert_eq!(
+        b_block_size % wg_threads, 0,
+        "AT-1745: b_block_size({b_block_size}) % wg_threads({wg_threads}) must == 0 \
+         (every shared B element covered exactly once by {wg_threads} threads)"
+    );
+
+    let (bytes, meta) = axc_driver::compile_source_with_assignments(src, &assignments)
+        .unwrap_or_else(|e| panic!("AT-1745: matmul_msg_coopmat.axc compile failed: {e:?}"));
+
+    assert!(!bytes.is_empty(), "AT-1745: matmul_msg_coopmat.axc produced empty SPIR-V");
+
+    let words: Vec<u32> = bytes.chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    // spirv-val must pass.
+    let validator = create_validator(Some(TargetEnv::Vulkan_1_1));
+    validator.validate(&words, None)
+        .unwrap_or_else(|e| panic!("AT-1745: matmul_msg_coopmat.axc spirv-val FAILED: {e}"));
+
+    // shared_memory_bytes == (a_block_size + b_block_size) * sizeof(f16) = (512+1024)*2 = 3072 bytes.
+    let expected_shared_bytes: u32 = ((a_block_size + b_block_size) * 2) as u32;
+    assert_eq!(
+        meta.shared_memory_bytes, expected_shared_bytes,
+        "AT-1745: shared_memory_bytes must be {expected_shared_bytes} \
+         (= (a_block_size={a_block_size} + b_block_size={b_block_size}) * 2 bytes/f16); \
+         got {}", meta.shared_memory_bytes
+    );
+    assert!(
+        meta.shared_memory_bytes <= 16384,
+        "AT-1745: shared_memory_bytes={} exceeds 16384 (portable minimum maxComputeSharedMemorySize)",
+        meta.shared_memory_bytes
+    );
+
+    // Body-scanner coverage proof: the kernel uses local_invocation_id() as the staging thread
+    // index inside loop-bound/shared-write-index expressions, so body_uses_local_invocation_id
+    // must detect it and emit the LocalInvocationId Input variable.
+    //
+    // SPIR-V BuiltIn LocalInvocationId = 27 (spirv crate autogen_spirv.rs).
+    // We search the raw word stream for value 27 appearing as the BuiltIn decoration operand
+    // in an OpDecorate instruction: [word_count<<16 | 71, var_id, 11(BuiltIn), 27(LocalId)].
+    // OpDecorate=71, BuiltIn=11.
+    // SPIR-V BuiltIn LocalInvocationId = 27 (spirv crate autogen_spirv.rs).
+    // SPIR-V Decoration::BuiltIn = 11 (verified from spirv autogen: BuiltIn = 11u32).
+    // We search the raw word stream for OpDecorate %var BuiltIn LocalInvocationId(27):
+    //   [word_count<<16 | 71, var_id, 11(BuiltIn), 27(LocalInvocationId)]
+    const OP_DECORATE: u32 = 71;
+    const BUILTIN_DECORATION: u32 = 11;  // Decoration::BuiltIn = 11 (SPIR-V spec)
+    const LOCAL_INVOCATION_ID_VALUE: u32 = 27;  // BuiltIn::LocalInvocationId = 27
+    let has_local_invocation_id_decoration = words.windows(4).any(|w| {
+        let opcode = w[0] & 0xFFFF;
+        opcode == OP_DECORATE && w[2] == BUILTIN_DECORATION && w[3] == LOCAL_INVOCATION_ID_VALUE
+    });
+    assert!(
+        has_local_invocation_id_decoration,
+        "AT-1745: module MUST emit LocalInvocationId Input var (body-scanner coverage proof). \
+         Expected OpDecorate BuiltIn LocalInvocationId(=27) in SPIR-V word stream \
+         (OpDecorate=71, Decoration::BuiltIn=11, LocalInvocationId=27). \
+         The kernel calls local_invocation_id() inside staging loop bounds/shared-write indices; \
+         if body_uses_local_invocation_id misses those positions, the var is not emitted."
+    );
+
+    eprintln!(
+        "AT-1745 PASS: matmul_msg_coopmat.axc compiles + spirv-val clean \
+         (wg_threads={wg_threads}, a_block_size={a_block_size}, b_block_size={b_block_size}, \
+         shared_memory_bytes={}, LocalInvocationId emitted)",
+        meta.shared_memory_bytes
+    );
+}
+
 /// AT-1734: matmul_rb_coopmat.axc (M3.3c register-blocked 2×2) compiles + spirv-val clean
 /// with the shipped RB strategy assignments (rb_m=2, rb_n=2, tile_k=16, a_block_size=512,
 /// b_block_size=512). Runs in CI without a coopmat GPU — CI compile anchor.

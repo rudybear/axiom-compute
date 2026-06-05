@@ -50,6 +50,7 @@ const MATMUL_SHARED_F32_SRC: &str = include_str!("../../../examples/matmul_share
 const TILED_ATTENTION_SRC: &str = include_str!("../../../examples/tiled_attention.axc");
 const OPPHI_COOPMAT_ACCUMULATE_SRC: &str = include_str!("../../../examples/opphi_coopmat_accumulate.axc");
 const MATMUL_RB_COOPMAT_SRC: &str = include_str!("../../../examples/matmul_rb_coopmat.axc");
+const MATMUL_MSG_COOPMAT_SRC: &str = include_str!("../../../examples/matmul_msg_coopmat.axc");
 
 // ── Helper: tile strategy assignments ────────────────────────────────────────
 
@@ -1101,6 +1102,240 @@ fn at1732_matmul_rb_kblock_count_bit_exact_gpu() {
     eprintln!(
         "AT-1732 PASS: RB 2×2 K-block-count variation (K=32/2-blocks, K=48/3-blocks) \
          both bit-exact on {} — tile_k={TILE_K} fixed (coopmat K dimension)",
+        ctx.physical_device_name()
+    );
+}
+
+// ── Helpers for MSG 2-subgroup tests (AT-1743, AT-1744) ──────────────────────
+
+/// Build MSG strategy assignments for matmul_msg_coopmat.axc (shipped config).
+///
+/// wg_threads=64, n_sg=2, rb_m=2, rb_n=2, tile_k=16, a_block_size=512, b_block_size=1024.
+fn msg_assignments() -> BTreeMap<String, i64> {
+    let mut m = BTreeMap::new();
+    m.insert("wg_threads".to_owned(), 64_i64);
+    m.insert("n_sg".to_owned(), 2_i64);
+    m.insert("rb_m".to_owned(), 2_i64);
+    m.insert("rb_n".to_owned(), 2_i64);
+    m.insert("tile_k".to_owned(), 16_i64);
+    m.insert("a_block_size".to_owned(), 512_i64);
+    m.insert("b_block_size".to_owned(), 1024_i64);
+    m
+}
+
+// ── AT-1743: MSG 2-subgroup bit-exact GPU dispatch ────────────────────────────
+
+/// AT-1743: matmul_msg_coopmat.axc is BIT-EXACT (max_diff==0.0) on NVIDIA.
+///
+/// M=32, N=64, K=32 → grid (1,1,1) = ONE workgroup = 2 subgroups covering full 32×64 C.
+/// K=32 → 2 K-blocks → loop-bottom WAR barrier exercised once across both subgroups.
+///
+/// Non-symmetric integer-f16 fixture (A in {1..4}, B in {1..3}, discriminates sg_id offsets).
+///
+/// GUARDS:
+///   subgroup_size()==32 (kernel REQUIRES sg_size==32; mirror AT-1510) +
+///   CoopMatUnsupported (Lavapipe).
+#[test]
+#[ignore]
+fn at1743_matmul_msg_coopmat_bit_exact() {
+    if !gpu_tests_enabled() {
+        eprintln!("AT-1743: AXC_ENABLE_GPU_TESTS not set; skipping");
+        return;
+    }
+    const M: usize = 32;
+    const N: usize = 64;
+    const K: usize = 32;
+
+    let assignments = msg_assignments();
+    let (bytes, meta) = compile_source_with_assignments(MATMUL_MSG_COOPMAT_SRC, &assignments)
+        .expect("AT-1743: matmul_msg_coopmat.axc must compile");
+    let words: Vec<u32> = bytes.chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+
+    let ctx = VulkanContext::new().expect("AT-1743: VulkanContext must init");
+    eprintln!("AT-1743: device={}", ctx.physical_device_name());
+
+    // --- subgroup_size==32 GUARD (mirror dispatch_matmul_tile.rs:231 AT-1510) ---
+    if ctx.subgroup_size() != 32 {
+        eprintln!(
+            "AT-1743: subgroup_size={} != 32; skipping (wave64 guard — kernel REQUIRES sg_size==32)",
+            ctx.subgroup_size()
+        );
+        return;
+    }
+
+    let handle = match ctx.prepare_kernel_checked(
+        &words, &meta.binding_plan, meta.push_constant_total_bytes,
+        &meta.entry_point, meta.coopmat.as_ref(), "matmul_msg_coopmat",
+        meta.shared_memory_bytes,
+    ) {
+        Ok(h) => h,
+        Err(DispatchError::CoopMatUnsupported { reason, .. }) => {
+            eprintln!("AT-1743: CoopMatUnsupported (typed-skip on Lavapipe): {reason}");
+            return;
+        }
+        Err(DispatchError::DeviceFeatureUnsupported { feature, .. }) => {
+            eprintln!("AT-1743: DeviceFeatureUnsupported({feature}) — typed-skip");
+            return;
+        }
+        Err(e) => panic!("AT-1743: prepare_kernel_checked failed: {e}"),
+    };
+
+    // Non-symmetric integer-f16 fixture (A in {1..4}, B in {1..3}).
+    // max element = K × max(A) × max(B) = 32 × 4 × 3 = 384 ≤ 2048 (f16-integer-exact).
+    let a_f32: Vec<f32> = (0..M * K).map(|idx| ((idx % 4) + 1) as f32).collect();
+    let b_f32: Vec<f32> = (0..K * N).map(|idx| ((idx % 3) + 1) as f32).collect();
+    let a_bytes = f32_slice_to_f16_le_bytes(&a_f32);
+    let b_bytes = f32_slice_to_f16_le_bytes(&b_f32);
+    let c_size = M * N * 2;
+
+    // MSG grid: (N/64, M/32, 1) = (1,1,1).
+    let wg_x: u32 = (N / 64) as u32;
+    let wg_y: u32 = (M / 32) as u32;
+    let pc = push_mnk(M as u32, N as u32, K as u32);
+
+    let outputs = ctx.dispatch_handle(
+        &handle, (wg_x, wg_y, 1),
+        &[&a_bytes, &b_bytes, &vec![0u8; c_size]],
+        &[0, 0, c_size],
+        &pc,
+    ).unwrap_or_else(|e| panic!("AT-1743: dispatch failed: {e}"));
+
+    let gpu_c = f16_le_bytes_to_f32_slice(&outputs[2]);
+    let cpu_c = cpu_f16_matmul_reference(&a_f32, &b_f32, M, N, K);
+
+    let mut max_diff = 0.0_f32;
+    for (g, c) in gpu_c.iter().zip(cpu_c.iter()) {
+        let diff = (g - c).abs();
+        if diff > max_diff { max_diff = diff; }
+    }
+
+    eprintln!(
+        "AT-1743: M={M} N={N} K={K}, grid=({wg_x},{wg_y},1) = 1 WG = 2 subgroups, \
+         max_diff={max_diff}, first4 GPU={:?}, CPU={:?}",
+        &gpu_c[..4.min(gpu_c.len())],
+        &cpu_c[..4.min(cpu_c.len())]
+    );
+
+    assert!(
+        max_diff == 0.0,
+        "AT-1743: MSG 2-subgroup matmul FAILED — max_diff={max_diff} != 0.\n\
+         HONESTY GATE: do NOT relax tolerance. Grid=({wg_x},{wg_y},1) M={M} N={N} K={K}.\n\
+         First4 GPU: {:?}, CPU: {:?}",
+        &gpu_c[..4.min(gpu_c.len())],
+        &cpu_c[..4.min(cpu_c.len())]
+    );
+    eprintln!(
+        "AT-1743 PASS: MSG 2-subgroup matmul bit-exact (max_diff=0.0) on {} — \
+         M={M} N={N} K={K}, grid=({wg_x},{wg_y},1)",
+        ctx.physical_device_name()
+    );
+}
+
+// ── AT-1744: MSG bit-exact, multi-WG + multi-K-block ─────────────────────────
+
+/// AT-1744: matmul_msg_coopmat.axc bit-exact, multi-workgroup + multi-K-block.
+///
+/// M=64, N=128, K=48 → grid (2,2,1) = 4 workgroups, 3 K-blocks.
+/// K=48 → 3 K-blocks → loop-bottom WAR barrier exercised TWICE across both subgroups.
+///
+/// GUARDS:
+///   subgroup_size()==32 (kernel REQUIRES sg_size==32; mirror AT-1510) +
+///   CoopMatUnsupported (Lavapipe).
+#[test]
+#[ignore]
+fn at1744_matmul_msg_coopmat_bit_exact_multiblock() {
+    if !gpu_tests_enabled() {
+        eprintln!("AT-1744: AXC_ENABLE_GPU_TESTS not set; skipping");
+        return;
+    }
+    const M: usize = 64;
+    const N: usize = 128;
+    const K: usize = 48;
+
+    let assignments = msg_assignments();
+    let (bytes, meta) = compile_source_with_assignments(MATMUL_MSG_COOPMAT_SRC, &assignments)
+        .expect("AT-1744: matmul_msg_coopmat.axc must compile");
+    let words: Vec<u32> = bytes.chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+
+    let ctx = VulkanContext::new().expect("AT-1744: VulkanContext must init");
+    eprintln!("AT-1744: device={}", ctx.physical_device_name());
+
+    // --- subgroup_size==32 GUARD (mirror AT-1510) ---
+    if ctx.subgroup_size() != 32 {
+        eprintln!(
+            "AT-1744: subgroup_size={} != 32; skipping (wave64 guard — kernel REQUIRES sg_size==32)",
+            ctx.subgroup_size()
+        );
+        return;
+    }
+
+    let handle = match ctx.prepare_kernel_checked(
+        &words, &meta.binding_plan, meta.push_constant_total_bytes,
+        &meta.entry_point, meta.coopmat.as_ref(), "matmul_msg_coopmat",
+        meta.shared_memory_bytes,
+    ) {
+        Ok(h) => h,
+        Err(DispatchError::CoopMatUnsupported { reason, .. }) => {
+            eprintln!("AT-1744: CoopMatUnsupported (typed-skip on Lavapipe): {reason}");
+            return;
+        }
+        Err(DispatchError::DeviceFeatureUnsupported { feature, .. }) => {
+            eprintln!("AT-1744: DeviceFeatureUnsupported({feature}) — typed-skip");
+            return;
+        }
+        Err(e) => panic!("AT-1744: prepare_kernel_checked failed: {e}"),
+    };
+
+    // Non-symmetric integer-f16 fixture.
+    // max element = K × 4 × 3 = 48 × 12 = 576 ≤ 2048 (f16-integer-exact).
+    let a_f32: Vec<f32> = (0..M * K).map(|idx| ((idx % 4) + 1) as f32).collect();
+    let b_f32: Vec<f32> = (0..K * N).map(|idx| ((idx % 3) + 1) as f32).collect();
+    let a_bytes = f32_slice_to_f16_le_bytes(&a_f32);
+    let b_bytes = f32_slice_to_f16_le_bytes(&b_f32);
+    let c_size = M * N * 2;
+
+    // MSG grid: (N/64, M/32, 1) = (2,2,1) for M=64, N=128.
+    let wg_x: u32 = (N / 64) as u32;
+    let wg_y: u32 = (M / 32) as u32;
+    let pc = push_mnk(M as u32, N as u32, K as u32);
+    let k_blocks = K / 16;
+
+    let outputs = ctx.dispatch_handle(
+        &handle, (wg_x, wg_y, 1),
+        &[&a_bytes, &b_bytes, &vec![0u8; c_size]],
+        &[0, 0, c_size],
+        &pc,
+    ).unwrap_or_else(|e| panic!("AT-1744: dispatch failed: {e}"));
+
+    let gpu_c = f16_le_bytes_to_f32_slice(&outputs[2]);
+    let cpu_c = cpu_f16_matmul_reference(&a_f32, &b_f32, M, N, K);
+
+    let mut max_diff = 0.0_f32;
+    for (g, c) in gpu_c.iter().zip(cpu_c.iter()) {
+        let diff = (g - c).abs();
+        if diff > max_diff { max_diff = diff; }
+    }
+
+    eprintln!(
+        "AT-1744: M={M} N={N} K={K} ({k_blocks} K-blocks), grid=({wg_x},{wg_y},1) = 4 WGs, \
+         max_diff={max_diff}, first4 GPU={:?}, CPU={:?}",
+        &gpu_c[..4.min(gpu_c.len())],
+        &cpu_c[..4.min(cpu_c.len())]
+    );
+
+    assert!(
+        max_diff == 0.0,
+        "AT-1744: MSG multi-K-block matmul FAILED — max_diff={max_diff} != 0.\n\
+         HONESTY GATE: do NOT relax. Grid=({wg_x},{wg_y},1) M={M} N={N} K={K} ({k_blocks} K-blocks).\n\
+         First4 GPU: {:?}, CPU: {:?}",
+        &gpu_c[..4.min(gpu_c.len())],
+        &cpu_c[..4.min(cpu_c.len())]
+    );
+    eprintln!(
+        "AT-1744 PASS: MSG multi-K-block matmul bit-exact (max_diff=0.0) on {} — \
+         M={M} N={N} K={K} ({k_blocks} K-blocks), grid=({wg_x},{wg_y},1)",
         ctx.physical_device_name()
     );
 }

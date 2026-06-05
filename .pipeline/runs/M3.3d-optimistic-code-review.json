@@ -1,0 +1,53 @@
+{
+  "verdict": "APPROVE",
+  "agent": "optimistic_code_reviewer",
+  "milestone_id": "M3.3d-multiwarp",
+  "branch": "coder/M33d-20260605-0900/M3.3d-multiwarp",
+  "review_date": "2026-06-05",
+  "qa_verdict_accepted": true,
+  "spec_compliance": true,
+
+  "positive_feedback": [
+    "PART A — local_invocation_id() builtin is clean end-to-end. Lexer: RESERVED_BUILTIN_INVOCATION_NAMES + is_reserved_invocation_builtin() sorted-for-binary-search, sorted-invariant test present. Parser: Expr::Call path unchanged (no grammar change), AT-1740 parse test confirms Call{name:'local_invocation_id'} shape. HIR expr.rs: LocalInvocationIdBuiltin{axis} variant with full doc comment; typecheck.rs: check_local_invocation_id_call is a verbatim mirror of check_gid_call (arity 1, axis literal 0..=2, result U32) with 3 new error variants (Arity, AxisOutOfRange, AxisMustBeConstant) and 7 unit tests covering all cases. lower.rs: leaf added to find_mul_add_in_expr exhaustively. typecheck.rs index_relation: LocalInvocationIdBuiltin arm mirrors GidBuiltin.",
+    "PART A — Codegen is textbook correct. buffers.rs: LocalInvocationIdVar struct + emit_local_invocation_id_variable() is an exact mirror of GlobalInvocationIdVar/emit_gid_variable() using BuiltIn::LocalInvocationId (NO capability flags — LocalInvocationId is core Shader per SPIR-V spec §3.21). body.rs: emit_local_invocation_id_component mirrors emit_gid_component with OpLoad vec3u32 + OpCompositeExtract by literal axis. emit.rs: body_uses_local_invocation_id full traversal covers ALL positions — Let/Assign/BufferWrite/If/ForRange (start AND end bounds, critical for MSG staging loops)/While/CoopMatStore/SharedWrite/SharedDeclMarker — with matching expr_uses_local_invocation_id and else_uses_local_invocation_id. var emitted only when used (opt-in; not on buffer presence). Interface list: local_id_var_id added to OpEntryPoint interface list.",
+    "AT-1740/1741/1742 all present and real. AT-1740: 7 typecheck unit tests (axes 0/1/2 ok; axis 3 rejected; arity 0/2 rejected; variable axis rejected; gid+local_invocation_id coexistence). AT-1741: 5 codegen tests (emit + no-new-cap + gid-only regression + both-emitted + not-emitted-when-unused + coopmat combo). AT-1742: GPU dispatch test bit-exact (out[g*64+l]==l, max_error=0) on NVIDIA RTX PRO 6000, confirmed by QA. Lavapipe-clean (no coopmat gating).",
+    "PART B — MSG matmul structure is correct. matmul_msg_coopmat.axc: @workgroup(64,1,1), sg_id = local_invocation_id(0u32)/subgroup_size() (NOT hardcoded 32), cooperative staging of a_tile[512]+b_tile[1024] by all 64 threads (staging-coverage invariant: 512%64=0 and 1024%64=0), ONE workgroup_barrier (scope Workgroup, semantics 0x108 AcquireRelease|WorkgroupMemory — guaranteed by construction via emit_workgroup_barrier), per-subgroup 2x2 RB with sg_id*32 B-col offset and c_col_base=block_col*64+sg_id*32. Loop-bottom WAR barrier present. 4 loop-carried coopmat accumulators reuse the M3.3c N-phi codegen path — NO codegen change for the matmul.",
+    "sg_size==32 guard present in all 3 required places: AT-1743 (dispatch_shared_m32.rs), AT-1744 (dispatch_shared_m32.rs), AT-1750 (resident_matmul_msg.rs). All three: correct '!= 32' sense, BEFORE allocation/dispatch, cite AT-1510 precedent.",
+    "AT-1743 and AT-1744 are GPU-confirmed bit-exact (max_diff=0.0) on NVIDIA RTX PRO 6000. Non-symmetric integer-f16 fixture (A in {1..4}, B in {1..3}) discriminates sg_id offset errors. AT-1744 exercises 3 K-blocks (2 WAR barriers) confirming the loop-bottom WAR barrier is sound. Both carry sg_size==32 guard + CoopMatUnsupported typed-skip.",
+    "AT-1745 CI compile anchor: asserts staging-coverage invariants (a_block_size%wg_threads==0, b_block_size%wg_threads==0), shared_memory_bytes==3072 and <=16384, spirv-val Vulkan_1_1 clean, and crucially proves body-scanner coverage by searching the raw SPIR-V word stream for OpDecorate BuiltIn LocalInvocationId(27) — uses BUILTIN_DECORATION=11 (correct per SPIR-V spec) in actual code constants.",
+    "Honesty is intact and exemplary. DESIGN.md §3.1.18 and ROADMAP.md M3.3d both report the regression honestly: 768³=24.0 TFLOPS (19.2%) vs M3.3c 31.2 TFLOPS (24.96%). Root cause (halved workgroup count 288 vs 576 at 768³ + cross-subgroup barrier overhead) stated explicitly. 'competitive' label NOT applied (19.2% < 25.0% threshold). Multi-subgroup explicitly labeled 'honest negative performance result'. Single-subgroup RB (M3.3c) explicitly stated as best. No asserted ratio in bench (only tflops>0 && finite). QA filled in the measured numbers; the coder's placeholder was honest.",
+    "No regression to prior milestones. 868 tests pass, 0 fail. gid-only kernel regression test confirms no LocalInvocationId leaked. Clippy clean with -D warnings. subgroup/coopmat expression walkers (expr_uses_gid, expr_uses_coopmat, expr_uses_subgroup_op) updated with LocalInvocationIdBuiltin leaf arm — exhaustive. Public API additive-only. Single-subgroup RB bench retained for A/B comparison.",
+    "Bench methodology follows the AT-1730 template faithfully: resident upload-once, N_WARMUP=2, MIN-of-10, GpuTimestamp. 2D grid pre-check on both axes. 50 GB cap before allocation. CpuFenceWall fallback correctly labeled scheduling-inclusive. Bench ID 'dispatch_resident_matmul_msg_coopmat' does not collide with AT-1711/AT-1730."
+  ],
+
+  "minor_issues": [
+    {
+      "file": "crates/axc-driver/tests/compile_shared_examples.rs",
+      "lines": "239-240",
+      "severity": "cosmetic non-blocking",
+      "description": "Stale comment at line 239 says '33(BuiltIn)' and 'OpDecorate=71, BuiltIn=33' — a leftover from an earlier debugging iteration before the correct SPIR-V value was verified. The actual code constants at lines 246-250 correctly use BUILTIN_DECORATION=11 (Decoration::BuiltIn = 11, per SPIR-V spec) and LOCAL_INVOCATION_ID_VALUE=27. The test passes, confirming the code is correct; the stale comment is purely cosmetic. Fix suggestion: replace lines 239-240 with '// in an OpDecorate instruction: [word_count<<16 | 71, var_id, 11(BuiltIn), 27(LocalId)].' and '// OpDecorate=71, BuiltIn=11.'",
+      "blocking": false
+    }
+  ],
+
+  "spec_compliance_checklist": {
+    "local_invocation_id_lexer_to_codegen": "PASS — complete 5-layer chain: token.rs collision guard, parser.rs Call arm, hir/expr.rs LocalInvocationIdBuiltin variant, hir/typecheck.rs check_local_invocation_id_call, codegen body.rs+buffers.rs+emit.rs wiring.",
+    "mirrors_gid_pattern": "PASS — every step is a verbatim mirror of the gid/GlobalInvocationId pattern. No divergence.",
+    "no_new_capability": "PASS — emit_local_invocation_id_variable() sets NO capability flags. AT-1741 asserts no OpCapability beyond Shader. BuiltIn::LocalInvocationId is core Shader per SPIR-V §3.21.",
+    "emit_when_used_only": "PASS — body_uses_local_invocation_id scanner in emit.rs, full traversal, opt-in only.",
+    "AT_1740": "PASS — 7 typecheck unit tests.",
+    "AT_1741": "PASS — 5 codegen tests including spirv-val-clean assertion.",
+    "AT_1742": "PASS — GPU-validated on NVIDIA, QA-confirmed, max_error=0.",
+    "AT_1743": "PASS — GPU-validated, max_diff=0.0, sg_size==32 guard present.",
+    "AT_1744": "PASS — GPU-validated, max_diff=0.0, 3 K-blocks, sg_size==32 guard present.",
+    "AT_1745": "PASS — CI compile anchor with staging-coverage invariants + body-scanner coverage proof + spirv-val clean.",
+    "sg_size_32_guard_all_3_places": "PASS — confirmed in AT-1743, AT-1744, AT-1750. All before allocation/dispatch.",
+    "no_matmul_codegen_change": "PASS — N-phi path reused from M3.3c; body.rs additions are only LocalInvocationIdBuiltin arm + emit_local_invocation_id_component.",
+    "honesty_regression_reported": "PASS — 19.2% < M3.3c 24.96% stated explicitly; competitive label not applied; single-subgroup RB retained as best.",
+    "no_asserted_ratio": "PASS — bench asserts only tflops>0 && finite.",
+    "single_subgroup_RB_retained": "PASS — matmul_rb_coopmat.axc + resident_matmul_rb.rs both in diff as untouched.",
+    "prior_milestone_no_regression": "PASS — 868 tests pass, gid regression test clean."
+  },
+
+  "summary": "M3.3d is an APPROVE. Both deliverables are complete and correct. PART A (local_invocation_id() builtin) is a clean 5-layer implementation: BuiltIn::LocalInvocationId lowering with zero new SPIR-V capability, opt-in emission via a full-traversal body scanner, GPU-validated AT-1742, and complete typecheck/codegen unit coverage. PART B (MSG matmul) is bit-exact GPU-confirmed (AT-1743/1744, max_diff=0.0), uses the sg_id=local_invocation_id(0u32)/subgroup_size() derivation correctly, has the sg_size==32 guard in all 3 required places, and reuses the M3.3c N-phi codegen path without modification. Honesty is fully intact: the 19.2% regression at 768³ vs M3.3c's 24.96% is reported in both DESIGN and ROADMAP with root cause and explicit 'NOT competitive' framing; the local_invocation_id() builtin is correctly positioned as the durable deliverable. The one cosmetic finding (stale '33(BuiltIn)' comment at compile_shared_examples.rs:239-240 — code uses correct 11) is non-blocking."
+}
