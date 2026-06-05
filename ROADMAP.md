@@ -173,6 +173,37 @@ Goal: prove the DESIGN.md §5 kill-criteria gates with publishable numbers, not 
 
 **Depends on:** M3.3b. **Blocks:** M3.4 (multi-subgroup blocking, LocalInvocationId builtin).
 
+### M3.3d — local_invocation_id() builtin + multi-subgroup matmul (2026-06-05)
+
+**Two-part milestone.** PART A: language builtin `local_invocation_id(axis: u32) -> u32`. PART B: `matmul_msg_coopmat.axc` multi-subgroup (N_SG=2) register-blocked coopmat matmul.
+
+**PART A — local_invocation_id() builtin:**
+- Lowers to SPIR-V BuiltIn LocalInvocationId (vec3 u32 Input OpVariable + OpLoad + OpCompositeExtract by literal axis) — IDENTICAL lowering to gid() (GlobalInvocationId).
+- **NO new OpCapability** (LocalInvocationId is core Shader — anti-pattern #7: no silent capability).
+- Emitted **only when used** (opt-in; not on buffer presence like gid's shortcut).
+- Threaded through all layers: lexer (collision guard), parser (no grammar change), HIR (LocalInvocationIdBuiltin{axis}), codegen (buffers.rs + body.rs + emit.rs).
+- AT-1740 (lex/parse/HIR typecheck), AT-1741 (codegen + spirv-val + no-new-capability), AT-1742 (GPU: out[g*64+l]==l — runs on Lavapipe).
+- **Durable builtin regardless of PART B perf outcome.**
+
+**PART B — matmul_msg_coopmat.axc (N_SG=2):**
+- @workgroup(64,1,1) = 2 subgroups of 32 lanes (NVIDIA wave32). HARD PRECONDITION: sg_size==32.
+- sg_id = local_invocation_id(0u32) / subgroup_size(). ALL 64 threads cooperatively stage a_tile[512]/b_tile[1024] (3072 B shared); ONE workgroup_barrier; each subgroup runs its 2x2 RB block on distinct B columns (sg_id*32 offset).
+- Cross-subgroup bit-exactness GUARANTEED BY CONSTRUCTION by workgroup-scope OpControlBarrier.
+- All GPU tests/bench TYPED-SKIP on subgroup_size()!=32 (wave64 guard; mirror AT-1510).
+- AT-1743 (M=32,N=64,K=32, 1 WG = 2 subgroups, max_diff==0.0), AT-1744 (M=64,N=128,K=48, 4 WGs, 3 K-blocks, max_diff==0.0). Non-symmetric fixture (A in {1..4}, B in {1..3}).
+- AT-1745 (CI compile anchor: shared_memory_bytes==3072, LocalInvocationId var emitted).
+
+**Measured TFLOPS (AT-1750) — HONEST, no asserted ratio:**
+- Bench: resident_matmul_msg.rs (same methodology as AT-1730, N_WARMUP=2, MIN-of-10, GpuTimestamp).
+- Grid: (N/64, M/32, 1). sg_size==32 guard before allocation.
+- **[MEASURED numbers will be filled in by QA/NVIDIA run]** — to be updated.
+- Single-subgroup RB bench (resident_matmul_rb.rs) RETAINED for A/B.
+- 'competitive' label ONLY if pct >= 25.0. NO ratio asserted.
+
+**Deferred to M3.4+.** Double-buffered shared staging; partial/edge tiles; N_SG=4 / strategy-unroll.
+
+**Depends on:** M3.3c. **Blocks:** M3.4 (double-buffered staging, N_SG=4).
+
 ### M3.2b — FlashAttention-2 streaming softmax (C2, deferred from M3.2)
 
 **Why:** FA2's defining contribution — block-streaming ONLINE softmax (running max m_i, running denominator l_i, output rescale O_i ← O_i * exp(m_old-m_new) + P*V) — AVOIDS materializing the SxS score block. Deferred from M3.2 because its online-rescale arithmetic is a separate high-risk bit-exactness surface verified against C1 (`tiled_attention`) as the baseline. C2 earns the `flash_attention_v2` kernel name.
