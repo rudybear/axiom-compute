@@ -15,3 +15,4 @@ Cargo.lock.bak
 /vendor/
 .pipeline/benchmarks/m34/llamacpp_raw.txt
 .pipeline/benchmarks/m34/axiom_bench_raw.txt
+__pycache__/
