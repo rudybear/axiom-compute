@@ -1,0 +1,54 @@
+{
+  "verdict": "APPROVE",
+  "agent": "pessimistic_code_reviewer",
+  "milestone_id": "M3.4-llamacpp-ab",
+  "review_scope": "git diff main..coder/M34-20260606-0900/M3.4-llamacpp-ab",
+  "review_axis": "benchmark A/B: MEASUREMENT FAIRNESS, HONESTY, REPRODUCIBILITY (not codegen)",
+  "critical_bugs": [],
+  "warnings": [
+    {
+      "description": "Headline ratio rounds to 1e-5 in ab_results.json/.md (ratio_axiom_over_llama_tflops); the load-bearing/unambiguous number is llama_over_axiom_speedup_tflops=87289.22 and the prose '~87,000x'. Not a bias — the rounded ratio is only the inverse of the disclosed speedup — but a reader skimming only the rounded ratio gets a lossy value. Cosmetic; the speedup field and prose are exact.",
+      "file": ".pipeline/benchmarks/m34/ab_results.json",
+      "line": "68-69"
+    },
+    {
+      "description": "fairness_caveat says '~structurally 100x under-parallelized' while the headline is ~87,000x. This is NOT a contradiction (100x ~ 1-of-188-SM parallelism deficit is ONE of the two stacked deficits; the other is 1/4096 work + latency-bound single workgroup), and DESIGN/BENCHMARKS decompose it correctly. But the bare '100x' in the JSON caveat, read in isolation, could be misread as understating the gap. The decomposition prose elsewhere is correct and present.",
+      "file": ".pipeline/benchmarks/m34/ab_results.json",
+      "line": "74"
+    },
+    {
+      "description": "SPIRV-Headers build workaround is recorded in DESIGN §3.1.19 (reproducibility) and in the script header/comments, but the SPIRV_HEADERS_PREFIX install step itself is operator-provided (not scripted). A naive re-runner on the same box must know to `cmake --install` SPIRV-Headers into vendor/spirv-headers/install. The workaround is documented, so reproducibility is preserved, but it is a manual prerequisite, not automated.",
+      "file": "scripts/m34_llamacpp_ab.sh",
+      "line": "83-90"
+    }
+  ],
+  "fairness_checks": {
+    "headline_ratio_matched_boundary": "PASS — emitter line 95 computes ratio_tflops = axc_tflops_sustained / llama_tflops, i.e. AXIOM sustained-CPU-wall vs llama.cpp sustained-CPU-wall MEAN (both batched-amortized). The GpuTimestamp MIN (tflops_min_gputimestamp / us_min) is disclosure-only and is NOT the kill number. NOTE the kill number even uses AXIOM's WORSE figure (sustained 8.5e-5 < min 9.1e-5), so AXIOM is if anything understated, never flattered.",
+    "flop_parity_each_side_own_M": "PASS — AXIOM flops = 2*K_CONTRACTION = 2*1*14336 = 28672 (M=1, bench line 317; JSON flops_per_dispatch=28672). llama recompute = 2*llama_m*n_eff*llama_k = 2*4096*1*14336 (emitter line 72). Each side's TFLOPS uses ITS OWN M. No accidental M=4096 on the AXIOM side (that would be 4096x flatter). Verified arithmetic: 28672/315456e-9/1e12=9.1e-5 (min), /338668e-9=8.5e-5 (sustained), ratio 8.5e-5/7.39=1.15e-5 => 87289x. All consistent.",
+    "n1_genuine_no_gemm_substitution": "PASS — selected line literally MUL_MAT(type_a=q4_K,...,n=1,...); script selects via grep ',n=1,' (line 130), forbids GEMM substitution, and sets kill_criterion_status=INCOMPLETE (non-zero exit, no ratio) if no n==1 case (lines 136-140). AT-1767 asserts PASS/FAIL requires llamacpp.n==1 and INCOMPLETE carries no ratio.",
+    "device_match_fail_closed": "PASS — byte-identical device-string equality required (script line 189; emitter forces INCOMPLETE on mismatch, line 87). RTX-PRO-6000 substring is secondary/disclosure only. Recorded byte_identical=true.",
+    "flop_consistency_gate": "PASS — recompute-from-us within 2% gate (emitter 67-86); recorded recomputed 7.3908 vs reported 7.39 (0.011% disagreement)."
+  },
+  "honesty_checks": {
+    "caveat_present_not_hidden": "PASS — 1-row-vs-4096-row caveat is in DESIGN §3.1.19, BENCHMARKS.md, ab_results.json (dims.note + fairness_caveat), and ab_results.md (output-rows table row + fairness caveat).",
+    "kill_criterion_mechanical_fail": "PASS — kill_status set mechanically (emitter 100-101: within_15 = ratio>=0.85), recorded FAIL, not hand-edited.",
+    "nvidia_only_qualifier_present": "PASS — kill_criterion_qualifier in JSON + DESIGN + BENCHMARKS: NVIDIA-only FAIL does NOT fire the any-vendor DESIGN §5 criterion; AMD/Intel deferred-not-dropped (EB.1).",
+    "gap_decomposition_correct": "PASS — gap decomposed into (1) 1/4096 output-row work + (2) dispatch-latency-dominated single workgroup (~1 of ~188 SMs, 316us for 14336 MACs ~= 0.09 GFLOPS). Arithmetically coherent; which gap is which is stated explicitly.",
+    "no_spin_understating_loss": "PASS — loss reported AS MEASURED; ~87,000x stated plainly; no cherry-picked dim.",
+    "no_spin_overstating_loss": "PASS — fairer representative (sustained, not a deliberately-crippled config) used; both kernels CORRECT; not comparing a worst-case strawman. Throughput-normalization is the FAIR metric (a raw-us comparison would flatter AXIOM, not hurt it — they chose the fair one).",
+    "gap_closing_path_stated": "PASS — fuse Q4_K dequant onto M3.3c coopmat matmul (31.2 TFLOPS plain-f16); recorded as follow-up milestone."
+  },
+  "reproducibility_checks": {
+    "literal_40char_sha_pinned": "PASS — LLAMACPP_COMMIT default = 6b80c74f285390368b3c99c5e750f19e9b096e98 (40 chars), checked-out SHA re-verified at runtime (script 73-77); tag b9542 recorded as secondary. AT-1766 asserts commit.sha length 40.",
+    "build_workaround_recorded": "PASS (with manual-prereq warning) — SPIRV-Headers CMake-config workaround recorded in DESIGN §3.1.19 + script comments; the install of SPIRV-Headers into vendor/spirv-headers/install is an operator prerequisite, not scripted.",
+    "provenance_complete": "PASS — ab_results.json records tag+SHA, ICD, all three device strings, dims (K + llama m/n/k), AXIOM min/mean/median/sustained, llama line verbatim, ratio, verdict, and verbatim timer-boundary excerpt.",
+    "vendor_gitignored": "PASS — /vendor/ + raw captures + __pycache__ gitignored; git ls-files | grep vendor == 0; no __pycache__ tracked."
+  },
+  "at_1761_bit_exact_check": "PASS — both kernels produce CORRECT Q4_K_M; AXIOM bit-exact vs ggml CPU ref enforced as a PRE-FLIGHT oracle before any timing (bench pre_flight_bit_exact, rel_err<1e-3) and as AT-1761 integration test (GPU-gated, runs on Lavapipe). A wrong-but-fast kernel cannot pollute the A/B.",
+  "regression_check": "PASS — purely additive: no compiler source under crates/*/src touched (verified via git diff --name-only). Only a new bench, new integration test, scripts, docs, gitignore, and Cargo.toml [[bench]] registration. No .unwrap() in the new bench; .expect()/assert! with messages is appropriate for a bench/test harness (not lib code).",
+  "spirv_val_check": "N/A — benchmark A/B milestone, no codegen change (M2.6 kernel FROZEN).",
+  "ub_check": "N/A — no new GPU kernel codegen; existing FROZEN kernel reused.",
+  "race_condition_check": "N/A — no new shared-memory/barrier code.",
+  "vendor_divergence_check": "PASS — NVIDIA-only result is explicitly qualified as NOT firing the any-vendor kill-criterion; AMD/Intel deferred with recorded reason (EB.1).",
+  "summary": "APPROVE. This is an honest, fairness-controlled benchmark A/B with no measurement bias in EITHER direction. (1) The headline ratio is matched-boundary: AXIOM sustained-CPU-wall vs llama.cpp sustained-CPU-wall MEAN (emitter line 95); GpuTimestamp MIN is disclosure-only and is NOT the kill number — and AXIOM's WORSE (sustained) number is the one used, so AXIOM is never flattered. (2) FLOP parity is correct: each side's TFLOPS uses ITS OWN M (AXIOM 2*1*14336=28672; llama 2*4096*1*14336); no accidental 4096x inflation — I re-derived the arithmetic and it matches. (3) The selected llama.cpp op is genuinely n==1 (GEMV); GEMM substitution is forbidden and the absent-case path is a real fail-closed INCOMPLETE. (4) Reproducible: literal 40-char SHA pinned + runtime-verified, full provenance in ab_results.json, vendor/ gitignored (0 tracked), build workaround documented (one manual prereq, noted as a warning). (5) Honest framing in both directions: the 1-row-vs-4096-row caveat is present everywhere, kill_criterion is mechanically FAIL, the NVIDIA-only != project-kill qualifier is present, the 1/4096-work + dispatch-latency decomposition is correct, and the FAIR throughput metric was chosen (a raw-us comparison would have FLATTERED AXIOM). (6) AT-1761 bit-exactness gates both the bench pre-flight and a GPU integration test. (7) No regression: zero compiler-src changes, additive only, no unwrap-panic in new code. Three non-blocking warnings: the rounded 1e-5 ratio is lossy (the exact 87,289x speedup field carries the real number), the bare '~100x' in the JSON caveat could be misread in isolation (the full decomposition is correct and present elsewhere), and the SPIRV-Headers install is a manual prerequisite (documented but not scripted). None of these affect fairness, the verdict, or reproducibility of the numbers. Most dangerous residual: the SPIRV-Headers manual prereq is the only non-automated step in an otherwise one-command reproduction — a re-runner on a clean box could be blocked at build until they install it, but it is documented and fail-closed (FATAL if test-backend-ops does not build, never a fabricated number)."
+}

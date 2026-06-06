@@ -1,0 +1,45 @@
+{
+  "verdict": "PASS",
+  "agent": "qa_agent",
+  "milestone_id": "M3.4-llamacpp-ab",
+  "requirements_total": 12,
+  "requirements_covered": 12,
+  "requirements_missing": [],
+  "test_results": {
+    "total": 884,
+    "passed": 884,
+    "failed": 0,
+    "ignored": 44,
+    "m34_suite": "16 passed, 0 failed, 1 ignored (at_1761 GPU-gated)"
+  },
+  "verification_results": {
+    "clippy_check": "PASS (clean, -D warnings, axc-driver+axc-runtime recompiled from scratch)",
+    "diff_check": "PASS (additive only: bench dispatch_q4km_ab + test m34_llamacpp_ab + scripts + docs + Cargo.toml [[bench]] entry; NO AXIOM codegen/compiler source touched; matvec kernel is FROZEN M2.6)",
+    "coder_self_report_matches_reality": true
+  },
+  "methodology_honesty": {
+    "llamacpp_not_committed": "PASS (git ls-files | grep -c vendor == 0; /vendor/ in .gitignore line 15)",
+    "ab_results_committed": "PASS (.pipeline/benchmarks/m34/ab_results.json + ab_results.md committed)",
+    "tag_and_40char_sha": "PASS (tag b9542 + literal SHA 6b80c74f285390368b3c99c5e750f19e9b096e98, len==40, AT-1766 asserts)",
+    "timer_boundary_verbatim": "PASS (llamacpp_timer_boundary records CPU-wall, batched-amortized MEAN, sustained >=1s, one warmup, no overhead subtracted, with the test-backend-ops.cpp source_excerpt verbatim)",
+    "device_match_byte_identical": "PASS (script fail-closes on non-byte-identical device strings; emitter sets INCOMPLETE if mismatch; recorded byte_identical=true, both 'NVIDIA RTX PRO 6000 Blackwell Workstation Edition')",
+    "n1_gemv_case": "PASS (selected MUL_MAT type_a=q4_K n=1, m=4096, k=14336; AT-1767 asserts n==1, never GEMM; INCOMPLETE path forbids GEMM substitution)",
+    "flop_convention_parity": "PASS (2*M*N*K MACs both sides, dequant excluded both sides; recompute-from-us check: independently reproduced 7.3908 vs reported 7.39 TFLOPS, 0.01% disagreement)",
+    "real_weights_not_zero": "PASS (generate_q4km_test_data emits real 144-byte Q4_K_M superblocks: f16 d/dmin in [0.1,2.0]/[0,0.5], 12 random scale bytes, 128 random nibble bytes; NOT the zero/64-byte broken bench)",
+    "matched_boundary_ratio": "PASS (headline ratio = AXIOM sustained CPU-wall vs llama.cpp sustained CPU-wall MEAN; GpuTimestamp MIN reported alongside for disclosure, NOT used as headline; no best-case-vs-sustained mismatch)",
+    "kill_criterion_mechanical_fail": "PASS (kill_criterion_status=FAIL derived mechanically: ratio 1e-5 < 0.85 threshold => FAIL; not spun)",
+    "honest_framing": "PASS (DESIGN 3.1.19 + BENCHMARKS.md state NVIDIA-only FAIL != project kill [criterion is any-vendor], gap-closing path stated [fuse dequant onto M3.3c coopmat, 31.2 TFLOPS plain-f16])"
+  },
+  "at_1761_bit_exact": {
+    "status": "PASS",
+    "detail": "at_1761_q4km_matvec_bit_exact + bench pre-flight oracle assert rel_err < 1e-3 vs ggml CPU ref. Independently re-ran on Lavapipe (VK_DRIVER_FILES=lvp_icd.json, AXC_ENABLE_GPU_TESTS=1): dispatched (0 skip messages), passed. Coder's claimed rel_err 1.2e-7 plausible (within the 1e-3 gate; not independently re-measured on NVIDIA hardware unavailable in this env)."
+  },
+  "framing_judgment_87000x": {
+    "verdict": "HONEST as-is (not misleading)",
+    "reasoning": "Work-normalized TFLOPS is the fair metric and is what the coder used; raw us would favor AXIOM (1/4096 the work). The caveat is stated explicitly and repeatedly (dims.note, fairness_caveat, BENCHMARKS.md, DESIGN 3.1.19): AXIOM computes 1 output row via 1 workgroup (~1 of ~188 SMs, dispatch-latency-dominated), llama.cpp computes 4096 rows tiled across all SMs. The DESIGN explicitly decomposes the gap into (1) 1/4096 work and (2) dispatch-latency domination. No conflation is hidden.",
+    "recommendation": "RECOMMEND (non-blocking) adding a multi-row context number. examples/q4km_dequant_matmul.axc (M3.1, computes ALL rows) exists but is a naive scalar matmul at K=256 (NOT K=14336, NOT coopmat), so it would isolate the per-row-efficiency gap from the work-size gap. This is a useful additional data point but NOT required for the kill-criterion: DESIGN 5 names the Q4_K_M kernel and the FROZEN M2.6 matvec IS the kernel under test. The single-row-matvec-vs-GEMV comparison fairly represents 'AXIOM's current Q4_K_M kernel vs llama.cpp' and does NOT overstate the gap given the prominent caveat."
+  },
+  "regression_check": "PASS (884 tests pass on main+branch; clippy clean; only additive changes; no AXIOM compiler/codegen source modified)",
+  "memory_footprint_ok": true,
+  "summary": "M3.4 A/B is fair, honest, and reproducible. llama.cpp gitignored (not committed); ab_results.json records tag+40-char-SHA, the test-backend-ops timer boundary verbatim, byte-identical device-match (fail-closed), the n==1 Q4_K GEMV dims, and FLOP-convention parity (2MNK MACs, dequant excluded both sides) verified by an independent recompute (7.3908 vs 7.39). AXIOM measured with REAL 144-byte Q4_K_M weights; the ratio is computed like-for-like on the matched sustained-CPU-wall boundary (NOT best-case-vs-sustained). kill_criterion_status=FAIL is mechanical (ratio 1e-5 < 0.85), and the docs frame it honestly as NVIDIA-only != project-kill with a stated gap-closing path. AT-1761 bit-exactness independently re-verified on Lavapipe (passed, 0 skips). AXIOM loses ~87,000x work-normalized, but that framing is HONEST (work-normalized TFLOPS + prominent 1-row-vs-4096-row caveat). Recommend (non-blocking) adding a multi-row context number to isolate per-row efficiency from work-size. PASS."
+}

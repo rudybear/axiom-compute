@@ -51,6 +51,28 @@ Not a GPU perf signal — validates dispatch plumbing.
 
 ---
 
+## M3.4 — llama.cpp Vulkan Q4_K_M A/B (NVIDIA RTX PRO 6000)
+
+The DESIGN.md §5 pre-registered kill-criterion head-to-head: AXIOM's FROZEN M2.6 single-row Q4_K_M dequant+matvec vs llama.cpp's Vulkan backend Q4_K_M MUL_MAT, **same machine, same `nvidia_icd.json`, kernel-only-vs-kernel-only, identical K=14336 contraction**. llama.cpp pinned at tag `b9542` / SHA `6b80c74f285390368b3c99c5e750f19e9b096e98`; op = `test-backend-ops perf` Q4_K MUL_MAT **n==1 (GEMV)**. Both kernels are CORRECT (AXIOM bit-exact vs the ggml CPU reference; llama.cpp IS ggml) — the A/B is purely PERF.
+
+**Boundary:** llama.cpp's `perf` path is CPU-wall, batched-amortized MEAN, sustained (loops ≥1 s; `avg_time_us = total_time_us / total_runs`; one warmup; no overhead subtracted) — read verbatim from `tests/test-backend-ops.cpp` at the SHA. AXIOM is made comparable: GpuTimestamp MIN/MEAN/MEDIAN **plus** a sustained CPU-wall number; the headline ratio uses the matched (sustained CPU-wall) boundary. FLOP convention is identical (2·m·n·k matmul MACs, dequant excluded) and verified by recompute (7.39 vs 7.39 TFLOPS).
+
+| metric | AXIOM (M2.6 single-row matvec) | llama.cpp (Q4_K MUL_MAT n=1) |
+|---|---|---|
+| output rows | 1 | 4096 |
+| µs (GpuTimestamp MIN) | 315.5 | (CPU-wall) |
+| µs/op (sustained CPU-wall) | 338.7 | **15.89** |
+| TFLOPS (GpuTimestamp MIN) | 0.000091 | — |
+| TFLOPS (sustained CPU-wall) | 0.000085 | **7.39** |
+
+**Headline ratio (AXIOM/llama, work-normalized TFLOPS, matched boundary): ≈ 1e-5 → llama.cpp ≈ 87,000× higher throughput.** **Kill-criterion (within 15% on NVIDIA): FAIL — the honest documented baseline.**
+
+**Fairness caveat:** AXIOM computes ONE output row per dispatch using ONE workgroup (the `if i>=1 return` guard → ~1 of ~188 SMs, dispatch-latency-dominated: 316 µs for 14336 MACs); llama.cpp computes m=4096 rows tiled across all SMs with vendor-tuned staging + dequant fusion. Throughput (TFLOPS) is the fair, work-normalized metric (raw µs would be apples-to-oranges since the two do different amounts of work). This NVIDIA-only FAIL does **not** fire the project kill-criterion (DESIGN §5 = "within 15% on ANY vendor"); AMD/Intel halves are deferred-not-dropped, pending hardware (EB.1). Gap-closing path: fuse the Q4_K_M dequant front-end onto the M3.3c register-blocked coopmat matmul (31.2 TFLOPS plain-f16) — a follow-up milestone.
+
+**Reproduce:** `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json AXC_ENABLE_GPU_BENCHES=1 scripts/m34_llamacpp_ab.sh` (clones + builds the pinned llama.cpp into the gitignored `vendor/llama.cpp`, runs both sides, writes `.pipeline/benchmarks/m34/ab_results.json` + `ab_results.md`).
+
+---
+
 ## Running benchmarks
 
 ```sh

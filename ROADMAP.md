@@ -23,7 +23,7 @@ Last updated: 2026-04-28. Test count baseline: **713**.
 | Bandwidth optimization (pinned memory, concurrent transfer) | ✅ M3.0 (saxpy_1m 7.5×, saxpy_1024 39×; <1ms gate re-scoped to GPU-resident metric) |
 | Multi-row tiled matmul (cooperative_matrix on real workloads) | ✅ M3.1 (first coopmat dispatch on Blackwell, bit-exact; resident-TFLOPS benchmark → M3.2) |
 | Cross-vendor real GPU CI (AMD RDNA3+, Intel Arc) | ❌ infra |
-| **llama.cpp Vulkan head-to-head A/B** | ❌ thesis-closing milestone |
+| **llama.cpp Vulkan head-to-head A/B** | NVIDIA done (M3.4) — gap quantified, kill-criterion FAIL on NVIDIA (honest baseline: AXIOM single-row matvec ≈ 87,000× below llama.cpp Q4_K GEMV throughput; ≠ project kill, criterion is any-vendor); AMD/Intel pending hw |
 
 ---
 
@@ -247,6 +247,8 @@ Goal: prove the DESIGN.md §5 kill-criteria gates with publishable numbers, not 
 **Effort:** ~1500 LOC + cross-vendor hardware access.
 **Depends on:** M3.0, M3.1.
 **Blocks:** practical adoption story.
+
+**STATUS — NVIDIA half DONE (2026-06-06).** The same-machine, same-ICD A/B is implemented (`scripts/m34_llamacpp_ab.sh`, `crates/axc-driver/benches/dispatch_q4km_ab.rs`, results in `.pipeline/benchmarks/m34/ab_results.json`). llama.cpp pinned at tag `b9542` / SHA `6b80c74f285390368b3c99c5e750f19e9b096e98`, op = `test-backend-ops perf` Q4_K MUL_MAT n==1 GEMV. **Measured (NVIDIA RTX PRO 6000 Blackwell, work-normalized TFLOPS, kernel-only):** AXIOM ≈ 0.000085 TFLOPS (single-row matvec, 338.7 µs/op sustained, 1 output row) vs llama.cpp 7.39 TFLOPS (15.89 µs/op, 4096 output rows) → ratio ≈ 1e-5, llama ≈ 87,000× faster. **Kill-criterion (within 15%): FAIL on NVIDIA — the HONEST documented baseline.** This does NOT fire the project kill-criterion (DESIGN §5 = "within 15% on ANY vendor"; NVIDIA FAIL with the current FROZEN M2.6 single-row kernel ≠ project kill). The gap is two stacked deficits (1/4096th the rows per dispatch + dispatch-latency-dominated single workgroup); gap-closing path = fuse Q4_K_M dequant onto the M3.3c register-blocked coopmat matmul (follow-up). **AMD APU / Intel Arc halves remain BLOCKED on cross-vendor hardware (EB.1)** — deferred-not-dropped; those are where the portability thesis is strongest. See DESIGN.md §3.1.19, BENCHMARKS.md.
 
 ---
 
