@@ -517,6 +517,13 @@ pub enum TypecheckError {
         span: Span,
     },
 
+    #[error("`f32_to_f16` requires an `f32` argument; got `{got_ty}`")]
+    F32ToF16ArgMustBeF32 {
+        got_ty: &'static str,
+        #[label("here")]
+        span: Span,
+    },
+
     #[error("`f32_from_u32` requires a `u32` argument; got `{got_ty}`")]
     Q4_0BuiltinArgTypeMismatch {
         name: &'static str,
@@ -3342,6 +3349,28 @@ fn check_q4_0_call(
                 span: call_span,
             })
         }
+
+        Q4_0Builtin::F32ToF16 => {
+            // arg0: x — must be f32. Result is f16 (narrowing OpFConvert, M3.5).
+            let x_arg = &args[0];
+            let x_hir = check_expr(tc, &x_arg.node, x_arg.span, Some(ScalarTy::F32))?;
+            if x_hir.ty != ScalarTy::F32 {
+                tc.errors.push(TypecheckError::F32ToF16ArgMustBeF32 {
+                    got_ty: x_hir.ty.display_name(),
+                    span: x_arg.span,
+                });
+                return None;
+            }
+            Some(HirExpr {
+                kind: crate::expr::HirExprKind::Q4_0Builtin {
+                    op,
+                    args: vec![x_hir],
+                    buf_param_index: None,
+                },
+                ty: ScalarTy::F16,
+                span: call_span,
+            })
+        }
     }
 }
 
@@ -5414,6 +5443,35 @@ mod tests {
                     if *name == "coopmat_zero"
             )),
             "expected CoopMatrixBuiltinRequiresExpectedType; got: {errors:?}"
+        );
+    }
+
+    // AT-1775: f32_to_f16 builtin typecheck — happy path produces an f16 binding.
+    #[test]
+    fn at_1775_f32_to_f16_happy_returns_f16() {
+        let (body, errors) = tc_body(
+            "let v: f32 = 1.5f32; let h: f16 = f32_to_f16(v); return;"
+        );
+        assert!(errors.is_empty(), "AT-1775: f32_to_f16 happy path errors: {errors:?}");
+        let h_binding = body.bindings.iter().find(|b| b.name == "h")
+            .expect("AT-1775: binding `h` must exist");
+        assert_eq!(
+            h_binding.ty, BindingTy::Scalar(ScalarTy::F16),
+            "AT-1775: f32_to_f16 result must be f16"
+        );
+    }
+
+    // AT-1775: f32_to_f16 rejects a non-f32 argument with F32ToF16ArgMustBeF32.
+    #[test]
+    fn at_1775_f32_to_f16_rejects_non_f32_arg() {
+        let (_body, errors) = tc_body(
+            "let u: u32 = 3u32; let h: f16 = f32_to_f16(u); return;"
+        );
+        assert!(
+            errors.iter().any(|e| matches!(
+                e, TypecheckError::F32ToF16ArgMustBeF32 { .. }
+            )),
+            "AT-1775: expected F32ToF16ArgMustBeF32 for a u32 arg; got: {errors:?}"
         );
     }
 }

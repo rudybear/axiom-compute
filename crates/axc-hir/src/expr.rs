@@ -176,15 +176,17 @@ pub enum HirExprKind {
     },
     /// Q4_0-path builtin call (M2.5).
     ///
-    /// Covers the four byte-access and conversion primitives:
+    /// Covers the five byte-access and conversion primitives:
     /// - `ptr_read_u8_zext(buf, byte_offset) -> u32`
     /// - `ptr_read_u16_zext(buf, byte_offset) -> u32`
     /// - `f16_bits_to_f32(bits: u32) -> f32`
     /// - `f32_from_u32(u: u32) -> f32`
+    /// - `f32_to_f16(x: f32) -> f16`  (M3.5 — narrowing OpFConvert, RNE)
     ///
     /// For the `ptr_read_*` variants, `buf_param_index` is the 0-based buffer-only
     /// binding slot used by the SPIR-V emitter to look up the SSBO variable id.
-    /// For the conversion variants (`F16BitsToF32`, `F32FromU32`), `buf_param_index` is `None`.
+    /// For the conversion variants (`F16BitsToF32`, `F32FromU32`, `F32ToF16`),
+    /// `buf_param_index` is `None`.
     Q4_0Builtin {
         op: crate::q4_0::Q4_0Builtin,
         args: Vec<HirExpr>,

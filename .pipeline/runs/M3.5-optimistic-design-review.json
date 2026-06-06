@@ -1,0 +1,90 @@
+{
+  "verdict": "APPROVE",
+  "agent": "optimistic_design_reviewer",
+  "milestone_id": "M3.5-q4km-coopmat-fusion",
+
+  "strengths": [
+    "f32_to_f16 builtin design is minimal and correct: a single OpFConvert f32->f16 (SPIR-V Unified Spec §3.42.11 OpFConvert: 'Convert value numerically from one floating-point type to another'; default rounding is RNE per §2.8 'If no rounding mode is specified, the default is round to nearest even') lowered under the ALREADY-DECLARED Float16 capability. This is precisely the inverse of the existing emit_f16_bits_to_f32 final step (codegen/q4_0.rs:167: `b.f_convert(f32_ty, None, f16_val)`). No new capability, no extension — AT-1773 diff-gates it. No-new-capability claim is substantiated by the caps lazy-accumulation pattern (emit.rs:364-365), confirmed in emit.rs:289 where float16 is pre-collected from shared_pre_caps BEFORE body emission, so f32_to_f16's `caps.float16=true` is additive-only and idempotent on a coopmat-f16 kernel.",
+
+    "f32_to_f16 as a 5th Q4_0Builtin variant reuses every existing routing layer: lexer (plain Ident), parser (Expr::Call, no grammar change), HIR (Q4_0Builtin node with op enum), from_source_name dispatch (typecheck.rs:3374 auto-routes it), reserved-name binary search (q4_0.rs:127, auto-covers new entry), typecheck arm (mirrors F16BitsToF32 at :3300), body.rs dispatch (mirrors F16BitsToF32 arm at :1532), codegen emit helper in q4_0.rs. The pattern is proven by 4 existing variants; the 5th is structurally identical. This is the minimum-surface language extension the thesis demands.",
+
+    "Sort invariant preserved: inserting 'f32_to_f16' into RESERVED_Q4_0_BUILTIN_NAMES places it at position 2 (between 'f32_from_u32' and 'ptr_read_u16_zext'), confirmed by lexicographic sort. The existing reserved_q4_0_builtin_names_is_sorted_for_binary_search test (q4_0.rs:224) will catch any mistake by the Coder. Binary search correctness maintained.",
+
+    "Fused kernel structure is architecturally sound: it is exactly M3.3c matmul_rb_coopmat.axc with the A-tile staging loop body replaced by the M2.6 Q4_K_M dequant inline logic plus one f32_to_f16 call per element. The Coder handoff instruction 'start from a COPY of matmul_rb_coopmat.axc' is the right strategy — surgical A-tile replacement, B-tile/barriers/coopmat-loads/mul_adds/stores UNCHANGED. This matches the pattern used by real ggml-vulkan coopmat kernels: ggml-vulkan's mul_mat_q4_k.comp dequantizes Q4_K into a shared f16 tile then feeds coopmat loads (ggml-org/llama.cpp, ggml-vulkan compute shaders, confirmed pattern).",
+
+    "Superblock-to-tile mapping is correct and clean: tile_k=16 divides 256 weights/superblock exactly (256/16=16), so no K-block ever straddles a superblock boundary. The mapping sb=k/256, chunk=(k%256)/64, l=(k%64)%32, nibble=lo/hi from (k%64)>=32 is a pure integer decode — no conditional boundary logic needed. AT-1770 (K=256=1 superblock=16 k_blocks) and AT-1771 (K=512=2 superblocks=32 k_blocks) cover both the within-superblock and the cross-superblock cases, giving a meaningful K-range for the within-tol gate.",
+
+    "Numerics approach is honest and correct: dequant in f32 (exact ggml path), single f32->f16 rounding at tile write (minimal precision loss forced by the f16 tensor-core format), f16 coopmat accumulator. This matches how real Q4_K_M coopmat kernels work (ggml-vulkan dequantizes to f16 for its coopmat MUL_MAT path). The oracle (common_q4km_f16ref.rs) applies the IDENTICAL f32->f16 rounding (half crate RNE round-trip matching OpFConvert RNE) before comparison, making the 1e-3 tolerance a genuine upper-bound on intrinsic rounding error — not a fudge factor hiding a logic error. This is the same tolerance discipline as AT-1520 (M2.6 Q4_K_M, 1e-3) and AT-1521 (f16 coopmat bridge, 1e-3).",
+
+    "Performance honesty is exemplary: the spec explicitly states the fused kernel's TFLOPS is expected BELOW M3.3c's 31.2 TFLOPS due to dequant ALU overhead, reports as-measured, gates 'competitive' label only at pct>=25.0, and the Coder cannot cherry-pick. The AT-1772 no-asserted-ratio constraint mirrors the DESIGN §5 discipline established in M3.3c/M3.4. OQ-4 (does fusion reach coopmat throughput?) is honestly flagged as unknown until measured.",
+
+    "A/B methodology reuse is rigorous: same machine, same ICD, same SHA-pin, device-match fail-closed, FLOP-consistency check (2*M*N*K, dequant excluded both sides matching M3.4 and the llama.cpp side), kernel-only-vs-kernel-only. The --fused mode adds a parallel code path without touching any frozen-matvec artifact. The emit.py kernel-discriminator and M/N parameters correctly feed the fused kernel's actual 2*M*N*K FLOP count into the ratio, avoiding the M3.4 shape mismatch problem.",
+
+    "FROZEN deliverables protection is explicit and specific: q4km_dequant_matvec.axc, matmul_rb_coopmat.axc, ab_results.json, and dispatch_q4km_ab.rs are named as UNTOUCHED; ab_results_fused.json is a NEW artifact. The Coder handoff final bullet repeats this with 'do NOT modify' language. AT-1520, AT-1730/1731/1732/1733, AT-1760..1767 regression gates are named.",
+
+    "AT-1770..1776 test suite is well-calibrated: AT-1773 (CI no-GPU, no-new-capability) + AT-1775/1776 (f32_to_f16 unit + codegen) + AT-1770/1771 (GPU correctness at K=256/512) + AT-1772 (honest TFLOPS bench) + AT-1774 (A/B re-run) covers the full delivery surface. The CI-only tests (AT-1773, AT-1775, AT-1776) are meaningful without a GPU, consistent with the anti-pattern #9 discipline. Typed-skip on Lavapipe (CoopMatUnsupported) and subgroup_size()!=32 mirrors M3.3c/M3.3d."
+  ],
+
+  "concerns": [
+    "Minor: The spec states the correctness oracle in AT-1771 rounds BOTH weights AND x activations f32->f16->f32 before the CPU matmul. But the fused kernel takes x as readonly_buffer[f16] — x arrives already f16 from the host. The oracle must therefore apply f32->f16->f32 to x only IF the host also passes f32->f16-rounded values (i.e., the test fixture must be consistent). The spec text covers this ('round each weight AND each x activation f32->f16->f32') but the Coder should be explicit: the GPU dispatch test fixture generates x as float, rounds it f32->f16 to build the host f16 buffer, and the CPU oracle applies the same round-trip. A mismatch in how the test fixture generates x could silently inflate the measured error. Suggest the Coder handoff note for common_q4km_f16ref.rs be clarified to call out that `x_f16: &[u16]` is the same bit-pattern as the GPU input buffer, and the round-trip is `f16_val.to_f32()` only (no additional f32 source).",
+
+    "Minor: OQ-2 as stated ('is 1e-3 the right tolerance at the largest TESTED K') leaves the gate-K implicit. The spec proposes gating within-tol at K=256/512, but AT-1771's description says 'K=512, 2 superblocks = 32 K-blocks'. Given that the bench runs to 768/1024, reporting un-gated error at those sizes as a disclosure item is good practice — the Coder should include a note in the bench output for sizes beyond the within-tol gate rather than silently omitting an accuracy number. This is an output-format issue, not a correctness gap.",
+
+    "Minor: The FLOP convention for the A/B uses 2*M*N*K (dequant excluded). This matches M3.4 and is disclosed explicitly, which is correct. However, the kill-criterion (DESIGN §5) is stated as 'within 15% on any vendor' — which implies TFLOPS comparability. If the fused kernel's dequant overhead causes it to spend, say, 30% of cycles on nibble unpacking, the reported TFLOPS overstates arithmetic efficiency vs a pure GEMM. This is not a flaw in the M3.5 design (it is the correct convention since both sides exclude dequant) but the DESIGN.md §3.1.20 addition should note the convention clearly for future reviewers who compare against non-ggml baselines."
+  ],
+
+  "validation_against_existing": [
+    "OpFConvert for f32->f16: SPIR-V Unified Spec §3.42.11 explicitly supports OpFConvert between any two floating-point types where the target capability (Float16) is declared. The only requirement is OpCapability Float16, which is already gated via emit.rs:364-365 for every coopmat-f16 kernel. No FPRoundingMode decoration is needed for the default (RNE) behavior per §3.24. This matches the existing emit_f16_bits_to_f32 usage of OpFConvert (codegen/q4_0.rs:167).",
+
+    "Float16 capability already declared for shared[f16]: shared.rs:74-76 (needs_float16() -> true for ScalarTy::F16) and emit.rs:269-289 (shared_pre_caps collects float16 from shared declarations before body emission) confirm Float16 is set for any kernel with shared[f16] arrays, BEFORE the body emitter runs. The fused kernel has shared a_tile: shared[f16, 512] — so Float16 is unconditionally declared by the shared-globals pre-pass, independently of the f32_to_f16 builtin's caps.float16=true. The builtin is thus idempotent with respect to capability declaration.",
+
+    "Q4_K_M dequant-to-coopmat pattern validated by ggml-vulkan: ggml-org/llama.cpp's Vulkan backend (the M3.4 reference) implements exactly this pattern — Q4_K weights are dequantized to f16 in a shared tile, then fed to cooperative matrix loads for coopmat mul_mat. The M3.5 design replicates this architecture in AXIOM-Compute with explicit source-level annotations, which is precisely the project's thesis (verified SPIR-V from annotated source).",
+
+    "Register-blocked 2x2 coopmat structure (matmul_rb_coopmat.axc) is proven at 31.2 TFLOPS = 24.96% cuBLAS estimate on NVIDIA RTX PRO 6000 (DESIGN §3.1.17, AT-1730). The fused kernel reuses this structure verbatim for the B-tile, barriers, coopmat loads, mul_adds, and stores — only the A-tile staging is changed. The well-tested M3.3c path is preserved intact.",
+
+    "Q4_K_M dequant logic (q4km_dequant_matvec.axc lines 41-104, the inline get_scale_min_k4 + nibble path) is proven bit-exact vs the ggml reference at rel_err 1.2e-7 (AT-1761, DESIGN §3.1.19). Its reuse in the fused kernel introduces NO new dequant logic — the M3.5 tests verify the END-TO-END dequant+coopmat pipeline rather than re-proving the dequant in isolation.",
+
+    "f16 accumulator precision with 1e-3 tolerance: Vulkan's SPV_KHR_cooperative_matrix specification (khronos/SPIRV-Registry, SPV_KHR_cooperative_matrix, §3.1) defines the coopmat result type as the accumulator's element type. For matrix[f16,16,16,accumulator], accumulation is implementation-defined at no worse than f16 precision. At K=512 (32 mul_adds per accumulator in each of 16 k_blocks = 512 K steps), the 1e-3 relative tolerance aligns with the established AT-1521 f16 coopmat bridge discipline. The oracle's f32-accumulator reference provides a tight upper bound on the GPU's f16-accumulator error for these sizes."
+  ],
+
+  "external_references": [
+    "SPIR-V Unified Specification §3.42.11 (OpFConvert): https://registry.khronos.org/SPIR-V/specs/unified1/SPIRV.html#OpFConvert",
+    "SPIR-V Unified Specification §2.8 (Rounding, default RNE): https://registry.khronos.org/SPIR-V/specs/unified1/SPIRV.html#_rounding_mode",
+    "SPV_KHR_cooperative_matrix specification (accumulator result type semantics): https://github.com/KhronosGroup/SPIRV-Registry/blob/main/extensions/KHR/SPV_KHR_cooperative_matrix.asciidoc",
+    "VK_KHR_cooperative_matrix Vulkan extension spec (component type and scope requirements): https://registry.khronos.org/vulkan/specs/latest/man/html/VK_KHR_cooperative_matrix.html",
+    "ggml-vulkan Q4_K coopmat mul_mat pattern (dequant->f16 shared tile->coopmat load): https://github.com/ggml-org/llama.cpp/tree/main/ggml/src/ggml-vulkan/vulkan-shaders",
+    "rspirv Builder::f_convert API (used in existing emit_f16_bits_to_f32): https://docs.rs/rspirv/latest/rspirv/dr/struct.Builder.html#method.f_convert",
+    "half crate (Rust f16 RNE round-trip, f16::from_f32/to_f32): https://docs.rs/half/latest/half/struct.f16.html"
+  ],
+
+  "test_adequacy": "SUFFICIENT",
+
+  "test_suggestions": [
+    "Clarify the AT-1770/AT-1771 test fixture: document explicitly that the GPU x input buffer is generated by the test as f32->f16 (via the half crate), and the CPU oracle receives the SAME bit-patterns (x_f16 is the identical byte buffer). This removes any ambiguity about double-rounding.",
+    "Consider adding AT-1777: a zero-weight fixture test (all Q4_K_M scales=0, all nibbles=0) where the output should be exactly zero regardless of accumulator precision. This validates the dequant->coopmat pipeline end-to-end on a case with an integer-exact expected result, providing a secondary correctness check alongside the 1e-3 tolerance tests.",
+    "For the AT-1772 bench: print the error metric (max rel diff vs CPU reference) at each measured size alongside the TFLOPS number, even for sizes >K=512. This makes it easy to observe where the f16 accumulator precision degrades without a separate test run, and documents the accuracy frontier transparently."
+  ],
+
+  "open_question_positions": {
+    "OQ-1_kill_criterion_metric": "AGREE with the architect's proposal: headline the GEMV-boundary ratio (fused GEMM TFLOPS vs llama.cpp's n==1 GEMV 7.39 TFLOPS) as the primary M3.4-successor kill-criterion metric, with the same-shape GEMM-vs-GEMM as the honest secondary. Rationale: M3.4 declared TFLOPS the 'FAIR metric' for this project's kill-criterion (DESIGN §3.1.19), and the gap-closing question for DESIGN §5 is 'does AXIOM's Q4_K_M reach competitive throughput?', not 'does AXIOM match llama at exactly n=1 batch?'. The GEMV-vs-GEMM TFLOPS comparison is apples-to-oranges in shape but work-normalized, which is the correct framing when AXIOM is explicitly a GEMM engine (coopmat requires >=16-wide tiles). Reporting BOTH comparisons as specified ensures full transparency. The kill-criterion-of-record should be the GEMV-boundary primary because that is the direct successor of M3.4's documented metric.",
+    "OQ-2_tolerance_gate_K": "AGREE with the proposed 1e-3 gate at K=256/512 only, with un-gated error reporting at K=768/1024. The 1e-3 budget is well-established for f16 coopmat (AT-1521) at these sizes; larger K where f16 accumulator precision may degrade should be disclosed but not gated without measurement. The Coder should print the max rel diff alongside TFLOPS in the AT-1772 bench output at all sizes. If a future K shows degradation beyond 1e-3, that is a meaningful signal motivating an f32-accumulator coopmat shape milestone — not a M3.5 blocker.",
+    "OQ-3_scale_caching": "AGREE: correctness-first is the right call. Shipping the simple per-element dequant form in M3.5 is lower-risk and the AT-1772 measurement will quantify whether dequant overhead dominates. Scale-caching (or whole-superblock pre-dequant) is a bounded follow-up if the bench shows ALU-bound behavior. The correctness proof is not entangled with the optimization.",
+    "OQ-4_coopmat_throughput": "HONEST ANSWER: probably ALU-bound at the simple per-element form, but the gap vs llama's 7.39 TFLOPS GEMV still closes dramatically (llama's n==1 GEMV is itself memory-bound and far below the RTX PRO 6000's tensor-core peak). Even 5-10 TFLOPS from a naive fused kernel would be a ~60,000-80,000x improvement over the 0.000085 TFLOPS M3.4 baseline. The honest no-asserted-ratio gate is correct — the project thesis is not defeated by a 'only' 10 TFLOPS result on the fused form.",
+    "OQ-5_x_as_f16_vs_f32": "AGREE: f16 input buffer matches ggml-vulkan's activation path for the coopmat mul_mat path and keeps the kernel focused on weight dequant. The f32_to_f16 builtin is available for an in-kernel conversion variant if the A/B needs to match an f32-activation llama boundary, but that is an optional follow-up."
+  },
+
+  "summary": "M3.5 is a well-scoped, architecturally sound milestone that correctly identifies the single language gap (f32->f16 conversion), fills it with the minimum possible surface area (one new Q4_0Builtin variant, proven reuse of every existing routing layer), and fuses two independently-proven building blocks (M2.6 Q4_K_M dequant, M3.3c register-blocked coopmat) into a design that mirrors real ggml-vulkan Q4_K coopmat practice. The numerics discipline is honest (f32 dequant then single f32->f16 rounding, 1e-3 tolerance vs an oracle that applies the identical rounding, not claiming bit-exactness). The performance reporting is honest (no asserted ratio, expected below M3.3c, gate = honest improvement over the 87,000x baseline). The A/B methodology reuse is rigorous (same SHA, same ICD, same boundary definition, fail-closed, new artifact, frozen baseline preserved). The test suite (AT-1770..1776) covers CI-without-GPU (AT-1773/1775/1776), GPU correctness (AT-1770/1771), performance (AT-1772), and the fair-fight A/B re-run (AT-1774). Three minor concerns are noted (x-rounding fixture clarity, bench error disclosure at large K, FLOP convention disclosure) but none are design-level blockers. The design is APPROVED for Coder implementation.",
+
+  "reviewed_files": [
+    "examples/q4km_dequant_matvec.axc",
+    "examples/matmul_rb_coopmat.axc",
+    "crates/axc-hir/src/q4_0.rs",
+    "crates/axc-hir/src/shared.rs",
+    "crates/axc-hir/src/typecheck.rs",
+    "crates/axc-codegen/src/q4_0.rs",
+    "crates/axc-codegen/src/body.rs",
+    "crates/axc-codegen/src/emit.rs",
+    "scripts/m34_llamacpp_ab.sh",
+    "DESIGN.md (§3.1.19)"
+  ]
+}

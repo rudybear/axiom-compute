@@ -1,0 +1,47 @@
+{
+  "verdict": "PASS",
+  "agent": "qa_agent",
+  "milestone_id": "M3.5-q4km-coopmat-fusion",
+  "branch": "coder/M35-20260606-1100/M3.5-q4km-coopmat-fusion",
+  "requirements_total": 7,
+  "requirements_covered": 7,
+  "requirements_missing": [],
+  "test_results": {
+    "total": 893,
+    "passed": 893,
+    "failed": 0,
+    "ignored": 46,
+    "note": "cargo test --workspace; GPU-dispatch tests (AT-1770/1771/1772/1774) are #[ignore]-gated and run by the NVIDIA orchestrator. AT-1773 (no-new-capability-beyond-union) and AT-1776 (f32_to_f16 OpFConvert + spirv-val) verified GREEN in CI by re-running them directly."
+  },
+  "verification_results": {
+    "clippy_check": "PASS (cargo clippy --workspace --all-targets -- -D warnings: clean)",
+    "diff_check": "PASS (all planned files present; compiler-src change confined to the f32_to_f16 builtin)",
+    "spirv_val_check": "PASS (AT-1773 + AT-1776 compile + spirv-val clean; fused kernel cap/ext set == M3.3c union M2.6 union, Float16 once)",
+    "coder_self_report_matches_reality": true
+  },
+  "check_1_tests_clippy": "PASS — 893 passed / 0 failed; clippy clean. No QA-fix needed for clippy.",
+  "check_2_f32_to_f16_builtin": "PASS — OpFConvert f32->f16 (RNE, no FPRoundingMode), sets ONLY caps.float16, NO extension. 5th Q4_0Builtin variant reusing every existing layer. AT-1773 union baseline = M3.3c coopmat caps UNION M2.6 Q4_K_M dequant caps (readonly_buffer[u8] legitimately adds Int8/StorageBuffer8BitAccess/SPV_KHR_8bit_storage); f32_to_f16 adds nothing. AT-1775 (layers) + AT-1776 (codegen) present and GREEN. NO new capability sneaks in.",
+  "check_3_fused_kernel": "PASS — examples/q4km_matmul_rb_coopmat.axc: byte-identical M2.6 dequant -> f32_to_f16 -> shared[f16] a_tile -> M3.3c RB coopmat (4 f16 accumulators, A/B reuse, N-phi) -> coopmat_store. Staging-coverage asserted in AT-1770/1771.",
+  "check_4_K_limited_correctness_honest": "PASS — THE CENTRAL HONESTY CHECK HOLDS. FROZEN_REL_TOL=1e-3 (NOT loosened). AT-1770 K=256 hard-asserts <=1e-3 (8.3e-4 PASS). AT-1771 K=512 implements the gate-K-CAP policy: if >1e-3 it reports the divergence SEPARATELY and passes by reporting (NOT by loosening 1e-3) — 3.6e-3 EXCEEDS 1e-3, gate capped at K=256. The bench reports max_rel_diff at EVERY size including the A/B shape (29.07 at k=14336). The frozen 1e-3 was NOT loosened anywhere in the tree.",
+  "check_5_json_honesty_bugs": "FIXED by QA — both orchestrator-spotted bugs corrected in ab_results_fused.json: (5a) dims.note rewritten from the STALE 'AXIOM computes M=1 output row' to the correct full m=4096,n=512 SAME-SHAPE GEMM framing (per axiom.fused_output_m=4096). (5b) llamacpp.selected_line replaced the contradictory n=1 GEMV line (7.42) with the actual SAME-SHAPE n=512 line (101.48 TFLOPS) that the headline tflops came from — selected_line now matches the headline. Also fixed: ratio_boundary_label (101.00->101.48), cross-shape n=1 value (7.39->7.42 to match the raw evidence). JSON re-validated; headline_ratio 0.111 = 11.27/101.48, llama_over_axiom=9.0, internally consistent.",
+  "check_5_extra_bug_found_and_fixed": "FOUND + FIXED a THIRD honesty bug the orchestrator did not flag: ab_results_fused.json fairness_caveat FALSELY claimed 'AXIOM's fused kernel is correct within the frozen 1e-3 vs the f16-accumulator ggml reference' — this is FALSE at the A/B shape (max_rel_diff=29.07). Rewrote fairness_caveat + kill_criterion_qualifier + gap_closing_path and added a dedicated numerical_validity block {valid_at_ab_shape:false, ab_shape_max_rel_diff:29.07, verdict, kill_criterion_interpretation}.",
+  "check_6_numerical_invalidity_caveat_front_and_center": "FIXED by QA — the ~9x throughput gap now carries the numerical-invalidity caveat in ALL four artifacts. DESIGN §3.1.20: K-limited finding added to the Numerics paragraph, measured table shows 11.27 TFLOPS + '29.07 NUMERICALLY INVALID' at the A/B row, A/B re-run paragraph states fast-but-WRONG at inference K + M3.5b needs f32-accumulator. BENCHMARKS.md: added a CRITICAL CORRECTNESS CAVEAT blockquote + measured 11.27/101.48 table + 'NOT a usable-kernel win'. ROADMAP.md: both M3.5 rows now state numerically-invalid-at-k=14336 + fast-but-wrong. JSON: numerical_validity block. The kill-criterion is correctly framed: throughput gap closed dramatically BUT NOT a usable-kernel win (numerically invalid at inference K).",
+  "check_7_no_regression": "PASS — M3.0-M3.4 tests green (893 pass). llama.cpp NOT committed (/vendor/ gitignored, no vendor files tracked). Compiler-src change confined to the f32_to_f16 builtin (q4_0.rs/body.rs/expr.rs/typecheck.rs); FROZEN artifacts (q4km_dequant_matvec.axc, matmul_rb_coopmat.axc, ab_results.json, dispatch_q4km_ab.rs) untouched.",
+  "qa_fixes_applied": [
+    ".pipeline/benchmarks/m34/ab_results_fused.json: fixed dims.note (5a), llamacpp.selected_line (5b), ratio_boundary_label/cross-shape value, fairness_caveat (false-correctness claim), kill_criterion_qualifier, gap_closing_path; added numerical_validity block",
+    "DESIGN.md §3.1.20: K-limited correctness finding + measured table (11.27 TFLOPS, 29.07 INVALID) + fast-but-wrong A/B framing + changelog",
+    "BENCHMARKS.md M3.5: CRITICAL CORRECTNESS CAVEAT blockquote + measured table + not-a-usable-win framing",
+    "ROADMAP.md: both M3.5 rows carry the numerical-invalidity caveat"
+  ],
+  "honesty_gate": {
+    "frozen_1e-3_loosened": false,
+    "K_limited_correctness_reported": true,
+    "29.07_garbage_at_k14336_reported": true,
+    "json_self_contradictions_5a_5b_fixed": true,
+    "numerical_invalidity_caveat_front_and_center": true,
+    "no_new_capability": true,
+    "9x_presented_as_clean_win": false
+  },
+  "memory_footprint_ok": true,
+  "summary": "PASS. The M3.5 implementation is honest and correct: the f32_to_f16 builtin is a single OpFConvert with NO new capability beyond the M3.3c union M2.6 union; the fused kernel does M2.6 dequant -> f32_to_f16 -> shared[f16] -> M3.3c RB coopmat; the frozen 1e-3 was NOT loosened (AT-1770 K=256 PASS 8.3e-4; AT-1771 K=512 3.6e-3 EXCEEDS 1e-3 with gate capped at K=256 and divergence reported separately); the bench reports max_rel_diff at every size including the 29.07 garbage at the A/B shape. 893 tests pass, clippy clean, no regression, llama.cpp not committed. QA FIXED the two orchestrator-spotted JSON honesty bugs (5a stale dims.note, 5b contradictory selected_line) PLUS a third (fairness_caveat falsely claiming correctness at the A/B shape), and propagated the numerical-invalidity caveat front-and-center into DESIGN/BENCHMARKS/ROADMAP/JSON. The ~9x throughput gap is now correctly framed as fast-but-WRONG at inference K (correct only at K<=256; needs an f32-accumulator coopmat in M3.5b), NOT a usable-kernel win."
+}

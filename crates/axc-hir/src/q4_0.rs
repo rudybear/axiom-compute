@@ -7,11 +7,12 @@
 //! are general byte-access and conversion primitives that Q4_K_M (M2.6) will
 //! also reuse verbatim.
 //!
-//! The four builtins are:
+//! The five builtins are:
 //!   - `ptr_read_u8_zext`  — byte load + zero-extend to u32
 //!   - `ptr_read_u16_zext` — two-byte little-endian load + zero-extend to u32
 //!   - `f16_bits_to_f32`   — reinterpret low 16 bits of u32 as f16, widen to f32
 //!   - `f32_from_u32`      — convert u32 to f32 via IEEE-754 RNE
+//!   - `f32_to_f16`        — narrow f32 to IEEE-754 binary16 via OpFConvert (RNE) — M3.5
 
 use crate::ty::ScalarTy;
 
@@ -51,6 +52,22 @@ pub enum Q4_0Builtin {
     /// Lowers to `OpConvertUToF`.
     /// No new capability side-effects (f32 and u32 are the baseline).
     F32FromU32,
+    /// Convert f32 to IEEE-754 binary16 (f16) via narrowing conversion (M3.5).
+    ///
+    /// Lowers to a single `OpFConvert %f16 %f32` (IEEE round-to-nearest-even —
+    /// the SPIR-V default for OpFConvert; NO FPRoundingMode decoration, matching
+    /// the in-tree convention). This is the exact inverse of the final
+    /// `OpFConvert f16→f32` step in `F16BitsToF32`.
+    ///
+    /// Required capability: `Float16` only (already declared by every coopmat-f16
+    /// kernel and `shared[f16]`). NO extension. Adds NOTHING beyond the
+    /// M3.3c-coopmat ∪ M2.6-Q4_K_M capability union.
+    ///
+    /// Motivation: the Q4_K_M dequant arithmetic is f32 (matching ggml), but the
+    /// register-blocked coopmat tiles are `shared[f16]`; writing f32 into a
+    /// `shared[f16]` element is a HARD ERROR (SharedWriteTypeMismatch — no implicit
+    /// coercion, anti-pattern #1). This builtin is the single explicit narrowing.
+    F32ToF16,
 }
 
 impl Q4_0Builtin {
@@ -61,6 +78,7 @@ impl Q4_0Builtin {
             Q4_0Builtin::PtrReadU16Zext => "ptr_read_u16_zext",
             Q4_0Builtin::F16BitsToF32   => "f16_bits_to_f32",
             Q4_0Builtin::F32FromU32     => "f32_from_u32",
+            Q4_0Builtin::F32ToF16       => "f32_to_f16",
         }
     }
 
@@ -73,6 +91,7 @@ impl Q4_0Builtin {
             "ptr_read_u16_zext" => Some(Q4_0Builtin::PtrReadU16Zext),
             "f16_bits_to_f32"   => Some(Q4_0Builtin::F16BitsToF32),
             "f32_from_u32"      => Some(Q4_0Builtin::F32FromU32),
+            "f32_to_f16"        => Some(Q4_0Builtin::F32ToF16),
             _                   => None,
         }
     }
@@ -83,12 +102,14 @@ impl Q4_0Builtin {
     /// - `PtrReadU16Zext`: 2 (buf, byte_offset)
     /// - `F16BitsToF32`:   1 (bits: u32)
     /// - `F32FromU32`:     1 (u: u32)
+    /// - `F32ToF16`:       1 (x: f32)
     pub fn arity(self) -> usize {
         match self {
             Q4_0Builtin::PtrReadU8Zext  => 2,
             Q4_0Builtin::PtrReadU16Zext => 2,
             Q4_0Builtin::F16BitsToF32   => 1,
             Q4_0Builtin::F32FromU32     => 1,
+            Q4_0Builtin::F32ToF16       => 1,
         }
     }
 
@@ -98,25 +119,28 @@ impl Q4_0Builtin {
     /// - `PtrReadU16Zext`: U32 (two bytes zero-extended to 32 bits)
     /// - `F16BitsToF32`:   F32 (widened from f16)
     /// - `F32FromU32`:     F32 (u32 converted to f32)
+    /// - `F32ToF16`:       F16 (narrowed from f32)
     pub fn return_ty(self) -> ScalarTy {
         match self {
             Q4_0Builtin::PtrReadU8Zext  => ScalarTy::U32,
             Q4_0Builtin::PtrReadU16Zext => ScalarTy::U32,
             Q4_0Builtin::F16BitsToF32   => ScalarTy::F32,
             Q4_0Builtin::F32FromU32     => ScalarTy::F32,
+            Q4_0Builtin::F32ToF16       => ScalarTy::F16,
         }
     }
 }
 
 // ── RESERVED_Q4_0_BUILTIN_NAMES ──────────────────────────────────────────────
 
-/// Sorted-for-binary-search list of the four Q4_0-path builtin names.
+/// Sorted-for-binary-search list of the five Q4_0-path builtin names.
 ///
 /// Used by the HIR reserved-name check to reject `let ptr_read_u8_zext = ...` etc.
 /// MUST remain sorted lexicographically; verified by the unit test below.
 pub const RESERVED_Q4_0_BUILTIN_NAMES: &[&str] = &[
     "f16_bits_to_f32",
     "f32_from_u32",
+    "f32_to_f16",
     "ptr_read_u16_zext",
     "ptr_read_u8_zext",
 ];
@@ -167,6 +191,14 @@ mod tests {
     }
 
     #[test]
+    fn q4_0_builtin_from_source_name_f32_to_f16() {
+        assert_eq!(
+            Q4_0Builtin::from_source_name("f32_to_f16"),
+            Some(Q4_0Builtin::F32ToF16)
+        );
+    }
+
+    #[test]
     fn q4_0_builtin_from_source_name_unknown_is_none() {
         assert_eq!(Q4_0Builtin::from_source_name("band"), None);
         assert_eq!(Q4_0Builtin::from_source_name(""), None);
@@ -180,6 +212,7 @@ mod tests {
             Q4_0Builtin::PtrReadU16Zext,
             Q4_0Builtin::F16BitsToF32,
             Q4_0Builtin::F32FromU32,
+            Q4_0Builtin::F32ToF16,
         ] {
             let name = builtin.source_name();
             let parsed = Q4_0Builtin::from_source_name(name);
@@ -193,6 +226,7 @@ mod tests {
         assert_eq!(Q4_0Builtin::PtrReadU16Zext.arity(), 2, "PtrReadU16Zext arity must be 2");
         assert_eq!(Q4_0Builtin::F16BitsToF32.arity(), 1, "F16BitsToF32 arity must be 1");
         assert_eq!(Q4_0Builtin::F32FromU32.arity(), 1, "F32FromU32 arity must be 1");
+        assert_eq!(Q4_0Builtin::F32ToF16.arity(), 1, "F32ToF16 arity must be 1");
     }
 
     #[test]
@@ -201,6 +235,7 @@ mod tests {
         assert_eq!(Q4_0Builtin::PtrReadU16Zext.return_ty(), ScalarTy::U32);
         assert_eq!(Q4_0Builtin::F16BitsToF32.return_ty(), ScalarTy::F32);
         assert_eq!(Q4_0Builtin::F32FromU32.return_ty(), ScalarTy::F32);
+        assert_eq!(Q4_0Builtin::F32ToF16.return_ty(), ScalarTy::F16);
     }
 
     #[test]
@@ -209,6 +244,7 @@ mod tests {
         assert!(is_reserved_q4_0_builtin("ptr_read_u16_zext"));
         assert!(is_reserved_q4_0_builtin("f16_bits_to_f32"));
         assert!(is_reserved_q4_0_builtin("f32_from_u32"));
+        assert!(is_reserved_q4_0_builtin("f32_to_f16"));
     }
 
     #[test]

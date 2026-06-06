@@ -73,6 +73,37 @@ The DESIGN.md §5 pre-registered kill-criterion head-to-head: AXIOM's FROZEN M2.
 
 ---
 
+## M3.5 — Q4_K_M dequant fused into the register-blocked coopmat matmul (SAME-SHAPE A/B)
+
+M3.5 FUSES the M2.6 Q4_K_M dequant front-end onto the M3.3c register-blocked coopmat matmul: each workgroup cooperatively dequantizes a tile of Q4_K_M weights into a `shared[f16]` tile (via the new `f32_to_f16` builtin — a single `OpFConvert f32→f16`, Float16-only, no capability beyond the M3.3c∪M2.6 union), stages the f16 activation tile, then runs the M3.3c 2×2 register-blocked coopmat K-loop (4 loop-carried f16 accumulators, A/B reuse, N-phi).
+
+> **CORRECTNESS IS K-LIMITED — the central honesty finding.** The GPU coopmat accumulator is **f16**, and an f16 accumulator cannot hold an inference-scale K sum. The fused kernel is correct vs the f16-accumulator ggml reference **only at small K** — AT-1770 **K=256: max-rel-diff 8.3e-4 PASS**; AT-1771 **K=512: max-rel-diff 3.6e-3 EXCEEDS the frozen 1e-3** (the gate is capped at K=256 and the K=512 divergence is reported separately; **the frozen 1e-3 was NOT loosened**). At the inference-scale A/B shape **k=14336 the max-rel-diff is 29.07 — the output is NUMERICALLY GARBAGE.** A correct large-K fused kernel requires an **f32-accumulator coopmat shape (M3.5b)**.
+
+**The A/B is now SAME-SHAPE (the fair fight).** AXIOM's fused GEMM at (m=4096, n=512, k=14336) vs llama.cpp Q4_K MUL_MAT at the **IDENTICAL** shape = **101.48 TFLOPS** (`.pipeline/benchmarks/m34/llamacpp_raw.txt:174`, 60.13 GFLOP/run). M3.4's headline compared two GEMVs (both n=1); M3.5's fused kernel is a GEMM, so comparing it against llama's n=1 GEMV (7.42 TFLOPS) would be apples-to-oranges in arithmetic intensity — the SAME llama kernel runs **13.7× faster** at n=512 (101.48) than at n=1 (7.42), so a GEMM-vs-GEMV headline would flatter AXIOM ~13×. The n=1 GEMV is therefore **cross-shape context only**, never the headline (CRITICAL-1).
+
+| metric | AXIOM (fused Q4_K_M RB coopmat GEMM) | llama.cpp (Q4_K MUL_MAT n=512) |
+|---|---|---|
+| shape (m,n,k) | 4096 × 512 × 14336 | 4096 × 512 × 14336 |
+| TFLOPS (GpuTimestamp MIN, kernel-only) | **11.27** | **101.48** |
+| max-rel-diff vs f16-accum ref | **29.07 — NUMERICALLY INVALID** | (ggml is the reference) |
+
+**Fused-kernel TFLOPS at cube sizes (AT-1772, honest, no asserted ratio):**
+
+| size (M=N=K) | TFLOPS | % of 125-TFLOPS estimate | max-rel-diff |
+|---|---|---|---|
+| 256 | _(NVIDIA orchestrator run)_ | _(orchestrator)_ | _(orchestrator; ≈8.3e-4 PASS at K=256)_ |
+| 512 | _(orchestrator)_ | _(orchestrator)_ | _(orchestrator; ≈3.6e-3 — EXCEEDS 1e-3)_ |
+| 768 | _(orchestrator)_ | _(orchestrator)_ | _(orchestrator; grows with K)_ |
+| 1024 | _(orchestrator)_ | _(orchestrator)_ | _(orchestrator; grows with K)_ |
+
+**Cross-shape CONTEXT (NOT the kill criterion):** llama n=1 GEMV = 7.42 TFLOPS (`llamacpp_raw.txt:24`) — labeled cross-shape; the SAME llama kernel runs 13.7× faster at n=512.
+
+**Measured result (honest, NOT spun as a win):** AXIOM fused GEMM **11.27 TFLOPS** vs llama **101.48 TFLOPS** same-shape → **AXIOM ≈ 9× BEHIND on throughput**. The throughput gap collapsed dramatically from M3.4's ~87,000× cross-shape matvec gap, **BUT this is NOT a usable-kernel win**: at the A/B shape AXIOM's output is **numerically INVALID** (max-rel-diff 29.07 — see the K-limited caveat above), so the kernel is **fast-but-WRONG at inference K**. The kill-criterion (within 15% on NVIDIA) does **not** fire — AXIOM is both behind on throughput AND numerically invalid at this K. The blocking next step is **correctness, not speed**: M3.5b must add an f32-accumulator coopmat shape so the fused kernel is correct at large K before the throughput number is a usable-kernel comparison. The per-element dequant also makes the kernel ALU-bound (get_scale_min_k4 + d/dmin recomputed across a superblock's 16 K-blocks, OQ-3); scale-caching is deferred to M3.5b. The cube-size table above is filled by the NVIDIA orchestrator run; the kernel, oracle, tests, bench, and A/B harness are landed and CI-green (compile + spirv-val + no-new-capability-beyond-union + CPU oracle + f32_to_f16 layer/codegen).
+
+**Reproduce:** `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json AXC_ENABLE_GPU_BENCHES=1 scripts/m34_llamacpp_ab.sh --fused` (runs the fused-kernel bench vs llama's same-shape line, writes `.pipeline/benchmarks/m34/ab_results_fused.json` + `ab_results_fused.md`; the frozen-matvec `ab_results.json` is retained).
+
+---
+
 ## Running benchmarks
 
 ```sh

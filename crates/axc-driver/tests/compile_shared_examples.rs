@@ -320,3 +320,147 @@ fn at1734_matmul_rb_coopmat_spirv_val() {
         meta.shared_memory_bytes, meta.entry_point
     );
 }
+
+// ── AT-1773: fused Q4_K_M coopmat matmul — no capability/extension beyond the union ──
+
+/// RB strategy assignments for the fused kernel (same as M3.3c RB 2×2).
+fn rb2x2_assignments() -> StrategyMap {
+    let mut m = StrategyMap::new();
+    m.insert("rb_m".to_owned(), 2_i64);
+    m.insert("rb_n".to_owned(), 2_i64);
+    m.insert("tile_k".to_owned(), 16_i64);
+    m.insert("a_block_size".to_owned(), 512_i64);
+    m.insert("b_block_size".to_owned(), 512_i64);
+    m
+}
+
+/// Extract the set of OpCapability values and OpExtension strings from a SPIR-V module.
+///
+/// Returns (capability values as u32, extension names). OpCapability=17 (2 words:
+/// [wc<<16|17, value]); OpExtension=10 (literal string operand follows the opcode word).
+fn capability_extension_sets(words: &[u32]) -> (std::collections::BTreeSet<u32>, std::collections::BTreeSet<String>) {
+    use std::collections::BTreeSet;
+    const OP_CAPABILITY: u32 = 17;
+    const OP_EXTENSION: u32 = 10;
+    let mut caps: BTreeSet<u32> = BTreeSet::new();
+    let mut exts: BTreeSet<String> = BTreeSet::new();
+    let mut i = 5usize; // skip header
+    while i < words.len() {
+        let opcode = words[i] & 0xFFFF;
+        let wc = (words[i] >> 16) as usize;
+        if wc == 0 {
+            break;
+        }
+        if opcode == OP_CAPABILITY && wc == 2 {
+            caps.insert(words[i + 1]);
+        } else if opcode == OP_EXTENSION {
+            // The literal string occupies words[i+1 .. i+wc] (UTF-8, null-padded).
+            let mut bytes: Vec<u8> = Vec::new();
+            for &wrd in &words[i + 1..i + wc] {
+                bytes.extend_from_slice(&wrd.to_le_bytes());
+            }
+            // Trim trailing NULs.
+            while bytes.last() == Some(&0) {
+                bytes.pop();
+            }
+            if let Ok(s) = String::from_utf8(bytes) {
+                exts.insert(s);
+            }
+        }
+        i += wc;
+    }
+    (caps, exts)
+}
+
+/// Compile a source (with optional assignments) and return SPIR-V words. spirv-val'd.
+fn compile_words(src: &str, assignments: Option<&StrategyMap>, name: &str) -> Vec<u32> {
+    let (bytes, _meta) = match assignments {
+        Some(a) => compile_source_with_assignments(src, a)
+            .unwrap_or_else(|e| panic!("{name}: compile failed: {e:?}")),
+        None => compile_source_with_meta(src)
+            .unwrap_or_else(|e| panic!("{name}: compile failed: {e:?}")),
+    };
+    words_and_validate(bytes, name)
+}
+
+/// AT-1773: the fused Q4_K_M coopmat matmul (q4km_matmul_rb_coopmat.axc) compiles,
+/// spirv-val passes, declares OpCapability Float16 exactly once, and declares NO
+/// capability/extension beyond the UNION of:
+///   - matmul_rb_coopmat.axc's caps (M3.3c coopmat: Float16, CooperativeMatrixKHR, ...)
+///   - q4km_dequant_matmul.axc's caps (M2.6 Q4_K_M: Int8, StorageBuffer8BitAccess,
+///     SPV_KHR_8bit_storage, Int16, ...)
+///
+/// The readonly_buffer[u8] weight buffer legitimately adds Int8/StorageBuffer8BitAccess/
+/// SPV_KHR_8bit_storage (via emit_ptr_read_u8_zext); the f32_to_f16 no-new-capability
+/// proof is that the fused module adds NOTHING beyond that union.
+#[test]
+fn at_1773_q4km_rb_coopmat_no_new_capability_beyond_union() {
+    use std::collections::BTreeSet;
+
+    let fused_src = include_str!("../../../examples/q4km_matmul_rb_coopmat.axc");
+    let rb_src = include_str!("../../../examples/matmul_rb_coopmat.axc");
+    let q4km_src = include_str!("../../../examples/q4km_dequant_matmul.axc");
+
+    let assignments = rb2x2_assignments();
+
+    let fused_words = compile_words(fused_src, Some(&assignments), "q4km_matmul_rb_coopmat.axc");
+    let rb_words = compile_words(rb_src, Some(&assignments), "matmul_rb_coopmat.axc");
+    let q4km_words = compile_words(q4km_src, None, "q4km_dequant_matmul.axc");
+
+    let (fused_caps, fused_exts) = capability_extension_sets(&fused_words);
+    let (rb_caps, rb_exts) = capability_extension_sets(&rb_words);
+    let (q4km_caps, q4km_exts) = capability_extension_sets(&q4km_words);
+
+    // UNION baseline.
+    let union_caps: BTreeSet<u32> = rb_caps.union(&q4km_caps).copied().collect();
+    let union_exts: BTreeSet<String> = rb_exts.union(&q4km_exts).cloned().collect();
+
+    // The fused module must declare NO capability beyond the union.
+    let extra_caps: Vec<u32> = fused_caps.difference(&union_caps).copied().collect();
+    assert!(
+        extra_caps.is_empty(),
+        "AT-1773: fused kernel declares capabilities NOT in (matmul_rb_coopmat ∪ q4km_dequant_matmul): \
+         {extra_caps:?} (fused={fused_caps:?}, union={union_caps:?})"
+    );
+
+    // ...and NO extension beyond the union.
+    let extra_exts: Vec<String> = fused_exts.difference(&union_exts).cloned().collect();
+    assert!(
+        extra_exts.is_empty(),
+        "AT-1773: fused kernel declares extensions NOT in the union: {extra_exts:?} \
+         (fused={fused_exts:?}, union={union_exts:?})"
+    );
+
+    // Float16 (= 9) must be present exactly once. capability_extension_sets dedups to a
+    // BTreeSet (a malformed double-OpCapability would still appear once here), so also
+    // do a raw structural count to assert "exactly once".
+    const FLOAT16_CAP: u32 = 9;
+    assert!(
+        fused_caps.contains(&FLOAT16_CAP),
+        "AT-1773: fused kernel must declare OpCapability Float16"
+    );
+    const OP_CAPABILITY: u32 = 17;
+    let mut float16_raw_count = 0usize;
+    let mut i = 5usize;
+    while i < fused_words.len() {
+        let opcode = fused_words[i] & 0xFFFF;
+        let wc = (fused_words[i] >> 16) as usize;
+        if wc == 0 {
+            break;
+        }
+        if opcode == OP_CAPABILITY && wc == 2 && fused_words[i + 1] == FLOAT16_CAP {
+            float16_raw_count += 1;
+        }
+        i += wc;
+    }
+    assert_eq!(
+        float16_raw_count, 1,
+        "AT-1773: OpCapability Float16 must appear exactly once; got {float16_raw_count}"
+    );
+
+    eprintln!(
+        "AT-1773 PASS: q4km_matmul_rb_coopmat.axc ⊆ (M3.3c ∪ M2.6) caps/exts; \
+         Float16 present exactly once. fused_caps={fused_caps:?} union_caps={union_caps:?} \
+         fused_exts={fused_exts:?} union_exts={union_exts:?}"
+    );
+}
