@@ -7,11 +7,13 @@
 //! - `emit_ptr_read_u16_zext` — two u8 loads + shift/or reassembly into u32
 //! - `emit_f16_bits_to_f32`   — OpUConvert(u32→u16) + OpBitcast(u16→f16) + OpFConvert(f16→f32)
 //! - `emit_f32_from_u32`      — OpConvertUToF(u32→f32)
+//! - `emit_f32_to_f16`        — OpFConvert(f32→f16) (RNE default; M3.5)
 //!
 //! **Capability side-effects (set on the `CapabilitiesRequired` struct):**
 //! - `emit_ptr_read_u8_zext` / `emit_ptr_read_u16_zext`: set `caps.int8 = true`, `caps.storage_8bit = true`
 //! - `emit_f16_bits_to_f32`:  set `caps.int16 = true`, `caps.float16 = true`
 //! - `emit_f32_from_u32`:     no new capabilities
+//! - `emit_f32_to_f16`:       set `caps.float16 = true` (no extension — Float16 only)
 //!
 //! **Invariants:**
 //! - All functions accept `&mut CapabilitiesRequired` and are responsible for
@@ -183,6 +185,37 @@ pub fn emit_f32_from_u32(
     let f32_ty = tc.scalar_id(b, ScalarTy::F32);
 
     let result_id = b.convert_u_to_f(f32_ty, None, u32_id)
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+
+    Ok(result_id)
+}
+
+/// Emit the narrowing conversion `OpFConvert f32 → f16` (M3.5).
+///
+/// Emits a single `OpFConvert %f16 %f32_id` with IEEE round-to-nearest-even (the
+/// SPIR-V default rounding mode for OpFConvert — NO `FPRoundingMode` decoration, to
+/// match the in-tree convention; none is used anywhere in codegen). This is the
+/// exact inverse of the final `OpFConvert f16→f32` step in `emit_f16_bits_to_f32`.
+///
+/// Used by the M3.5 fused Q4_K_M coopmat matmul to narrow each dequantized f32
+/// weight into the `shared[f16]` coopmat staging tile.
+///
+/// Returns the `f16` result id.
+///
+/// Sets `caps.float16 = true`. No extension (Float16 is already declared by every
+/// coopmat-f16 kernel and `shared[f16]`); adds nothing beyond the existing union.
+pub fn emit_f32_to_f16(
+    b: &mut Builder,
+    tc: &mut ScalarTypeCache,
+    caps: &mut CapabilitiesRequired,
+    f32_id: Word,
+) -> Result<Word, BodyCodegenError> {
+    caps.float16 = true;
+
+    let f16_ty = tc.scalar_id(b, ScalarTy::F16);
+
+    // OpFConvert f32 → f16 (narrow to half-precision, RNE default).
+    let result_id = b.f_convert(f16_ty, None, f32_id)
         .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
 
     Ok(result_id)

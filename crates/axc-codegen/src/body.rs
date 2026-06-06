@@ -1547,6 +1547,16 @@ fn emit_expr(em: &mut BodyEmitter<'_>, expr: &HirExpr) -> Result<Word, BodyCodeg
                     let u_id = emit_expr(em, &args[0])?;
                     q::emit_f32_from_u32(em.b, em.type_cache, u_id)
                 }
+                Q4_0Builtin::F32ToF16 => {
+                    if args.len() != 1 {
+                        return Err(BodyCodegenError::UnexpectedHir(
+                            "f32_to_f16: expected 1 arg"
+                        ));
+                    }
+                    let v_id = emit_expr(em, &args[0])?;
+                    // Sets caps.float16=true internally; Float16 declared by emit.rs gate.
+                    q::emit_f32_to_f16(em.b, em.type_cache, em.caps, v_id)
+                }
             }
         }
         // M3.2: SharedRead → emit_shared_read (SINGLE-index access chain + OpLoad).
