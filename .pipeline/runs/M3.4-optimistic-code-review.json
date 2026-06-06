@@ -1,0 +1,50 @@
+{
+  "verdict": "APPROVE",
+  "agent": "optimistic_code_reviewer",
+  "milestone_id": "M3.4-llamacpp-ab",
+  "spec_compliance": true,
+  "positive_feedback": [
+    "Good: harness (m34_llamacpp_ab.sh) is fully reproducible — clones and pins llama.cpp to a literal 40-char SHA (6b80c74f285390368b3c99c5e750f19e9b096e98 / tag b9542) via a SHA-exact checkout verify, builds with -DGGML_VULKAN=ON -DLLAMA_BUILD_TESTS=ON, and gitignores vendor/ completely. llama.cpp is provably absent from the committed tree (git ls-tree confirms no vendor/ entries).",
+    "Good: A/B is fair on every dimension specified by the Architect — matched sustained-CPU-wall boundary (both sides are CPU-wall, batched-amortized MEAN, ≥1 s sustained; the headline ratio uses AXIOM-sustained-CPU-wall vs llama.cpp-sustained-CPU-wall, not the favorable GpuTimestamp MIN); FLOP parity (2·M·N·K MACs, dequant excluded both sides, verified by recompute: 7.3908 vs 7.39 TFLOPS, 0.011% disagreement); n==1 GEMV case confirmed (m=4096, n=1, k=14336); byte-identical device-match (fail-closed on any string difference, recorded as true).",
+    "Good: honesty is intact and multi-layered. kill_criterion_status=FAIL is derived mechanically (ratio 1e-5 < 0.85 threshold — no editorial spin). The 87,000× ratio is labeled with the prominent 1-row-vs-4096-row caveat everywhere it appears (dims.note, fairness_caveat, DESIGN §3.1.19, BENCHMARKS.md). NVIDIA-only FAIL ≠ project kill-criterion is restated in every artifact (ab_results.json kill_criterion_qualifier, DESIGN §3.1.19, BENCHMARKS.md, ROADMAP.md). The gap-closing path (fuse Q4_K_M dequant onto M3.3c register-blocked coopmat, 31.2 TFLOPS plain-f16) is stated concretely.",
+    "Good: all four acceptance tests are present and correct. AT-1760 asserts the literal 40-char SHA default and both fail-closed paths (INCOMPLETE, n=1 selection) live in the script text. AT-1761 is a GPU-gated #[ignore] test with a pre-flight correctness oracle that runs on Lavapipe in CI and fires before timing to prevent a wrong-but-fast kernel from polluting the A/B. AT-1766 fully validates the ab_results.json schema (verbatim timer-boundary excerpt, tag+40-char-SHA length, AXIOM min/mean/median/sustained, boundary label, flop_consistency.ok, device_match.byte_identical) against the committed artifact. AT-1767 asserts llama.cpp.n==1 for any PASS/FAIL status and forbids a ratio under INCOMPLETE.",
+    "Good: no regression — zero AXIOM compiler/codegen/runtime source touched; the only Rust additions are benches/dispatch_q4km_ab.rs (additive) and tests/m34_llamacpp_ab.rs (additive); 884 tests pass; clippy -D warnings clean per QA.",
+    "Good: dispatch_q4km_ab.rs mirrors the resident_matmul.rs methodology exactly (N_WARMUP=2, MIN-of-10 GpuTimestamp, CpuFenceWall typed-fallback) and adds the CRITICAL-1-mandated sustained/batched CPU-wall number (N_SUSTAINED=200 back-to-back dispatches / 200, fence-synchronized per dispatch_resident). Real 144-byte Q4_K_M weights via generate_q4km_test_data — not the doubly-broken all-zero/64-byte existing bench. 50 GB cap asserted. Typed-skips on DeviceFeatureUnsupported, no-Vulkan, and AXC_ENABLE_GPU_BENCHES unset.",
+    "Good: m34_emit.py is clean and correct — all arithmetic verified from first principles (ratio 1.14e-5, 87289× speedup, recomputed TFLOPS 7.3908, flop_consistency.ok=true). INCOMPLETE path in the emitter (FLOP-check fail → INCOMPLETE, device-mismatch → INCOMPLETE) mirrors the shell INCOMPLETE path — both guard against emitting a ratio under invalid conditions. AXC_Q4KM_AB machine-readable line is println! (stdout), captured by `cargo bench > file 2>&1` — correctly accessible to the shell grep.",
+    "Good: DESIGN §3.1.19 and BENCHMARKS.md M3.4 section are accurate, complete, and reproducible — verbatim selected-line quoted, timer-boundary reading documented, gap decomposition into (1) 1/4096 rows and (2) dispatch-latency-dominated single workgroup is clear and honest."
+  ],
+  "minor_issues": [
+    {
+      "file": ".pipeline/benchmarks/m34/ab_results.md",
+      "line": "13-14",
+      "description": "TFLOPS rows display '0.0001' for both GpuTimestamp-MIN (9.1e-5) and sustained-CPU-wall (8.5e-5) because fmt(x, d=4) rounds sub-0.001 values to the same 4-dp string. The JSON is authoritative (tflops_min_gputimestamp=9.1e-05, tflops_sustained_cpuwall=8.5e-05 both present at full precision). No correctness impact — cosmetic only. Low priority fix: use d=6 for values < 1e-3, or scientific notation."
+    }
+  ],
+  "qa_nonblocking_finding_assessment": {
+    "finding": "QA recommends adding a multi-row Q4_K_M context number (e.g. using examples/q4km_dequant_matmul.axc, M3.1 naive scalar matmul at K=256) to isolate per-row efficiency from work-size gap.",
+    "assessment": "Not required for M3.4. The kill-criterion target is AXIOM's current Q4_K_M kernel, which IS the M2.6 single-row matvec. The K=256 naive scalar matmul is not at the same contraction size (14336 vs 256), not coopmat, and would measure a different kernel under different dims — its inclusion would ADD confusion rather than clarity without a careful framing that's out of scope for M3.4. The 1-row-vs-4096-row structural caveat is already prominently documented everywhere. Agree this could be useful in a future characterization milestone, but it is correctly deferred here."
+  },
+  "spec_compliance_checklist": {
+    "harness_clean_and_reproducible": true,
+    "llamacpp_not_committed": true,
+    "vendor_gitignored": true,
+    "sha_pinned_literal_40char": true,
+    "matched_sustained_cpu_wall_boundary": true,
+    "flop_parity_2mnk_dequant_excluded_both": true,
+    "flop_consistency_check_passes": true,
+    "n1_gemv_case_verified_never_gemm": true,
+    "device_match_byte_identical_fail_closed": true,
+    "real_144byte_weights_not_zeros": true,
+    "kill_criterion_fail_mechanical": true,
+    "nvidia_only_qualifier_stated": true,
+    "gap_closing_path_stated": true,
+    "at_1760_present_and_correct": true,
+    "at_1761_gpu_gated_with_preflight_oracle": true,
+    "at_1766_schema_validates_committed_artifact": true,
+    "at_1767_n1_or_incomplete_no_ratio": true,
+    "no_regression_zero_src_changes": true,
+    "clippy_clean": true,
+    "design_benchmarks_accurate": true
+  },
+  "summary": "M3.4 APPROVED. The A/B harness is clean, fully reproducible, and honest by construction. Every CRITICAL and WARNING from the Architect's r1 spec is satisfied: CRITICAL-1 (matched sustained-CPU-wall boundary, verbatim timer-boundary in ab_results.json), CRITICAL-2 (n==1 GEMV confirmed, INCOMPLETE path forbids GEMM substitution), WARNING-3 (FLOP-convention parity verified by recompute), WARNING-4 (literal 40-char SHA pinned), WARNING-5 (device-match fail-closed). All four ATs (1760–1767) are present, correct, and exercised. The 87,000× ratio is reported AS MEASURED with the work-normalization rationale and 1-row-vs-4096-row caveat stated prominently in every artifact. kill_criterion_status=FAIL is mechanical and correctly qualified as NVIDIA-only, not project-kill. No regressions. The single minor cosmetic issue (TFLOPS display precision in ab_results.md) is non-blocking. The QA non-blocking finding (multi-row context number) is correctly deferred — not in scope for M3.4."
+}

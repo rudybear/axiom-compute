@@ -1,0 +1,100 @@
+{
+  "verdict": "IMPLEMENTED",
+  "agent": "coder",
+  "milestone_id": "M3.4-llamacpp-ab",
+  "honest": true,
+  "files_created": [
+    "crates/axc-driver/benches/dispatch_q4km_ab.rs",
+    "crates/axc-driver/tests/m34_llamacpp_ab.rs",
+    "scripts/m34_llamacpp_ab.sh",
+    "scripts/m34_emit.py",
+    ".pipeline/benchmarks/m34/ab_results.json",
+    ".pipeline/benchmarks/m34/ab_results.md"
+  ],
+  "files_modified": [
+    "crates/axc-driver/Cargo.toml",
+    ".gitignore",
+    "DESIGN.md",
+    "ROADMAP.md",
+    "BENCHMARKS.md"
+  ],
+  "llama_cpp_not_committed": true,
+  "step0_timer_boundary": {
+    "source_file": "vendor/llama.cpp/tests/test-backend-ops.cpp",
+    "sha": "6b80c74f285390368b3c99c5e750f19e9b096e98",
+    "measurement": "CPU wall-clock (ggml_time_us) bracketing ggml_backend_graph_compute over a graph that DUPLICATES the op n_runs times",
+    "per_op_or_amortized": "batched-amortized: avg_time_us = total_time_us / total_runs",
+    "min_mean_or_sustained": "sustained MEAN (loops until total_time_us >= 1s; reports mean per-op, NOT min)",
+    "warmup": "ONE ggml_backend_graph_compute warmup discarded",
+    "overhead_subtracted": "none",
+    "n_runs_basis": "FLOP-targeted for MUL_MAT (~100 GFLOP / op_flops), many op copies per graph"
+  },
+  "llamacpp_pin": {
+    "tag": "b9542",
+    "sha": "6b80c74f285390368b3c99c5e750f19e9b096e98"
+  },
+  "n1_q4k_case_exists": true,
+  "selected_llamacpp_line": "MUL_MAT(type_a=q4_K,type_b=f32,m=4096,n=1,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): ~63000 runs - 15.89 us/run - 117.44 MFLOP/run - 7.39 TFLOPS",
+  "measured_ab": {
+    "device": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+    "icd": "/usr/share/vulkan/icd.d/nvidia_icd.json",
+    "device_match_byte_identical": true,
+    "K_contraction": 14336,
+    "axiom_us_gputimestamp_min": 315.5,
+    "axiom_us_sustained_cpuwall": 338.7,
+    "axiom_tflops_gputimestamp_min": 0.000091,
+    "axiom_tflops_sustained_cpuwall": 0.000085,
+    "axiom_output_rows": 1,
+    "llamacpp_us_per_op": 15.89,
+    "llamacpp_tflops": 7.39,
+    "llamacpp_output_rows": 4096,
+    "flop_consistency_ok": true,
+    "flop_consistency_recomputed_vs_reported_tflops": "7.39 vs 7.39 (0.01% disagreement)",
+    "ratio_axiom_over_llama_tflops": 1.1e-05,
+    "llama_over_axiom_speedup": 87289,
+    "kill_criterion_status": "FAIL",
+    "kill_criterion_within_15pct": false
+  },
+  "public_apis_implemented": [
+    "fn bench_q4km_ab(c: &mut Criterion)  // bench ID: dispatch_q4km_ab",
+    "fn axiom_q4km_kernel_measurement(...) -> AbMeasurement (min/mean/median GpuTimestamp + sustained CPU-wall)",
+    "scripts/m34_llamacpp_ab.sh [--skip-build] [--skip-llama]",
+    "scripts/m34_emit.py (M34_* env-driven JSON/MD emitter; non-zero exit on INCOMPLETE)"
+  ],
+  "tests_written": [
+    "at_1760_ab_harness_present",
+    "at_1761_q4km_matvec_bit_exact (GPU-gated, NVIDIA-verified rel_err 1.2e-7)",
+    "at_1766_ab_results_records_boundary_and_metadata",
+    "at_1767_kill_number_is_n1_never_gemm"
+  ],
+  "cargo_check_status": "pass",
+  "cargo_clippy_status": "pass (--workspace --all-targets -D warnings, 0 warnings)",
+  "cargo_test_status": "pass (full workspace green; M3.4 tests 16 pass + 1 ignored GPU-gated; AT-1761 verified green on NVIDIA)",
+  "spirv_val_status": "n/a (no codegen changes — zero changes to lexer/parser/hir/codegen/runtime)",
+  "llamacpp_build_status": "succeeded (GGML_VULKAN=ON, test-backend-ops target). NOTE: this box's libvulkan-dev does not ship the SPIRV-Headers CMake config; cloned+installed SPIRV-Headers into gitignored vendor/spirv-headers/install and injected its include dir via CMAKE_CXX_FLAGS (ggml-vulkan find_package's SPIRV-Headers but does not link the target). The script encodes this fallback (SPIRV_HEADERS_PREFIX).",
+  "self_assessment": {
+    "spec_coverage": "All M3.4 r1 spec items implemented: STEP-0 timer-boundary recorded verbatim; literal 40-char SHA pin (b9542 / 6b80c74); n==1 GEMV verified to exist and selected (no GEMM substitution); FLOP-consistency recompute (PASS); byte-identical device-match fail-closed; AXIOM min/mean/median + sustained CPU-wall for boundary comparability; bit-exact pre-flight (AT-1761); INCOMPLETE first-class path; honest expected-FAIL reported AS MEASURED; vendor/ gitignored, ab_results committed; DESIGN/ROADMAP/BENCHMARKS filled with actual numbers.",
+    "known_limitations": [
+      "The headline ratio is the work-normalized TFLOPS ratio (~1e-5 / ~87,000x). This is the architect-prescribed FAIR metric, but it stacks TWO deficits: (1) AXIOM computes 1/4096th of llama.cpp's output rows per dispatch, and (2) that single dispatch is dispatch-latency-dominated (316 us for 14336 MACs). Both are disclosed in ab_results.json (dims.note, fairness_caveat) and the prose. A reader must read the row-count caveat to interpret the 87,000x correctly — it is NOT '87,000x slower per equal work end-to-end'; it is the throughput gap of the FROZEN single-row kernel, which is the honest baseline M3.4 set out to quantify.",
+      "AMD/Intel halves not run (no cross-vendor hardware, EB.1) — deferred-not-dropped.",
+      "SPIRV-Headers had to be vendored locally to build llama.cpp Vulkan on this box (no root for apt). The script documents + automates this; a box with libvulkan-dev's full SDK would not need it."
+    ],
+    "deviations": [
+      "Architect mentioned reporting a SECOND AXIOM row for full host-round-trip; the bench reports kernel-only GpuTimestamp MIN/MEAN/MEDIAN + sustained CPU-wall (which IS the host-inclusive per-dispatch number, since each dispatch_resident fence-waits). The sustained CPU-wall row covers the host-inclusive framing; a separate upload+readback-inclusive number was not added as it would not change the FAIL verdict and the spec's primary contract (kernel-only-vs-kernel-only) is satisfied.",
+      "Headline ratio uses TFLOPS (work-normalized) rather than raw us, because the n==1 case computes m=4096 rows on the llama.cpp side — a raw us ratio would be apples-to-oranges in AXIOM's favour. This matches the architect's 'TFLOPS is the fair metric' guidance and is labeled."
+    ]
+  },
+  "git_commits": [
+    "1706bd8 bench(M3.4): AXIOM-side Q4_K_M A/B bench + gitignore vendor/",
+    "225cf3b test(M3.4): llama.cpp A/B harness + emitter + integration tests",
+    "d200647 docs(M3.4): NVIDIA Q4_K_M A/B measured result — kill-criterion FAIL (honest baseline)",
+    "1fa171f chore: gitignore __pycache__"
+  ],
+  "orchestrator_reverify_on_nvidia": [
+    "Run: VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json AXC_ENABLE_GPU_BENCHES=1 scripts/m34_llamacpp_ab.sh  (full: clones+builds llama.cpp from the pinned SHA, runs both sides, regenerates ab_results.json/.md). Expect exit 0, kill_criterion_status=FAIL.",
+    "Confirm both sides print 'NVIDIA RTX PRO 6000 Blackwell Workstation Edition' and device_match.byte_identical=true.",
+    "Confirm the selected llama.cpp line has n=1 (GEMV), flop_consistency.ok=true, commit.sha length 40.",
+    "Run: AXC_ENABLE_GPU_TESTS=1 VK_DRIVER_FILES=.../nvidia_icd.json cargo test -p axc-driver --test m34_llamacpp_ab -- --ignored  (AT-1761 bit-exact, expect green).",
+    "Confirm the ~87,000x throughput gap reproduces within run-to-run variance (llama.cpp us/run varies ~15.7-15.9 us; AXIOM ~315-317 us GpuTimestamp MIN)."
+  ]
+}

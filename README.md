@@ -12,8 +12,9 @@ AXIOM-Compute makes intent first-class. `@strategy { workgroup_x: ?[32, 64, 128,
 
 ## Current status (2026-06-01)
 
-- **19 milestones merged on `main`**: M0 → M3.3d
-- **868 tests passing**, clippy `--all-targets` clean, zero SPIR-V validation errors
+- **20 milestones merged on `main`**: M0 → M3.4
+- **884 tests passing**, clippy `--all-targets` clean, zero SPIR-V validation errors
+- **llama.cpp Q4_K_M Vulkan A/B (M3.4 — the pre-registered kill-criterion)**: an honest same-machine head-to-head on NVIDIA (matched timer boundary, FLOP-parity-verified, n=1 GEMV, device-match). AXIOM's *frozen M2.6 single-row Q4_K_M matvec* is **~87,000× lower throughput** than llama.cpp's optimized Vulkan kernel → **kill-criterion FAIL on NVIDIA** — the documented baseline. (This is the un-optimized matvec, not the M3.3c register-blocked matmul; an NVIDIA-only FAIL does **not** fire the project kill-criterion, which is "within 15% on *any* vendor" — AMD/Intel pending hardware. Gap-closing path: fuse Q4_K_M dequant onto the 31-TFLOPS coopmat matmul.)
 - **`local_invocation_id()` builtin + multi-subgroup matmul (M3.3d)**: a new within-workgroup-id builtin (GPU-validated). Multi-subgroup blocking was tried and is **bit-exact but slower** (768³ = 24.0 TFLOPS / 19.2%) than single-subgroup register blocking (24.96%) — the halved workgroup count + cross-subgroup barrier outweigh staging amortization. An honest negative perf result; single-subgroup RB remains the best matmul. The builtin is the durable deliverable (unblocks future multi-warp work).
 - **OpPhi loop-carried SSA (M3.3)**: `emit_for_range` now carries cooperative-matrix accumulators across loop iterations via OpPhi (the M3.2 blocker) — **GPU-proven** bit-exact on NVIDIA.
 - **Multi-tile cooperative_matrix matmul (M3.3b/M3.3c)**: a real tiled tensor-core matmul — a grid of workgroups, each K-looping with the OpPhi accumulator — is **bit-exact on NVIDIA** (full M×N) from one annotated `.axc` source → portable coopmat SPIR-V. **2×2 register blocking (M3.3c)** raises throughput with matmul size (honest occupancy tradeoff): 256³ = 3.1 TFLOPS (regresses, under-occupied), 512³ = 14.6, **768³ = 31.2 TFLOPS ≈ 24.96% of the cuBLAS f32 datasheet estimate — a 6.2× gain over the single-tile baseline** (just under the 25% "competitive" bar; still single-subgroup-per-block — multi-warp blocking is a follow-up).
