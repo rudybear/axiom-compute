@@ -142,7 +142,7 @@ fn run_fused(
     }
 
     let k: usize = n_bpr * 256;
-    assert!(m % 32 == 0 && n % 32 == 0, "{at}: M and N must be multiples of 32");
+    assert!(m.is_multiple_of(32) && n.is_multiple_of(32), "{at}: M and N must be multiples of 32");
 
     // Fixtures (non-symmetric).
     let q_bytes = make_q4km_weights(m, n_bpr, 0xC0FFEE ^ (m as u64));

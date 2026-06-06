@@ -224,6 +224,7 @@ pub fn max_rel_diff(gpu: &[f32], reference: &[f32]) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
     use super::*;
 
     /// round_f32_to_f16_to_f32 is idempotent for exactly-representable f16 values.
