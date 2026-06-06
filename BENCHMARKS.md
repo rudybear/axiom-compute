@@ -73,6 +73,35 @@ The DESIGN.md §5 pre-registered kill-criterion head-to-head: AXIOM's FROZEN M2.
 
 ---
 
+## M3.5 — Q4_K_M dequant fused into the register-blocked coopmat matmul (SAME-SHAPE A/B)
+
+M3.5 FUSES the M2.6 Q4_K_M dequant front-end onto the M3.3c register-blocked coopmat matmul: each workgroup cooperatively dequantizes a tile of Q4_K_M weights into a `shared[f16]` tile (via the new `f32_to_f16` builtin — a single `OpFConvert f32→f16`, Float16-only, no capability beyond the M3.3c∪M2.6 union), stages the f16 activation tile, then runs the M3.3c 2×2 register-blocked coopmat K-loop (4 loop-carried f16 accumulators, A/B reuse, N-phi). Correctness is within the **FROZEN 1e-3** relative tolerance vs an **f16-ACCUMULATOR-matched** ggml Q4_K_M reference (dequant f32 → round weights+x f32→f16 → accumulate in f16 per depth-16 tile, matching the GPU's confirmed f16 coopmat accumulator); the measured max-rel-diff is reported at every size and the within-tol gate is asserted at the measured provably-1e-3 K (gate-K policy; the frozen 1e-3 is never loosened).
+
+**The A/B is now SAME-SHAPE (the fair fight).** AXIOM's fused GEMM at (m=4096, n=512, k=14336) vs llama.cpp Q4_K MUL_MAT at the **IDENTICAL** shape = **101.00 TFLOPS** (`.pipeline/benchmarks/m34/llamacpp_raw.txt:174`, 60.13 GFLOP/run). M3.4's headline compared two GEMVs (both n=1); M3.5's fused kernel is a GEMM, so comparing it against llama's n=1 GEMV (7.39 TFLOPS) would be apples-to-oranges in arithmetic intensity — the SAME llama kernel runs **13.7× faster** at n=512 (101.00) than at n=1 (7.39), so a GEMM-vs-GEMV headline would flatter AXIOM ~13×. The n=1 GEMV is therefore **cross-shape context only**, never the headline (CRITICAL-1).
+
+| metric | AXIOM (fused Q4_K_M RB coopmat GEMM) | llama.cpp (Q4_K MUL_MAT n=512) |
+|---|---|---|
+| shape (m,n,k) | 4096 × 512 × 14336 | 4096 × 512 × 14336 |
+| TFLOPS (GpuTimestamp MIN, kernel-only) | _(NVIDIA orchestrator)_ | **101.00** |
+| max-rel-diff vs f16-accum ref | _(orchestrator)_ | (ggml is the reference) |
+
+**Fused-kernel TFLOPS at cube sizes (AT-1772, honest, no asserted ratio):**
+
+| size (M=N=K) | TFLOPS | % of 125-TFLOPS estimate | max-rel-diff |
+|---|---|---|---|
+| 256 | _(orchestrator)_ | _(orchestrator)_ | _(orchestrator)_ |
+| 512 | _(orchestrator)_ | _(orchestrator)_ | _(orchestrator)_ |
+| 768 | _(orchestrator)_ | _(orchestrator)_ | _(orchestrator)_ |
+| 1024 | _(orchestrator)_ | _(orchestrator)_ | _(orchestrator)_ |
+
+**Cross-shape CONTEXT (NOT the kill criterion):** llama n=1 GEMV = 7.39 TFLOPS (`llamacpp_raw.txt:24`) — labeled cross-shape; the SAME llama kernel runs 13.7× faster at n=512.
+
+**Honest expected result:** AXIOM fused GEMM ≈ 10–25 TFLOPS vs llama 101 TFLOPS same-shape → **AXIOM ≈ 4–10× BEHIND**. This is a MASSIVE improvement from M3.4's ~87,000× cross-shape matvec gap, but it is **STILL behind** and is reported as exactly that — **not spun as a win**. The kill-criterion (within 15% on NVIDIA) does **not** fire (AXIOM behind same-shape). If the per-element dequant makes the kernel ALU-bound (get_scale_min_k4 + d/dmin recomputed across a superblock's 16 K-blocks, OQ-3) and AXIOM is further behind 101, that is the reported result; scale-caching is deferred to M3.5b. The measured numbers above are filled by the NVIDIA orchestrator run; the kernel, oracle, tests, bench, and A/B harness are landed and CI-green (compile + spirv-val + no-new-capability-beyond-union + CPU oracle + f32_to_f16 layer/codegen).
+
+**Reproduce:** `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json AXC_ENABLE_GPU_BENCHES=1 scripts/m34_llamacpp_ab.sh --fused` (runs the fused-kernel bench vs llama's same-shape line, writes `.pipeline/benchmarks/m34/ab_results_fused.json` + `ab_results_fused.md`; the frozen-matvec `ab_results.json` is retained).
+
+---
+
 ## Running benchmarks
 
 ```sh

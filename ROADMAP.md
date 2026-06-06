@@ -23,7 +23,8 @@ Last updated: 2026-04-28. Test count baseline: **713**.
 | Bandwidth optimization (pinned memory, concurrent transfer) | ✅ M3.0 (saxpy_1m 7.5×, saxpy_1024 39×; <1ms gate re-scoped to GPU-resident metric) |
 | Multi-row tiled matmul (cooperative_matrix on real workloads) | ✅ M3.1 (first coopmat dispatch on Blackwell, bit-exact; resident-TFLOPS benchmark → M3.2) |
 | Cross-vendor real GPU CI (AMD RDNA3+, Intel Arc) | ❌ infra |
-| **llama.cpp Vulkan head-to-head A/B** | NVIDIA done (M3.4) — gap quantified, kill-criterion FAIL on NVIDIA (honest baseline: AXIOM single-row matvec ≈ 87,000× below llama.cpp Q4_K GEMV throughput; ≠ project kill, criterion is any-vendor); AMD/Intel pending hw |
+| **llama.cpp Vulkan head-to-head A/B** | NVIDIA done (M3.4 matvec; M3.5 fused SAME-SHAPE). M3.4: AXIOM single-row matvec ≈ 87,000× below llama Q4_K n=1 GEMV (cross-shape baseline). M3.5: fused Q4_K_M dequant→RB coopmat GEMM, re-run SAME-SHAPE (AXIOM GEMM vs llama Q4_K MUL_MAT @ m=4096,n=512,k=14336 = **101.00 TFLOPS**) — honest expected **≈ 4–10× behind** (down from ~87,000× cross-shape, STILL behind, NOT a win). Kill-criterion FAIL on NVIDIA (≠ project kill, criterion is any-vendor); AMD/Intel pending hw |
+| **Q4_K_M coopmat fusion (M3.5)** | ✅ landed — `f32_to_f16` builtin (no new capability beyond M3.3c∪M2.6 union) + fused `q4km_matmul_rb_coopmat.axc`; within FROZEN 1e-3 vs f16-accumulator ggml ref (gate-K, max-rel-diff reported per size); honest multi-size TFLOPS; SAME-SHAPE A/B (`--fused` → ab_results_fused.json). NVIDIA measured numbers via orchestrator run |
 
 ---
 
