@@ -9,3 +9,9 @@ Cargo.lock.bak
 .idea/
 *.swp
 *.log
+# M3.4: cloned + built llama.cpp tree (large external tree, own license) — NEVER committed.
+# The A/B RESULTS (ab_results.json/.md) under .pipeline/benchmarks/m34/ ARE committed (the
+# numbers are the deliverable); the large raw captures are intermediates, NOT committed.
+/vendor/
+.pipeline/benchmarks/m34/llamacpp_raw.txt
+.pipeline/benchmarks/m34/axiom_bench_raw.txt
