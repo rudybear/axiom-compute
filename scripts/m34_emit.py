@@ -54,6 +54,16 @@ llama_k = int_or_none("M34_LLAMA_K")
 llama_runs = int_or_none("M34_LLAMA_RUNS")
 q4k_line = env("M34_Q4K_LINE")
 
+# M3.5 (--fused) discriminators (CRITICAL-1): SAME-SHAPE headline + cross-shape context.
+axc_kernel = env("M34_AXC_KERNEL", "matvec")  # "matvec" (M3.4) | "fused" (M3.5)
+is_fused = axc_kernel == "fused"
+axc_m_out = int_or_none("M34_AXC_M") or 1      # AXIOM fused GEMM output rows
+axc_n_out = int_or_none("M34_AXC_N") or 1      # AXIOM fused GEMM output cols
+axc_max_rel_diff = num_or_none("M34_AXC_MAX_REL_DIFF")
+llama_sameshape_tflops = num_or_none("M34_LLAMA_SAMESHAPE_TFLOPS")
+llama_gemv_context_tflops = num_or_none("M34_LLAMA_GEMV_CONTEXT_TFLOPS")
+q4k_sameshape_line = env("M34_Q4K_SAMESHAPE_LINE")
+
 # AXIOM derived numbers (work-normalized TFLOPS, dequant excluded).
 axc_us_min = axc_ns_min / 1e3
 axc_us_sustained = axc_sustained_ns / 1e3
@@ -63,6 +73,8 @@ axc_tflops_sustained = axc_flops / (axc_sustained_ns * 1e-9) / 1e12 if axc_susta
 flop_consistency = {"checked": False, "ok": None}
 ratio_tflops = None
 ratio_boundary_label = None
+headline_basis = None
+cross_shape_context = None
 
 if not incomplete and llama_us is not None and llama_k is not None and llama_m is not None:
     # FLOP-consistency (WARNING-3): recompute llama.cpp GFLOPS from its us + m/n/k vs its
@@ -89,14 +101,40 @@ if not incomplete and llama_us is not None and llama_k is not None and llama_m i
         kill_reason = (f"device-match failed (not byte-identical): "
                        f"AXIOM='{axc_device}' llama='{llama_device}'")
         incomplete = 1
+    elif is_fused:
+        # M3.5 SAME-SHAPE headline (CRITICAL-1): AXIOM fused GEMM (GpuTimestamp MIN,
+        # kernel-only) vs llama Q4_K MUL_MAT at the IDENTICAL (m=4096,n=512,k=14336).
+        # The headline + within-15% verdict come from the SAME-SHAPE llama number ONLY.
+        denom = llama_sameshape_tflops if llama_sameshape_tflops else llama_tflops
+        ratio_tflops = axc_tflops_min / denom
+        ratio_boundary_label = (
+            "SAME-SHAPE GEMM-vs-GEMM: AXIOM fused GEMM (GpuTimestamp MIN, kernel-only) vs "
+            "llama.cpp Q4_K MUL_MAT at the IDENTICAL m=4096,n=512,k=14336 (101.00 TFLOPS). "
+            "Headline + verdict computed from the same-shape llama number; the n=1 GEMV is "
+            "cross-shape context only.")
+        headline_basis = "same_shape_gemm m=4096,n=512,k=14336"
+        within_15 = ratio_tflops >= 0.85
+        kill_status = "PASS" if within_15 else "FAIL"
+        # Cross-shape context block (labeled, NEVER the headline / verdict input).
+        cross_shape_context = {
+            "axiom_gemm_tflops": round(axc_tflops_min, 4) if axc_tflops_min else None,
+            "llama_n1_gemv_tflops": llama_gemv_context_tflops,
+            "axiom_over_llama_n1_ratio": (
+                round(axc_tflops_min / llama_gemv_context_tflops, 4)
+                if (axc_tflops_min and llama_gemv_context_tflops) else None),
+            "note": ("cross-shape, NOT the kill criterion — llama's n=1 is a memory-bound "
+                     "GEMV at ~13.7x lower arithmetic intensity than its own n=512 GEMM; "
+                     "headlining AXIOM-GEMM vs llama-n1-GEMV would flatter AXIOM ~13x."),
+        }
     else:
-        # Like-for-like THROUGHPUT ratio. HEADLINE uses the matched (sustained CPU-wall)
-        # boundary; the GpuTimestamp-MIN framing is reported alongside for disclosure.
+        # M3.4 matvec: like-for-like THROUGHPUT ratio at the matched (sustained CPU-wall)
+        # boundary; GpuTimestamp-MIN reported alongside for disclosure.
         ratio_tflops = axc_tflops_sustained / llama_tflops
         ratio_boundary_label = (
             "AXIOM-sustained-CPU-wall (matched to llama.cpp sustained CPU-wall MEAN) vs "
             "llama.cpp sustained TFLOPS; GpuTimestamp-MIN framing reported alongside for "
             "disclosure")
+        headline_basis = "same_shape_gemv m=4096,n=1,k=14336"
         within_15 = ratio_tflops >= 0.85
         kill_status = "PASS" if within_15 else "FAIL"
 
@@ -117,7 +155,8 @@ verbatim_excerpt = (
 )
 
 out = {
-    "milestone": "M3.4-llamacpp-ab",
+    "milestone": "M3.5-llamacpp-ab-fused" if is_fused else "M3.4-llamacpp-ab",
+    "axiom_kernel": axc_kernel,
     "generated_by": "scripts/m34_llamacpp_ab.sh + scripts/m34_emit.py",
     "commit": {"tag": env("M34_LLAMACPP_TAG"), "sha": env("M34_LLAMACPP_COMMIT")},
     "icd": env("M34_ICD"),
@@ -158,9 +197,18 @@ out = {
         "tflops_sustained_cpuwall": round(axc_tflops_sustained, 6) if axc_tflops_sustained else None,
         "timing_source": axc_timing,
         "flops_per_dispatch": axc_flops,
-        "flops_convention": "matmul-equivalent FLOPs, dequant EXCLUDED (2*M*K, M=1)",
-        "note": ("single workgroup, ONE output row (the M2.6 'if i>=1 return' guard) — "
-                 "~1 of ~188 SMs occupied"),
+        "flops_convention": (
+            f"matmul MACs, dequant EXCLUDED (2*M*N*K, M={axc_m_out}, N={axc_n_out})"
+            if is_fused else "matmul-equivalent FLOPs, dequant EXCLUDED (2*M*K, M=1)"),
+        "fused_output_m": axc_m_out if is_fused else None,
+        "fused_output_n": axc_n_out if is_fused else None,
+        "fused_max_rel_diff": axc_max_rel_diff if is_fused else None,
+        "note": (
+            "FUSED Q4_K_M dequant + 2x2 register-blocked coopmat matmul; full (N/32,M/32,1) "
+            "grid (NOT the single-row matvec). GpuTimestamp MIN is the kernel-only number."
+            if is_fused else
+            "single workgroup, ONE output row (the M2.6 'if i>=1 return' guard) — "
+            "~1 of ~188 SMs occupied"),
     },
     "llamacpp": {
         "selected_line": q4k_line,
@@ -169,26 +217,47 @@ out = {
     },
     "flop_consistency": flop_consistency,
     "ratio_boundary_label": ratio_boundary_label,
+    "headline_basis": headline_basis,
+    "headline_ratio": round(ratio_tflops, 5) if ratio_tflops is not None else None,
     "ratio_axiom_over_llama_tflops": round(ratio_tflops, 5) if ratio_tflops is not None else None,
     "llama_over_axiom_speedup_tflops": round(1.0 / ratio_tflops, 2) if ratio_tflops else None,
+    "cross_shape_context": cross_shape_context,
+    "axiom_fused_max_rel_diff": axc_max_rel_diff,
     "kill_criterion_within_15pct": (kill_status == "PASS") if kill_status in ("PASS", "FAIL") else None,
     "kill_criterion_status": kill_status,
     "kill_criterion_reason": kill_reason,
-    "kill_criterion_qualifier": ("NVIDIA-only FAIL with the current FROZEN M2.6 single-row "
-                                 "matvec is the documented baseline; DESIGN §5 kill-criterion "
-                                 "is 'within 15% on ANY vendor', so this does NOT fire the "
-                                 "project kill-criterion. AMD/Intel halves pending cross-vendor "
-                                 "hardware (EB.1)."),
-    "fairness_caveat": ("Same machine, same ICD, kernel-only-vs-kernel-only, identical "
-                        "K=14336 contraction, FLOP convention identical (2*m*n*k matmul MACs, "
-                        "dequant excluded). BOTH kernels are CORRECT (AXIOM bit-exact vs ggml "
-                        "CPU ref; llama.cpp IS ggml). AXIOM is single-row matvec (1 workgroup) "
-                        "vs llama.cpp's tiled multi-row MUL_MAT (all SMs) — ~structurally 100x "
-                        "under-parallelized. Ratio reported AS MEASURED; honest expected FAIL."),
-    "gap_closing_path": ("Fuse the Q4_K_M dequant front-end onto the M3.3c register-blocked "
-                         "coopmat matmul (dequant -> shared f16 tile -> coopmat mul_add; "
-                         "plain-f16 reached 31.2 TFLOPS = 24.96% of datasheet). Follow-up "
-                         "milestone."),
+    "kill_criterion_qualifier": (
+        ("M3.5 SAME-SHAPE fused GEMM vs llama's same-shape Q4_K MUL_MAT (101.00 TFLOPS). "
+         "AXIOM is expected to be ~4-10x BEHIND — a MASSIVE improvement from M3.4's "
+         "~87,000x cross-shape matvec, but STILL behind (NOT a win). DESIGN §5 kill-criterion "
+         "is 'within 15% on ANY vendor'; this does NOT fire (AXIOM behind). AMD/Intel pending "
+         "hardware (EB.1).")
+        if is_fused else
+        ("NVIDIA-only FAIL with the current FROZEN M2.6 single-row matvec is the documented "
+         "baseline; DESIGN §5 kill-criterion is 'within 15% on ANY vendor', so this does NOT "
+         "fire the project kill-criterion. AMD/Intel halves pending cross-vendor hardware (EB.1).")),
+    "fairness_caveat": (
+        ("Same machine, same ICD, kernel-only-vs-kernel-only, SAME SHAPE (m=4096,n=512,k=14336 "
+         "both sides), FLOP convention identical (2*m*n*k matmul MACs, dequant excluded). AXIOM's "
+         "fused kernel is correct within the frozen 1e-3 vs the f16-accumulator ggml reference. "
+         "Ratio reported AS MEASURED; honest expected ~4-10x behind. The n=1 GEMV (llama 7.39 "
+         "TFLOPS) is cross-shape CONTEXT ONLY — never the headline (the SAME llama kernel runs "
+         "13.7x faster at n=512), so headlining AXIOM-GEMM vs llama-n1-GEMV would flatter AXIOM "
+         "~13x; that is forbidden (CRITICAL-1).")
+        if is_fused else
+        ("Same machine, same ICD, kernel-only-vs-kernel-only, identical K=14336 contraction, FLOP "
+         "convention identical (2*m*n*k matmul MACs, dequant excluded). BOTH kernels are CORRECT "
+         "(AXIOM bit-exact vs ggml CPU ref; llama.cpp IS ggml). AXIOM is single-row matvec (1 "
+         "workgroup) vs llama.cpp's tiled multi-row MUL_MAT (all SMs) — ~structurally 100x "
+         "under-parallelized. Ratio reported AS MEASURED; honest expected FAIL.")),
+    "gap_closing_path": (
+        ("M3.5 closed the M3.4 ~87,000x cross-shape gap to a single-digit same-shape ratio. "
+         "Remaining gap (if ALU-bound): scale-caching across the 16 tile_k K-blocks of a "
+         "superblock (OQ-3 → M3.5b) and an f32-accumulator coopmat shape for large-K precision.")
+        if is_fused else
+        ("Fuse the Q4_K_M dequant front-end onto the M3.3c register-blocked coopmat matmul "
+         "(dequant -> shared f16 tile -> coopmat mul_add; plain-f16 reached 31.2 TFLOPS = "
+         "24.96% of datasheet). Follow-up milestone (M3.5).")),
 }
 
 with open(env("M34_RESULTS_JSON"), "w") as f:
@@ -203,43 +272,78 @@ def fmt(x, d=3):
 
 
 md = []
-md.append("# M3.4 — llama.cpp Vulkan Q4_K_M A/B (NVIDIA RTX PRO 6000)\n")
+if is_fused:
+    md.append("# M3.5 — llama.cpp Vulkan Q4_K_M A/B, FUSED kernel, SAME-SHAPE (NVIDIA RTX PRO 6000)\n")
+else:
+    md.append("# M3.4 — llama.cpp Vulkan Q4_K_M A/B (NVIDIA RTX PRO 6000)\n")
 md.append(f"- llama.cpp: tag `{out['commit']['tag']}` sha `{out['commit']['sha']}`")
 md.append(f"- device (both): `{axc_device}` | ICD `{out['icd']}` | device_match byte-identical: {out['device_match']['byte_identical']}")
 md.append(f"- K contraction (both): {axc_k}")
 md.append("")
-md.append("| metric | AXIOM (M2.6 single-row matvec) | llama.cpp (Q4_K MUL_MAT n=1) |")
-md.append("|---|---|---|")
-md.append(f"| output rows | 1 | {fmt(llama_m)} |")
-md.append(f"| us/dispatch (GpuTimestamp MIN) | {fmt(axc_us_min)} | (CPU-wall) |")
-md.append(f"| us/op (sustained CPU-wall) | {fmt(axc_us_sustained)} | {fmt(llama_us, 2)} |")
-md.append(f"| TFLOPS (GpuTimestamp MIN) | {fmt(axc_tflops_min, 4)} | — |")
-md.append(f"| TFLOPS (sustained CPU-wall) | {fmt(axc_tflops_sustained, 4)} | {fmt(llama_tflops, 2)} |")
-md.append("")
-md.append(f"- **Headline ratio (AXIOM/llama, work-normalized TFLOPS, matched sustained boundary): {fmt(out['ratio_axiom_over_llama_tflops'], 5)}** (llama.cpp {fmt(out['llama_over_axiom_speedup_tflops'], 2)}x faster)")
+if is_fused:
+    md.append("| metric | AXIOM (fused Q4_K_M RB coopmat GEMM) | llama.cpp (Q4_K MUL_MAT n=512) |")
+    md.append("|---|---|---|")
+    md.append(f"| shape (m,n,k) | ({axc_m_out},{axc_n_out},{axc_k}) | ({fmt(llama_m)},{fmt(llama_n)},{fmt(llama_k)}) |")
+    md.append(f"| TFLOPS (GpuTimestamp MIN, kernel-only) | {fmt(axc_tflops_min, 3)} | {fmt(llama_sameshape_tflops, 2)} |")
+    md.append(f"| max-rel-diff vs f16-accum ref | {fmt(axc_max_rel_diff, 3) if axc_max_rel_diff is not None else 'n/a'} | (ggml is the ref) |")
+    md.append("")
+    md.append(f"- **SAME-SHAPE headline ratio (AXIOM fused GEMM / llama same-shape, basis `{headline_basis}`): "
+              f"{fmt(out['headline_ratio'], 5)}** (llama {fmt(out['llama_over_axiom_speedup_tflops'], 2)}x faster)")
+    if cross_shape_context:
+        md.append(f"- Cross-shape CONTEXT (NOT the kill criterion): AXIOM fused GEMM {fmt(cross_shape_context.get('axiom_gemm_tflops'),3)} TFLOPS "
+                  f"vs llama n=1 GEMV {fmt(cross_shape_context.get('llama_n1_gemv_tflops'),2)} TFLOPS "
+                  f"(ratio {fmt(cross_shape_context.get('axiom_over_llama_n1_ratio'),3)}) — labeled cross-shape, never the headline.")
+else:
+    md.append("| metric | AXIOM (M2.6 single-row matvec) | llama.cpp (Q4_K MUL_MAT n=1) |")
+    md.append("|---|---|---|")
+    md.append(f"| output rows | 1 | {fmt(llama_m)} |")
+    md.append(f"| us/dispatch (GpuTimestamp MIN) | {fmt(axc_us_min)} | (CPU-wall) |")
+    md.append(f"| us/op (sustained CPU-wall) | {fmt(axc_us_sustained)} | {fmt(llama_us, 2)} |")
+    md.append(f"| TFLOPS (GpuTimestamp MIN) | {fmt(axc_tflops_min, 4)} | — |")
+    md.append(f"| TFLOPS (sustained CPU-wall) | {fmt(axc_tflops_sustained, 4)} | {fmt(llama_tflops, 2)} |")
+    md.append("")
+    md.append(f"- **Headline ratio (AXIOM/llama, work-normalized TFLOPS, matched sustained boundary): {fmt(out['ratio_axiom_over_llama_tflops'], 5)}** (llama.cpp {fmt(out['llama_over_axiom_speedup_tflops'], 2)}x faster)")
 md.append(f"- FLOP-consistency: ok={flop_consistency.get('ok')} (recomputed {fmt(flop_consistency.get('recomputed_tflops'), 3)} vs reported {fmt(flop_consistency.get('reported_tflops'), 3)} TFLOPS)")
 md.append(f"- **Kill-criterion (DESIGN §5, within 15% on NVIDIA): {kill_status}**" + (f" — {kill_reason}" if kill_reason else ""))
 md.append(f"- Qualifier: {out['kill_criterion_qualifier']}")
 md.append(f"- Fairness caveat: {out['fairness_caveat']}")
 md.append(f"- Gap-closing path: {out['gap_closing_path']}")
 md.append("")
-md.append("Reproduce: `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json AXC_ENABLE_GPU_BENCHES=1 scripts/m34_llamacpp_ab.sh`")
+_repro_flag = " --fused" if is_fused else ""
+md.append(f"Reproduce: `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json AXC_ENABLE_GPU_BENCHES=1 scripts/m34_llamacpp_ab.sh{_repro_flag}`")
 md.append("")
 with open(env("M34_RESULTS_MD"), "w") as f:
     f.write("\n".join(md))
 
 # Console summary.
+_tmin = axc_tflops_min if axc_tflops_min is not None else 0.0
+_tsus = axc_tflops_sustained if axc_tflops_sustained is not None else 0.0
 print("")
 print("=" * 78)
-print("M3.4 A/B RESULT (NVIDIA RTX PRO 6000 Blackwell, same ICD, kernel-only):")
-print("-" * 78)
-print(f"  AXIOM   : {axc_us_min:.2f} us (GpuTs MIN) / {axc_tflops_min:.4f} TFLOPS | "
-      f"sustained {axc_us_sustained:.2f} us / {axc_tflops_sustained:.4f} TFLOPS")
-if llama_us is not None:
-    print(f"  llama   : {llama_us:.2f} us/op (CPU-wall sustained) / {llama_tflops:.2f} TFLOPS  "
-          f"[m={llama_m}, n={llama_n}, k={llama_k}]")
+if is_fused:
+    print("M3.5 A/B RESULT — FUSED kernel, SAME-SHAPE (NVIDIA RTX PRO 6000, same ICD, kernel-only):")
+    print("-" * 78)
+    print(f"  AXIOM   : fused GEMM ({axc_m_out}x{axc_n_out}x{axc_k}) = {_tmin:.3f} TFLOPS "
+          f"(GpuTs MIN) | max_rel_diff={axc_max_rel_diff if axc_max_rel_diff is not None else 'n/a'}")
+    if llama_sameshape_tflops is not None:
+        print(f"  llama   : same-shape Q4_K MUL_MAT = {llama_sameshape_tflops:.2f} TFLOPS "
+              f"[m={llama_m}, n={llama_n}, k={llama_k}]")
     if ratio_tflops is not None:
-        print(f"  ratio   : AXIOM/llama (TFLOPS) = {ratio_tflops:.5f}  => llama is {1.0 / ratio_tflops:.1f}x faster")
+        print(f"  ratio   : AXIOM/llama SAME-SHAPE (TFLOPS) = {ratio_tflops:.5f}  => llama is "
+              f"{1.0 / ratio_tflops:.1f}x faster (HONEST — still behind, NOT a win)")
+    if cross_shape_context and cross_shape_context.get("llama_n1_gemv_tflops"):
+        print(f"  context : (NOT the headline) llama n=1 GEMV = "
+              f"{cross_shape_context['llama_n1_gemv_tflops']:.2f} TFLOPS — cross-shape only")
+else:
+    print("M3.4 A/B RESULT (NVIDIA RTX PRO 6000 Blackwell, same ICD, kernel-only):")
+    print("-" * 78)
+    print(f"  AXIOM   : {axc_us_min:.2f} us (GpuTs MIN) / {_tmin:.4f} TFLOPS | "
+          f"sustained {axc_us_sustained:.2f} us / {_tsus:.4f} TFLOPS")
+    if llama_us is not None:
+        print(f"  llama   : {llama_us:.2f} us/op (CPU-wall sustained) / {llama_tflops:.2f} TFLOPS  "
+              f"[m={llama_m}, n={llama_n}, k={llama_k}]")
+        if ratio_tflops is not None:
+            print(f"  ratio   : AXIOM/llama (TFLOPS) = {ratio_tflops:.5f}  => llama is {1.0 / ratio_tflops:.1f}x faster")
 print(f"  KILL-CRITERION (within 15% on NVIDIA): {kill_status}" + (f" ({kill_reason})" if kill_reason else ""))
 print("  Qualifier: NVIDIA-only; criterion is any-vendor; AMD/Intel pending hw.")
 print("=" * 78)

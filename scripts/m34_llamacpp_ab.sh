@@ -39,18 +39,26 @@ ICD="${VK_DRIVER_FILES:-/usr/share/vulkan/icd.d/nvidia_icd.json}"
 
 SKIP_BUILD=0
 SKIP_LLAMA=0
+FUSED=0   # M3.5: --fused switches to the SAME-SHAPE fused-kernel A/B (AT-1774).
 for arg in "$@"; do
     case "$arg" in
         --skip-build) SKIP_BUILD=1 ;;
         --skip-llama) SKIP_LLAMA=1 ;;
+        --fused) FUSED=1 ;;
         *) echo "unknown arg: $arg" >&2; exit 2 ;;
     esac
 done
 
 mkdir -p "$OUTDIR"
 RAW="${OUTDIR}/llamacpp_raw.txt"
-RESULTS_JSON="${OUTDIR}/ab_results.json"
-RESULTS_MD="${OUTDIR}/ab_results.md"
+# M3.5 (--fused) writes a DISTINCT artifact; the frozen-matvec ab_results.json is kept.
+if [ "${FUSED}" -eq 1 ]; then
+    RESULTS_JSON="${OUTDIR}/ab_results_fused.json"
+    RESULTS_MD="${OUTDIR}/ab_results_fused.md"
+else
+    RESULTS_JSON="${OUTDIR}/ab_results.json"
+    RESULTS_MD="${OUTDIR}/ab_results.md"
+fi
 
 export VK_DRIVER_FILES="$ICD"
 
@@ -125,50 +133,99 @@ echo "-- llama.cpp device: ${LLAMA_DEVICE}"
 # Strip ANSI color codes for parsing.
 CLEAN_RAW="$(sed 's/\x1b\[[0-9;]*m//g' "${RAW}")"
 
-# Select the Q4_K MUL_MAT n==1 (GEMV) case. CRITICAL-2: if none, INCOMPLETE.
+# Helper: parse one Q4_K line into TFLOPS / m / n / k / us / runs (echoed space-separated).
+parse_q4k_line() {
+    local line="$1"
+    local _m _n _k _runs _us _tf
+    _m="$(echo "${line}" | sed -n 's/.*[,(]m=\([0-9]*\).*/\1/p')"
+    _n="$(echo "${line}" | sed -n 's/.*,n=\([0-9]*\),.*/\1/p')"
+    _k="$(echo "${line}" | sed -n 's/.*,k=\([0-9]*\),.*/\1/p')"
+    _runs="$(echo "${line}" | sed -n 's/.*[:)] *\([0-9]*\) runs.*/\1/p')"
+    _us="$(echo "${line}" | sed -n 's/.* runs - *\([0-9.]*\) us\/run.*/\1/p')"
+    _tf="$(echo "${line}" | sed -n 's/.* - *\([0-9.]*\) TFLOPS.*/\1/p')"
+    echo "${_m} ${_n} ${_k} ${_runs} ${_us} ${_tf}"
+}
+
+# The n==1 (GEMV) case — CROSS-SHAPE CONTEXT in --fused mode; the headline in matvec mode.
 Q4K_N1_LINE="$(printf '%s\n' "${CLEAN_RAW}" \
     | grep 'MUL_MAT(type_a=q4_K' | grep ',n=1,' | head -1 || true)"
+# The n==512 SAME-SHAPE case — the HEADLINE in --fused mode (m=4096,n=512,k=14336=101 TFLOPS).
+Q4K_N512_LINE="$(printf '%s\n' "${CLEAN_RAW}" \
+    | grep 'MUL_MAT(type_a=q4_K' | grep ',m=4096,n=512,k=14336,' | head -1 || true)"
 
 KILL_STATUS="FAIL"          # mechanical; expected FAIL on NVIDIA
 KILL_REASON=""
 INCOMPLETE=0
+# Defaults.
+LLAMA_US="null"; LLAMA_TFLOPS="null"; LLAMA_M="null"; LLAMA_N="null"; LLAMA_K="null"; LLAMA_RUNS="null"
+LLAMA_SAMESHAPE_TFLOPS="null"; LLAMA_GEMV_CONTEXT_TFLOPS="null"
 
+# ── n==1 GEMV parse (kill-criterion headline in matvec mode; context in fused mode) ─
 if [ -z "${Q4K_N1_LINE}" ]; then
-    KILL_STATUS="INCOMPLETE"
-    KILL_REASON="no type_a=q4_K MUL_MAT n==1 (GEMV) case found in test-backend-ops perf output (CRITICAL-2: GEMM substitution forbidden)"
-    INCOMPLETE=1
-    LLAMA_US="null"; LLAMA_TFLOPS="null"; LLAMA_M="null"; LLAMA_N="null"; LLAMA_K="null"; LLAMA_RUNS="null"
-else
-    echo "-- selected Q4_K n==1 line:"
-    echo "   ${Q4K_N1_LINE}"
-    # Parse m,n,k and us/run and TFLOPS.
-    LLAMA_M="$(echo "${Q4K_N1_LINE}" | sed -n 's/.*[,(]m=\([0-9]*\).*/\1/p')"
-    LLAMA_N="$(echo "${Q4K_N1_LINE}" | sed -n 's/.*,n=\([0-9]*\),.*/\1/p')"
-    LLAMA_K="$(echo "${Q4K_N1_LINE}" | sed -n 's/.*,k=\([0-9]*\),.*/\1/p')"
-    LLAMA_RUNS="$(echo "${Q4K_N1_LINE}" | sed -n 's/.*[:)] *\([0-9]*\) runs.*/\1/p')"
-    LLAMA_US="$(echo "${Q4K_N1_LINE}" | sed -n 's/.* runs - *\([0-9.]*\) us\/run.*/\1/p')"
-    LLAMA_TFLOPS="$(echo "${Q4K_N1_LINE}" | sed -n 's/.* - *\([0-9.]*\) TFLOPS.*/\1/p')"
-
-    if [ -z "${LLAMA_M}" ] || [ -z "${LLAMA_K}" ] || [ -z "${LLAMA_US}" ] || [ -z "${LLAMA_TFLOPS}" ]; then
+    if [ "${FUSED}" -eq 0 ]; then
         KILL_STATUS="INCOMPLETE"
-        KILL_REASON="failed to parse m/k/us/TFLOPS from the selected Q4_K line (format drift)"
+        KILL_REASON="no type_a=q4_K MUL_MAT n==1 (GEMV) case found (CRITICAL-2: GEMM substitution forbidden)"
         INCOMPLETE=1
+    fi
+else
+    echo "-- Q4_K n==1 (GEMV) line:"
+    echo "   ${Q4K_N1_LINE}"
+    read -r N1_M N1_N N1_K N1_RUNS N1_US N1_TF <<< "$(parse_q4k_line "${Q4K_N1_LINE}")"
+    LLAMA_GEMV_CONTEXT_TFLOPS="${N1_TF}"
+    if [ "${FUSED}" -eq 0 ]; then
+        LLAMA_M="${N1_M}"; LLAMA_N="${N1_N}"; LLAMA_K="${N1_K}"
+        LLAMA_RUNS="${N1_RUNS}"; LLAMA_US="${N1_US}"; LLAMA_TFLOPS="${N1_TF}"
+        if [ -z "${LLAMA_M}" ] || [ -z "${LLAMA_K}" ] || [ -z "${LLAMA_US}" ] || [ -z "${LLAMA_TFLOPS}" ]; then
+            KILL_STATUS="INCOMPLETE"
+            KILL_REASON="failed to parse m/k/us/TFLOPS from the n=1 Q4_K line (format drift)"
+            INCOMPLETE=1
+        fi
     fi
 fi
 
-# ── 5. AXIOM side: run the dispatch_q4km_ab bench, parse the AXC_Q4KM_AB line ─────────────
-echo "-- running AXIOM dispatch_q4km_ab bench"
+# ── n==512 SAME-SHAPE parse (kill-criterion headline in --fused mode, CRITICAL-1) ──
+if [ "${FUSED}" -eq 1 ]; then
+    if [ -z "${Q4K_N512_LINE}" ]; then
+        KILL_STATUS="INCOMPLETE"
+        KILL_REASON="no type_a=q4_K MUL_MAT same-shape (m=4096,n=512,k=14336) case found (CRITICAL-1: SAME-SHAPE headline required)"
+        INCOMPLETE=1
+    else
+        echo "-- Q4_K SAME-SHAPE (m=4096,n=512,k=14336) line:"
+        echo "   ${Q4K_N512_LINE}"
+        read -r S_M S_N S_K S_RUNS S_US S_TF <<< "$(parse_q4k_line "${Q4K_N512_LINE}")"
+        LLAMA_M="${S_M}"; LLAMA_N="${S_N}"; LLAMA_K="${S_K}"
+        LLAMA_RUNS="${S_RUNS}"; LLAMA_US="${S_US}"; LLAMA_TFLOPS="${S_TF}"
+        LLAMA_SAMESHAPE_TFLOPS="${S_TF}"
+        if [ -z "${LLAMA_M}" ] || [ -z "${LLAMA_K}" ] || [ -z "${LLAMA_US}" ] || [ -z "${LLAMA_TFLOPS}" ]; then
+            KILL_STATUS="INCOMPLETE"
+            KILL_REASON="failed to parse m/n/k/us/TFLOPS from the same-shape Q4_K line (format drift)"
+            INCOMPLETE=1
+        fi
+    fi
+fi
+
+# ── 5. AXIOM side: run the AXIOM bench, parse its anchored line ───────────────────────────
+if [ "${FUSED}" -eq 1 ]; then
+    AXC_BENCH="resident_q4km_matmul_rb"
+    AXC_PREFIX="AXC_Q4KM_AB_FUSED"
+    AXC_KERNEL="fused"
+else
+    AXC_BENCH="dispatch_q4km_ab"
+    AXC_PREFIX="AXC_Q4KM_AB"
+    AXC_KERNEL="matvec"
+fi
+echo "-- running AXIOM ${AXC_BENCH} bench (kernel=${AXC_KERNEL})"
 BENCH_OUT="${OUTDIR}/axiom_bench_raw.txt"
 AXC_ENABLE_GPU_BENCHES=1 VK_DRIVER_FILES="${ICD}" \
-    cargo bench --manifest-path "${REPO_ROOT}/Cargo.toml" -p axc-driver --bench dispatch_q4km_ab \
+    cargo bench --manifest-path "${REPO_ROOT}/Cargo.toml" -p axc-driver --bench "${AXC_BENCH}" \
     > "${BENCH_OUT}" 2>&1 || {
     echo "FATAL: AXIOM bench exited non-zero (see ${BENCH_OUT})" >&2
     exit 1
 }
 
-AXC_LINE="$(grep -m1 '^AXC_Q4KM_AB ' "${BENCH_OUT}" || true)"
+AXC_LINE="$(grep -m1 "^${AXC_PREFIX} " "${BENCH_OUT}" || true)"
 if [ -z "${AXC_LINE}" ]; then
-    echo "FATAL: no AXC_Q4KM_AB line in bench output (GPU benches may be disabled/skipped)" >&2
+    echo "FATAL: no ${AXC_PREFIX} line in bench output (GPU benches may be disabled/skipped)" >&2
     exit 1
 fi
 echo "-- AXIOM line: ${AXC_LINE}"
@@ -181,7 +238,16 @@ AXC_SUSTAINED_NS="$(axc_field sustained_ns)"
 AXC_TIMING_SRC="$(axc_field timing_source)"
 AXC_K="$(axc_field K)"
 AXC_FLOPS="$(axc_field flops)"
-AXIOM_DEVICE="$(echo "${AXC_LINE}" | sed -n 's/.* device=\(.*\)$/\1/p')"
+AXC_DEVICE="$(echo "${AXC_LINE}" | sed -n 's/.* device=\(.*\)$/\1/p')"
+AXIOM_DEVICE="${AXC_DEVICE}"
+# Fused-only: the AXIOM GEMM output dims (m=rows, n=cols) for the same-shape ratio.
+if [ "${FUSED}" -eq 1 ]; then
+    AXC_M="$(axc_field m)"
+    AXC_N="$(axc_field n)"
+    AXC_MAX_REL_DIFF="$(axc_field max_rel_diff)"
+else
+    AXC_M="1"; AXC_N="1"; AXC_MAX_REL_DIFF="null"
+fi
 echo "-- AXIOM device: ${AXIOM_DEVICE}"
 
 # ── 6. Device-match FAIL-CLOSED (WARNING-5): byte-identical device strings ────────────────
@@ -224,6 +290,14 @@ export M34_LLAMA_N="${LLAMA_N}"
 export M34_LLAMA_K="${LLAMA_K}"
 export M34_LLAMA_RUNS="${LLAMA_RUNS}"
 export M34_Q4K_LINE="${Q4K_N1_LINE}"
+# M3.5 (--fused) discriminators + same-shape / cross-shape llama numbers (CRITICAL-1).
+export M34_AXC_KERNEL="${AXC_KERNEL}"
+export M34_AXC_M="${AXC_M}"
+export M34_AXC_N="${AXC_N}"
+export M34_AXC_MAX_REL_DIFF="${AXC_MAX_REL_DIFF}"
+export M34_LLAMA_SAMESHAPE_TFLOPS="${LLAMA_SAMESHAPE_TFLOPS}"
+export M34_LLAMA_GEMV_CONTEXT_TFLOPS="${LLAMA_GEMV_CONTEXT_TFLOPS}"
+export M34_Q4K_SAMESHAPE_LINE="${Q4K_N512_LINE:-}"
 export M34_VULKANINFO_DEVICE="${VULKANINFO_DEVICE}"
 export M34_LLAMACPP_TAG="${LLAMACPP_TAG}"
 export M34_LLAMACPP_COMMIT="${LLAMACPP_COMMIT}"
