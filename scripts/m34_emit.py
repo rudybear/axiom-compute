@@ -70,11 +70,16 @@ axc_us_sustained = axc_sustained_ns / 1e3
 axc_tflops_min = axc_flops / (axc_ns_min * 1e-9) / 1e12 if axc_ns_min else None
 axc_tflops_sustained = axc_flops / (axc_sustained_ns * 1e-9) / 1e12 if axc_sustained_ns else None
 
+# Frozen correctness tolerance (DESIGN §3.1.20; AT-1770/1771). The fused kernel is only
+# numerically valid where the measured max_rel_diff stays within this bound.
+FROZEN_TOL = 1e-3
+
 flop_consistency = {"checked": False, "ok": None}
 ratio_tflops = None
 ratio_boundary_label = None
 headline_basis = None
 cross_shape_context = None
+numerical_validity = None
 
 if not incomplete and llama_us is not None and llama_k is not None and llama_m is not None:
     # FLOP-consistency (WARNING-3): recompute llama.cpp GFLOPS from its us + m/n/k vs its
@@ -107,14 +112,54 @@ if not incomplete and llama_us is not None and llama_k is not None and llama_m i
         # The headline + within-15% verdict come from the SAME-SHAPE llama number ONLY.
         denom = llama_sameshape_tflops if llama_sameshape_tflops else llama_tflops
         ratio_tflops = axc_tflops_min / denom
+        # Numerical validity at the A/B shape (computed from the MEASURED max_rel_diff, never
+        # hand-asserted): the f16 coopmat accumulator overflows precision at inference-scale K.
+        ab_valid = (axc_max_rel_diff is not None) and (axc_max_rel_diff <= FROZEN_TOL)
         ratio_boundary_label = (
             "SAME-SHAPE GEMM-vs-GEMM: AXIOM fused GEMM (GpuTimestamp MIN, kernel-only) vs "
-            "llama.cpp Q4_K MUL_MAT at the IDENTICAL m=4096,n=512,k=14336 (101.00 TFLOPS). "
+            f"llama.cpp Q4_K MUL_MAT at the IDENTICAL m=4096,n=512,k=14336 ({denom:.2f} TFLOPS). "
             "Headline + verdict computed from the same-shape llama number; the n=1 GEMV is "
-            "cross-shape context only.")
+            "cross-shape context only."
+            + ("" if ab_valid else
+               f" CAVEAT: AXIOM is numerically INVALID at this k (max_rel_diff="
+               f"{axc_max_rel_diff:.2f}) — the ratio is throughput-only, NOT a usable-kernel "
+               f"comparison (see numerical_validity)."))
         headline_basis = "same_shape_gemm m=4096,n=512,k=14336"
         within_15 = ratio_tflops >= 0.85
         kill_status = "PASS" if within_15 else "FAIL"
+        # numerical_validity (CRITICAL correctness gate): computed from the MEASURED
+        # max_rel_diff at the A/B shape, never hand-asserted. valid only when within tol.
+        _mrd = axc_max_rel_diff if axc_max_rel_diff is not None else float("nan")
+        if ab_valid:
+            _nv_verdict = (
+                f"numerically VALID at the A/B shape: max_rel_diff={_mrd:.3g} <= frozen "
+                f"{FROZEN_TOL:g}. The throughput ratio below is a usable-kernel comparison.")
+            _nv_kill = ("Throughput gap closed (M3.4 ~87,000x -> M3.5 same-shape) AND "
+                        "numerically valid at the A/B shape — a usable-kernel comparison.")
+        else:
+            _over = _mrd / FROZEN_TOL if _mrd == _mrd else float("inf")
+            _nv_verdict = (
+                f"fast-but-WRONG at inference K (f16 accumulator); correct only at K<=256; "
+                f"usable competitive kernel needs an f32-accumulator coopmat shape (M3.5b). "
+                f"At k={axc_k} the fused kernel's max_rel_diff={_mrd:.4g} vs the "
+                f"f16-accumulator ggml reference — ~{_over:.0f}x over the frozen {FROZEN_TOL:g}. "
+                f"The f16 coopmat accumulator cannot hold an inference-scale K sum; the output "
+                f"is GARBAGE at this K. Correctness holds ONLY at small K (AT-1770 K=256 "
+                f"max_rel_diff=8.3e-4 PASS; AT-1771 K=512 max_rel_diff=3.6e-3 EXCEEDS 1e-3, "
+                f"gate capped at K=256). The throughput ratio is therefore FAST-BUT-WRONG at "
+                f"inference K — NOT a usable-kernel win. A correct large-K fused kernel needs "
+                f"an f32-accumulator coopmat shape (M3.5b).")
+            _nv_kill = (
+                f"Throughput gap closed dramatically (M3.4 ~87,000x -> M3.5 same-shape) BUT "
+                f"this is NOT a usable-kernel win: AXIOM's result is numerically invalid at "
+                f"inference K.")
+        numerical_validity = {
+            "valid_at_ab_shape": bool(ab_valid),
+            "ab_shape_max_rel_diff": axc_max_rel_diff,
+            "frozen_tol": FROZEN_TOL,
+            "verdict": _nv_verdict,
+            "kill_criterion_interpretation": _nv_kill,
+        }
         # Cross-shape context block (labeled, NEVER the headline / verdict input).
         cross_shape_context = {
             "axiom_gemm_tflops": round(axc_tflops_min, 4) if axc_tflops_min else None,
@@ -171,9 +216,16 @@ out = {
     },
     "dims": {
         "K_contraction": axc_k, "llama_m": llama_m, "llama_n": llama_n, "llama_k": llama_k,
-        "note": ("AXIOM computes M=1 output row; llama.cpp computes m=4096 rows over the "
-                 "SAME K=14336 contraction (the apples-to-oranges row-count caveat). "
-                 "Throughput (TFLOPS) is the fair, work-normalized metric."),
+        "note": (
+            (f"SAME-SHAPE GEMM-vs-GEMM: AXIOM's FUSED kernel computes the full m={axc_m_out}, "
+             f"n={axc_n_out} GEMM (axiom.fused_output_m={axc_m_out}, "
+             f"fused_output_n={axc_n_out}), and llama.cpp Q4_K MUL_MAT computes the IDENTICAL "
+             f"m={llama_m}, n={llama_n}, k={llama_k}. Throughput (TFLOPS) is the work-normalized "
+             "metric (2*m*n*k MACs, dequant excluded, both sides).")
+            if is_fused else
+            ("AXIOM computes M=1 output row; llama.cpp computes m=4096 rows over the "
+             "SAME K=14336 contraction (the apples-to-oranges row-count caveat). "
+             "Throughput (TFLOPS) is the fair, work-normalized metric.")),
     },
     "llamacpp_timer_boundary": {
         "source_file": "tests/test-backend-ops.cpp",
@@ -211,7 +263,9 @@ out = {
             "~1 of ~188 SMs occupied"),
     },
     "llamacpp": {
-        "selected_line": q4k_line,
+        # CRITICAL-1: in fused mode the headline TFLOPS come from the SAME-SHAPE (n=512) line,
+        # so selected_line MUST be that same-shape line (not the n=1 GEMV context line).
+        "selected_line": (q4k_sameshape_line if (is_fused and q4k_sameshape_line) else q4k_line),
         "us_per_run": llama_us, "tflops": llama_tflops, "n_runs": llama_runs,
         "m": llama_m, "n": llama_n, "k": llama_k,
     },
@@ -226,24 +280,47 @@ out = {
     "kill_criterion_within_15pct": (kill_status == "PASS") if kill_status in ("PASS", "FAIL") else None,
     "kill_criterion_status": kill_status,
     "kill_criterion_reason": kill_reason,
+    "numerical_validity": numerical_validity,
     "kill_criterion_qualifier": (
-        ("M3.5 SAME-SHAPE fused GEMM vs llama's same-shape Q4_K MUL_MAT (101.00 TFLOPS). "
-         "AXIOM is expected to be ~4-10x BEHIND — a MASSIVE improvement from M3.4's "
-         "~87,000x cross-shape matvec, but STILL behind (NOT a win). DESIGN §5 kill-criterion "
-         "is 'within 15% on ANY vendor'; this does NOT fire (AXIOM behind). AMD/Intel pending "
-         "hardware (EB.1).")
+        (f"M3.5 SAME-SHAPE fused GEMM vs llama's same-shape Q4_K MUL_MAT "
+         f"({(llama_sameshape_tflops if llama_sameshape_tflops else llama_tflops):.2f} TFLOPS). "
+         f"AXIOM measured {axc_tflops_min:.2f} TFLOPS = "
+         f"~{(1.0 / ratio_tflops):.0f}x BEHIND on throughput — a MASSIVE improvement from "
+         f"M3.4's ~87,000x cross-shape matvec." +
+         ("" if (numerical_validity and numerical_validity["valid_at_ab_shape"]) else
+          f" BUT this is NOT a usable-kernel win: AXIOM's output is NUMERICALLY INVALID at this "
+          f"k={axc_k} shape (max_rel_diff={axc_max_rel_diff:.2f}, see numerical_validity) "
+          f"because the f16 coopmat accumulator overflows precision at inference-scale K; "
+          f"correct only at K<=256. So the throughput gap closed dramatically but AXIOM is "
+          f"fast-but-WRONG at inference K (needs an f32-accumulator coopmat, M3.5b).") +
+         f" DESIGN §5 kill-criterion is 'within 15% on ANY vendor'; this does NOT fire "
+         f"(AXIOM behind" +
+         ("" if (numerical_validity and numerical_validity["valid_at_ab_shape"]) else
+          " AND numerically invalid") +
+         f"). AMD/Intel pending hardware (EB.1).")
         if is_fused else
         ("NVIDIA-only FAIL with the current FROZEN M2.6 single-row matvec is the documented "
          "baseline; DESIGN §5 kill-criterion is 'within 15% on ANY vendor', so this does NOT "
          "fire the project kill-criterion. AMD/Intel halves pending cross-vendor hardware (EB.1).")),
     "fairness_caveat": (
         ("Same machine, same ICD, kernel-only-vs-kernel-only, SAME SHAPE (m=4096,n=512,k=14336 "
-         "both sides), FLOP convention identical (2*m*n*k matmul MACs, dequant excluded). AXIOM's "
-         "fused kernel is correct within the frozen 1e-3 vs the f16-accumulator ggml reference. "
-         "Ratio reported AS MEASURED; honest expected ~4-10x behind. The n=1 GEMV (llama 7.39 "
-         "TFLOPS) is cross-shape CONTEXT ONLY — never the headline (the SAME llama kernel runs "
-         "13.7x faster at n=512), so headlining AXIOM-GEMM vs llama-n1-GEMV would flatter AXIOM "
-         "~13x; that is forbidden (CRITICAL-1).")
+         "both sides), FLOP convention identical (2*m*n*k matmul MACs, dequant excluded). " +
+         (("AXIOM's fused kernel is numerically VALID at this A/B shape (max_rel_diff="
+           f"{axc_max_rel_diff:.3g} <= frozen 1e-3); the ratio is a usable-kernel comparison.")
+          if (numerical_validity and numerical_validity["valid_at_ab_shape"]) else
+          ("CRITICAL CORRECTNESS CAVEAT: AXIOM's fused output is NUMERICALLY INVALID at this A/B "
+           f"shape (k={axc_k}, max_rel_diff={axc_max_rel_diff:.2f} — see numerical_validity) "
+           "because the f16 coopmat accumulator overflows precision at inference-scale K; it is "
+           f"correct ONLY at K<=256. So the ~{(1.0 / ratio_tflops):.0f}x throughput gap is "
+           "fast-but-WRONG at inference K, NOT AXIOM being that far behind a usable kernel of "
+           "its own.")) +
+         f" Ratio reported AS MEASURED for a numerically-"
+         f"{'VALID' if (numerical_validity and numerical_validity['valid_at_ab_shape']) else 'INVALID'}"
+         f" result at the A/B K. The n=1 GEMV (llama "
+         f"{(llama_gemv_context_tflops if llama_gemv_context_tflops else 0.0):.2f} TFLOPS) is "
+         "cross-shape CONTEXT ONLY — never the headline (the SAME llama kernel runs 13.7x faster "
+         "at n=512), so headlining AXIOM-GEMM vs llama-n1-GEMV would flatter AXIOM ~13x; that is "
+         "forbidden (CRITICAL-1).")
         if is_fused else
         ("Same machine, same ICD, kernel-only-vs-kernel-only, identical K=14336 contraction, FLOP "
          "convention identical (2*m*n*k matmul MACs, dequant excluded). BOTH kernels are CORRECT "
@@ -251,9 +328,18 @@ out = {
          "workgroup) vs llama.cpp's tiled multi-row MUL_MAT (all SMs) — ~structurally 100x "
          "under-parallelized. Ratio reported AS MEASURED; honest expected FAIL.")),
     "gap_closing_path": (
-        ("M3.5 closed the M3.4 ~87,000x cross-shape gap to a single-digit same-shape ratio. "
-         "Remaining gap (if ALU-bound): scale-caching across the 16 tile_k K-blocks of a "
-         "superblock (OQ-3 → M3.5b) and an f32-accumulator coopmat shape for large-K precision.")
+        ("M3.5 closed the M3.4 ~87,000x cross-shape THROUGHPUT gap to a single-digit same-shape "
+         "ratio. " +
+         (("Remaining gap (if ALU-bound): scale-caching across the 16 tile_k K-blocks of a "
+           "superblock (OQ-3 -> M3.5b) to cut ALU-bound dequant overhead.")
+          if (numerical_validity and numerical_validity["valid_at_ab_shape"]) else
+          ("But the BLOCKING issue is NOT throughput — it is CORRECTNESS: the f16 coopmat "
+           f"accumulator is numerically invalid at inference-scale K (max_rel_diff="
+           f"{axc_max_rel_diff:.2f} at k={axc_k}). The next milestone (M3.5b) MUST add an "
+           "f32-accumulator coopmat shape so the fused kernel is CORRECT at large K; only then "
+           "is the throughput number a usable-kernel comparison. Secondary: scale-caching "
+           "across the 16 tile_k K-blocks of a superblock (OQ-3) to cut ALU-bound dequant "
+           "overhead.")))
         if is_fused else
         ("Fuse the Q4_K_M dequant front-end onto the M3.3c register-blocked coopmat matmul "
          "(dequant -> shared f16 tile -> coopmat mul_add; plain-f16 reached 31.2 TFLOPS = "
@@ -287,8 +373,15 @@ if is_fused:
     md.append(f"| TFLOPS (GpuTimestamp MIN, kernel-only) | {fmt(axc_tflops_min, 3)} | {fmt(llama_sameshape_tflops, 2)} |")
     md.append(f"| max-rel-diff vs f16-accum ref | {fmt(axc_max_rel_diff, 3) if axc_max_rel_diff is not None else 'n/a'} | (ggml is the ref) |")
     md.append("")
+    if numerical_validity is not None and not numerical_validity["valid_at_ab_shape"]:
+        md.append(f"> **NUMERICALLY INVALID at the A/B shape** (max_rel_diff="
+                  f"{fmt(axc_max_rel_diff, 3)} > frozen {FROZEN_TOL:g}). {numerical_validity['verdict']}")
+        md.append("")
     md.append(f"- **SAME-SHAPE headline ratio (AXIOM fused GEMM / llama same-shape, basis `{headline_basis}`): "
-              f"{fmt(out['headline_ratio'], 5)}** (llama {fmt(out['llama_over_axiom_speedup_tflops'], 2)}x faster)")
+              f"{fmt(out['headline_ratio'], 5)}** (llama {fmt(out['llama_over_axiom_speedup_tflops'], 2)}x faster"
+              + ("" if (numerical_validity and numerical_validity['valid_at_ab_shape']) else
+                 ", on a NUMERICALLY INVALID AXIOM result — throughput-only, NOT a usable-kernel win")
+              + ")")
     if cross_shape_context:
         md.append(f"- Cross-shape CONTEXT (NOT the kill criterion): AXIOM fused GEMM {fmt(cross_shape_context.get('axiom_gemm_tflops'),3)} TFLOPS "
                   f"vs llama n=1 GEMV {fmt(cross_shape_context.get('llama_n1_gemv_tflops'),2)} TFLOPS "
@@ -329,8 +422,11 @@ if is_fused:
         print(f"  llama   : same-shape Q4_K MUL_MAT = {llama_sameshape_tflops:.2f} TFLOPS "
               f"[m={llama_m}, n={llama_n}, k={llama_k}]")
     if ratio_tflops is not None:
+        _nv_tag = ("usable-kernel comparison"
+                   if (numerical_validity and numerical_validity["valid_at_ab_shape"])
+                   else "NUMERICALLY INVALID AXIOM result — fast-but-WRONG at this K, NOT a win")
         print(f"  ratio   : AXIOM/llama SAME-SHAPE (TFLOPS) = {ratio_tflops:.5f}  => llama is "
-              f"{1.0 / ratio_tflops:.1f}x faster (HONEST — still behind, NOT a win)")
+              f"{1.0 / ratio_tflops:.1f}x faster (HONEST — {_nv_tag})")
     if cross_shape_context and cross_shape_context.get("llama_n1_gemv_tflops"):
         print(f"  context : (NOT the headline) llama n=1 GEMV = "
               f"{cross_shape_context['llama_n1_gemv_tflops']:.2f} TFLOPS — cross-shape only")

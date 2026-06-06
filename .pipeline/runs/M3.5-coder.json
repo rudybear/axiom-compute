@@ -1,0 +1,112 @@
+{
+  "verdict": "IMPLEMENTED",
+  "agent": "coder",
+  "milestone_id": "M3.5-q4km-coopmat-fusion",
+  "revision_implemented": "r1",
+  "branch": "coder/M35-20260606-1100/M3.5-q4km-coopmat-fusion",
+  "summary": "Implemented the M3.5 spec exactly as approved (r1): the f32_to_f16 builtin (5th Q4_0Builtin variant, OpFConvert f32->f16 RNE, Float16-only, no capability beyond the M3.3c-coopmat union M2.6-Q4_K_M-dequant union), the fused q4km_matmul_rb_coopmat.axc (per-workgroup Q4_K_M dequant -> shared[f16] -> M3.3c register-blocked coopmat K-loop, byte-identical M2.6 dequant + verbatim M3.3c structure), the f16-ACCUMULATOR-matched ggml CPU oracle with gate-K policy, the bit-within-tol GPU tests (AT-1770/1771), the honest multi-size TFLOPS bench + SAME-SHAPE A/B line (AT-1772/1774), the no-new-capability-beyond-union CI anchor (AT-1773), the f32_to_f16 layer + codegen unit coverage (AT-1775/1776), and the m34 --fused SAME-SHAPE A/B harness (script + emit.py). All non-GPU work is CI-green; the GPU-gated numbers were filled by the NVIDIA orchestrator run and emit.py was fixed so they REPRODUCE BY CONSTRUCTION. HONEST (measured): the fused kernel collapses M3.4's ~87,000x cross-shape gap to ~9x SAME-SHAPE (AXIOM 11.27 TFLOPS vs llama 101.48 TFLOPS) BUT this is NOT a usable-kernel win — at the A/B k=14336 AXIOM is NUMERICALLY INVALID (max_rel_diff=29.07, f16 accumulator overflows; correct only K<=256), so it is fast-but-WRONG at inference K; M3.5b needs an f32-accumulator coopmat. The n=1 GEMV (7.42) is cross-shape context only.",
+  "files_created": [
+    "examples/q4km_matmul_rb_coopmat.axc",
+    "crates/axc-codegen/tests/f32_to_f16_codegen.rs",
+    "crates/axc-driver/tests/common_q4km_f16ref.rs",
+    "crates/axc-driver/tests/dispatch_q4km_matmul_rb.rs",
+    "crates/axc-driver/benches/resident_q4km_matmul_rb.rs",
+    ".pipeline/runs/M3.5-coder.json"
+  ],
+  "files_modified": [
+    "crates/axc-hir/src/q4_0.rs",
+    "crates/axc-hir/src/typecheck.rs",
+    "crates/axc-hir/src/expr.rs",
+    "crates/axc-codegen/src/q4_0.rs",
+    "crates/axc-codegen/src/body.rs",
+    "crates/axc-driver/tests/compile_shared_examples.rs",
+    "crates/axc-driver/Cargo.toml",
+    "scripts/m34_llamacpp_ab.sh",
+    "scripts/m34_emit.py",
+    "DESIGN.md",
+    "BENCHMARKS.md",
+    "ROADMAP.md"
+  ],
+  "public_apis_implemented": [
+    "axc_hir::q4_0::Q4_0Builtin::F32ToF16 (variant) + source_name/from_source_name/arity=1/return_ty=F16",
+    "axc_hir::q4_0::RESERVED_Q4_0_BUILTIN_NAMES now includes \"f32_to_f16\" (sorted between f32_from_u32 and ptr_read_u16_zext)",
+    "axc_hir::typecheck::TypecheckError::F32ToF16ArgMustBeF32",
+    "axc_codegen::q4_0::emit_f32_to_f16(b, tc, caps, f32_id) -> Result<Word, BodyCodegenError> (caps.float16=true; OpFConvert f32->f16)",
+    "examples/q4km_matmul_rb_coopmat.axc: fn q4km_matmul_rb_coopmat(q: readonly_buffer[u8], x: readonly_buffer[f16], C: buffer[f16], M, N, K, n_blocks_per_row) -> void",
+    "common_q4km_f16ref::q4km_dequant_matmul_f16accum_cpu(q, x_f16, n_rows, n_cols, n_blocks_per_row, tile_k) -> Vec<f32>",
+    "common_q4km_f16ref::round_f32_to_f16_to_f32(x) -> f32",
+    "common_q4km_f16ref::expected_a_tile_f16(q, block_row, k_block, n_blocks_per_row, tile_k) -> Vec<u16> (staging-coverage re-derivation, write-once)",
+    "common_q4km_f16ref::max_rel_diff(gpu, reference) -> f64",
+    "resident_q4km_matmul_rb::effective_q4km_tflops(m,n,k,kernel_ns) -> f64 + measure_q4km_rb_tflops(...) + AXC_Q4KM_AB_FUSED stdout line",
+    "scripts/m34_llamacpp_ab.sh --fused; scripts/m34_emit.py M34_AXC_KERNEL=fused (SAME-SHAPE headline + cross_shape_context)"
+  ],
+  "tests_written": [
+    "AT-1775: at_1775_f32_to_f16_happy_returns_f16 + at_1775_f32_to_f16_rejects_non_f32_arg (axc-hir typecheck) + q4_0.rs unit tests extended (from_source_name/round_trip/arity/return_ty/is_reserved/sorted-invariant)",
+    "AT-1776: at_1776_f32_to_f16_emits_fconvert_and_validates (axc-codegen — exactly one OpFConvert f32->f16, OpCapability Float16, no cooperative/8bit extension, spirv-val clean)",
+    "AT-1773: at_1773_q4km_rb_coopmat_no_new_capability_beyond_union (compile + spirv-val + emitted cap/ext set == M3.3c union M2.6 union, Float16 exactly once)",
+    "AT-1770: at_1770_q4km_rb_coopmat_bit_within_tol_k256 (NVIDIA #[ignore]; asserts within frozen 1e-3, reports max-rel-diff, staging coverage)",
+    "AT-1771: at_1771_q4km_rb_coopmat_bit_within_tol_k512_2superblocks (NVIDIA #[ignore]; gate-K policy)",
+    "AT-1772 + AT-1774: resident_q4km_matmul_rb bench (honest TFLOPS at 256/512/768/1024 + SAME-SHAPE A/B line)",
+    "common_q4km_f16ref CPU-only smoke: round_f16_idempotent_for_representable, f16accum_ref_and_staging_coverage_smoke"
+  ],
+  "cargo_check_status": "pass",
+  "cargo_clippy_status": "pass (--workspace --all-targets -- -D warnings)",
+  "cargo_test_status": "pass (cargo test --workspace: 0 failed; GPU tests #[ignore]-gated self-skip without AXC_ENABLE_GPU_TESTS)",
+  "spirv_val_status": "pass (fused kernel compiles to spirv-val-clean SPIR-V; AT-1773 + AT-1776 validate in CI)",
+  "self_assessment": {
+    "spec_coverage": "All implementable items from M3.5-architect.json (r1) implemented. The GPU-measured numbers (AT-1770/1771 max-rel-diff, AT-1772 TFLOPS, AT-1774 same-shape ratio) require NVIDIA RTX PRO 6000 hardware not present in this environment; the kernel, oracle, tests, bench, and A/B harness are landed and CI-green, with orchestrator-placeholder cells in DESIGN/BENCHMARKS for the GPU numbers.",
+    "measured_in_ci": {
+      "fused_kernel_caps_ext_set": "EXACTLY the union of matmul_rb_coopmat.axc caps and q4km_dequant_matmul.axc caps: caps {Shader=1, Float16=9, Int16=22, Int8=39, StorageBuffer16BitAccess=4433, StorageBuffer8BitAccess=4448, CooperativeMatrixKHR=6022, VulkanMemoryModel=5345}; exts {SPV_KHR_8bit_storage, SPV_KHR_16bit_storage, SPV_KHR_cooperative_matrix, SPV_KHR_shader_subgroup_basic, SPV_KHR_vulkan_memory_model}. fused == union; Float16 present exactly once; f32_to_f16 adds nothing (AT-1773).",
+      "f32_to_f16_codegen": "exactly one OpFConvert with f16 result type from an f32 operand; OpCapability Float16; no new extension; spirv-val exit 0 (AT-1776).",
+      "emit_py_fused_reproduced": "headline_ratio = axc_fused_tflops / llama_sameshape (PARSED 101.48, NOT hardcoded) = 0.1111; basis 'same_shape_gemm m=4096,n=512,k=14336'; within_15pct from the same-shape ratio (FAIL); numerical_validity{valid_at_ab_shape:false, ab_shape_max_rel_diff:29.06921, frozen_tol:0.001} computed from the measured max_rel_diff; cross_shape_context {axiom_gemm 11.27, llama_n1=7.42, 'NOT the kill criterion'} populated; matvec path byte-preserved (milestone + cross_shape_context=None + matvec caveat unchanged)."
+    },
+    "expected_on_nvidia": {
+      "AT-1770_K256": "measured max-rel-diff vs the f16-accumulator ggml reference, asserted <= frozen 1e-3 (certain gate-K). Staging write-count == 1 for all 512 a_tile elements.",
+      "AT-1771_K512": "gate-K policy: assert <= 1e-3 IF it holds (gate extends to K=512); else cap the gate at K=256 and report the K=512 max-rel-diff SEPARATELY (test passes by reporting, NOT by loosening 1e-3). The f16 accumulator over 32 depth-16 tiles MAY exceed 1e-3 — reported honestly if so (would motivate an f32-accumulator coopmat shape, out of M3.5 scope).",
+      "AT-1772_TFLOPS": "fused-kernel effective TFLOPS at 256/512/768/1024 + the A/B shape, expected BELOW M3.3c's 31.2 TFLOPS (ALU-bound dequant); reported as-measured with per-size max-rel-diff.",
+      "AT-1774_same_shape_ratio": "MEASURED: AXIOM fused GEMM (GpuTimestamp MIN) 11.27 TFLOPS at m=4096,n=512,k=14336 vs llama Q4_K MUL_MAT @ identical shape 101.48 TFLOPS -> ~9x BEHIND (down from M3.4's ~87,000x cross-shape) BUT NUMERICALLY INVALID at this K (max_rel_diff=29.07, correct only K<=256) -> fast-but-WRONG, NOT a usable-kernel win; M3.5b needs f32-accum coopmat. kill_criterion_within_15pct false (FAIL); the n=1 GEMV (7.42) is cross-shape context only."
+    },
+    "known_limitations": [
+      "GPU-measured numbers (AT-1770/1771/1772/1774) require the NVIDIA orchestrator run; placeholders in DESIGN/BENCHMARKS.",
+      "Per-element dequant recomputes get_scale_min_k4 + d/dmin across a superblock's 16 tile_k K-blocks (OQ-3); scale-caching deferred to M3.5b per the spec (correctness-first).",
+      "The f16-accumulator within-tol result is NVIDIA-coopmat-accumulator-specific (documented); a strict-f16 vendor accumulator may differ.",
+      "PRE-EXISTING (NOT introduced by M3.5): crates/axc-optimize/src/lib.rs has a `rust,ignore` module doctest that does not compile when `cargo test --workspace -- --ignored` forces ignored doctests to run (uses an undefined `kernel`). Verified present on the milestone base db10531; out of M3.5 scope (axc-optimize/src/lib.rs untouched by this milestone)."
+    ],
+    "deviations": [
+      "AT-1775 layer coverage is split as the spec intended: the round-trip/arity/return_ty/from_source_name/is_reserved/sorted-invariant assertions live as q4_0.rs unit tests (extended in place); the typecheck happy-path + non-f32-reject assertions are added as axc-hir typecheck unit tests. No separate integration test file was created (matches the existing q4_0 test placement pattern).",
+      "common_q4km_f16ref.rs (a tests/ helper used via #[path]) is also picked up by cargo as a standalone integration target whose #[cfg(test)] smoke tests run twice — identical to the existing common_matmul.rs pattern; harmless."
+    ]
+  },
+  "honesty_gate": {
+    "frozen_1e-3_loosened": false,
+    "gemv_used_as_headline": false,
+    "same_shape_headline_basis": "same_shape_gemm m=4096,n=512,k=14336 (llama MEASURED 101.48 TFLOPS; parsed from the live run, NOT hardcoded)",
+    "cross_shape_context_labeled": "llama n=1 GEMV = 7.42 TFLOPS, labeled 'cross-shape, NOT the kill criterion'",
+    "measured_result_framing": "AXIOM 11.27 TFLOPS ~9x BEHIND same-shape (down from M3.4's ~87,000x cross-shape) BUT NUMERICALLY INVALID at k=14336 (max_rel_diff=29.07) -> fast-but-WRONG at inference K, NOT a usable-kernel win; reported as that, NOT spun as a win",
+    "numerical_validity_caveat_present": true,
+    "frozen_artifacts_untouched": "q4km_dequant_matvec.axc, matmul_rb_coopmat.axc, ab_results.json, dispatch_q4km_ab.rs all unchanged"
+  },
+  "generator_honesty_fix": {
+    "blocking_issue": "Pessimistic code reviewer: the M3.5 honesty fix was UNCOMMITTED and scripts/m34_emit.py (the GENERATOR) was dishonest-by-construction — re-running the harness would OVERWRITE QA's honest ab_results_fused.json with spin (hardcoded '101.00 TFLOPS' pre-measurement estimate, false fairness_caveat='correct within the frozen 1e-3' at the A/B shape where max_rel_diff=29.07, and NO numerical_validity block).",
+    "fixes_applied": [
+      "scripts/m34_emit.py: replaced BOTH hardcoded '101.00 TFLOPS' literals (ratio_boundary_label, kill_criterion_qualifier) with the parsed/passed same-shape value formatted f'{denom:.2f} TFLOPS' (denom = M34_LLAMA_SAMESHAPE_TFLOPS = the measured 101.48).",
+      "scripts/m34_emit.py: added a numerical_validity block computed from the MEASURED M34_AXC_MAX_REL_DIFF vs FROZEN_TOL=1e-3 — valid_at_ab_shape only true when within tol; verdict states 'fast-but-WRONG at inference K (f16 accumulator); correct only at K<=256; usable competitive kernel needs an f32-accumulator coopmat shape (M3.5b)'. Emitted both inside `out` and surfaced in the .md and console.",
+      "scripts/m34_emit.py: fairness_caveat is now truthful — when max_rel_diff > tol it states the throughput ratio is for a NUMERICALLY INVALID result at the A/B K (no false 'correct within 1e-3'); the matvec-mode caveat is byte-preserved.",
+      "scripts/m34_emit.py: selected_line now uses the SAME-SHAPE (n=512) line (q4k_sameshape_line) in fused mode, not the n=1 GEMV line; dims.note carries the same-shape framing in fused mode.",
+      "scripts/m34_emit.py: kill_criterion_qualifier + gap_closing_path now derive the throughput multiple and the numerical-invalidity caveat from the measured values (no hardcoded '~4-10x').",
+      "crates/axc-driver/benches/resident_q4km_matmul_rb.rs (~line 16): removed the stale '101.00 TFLOPS' literal (now 'parsed from the live llama.cpp run, NOT hardcoded') and added the numerical-invalidity HONESTY note (k=14336 max_rel_diff ~29, correct only K<=256, fast-but-WRONG, M3.5b f32-accum)."
+    ],
+    "reproduced_by_construction": "Re-ran scripts/m34_emit.py with the measured M34_* env vars (same-shape 101.48 TFLOPS, max_rel_diff 29.06921, AXIOM 11.27 TFLOPS); the regenerated ab_results_fused.json/.md is the honest artifact BY CONSTRUCTION (no hardcoded 101.00; no false 'correct within 1e-3'; numerical_validity{valid_at_ab_shape:false, ab_shape_max_rel_diff:29.06921, frozen_tol:0.001} present; headline_ratio 0.1111 = llama 9.0x faster; kill_criterion_status FAIL). The ab_results_fused.json/.md are now the SCRIPT'S OUTPUT, not a hand-edit.",
+    "docs_verified_honest": "DESIGN.md §3.1.20, BENCHMARKS.md, ROADMAP.md (QA's edits) carry the honest framing: ~9x throughput gap WITH the numerical-invalidity caveat (fast-but-WRONG at k=14336, max_rel_diff=29.07, correct only K<=256, M3.5b needs f32 accum); kill-criterion = 'throughput gap closed 87,000x->~9x BUT NOT a usable-kernel win'.",
+    "frozen_untouched": "The frozen M3.4 ab_results.json (matvec) is untouched (git status clean); the matvec branch of m34_emit.py is logic-preserved (all changes are is_fused-guarded).",
+    "verify": "cargo check --workspace --benches + cargo clippy --workspace --all-targets -- -D warnings + cargo test --workspace ALL GREEN (0 failed). git show HEAD:BENCHMARKS.md | grep -c 'NUMERICALLY INVALID|max_rel_diff' > 0 after commit."
+  },
+  "git_commits": [
+    "d4ef742 feat(builtin): f32_to_f16 — 5th Q4_0Builtin variant (OpFConvert f32->f16, RNE)",
+    "bb93f21 feat(example): q4km_matmul_rb_coopmat.axc — Q4_K_M dequant fused into RB coopmat matmul",
+    "21f2497 test(M3.5): f16-accumulator Q4_K_M oracle + fused-kernel bit-within-tol tests (AT-1770/1771)",
+    "ab8c6ca bench(M3.5): resident_q4km_matmul_rb — honest TFLOPS (AT-1772) + SAME-SHAPE A/B (AT-1774)",
+    "2f333c9 feat(ab): m34 --fused SAME-SHAPE A/B re-run for the fused kernel (AT-1774)",
+    "9261601 docs(M3.5): DESIGN 3.1.20 measured-table + BENCHMARKS SAME-SHAPE A/B + ROADMAP status"
+  ]
+}

@@ -13,10 +13,17 @@
 //!
 //! ## AT-1774 — SAME-SHAPE A/B line
 //! The pinned A/B shape (m=4096, n=512, k=14336) is in the size set so the headline ratio
-//! is SAME-SHAPE (AXIOM fused GEMM vs llama Q4_K MUL_MAT at the IDENTICAL shape = 101.00
-//! TFLOPS). Emits the machine-readable `AXC_Q4KM_AB_FUSED` line (parsed by
-//! scripts/m34_llamacpp_ab.sh --fused) with kernel ns, K, flops (2*M*N*K), m, n,
-//! max_rel_diff, device. FLOP convention: 2*M*N*K matmul MACs, dequant EXCLUDED (both sides).
+//! is SAME-SHAPE (AXIOM fused GEMM vs llama Q4_K MUL_MAT at the IDENTICAL shape; the
+//! same-shape llama TFLOPS is parsed from the live llama.cpp run, NOT hardcoded). Emits the
+//! machine-readable `AXC_Q4KM_AB_FUSED` line (parsed by scripts/m34_llamacpp_ab.sh --fused)
+//! with kernel ns, K, flops (2*M*N*K), m, n, max_rel_diff, device. FLOP convention: 2*M*N*K
+//! matmul MACs, dequant EXCLUDED (both sides).
+//!
+//! HONESTY: at the A/B K=14336 the fused kernel is NUMERICALLY INVALID (f16 coopmat
+//! accumulator overflows precision; measured max_rel_diff ~= 29 vs the f16-accum ggml ref,
+//! correct only at K<=256). The same-shape throughput ratio is therefore throughput-only
+//! (fast-but-WRONG at inference K), NOT a usable-kernel win — a correct large-K fused kernel
+//! needs an f32-accumulator coopmat shape (M3.5b). See .pipeline/benchmarks/m34/.
 //!
 //! Gated on AXC_ENABLE_GPU_BENCHES=1 + a responsive Vulkan ICD. Typed-skip on
 //! CoopMatUnsupported (Lavapipe) / DeviceFeatureUnsupported / subgroup_size() != 32.
