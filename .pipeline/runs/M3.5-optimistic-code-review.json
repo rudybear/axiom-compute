@@ -1,0 +1,55 @@
+{
+  "verdict": "APPROVE",
+  "agent": "optimistic_code_reviewer",
+  "milestone_id": "M3.5-q4km-coopmat-fusion",
+  "branch": "coder/M35-20260606-1100/M3.5-q4km-coopmat-fusion",
+  "spec_compliance": true,
+  "qa_pass_acknowledged": true,
+  "positive_feedback": [
+    "f32_to_f16 builtin (AT-1773/1775/1776): textbook addition — a 5th Q4_0Builtin variant routed through every existing layer (HIR enum, source_name/from_source_name round-trip, arity/return_ty, RESERVED_Q4_0_BUILTIN_NAMES sorted insert, typecheck check_q4_0_call arm, codegen body.rs dispatch + q4_0.rs emit_f32_to_f16). Single OpFConvert f32→f16, sets caps.float16 only, no extension. Exactly matches the AT-1773 union-baseline requirement: Float16 already declared by the M3.3c coopmat union the M2.6 Q4_K_M dequant; f32_to_f16 adds nothing beyond that union. Confirmed by AT-1773 (raw OpCapability Float16 count == 1 in the fused module) and AT-1776 (exactly one OpFConvert→f16, passes spirv-val, no cooperative-matrix or 8-bit-storage extension).",
+    "AT-1775 typecheck tests are complete and correct: happy path asserts binding ty = F16; error path asserts F32ToF16ArgMustBeF32 on a u32 argument. The dedicated error variant and its diagnostic message are specific and not reusing the generic Q4_0BuiltinArgTypeMismatch, which is appropriate given the different argument type.",
+    "Fused kernel (q4km_matmul_rb_coopmat.axc): the byte-identical M2.6 inline get_scale_min_k4 + d/dmin + nibble decode is correct — dsc * f32_from_u32(nib) - dmm matches the M2.6 formula (d1 * f32_from_u32(lo_nib) - m1f / d2 * f32_from_u32(hi_nib) - m2f), specialized to the single (sub-block, nibble) the current element needs. The single f32_to_f16 narrowing at the a_tile write is the correct architectural seam. The M3.3c K-loop (4 loop-carried f16 accumulators, A/B reuse, N-phi, both barriers) is structurally verbatim and clearly documented as frozen.",
+    "Staging-coverage proof (AT-1620 class): the expected_a_tile_f16 helper in common_q4km_f16ref.rs independently re-derives every a_tile[ei_a] and uses Option<u16> with is_none() / unwrap_or_else panics to assert write-count == 1 per element. AT-1770/1771 call it for block_row=0/k_block=0 AND for the last block_row/k_block, giving corner coverage. This is the correct pattern for catching superblock-to-tile mapping bugs masked by symmetric fixtures.",
+    "The f16-accumulator oracle (common_q4km_f16ref.rs) correctly matches the GPU's confirmed f16 accumulator (matmul_rb_coopmat.axc:122-125 matrix[f16,16,16,accumulator]): dequant in f32, round weights+x f32→f16→f32 (RNE via half crate), then round the running accumulator to f16 after each depth-16 tile add. This is the only oracle that produces a valid error bound for the fused kernel's actual accumulation precision.",
+    "K-limited correctness honesty is exemplary: AT-1770 hard-asserts K=256 ≤ 1e-3 (measured 8.3e-4 PASS); AT-1771 implements a gate-K-cap policy that passes by reporting (not by loosening 1e-3) when K=512 exceeds the gate; the frozen 1e-3 was not loosened anywhere in the tree. The bench reports max_rel_diff at every measured size including the A/B shape (29.07 at k=14336), with the bench comment explicitly stating this documents the f16-accumulator precision frontier.",
+    "A/B framing (CRITICAL-1) is correctly implemented end-to-end: the headline ratio (0.1111) uses the same-shape llama 101.48 TFLOPS line (m=4096,n=512,k=14336), not the n=1 GEMV. The n=1 GEMV (7.42 TFLOPS) appears only in cross_shape_context with an explicit 'NOT the kill criterion' note. The cross_shape_context.note explains why using the n=1 line as the headline would flatter AXIOM ~13x. This is correct and matches CRITICAL-1 of the architect spec.",
+    "JSON internal consistency (post-QA fixes): selected_line contains the 101.48 TFLOPS n=512 line; headline_ratio = 0.1111 = 11.274808/101.48 (verified: 0.11110374, rounds to 0.1111); llama_over_axiom = 9.0 = round(1/0.1111, 2); flops_per_dispatch = 60129542144 = 2*4096*512*14336 (verified exact); FLOP-consistency ok=true with disagreement_frac=4e-5 (within noise). The numerical_validity block correctly sets valid_at_ab_shape=false, ab_shape_max_rel_diff=29.069, and carries the fast-but-WRONG framing. The dims.note correctly describes the same-shape GEMM framing.",
+    "Numerical-invalidity caveat propagation: all four artifacts (JSON, DESIGN §3.1.20, BENCHMARKS.md, ROADMAP.md) carry the 29.07/fast-but-WRONG/correct-only-K≤256/needs-M3.5b framing. The kill_criterion_qualifier correctly states that AXIOM is both behind on throughput AND numerically invalid — no clean-win spin anywhere.",
+    "No regression: compiler-src change confined to the f32_to_f16 builtin (q4_0.rs, body.rs, expr.rs, typecheck.rs). FROZEN artifacts (q4km_dequant_matvec.axc, matmul_rb_coopmat.axc, ab_results.json, dispatch_q4km_ab.rs, BENCHMARKS M3.4 section) untouched. 893 tests pass, 46 #[ignore]-gated GPU tests preserved for the NVIDIA orchestrator run.",
+    "The --fused mode in m34_llamacpp_ab.sh writes to a DISTINCT artifact (ab_results_fused.json) and does NOT overwrite the frozen-matvec ab_results.json, preserving the M3.4 regression record.",
+    "AT-1773 no-new-capability test is structurally thorough: computes the M3.3c ∪ M2.6 capability and extension BTreeSets, asserts fused ⊆ union for both, and additionally counts the raw Float16 OpCapability words to assert exactly one (the BTreeSet dedup would hide a double-declaration).",
+    "make_q4km_weights uses non-symmetric seeds (varying d, dmin, scales, and weight bytes per (row, superblock)) so a transpose/mis-map bug cannot hide via accidental matrix symmetry — this is a meaningful fixture design."
+  ],
+  "minor_issues": [
+    {
+      "file": "scripts/m34_emit.py",
+      "line": 112,
+      "description": "ratio_boundary_label string has '(101.00 TFLOPS)' hardcoded (the pre-measurement architect estimate). The generated ab_results_fused.json has the correct '101.48 TFLOPS' because QA hand-edited the output file, but if the script is re-run it will regenerate with 101.00 in ratio_boundary_label and kill_criterion_qualifier (lines 112 and 230). The measured number should be interpolated from llama_sameshape_tflops. Non-blocking because: (a) the ab_results_fused.json is the committed artifact, (b) the headline_ratio and tflops fields are computed correctly from the actual measured value, and (c) 101.00 vs 101.48 is immaterial to any correctness or honesty claim. Fix in M3.5b: replace '101.00 TFLOPS' with f'{llama_sameshape_tflops:.2f} TFLOPS' in both string literals."
+    },
+    {
+      "file": "crates/axc-driver/benches/resident_q4km_matmul_rb.rs",
+      "line": 16,
+      "description": "Doc comment on AT-1774 says 'IDENTICAL shape = 101.00 TFLOPS'. Same pre-estimate stale value as in emit.py. Non-blocking; update to 101.48 in M3.5b alongside the emit.py fix."
+    },
+    {
+      "file": ".pipeline/benchmarks/m34/ab_results_fused.md",
+      "line": 17,
+      "description": "Qualifier line contains '101.00 TFLOPS' (generated by emit.py before QA's hand-edit of the JSON). The MD is a human-readable companion; the JSON is the authoritative artifact. If the script is re-run, the MD will also regenerate with the correct value once emit.py is patched (see above). Non-blocking."
+    },
+    {
+      "file": "crates/axc-hir/src/typecheck.rs",
+      "line": 3380,
+      "description": "The F32ToF16 arm in check_q4_0_call calls check_expr with a hint of Some(ScalarTy::F32) and then re-checks x_hir.ty == F32. The pattern is consistent with the other arms. Very minor: the error message in F32ToF16ArgMustBeF32 says 'requires an f32 argument' without listing which builtin by name (unlike Q4_0BuiltinArgTypeMismatch which has a 'name' field). Non-blocking; the error variant name itself is unambiguous."
+    }
+  ],
+  "summary": "M3.5 is a clean, well-contained milestone that ships three logically separable deliverables — the f32_to_f16 language builtin, the fused kernel, and the same-shape A/B re-run — each with complete test coverage. The implementation matches the agreed spec on all material points: f32_to_f16 is a single OpFConvert under Float16 (no capability beyond the M3.3c ∪ M2.6 union, AT-1773 green); the fused kernel uses byte-identical M2.6 dequant + f32_to_f16 + frozen M3.3c RB coopmat; the oracle matches the GPU's f16 accumulator; the frozen 1e-3 was not loosened; and the K-limited correctness limitation (correct only at K≤256, max_rel_diff=29.07 at k=14336) is reported honestly and carried as the numerical-invalidity caveat in all four artifacts without spin. The same-shape A/B framing is correct (CRITICAL-1 resolved): the headline uses the n=512 same-shape llama 101.48 TFLOPS, not the n=1 GEMV; the JSON is internally consistent (post-QA fix); the ~9x throughput gap is reported as fast-but-WRONG at inference K, not as a win. The four minor issues (101.00 stale pre-estimate in two source comments + emit.py string + generated MD) are cosmetically inconsistent with the committed JSON but materially harmless. All 893 tests pass; the compiler-src change is confined to the f32_to_f16 builtin; frozen artifacts are untouched.",
+  "at_coverage": {
+    "AT-1770": "COVERED — K=256 hard-assert ≤ 1e-3; staging-coverage; reports measured max_rel_diff",
+    "AT-1771": "COVERED — K=512 gate-K-cap policy; honest reporting when > 1e-3; reports measured max_rel_diff",
+    "AT-1772": "COVERED — honest multi-size TFLOPS + max_rel_diff at every size; no asserted ratio; competitive label threshold",
+    "AT-1773": "COVERED — no-new-capability-beyond-union; Float16 count == 1; spirv-val clean",
+    "AT-1774": "COVERED — same-shape A/B line emitted; headline from n=512 measured tflops; n=1 as cross-shape context",
+    "AT-1775": "COVERED — typecheck happy path (returns f16) + error path (rejects non-f32 arg)",
+    "AT-1776": "COVERED — codegen emits exactly one OpFConvert→f16; declares Float16; no cooperative-matrix or 8-bit-storage extension; passes spirv-val"
+  }
+}

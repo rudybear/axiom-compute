@@ -1,0 +1,49 @@
+{
+  "verdict": "REQUEST_CHANGES",
+  "agent": "pessimistic_code_reviewer",
+  "milestone_id": "M3.5-q4km-coopmat-fusion",
+  "branch": "coder/M35-20260606-1100/M3.5-q4km-coopmat-fusion",
+  "scope": "git diff main..HEAD + working tree",
+  "critical_bugs": [
+    {
+      "description": "THE HONEST FRAMING IS UNCOMMITTED. The entire QA correctness/honesty fix (numerical-invalidity caveat, measured 11.27 vs 101.48, max_rel_diff=29.07 NUMERICALLY INVALID, K-limited central finding) exists ONLY in the working tree: DESIGN.md / BENCHMARKS.md / ROADMAP.md are MODIFIED-uncommitted, and .pipeline/benchmarks/m34/ab_results_fused.json + .md are UNTRACKED. The COMMITTED HEAD (commit 9261601) still ships the pre-QA SPIN: DESIGN.md/BENCHMARKS.md say '101.00 TFLOPS', 'AXIOM ~4-10x BEHIND', 'Correctness is within the FROZEN 1e-3 relative tolerance' presented UNCONDITIONALLY, with ZERO mention of numerical invalidity at k=14336. `git show HEAD:BENCHMARKS.md | grep -c 'NUMERICALLY INVALID|11.27|fast-but-WRONG'` == 0; same for DESIGN.md. A reader of the committed branch would take away 'AXIOM does Q4_K_M correct-within-1e-3 at ~4-10x of llama' — exactly the intent-laundered spin the thesis forbids. The 9x does NOT carry the numerical-invalidity caveat in the committed state. The A/B JSON artifact does not exist in any commit (it is untracked and at risk of loss).",
+      "file": "DESIGN.md, BENCHMARKS.md, ROADMAP.md, .pipeline/benchmarks/m34/ab_results_fused.json",
+      "line": "DESIGN.md §3.1.20; BENCHMARKS.md M3.5 section",
+      "severity": "critical"
+    },
+    {
+      "description": "THE A/B GENERATOR REGRESSES THE HONEST JSON. scripts/m34_emit.py (committed) does NOT emit the numerical_validity block and HARD-CODES dishonest prose: fairness_caveat literally says the fused kernel 'is correct within the frozen 1e-3 vs the f16-accumulator ggml reference' (FALSE at the A/B shape: max_rel_diff=29.07), kill_criterion_qualifier says '~4-10x BEHIND ... STILL behind (NOT a win)' with no invalidity caveat, ratio_boundary_label cites '101.00 TFLOPS'. `git show HEAD:scripts/m34_emit.py | grep -c 'numerical_validity|NUMERICALLY|fast-but-WRONG'` == 0. The committed ab_results_fused.json was HAND-PATCHED to be honest, but its generator was not updated, so re-running `scripts/m34_llamacpp_ab.sh --fused` would OVERWRITE the honest artifact with one asserting correctness-within-1e-3 and dropping the unmissable invalidity caveat. The honest artifact is therefore non-reproducible and one rerun away from regressing to spin.",
+      "file": "scripts/m34_emit.py",
+      "line": "112, 230-243 (hard-coded caveat strings); missing numerical_validity emission",
+      "severity": "critical"
+    }
+  ],
+  "warnings": [
+    {
+      "description": "AT-1771 (K=512) is a PASSING test that does NOT assert correctness at its own size: when max_rel_diff (3.6e-3) EXCEEDS the frozen 1e-3 it only eprintln!s and the test passes. This is honestly labeled (gate-K capped at K=256, divergence reported separately, frozen tol provably not loosened) and AT-1770 hard-asserts the certain point, so it is acceptable — but it IS structurally a test that passes by not checking correctness at a larger K. The orchestrator, not the test gate, is the consumer of the K=512 number; if the orchestrator step is skipped, a real K=512 regression would pass silently.",
+      "file": "crates/axc-driver/tests/dispatch_q4km_matmul_rb.rs",
+      "line": "245-261"
+    },
+    {
+      "description": "Minor: the resident bench header comment (line 16-17) and an intermediate doc state cite the A/B llama number as '101.00 TFLOPS' (the datasheet/estimate value) whereas the corrected JSON + working-tree docs use the MEASURED 101.48 from the selected_line. Harmonize on the measured value everywhere.",
+      "file": "crates/axc-driver/benches/resident_q4km_matmul_rb.rs",
+      "line": "16"
+    },
+    {
+      "description": "The f16-accumulator oracle (common_q4km_f16ref.rs) sums each depth-tile_k chunk in f32 then rounds the RUNNING accumulator to f16 after each tile add — an APPROXIMATION of the real coopmat accumulator's internal rounding (correctly disclosed at lines 23-25 as NVIDIA-coopmat-accumulator-specific, not portable). This is honest but means the 1e-3 within-tol claim at K<=256 is oracle-model-specific; a vendor whose tensor core accumulates above f16 would diverge from this reference even when MORE accurate. Acceptable given the disclosure.",
+      "file": "crates/axc-driver/tests/common_q4km_f16ref.rs",
+      "line": "133-145"
+    }
+  ],
+  "spirv_val_check": "PASS",
+  "ub_check": "PASS",
+  "race_condition_check": "PASS",
+  "vendor_divergence_check": "PASS",
+  "f32_to_f16_correctness": "PASS — single OpFConvert f32->f16, IEEE RNE default (no FPRoundingMode, matches in-tree convention), exact inverse of f16_bits_to_f32's final widening; sets caps.float16 only, NO extension; arity (1) and type (f32) checked up-front in check_q4_0_call; AT-1776 codegen test asserts exactly one f16-producing OpFConvert + OpCapability Float16 + no coopmat/8bit extension + spirv-val; AT-1775 typecheck happy/reject both green. No new OpCapability beyond Float16.",
+  "no_new_capability_check": "PASS — AT-1773 verifies the fused module's caps/exts are a SUBSET of the CORRECT union baseline (matmul_rb_coopmat M3.3c UNION q4km_dequant_matmul M2.6), NOT the M3.3c-only baseline that would falsely pass (Float16 lives in M3.3c). Float16 asserted present exactly once via raw word-count scan. Int8/StorageBuffer8BitAccess/SPV_KHR_8bit_storage come from the readonly_buffer[u8] weight buffer (frozen M2.6 caps), not from f32_to_f16. Test GREEN.",
+  "fused_kernel_correctness": "PASS — dequant byte-logic (get_scale_min_k4, nibble lo/hi, superblock-to-tile decode) mirrors the frozen M2.6 path; f32_to_f16 applied per weight into shared[f16] a_tile; staging coverage (ei_a 0..511 written exactly once) asserted by CPU re-derivation (expected_a_tile_f16 panics on double-write/gap); coopmat structure (4 f16 accumulators, A/B reuse, N-phi) reused verbatim from M3.3c with no new codegen. The kernel DOES encode the f16 accumulator (acc_* : matrix[f16,16,16,accumulator]) — the confirmed root of the large-K divergence.",
+  "frozen_tolerance_check": "PASS — FROZEN_REL_TOL is a single const = 1e-3, hard-asserted at AT-1770 (K=256), and NOT loosened anywhere. AT-1771 reports K=512 divergence WITHOUT loosening (gate capped at K=256). max_rel_diff reported at EVERY bench size including the A/B k=14336 (=29.07). No hidden-garbage / lucky-pass path found in the test or bench code.",
+  "ab_artifact_honesty": "PASS-AS-WRITTEN-BUT-UNCOMMITTED — the ab_results_fused.json artifact itself is exemplary: selected_line is the same-shape m=4096,n=512,k=14336=101.48 (NOT the n=1/7.42 GEMV, correctly relegated to cross_shape_context); dims.note = full GEMM; numerical_validity block present (valid_at_ab_shape=false, 29.07, frozen_tol=0.001); fairness_caveat truthful with the correctness caveat front-and-center; kill_criterion FAIL, NOT spun as a win; the 9x carries the invalidity caveat in every field. BUT this artifact is UNTRACKED and its generator (m34_emit.py) cannot reproduce it (see critical bug 2).",
+  "no_regression_check": "PASS — compiler crates green (axc-hir 252 + axc-codegen suites all pass; AT-1773/1775/1776 green); change confined to f32_to_f16 (new Q4_0Builtin variant + one body.rs arm + typecheck arm); no unwrap/expect/panic in new lib code (q4_0.rs codegen+hir); llama.cpp tree NOT committed (vendor/ gitignored; only harness script+test present).",
+  "summary": "The ENGINEERING is correct and the QA honesty fix is genuinely excellent — f32_to_f16 is a clean single OpFConvert with no new capability (AT-1773 uses the correct M3.3c∪M2.6 union baseline, not the falsely-passing M3.3c-only one), the fusion is byte-faithful to M2.6 with asserted staging coverage, the frozen 1e-3 is provably never loosened, and the working-tree A/B framing makes the numerical-invalidity caveat UNMISSABLE (11.27 TFLOPS ~9x behind on throughput BUT NUMERICALLY GARBAGE at k=14336, max_rel_diff=29.07, fast-but-WRONG, needs f32-accumulator M3.5b). REQUEST_CHANGES on a STATE/PROCESS hole, not an engineering one: that entire honest framing is UNCOMMITTED. The committed branch HEAD still ships the pre-QA spin (101.00, '~4-10x behind', 'correct within 1e-3', zero invalidity caveat in DESIGN.md/BENCHMARKS.md) and the honest ab_results_fused.json is untracked. Worse, the committed generator (m34_emit.py) hard-codes 'correct within the frozen 1e-3' and omits the numerical_validity block, so re-running --fused would overwrite the honest artifact with spin. REQUIRED before merge: (1) commit the DESIGN/BENCHMARKS/ROADMAP corrections + the ab_results_fused.json/.md artifacts; (2) update m34_emit.py to EMIT the numerical_validity block and the invalidity-aware caveat strings (parameterized on max_rel_diff vs frozen_tol) so the honest JSON is reproducible and a rerun cannot regress it. Until both are committed, the 9x does NOT carry the numerical-invalidity caveat in the shipped state and the milestone spins."
+}
