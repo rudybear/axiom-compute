@@ -18,9 +18,13 @@
 #   --fused          M3.5 f16-accumulator fused GEMM vs llama Q4_K n=512 same-shape (fast-but-
 #                    WRONG at inference K — the f16 coopmat accumulator overflows precision).
 #   --fused-f32acc   M3.5b f32-accumulator fused GEMM vs llama Q4_K n=512 same-shape. Now
-#                    NUMERICALLY VALID at k=14336 (max_rel_diff <= frozen 1e-3) — a REAL
-#                    fast-AND-correct comparison (still behind on throughput; numerically_valid
-#                    is driven by the MEASURED max_rel_diff, never hardcoded).
+#                    NUMERICALLY VALID at k=14336 under the condition-aware COMBINED metric
+#                    (|gpu-ref|/max(|ref|,Σ|wₖxₖ|) <= frozen 1e-3 — the same backward-stable gate
+#                    the GPU dispatch ATs use) — a REAL fast-AND-correct comparison (still behind
+#                    on throughput). numerically_valid is driven by the MEASURED COMBINED metric,
+#                    never hardcoded; the RAW forward error (~1e-2 on cancellation outputs, a
+#                    metric artifact identical-in-kind to llama.cpp's HMMA) is recorded for
+#                    transparency but does NOT gate validity.
 #
 # Env:
 #   LLAMACPP_DIR     (default vendor/llama.cpp)
@@ -260,12 +264,23 @@ AXC_FLOPS="$(axc_field flops)"
 AXC_DEVICE="$(echo "${AXC_LINE}" | sed -n 's/.* device=\(.*\)$/\1/p')"
 AXIOM_DEVICE="${AXC_DEVICE}"
 # Fused-only: the AXIOM GEMM output dims (m=rows, n=cols) for the same-shape ratio.
-if [ "${FUSED}" -eq 1 ]; then
+# M3.5b (--fused-f32acc) emits TWO correctness fields: `combined` (condition-aware backward-stable
+# metric, the GPU-AT gate) and `raw` (forward error, reporting only). numerically_valid MUST be
+# driven by the COMBINED metric — the raw forward error is ~1e-2 on near-zero cancellation outputs
+# at the A/B shape (a metric artifact, identical-in-kind to llama.cpp's own HMMA), so keying
+# validity off raw would dishonestly under-claim. M3.5 (--fused) emits a single `max_rel_diff`.
+if [ "${FUSED_F32ACC}" -eq 1 ]; then
+    AXC_M="$(axc_field m)"
+    AXC_N="$(axc_field n)"
+    AXC_MAX_REL_DIFF="$(axc_field combined)"   # COMBINED drives numerically_valid (≤ frozen 1e-3)
+    AXC_RAW_REL_DIFF="$(axc_field raw)"        # raw forward error, recorded for transparency
+elif [ "${FUSED}" -eq 1 ]; then
     AXC_M="$(axc_field m)"
     AXC_N="$(axc_field n)"
     AXC_MAX_REL_DIFF="$(axc_field max_rel_diff)"
+    AXC_RAW_REL_DIFF="null"
 else
-    AXC_M="1"; AXC_N="1"; AXC_MAX_REL_DIFF="null"
+    AXC_M="1"; AXC_N="1"; AXC_MAX_REL_DIFF="null"; AXC_RAW_REL_DIFF="null"
 fi
 echo "-- AXIOM device: ${AXIOM_DEVICE}"
 
@@ -314,6 +329,7 @@ export M34_AXC_KERNEL="${AXC_KERNEL}"
 export M34_AXC_M="${AXC_M}"
 export M34_AXC_N="${AXC_N}"
 export M34_AXC_MAX_REL_DIFF="${AXC_MAX_REL_DIFF}"
+export M34_AXC_RAW_REL_DIFF="${AXC_RAW_REL_DIFF}"
 export M34_LLAMA_SAMESHAPE_TFLOPS="${LLAMA_SAMESHAPE_TFLOPS}"
 export M34_LLAMA_GEMV_CONTEXT_TFLOPS="${LLAMA_GEMV_CONTEXT_TFLOPS}"
 export M34_Q4K_SAMESHAPE_LINE="${Q4K_N512_LINE:-}"

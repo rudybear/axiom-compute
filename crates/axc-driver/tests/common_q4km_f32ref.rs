@@ -479,6 +479,102 @@ mod tests {
         assert!(ok <= 1e-3, "f32-noise on a cancellation output must pass (got {ok:.3e})");
     }
 
+    /// AT-1790 — MUTATION COVERAGE (CPU-only, no GPU). The combined condition-aware gate must
+    /// still CATCH a genuinely wrong kernel even at a cancellation-prone (A/B-style large-K)
+    /// shape — i.e. the condition-awareness tolerates VALID f32-reordering noise WITHOUT masking
+    /// a real systematic error. We take a real Q4_K_M fixture's f32-accumulator CPU reference
+    /// (the same fixture builders as the dispatch bench / AT-1782) at a cancellation-prone shape,
+    /// then MUTATE it by a 1% systematic scale (multiply the WHOLE matrix, incl. well-conditioned
+    /// elements, by 1.01) — a 1% forward error on every output. The combined metric MUST exceed
+    /// the frozen 1e-3, proving the gate catches a wrong kernel and is NOT a rubber stamp. (The
+    /// abs_scale denominator only relaxes the gate for the FEW near-zero cancellation outputs;
+    /// the many well-conditioned outputs — where |ref| ~ abs_scale — keep the full 1e-3 relative
+    /// gate, so a global 1% scale trips it.) No GPU, deterministic.
+    #[test]
+    fn at1790_combined_gate_catches_one_percent_systematic_error() {
+        // Same RNG fixture builders as benches/resident_q4km_matmul_rb_f32acc.rs (AT-1782/1784).
+        fn make_q4km_weights(m: usize, n_bpr: usize, seed: u64) -> Vec<u8> {
+            let mut q = vec![0u8; m * n_bpr * 144];
+            let mut state = seed | 1;
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            for row in 0..m {
+                for sb in 0..n_bpr {
+                    let base = row * n_bpr * 144 + sb * 144;
+                    let d = 0.02_f32 + ((next() % 16) as f32) * 0.002;
+                    let dmin = 0.01_f32 + ((next() % 8) as f32) * 0.001;
+                    q[base..base + 2].copy_from_slice(&f16::from_f32(d).to_bits().to_le_bytes());
+                    q[base + 2..base + 4].copy_from_slice(&f16::from_f32(dmin).to_bits().to_le_bytes());
+                    for j in 0..12 {
+                        q[base + 4 + j] = (next() & 0x3F) as u8;
+                    }
+                    for kk in 0..128 {
+                        q[base + 16 + kk] = (next() & 0xFF) as u8;
+                    }
+                }
+            }
+            q
+        }
+        fn make_x_f16(k: usize, n: usize, seed: u64) -> Vec<u16> {
+            let mut state = seed | 1;
+            let mut out = Vec::with_capacity(k * n);
+            for idx in 0..k * n {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let v = (((state % 2000) as f32) / 1000.0 - 1.0) + (idx % 3) as f32 * 0.01;
+                out.push(f16::from_f32(v).to_bits());
+            }
+            out
+        }
+
+        // Cancellation-prone A/B-style shape (large K with the SAME cancellation-prone fixtures as
+        // the k=14336 A/B; kept CPU-feasible). n_bpr=8 -> K=2048; enough depth + signed terms to
+        // produce near-zero cancellation outputs (the case condition-awareness must tolerate),
+        // while still containing many well-conditioned outputs (the case it must NOT mask).
+        let (m, n, n_bpr) = (32usize, 32usize, 8usize);
+        let k = n_bpr * 256;
+        let q = make_q4km_weights(m, n_bpr, 0xC0FFEE ^ (m as u64));
+        let x_f16 = make_x_f16(k, n, 0xBADF00D ^ (n as u64));
+
+        // The honest CPU reference (what a CORRECT kernel produces).
+        let y_ref = q4km_dequant_matmul_f32accum_cpu(&q, &x_f16, m, n, n_bpr);
+        let abs_scale = q4km_abs_dot_scale(&q, &x_f16, m, n, n_bpr);
+
+        // Sanity: this shape really IS cancellation-prone (some near-zero outputs whose abs_scale
+        // dwarfs |ref|) — i.e. it exercises the same condition-awareness the A/B relies on.
+        let has_cancellation = y_ref
+            .iter()
+            .zip(abs_scale.iter())
+            .any(|(&r, &s)| (r as f64).abs() < 1e-2 * (s as f64));
+        assert!(
+            has_cancellation,
+            "AT-1790 fixture must contain cancellation outputs (|ref| << abs_scale) to be a \
+             meaningful test of the condition-aware gate"
+        );
+
+        // MUTANT: a 1% systematic forward error on the WHOLE matrix (a genuinely wrong kernel).
+        let y_mut: Vec<f32> = y_ref.iter().map(|&r| r * 1.01_f32).collect();
+
+        let combined = max_rel_diff_combined(&y_mut, &y_ref, &abs_scale);
+
+        eprintln!(
+            "AT-1790 mutation K={k}: combined(condition-aware) on a 1% systematic error = \
+             {combined:.3e} (must exceed frozen 1e-3)"
+        );
+        // The gate MUST trip: a 1% systematic error on well-conditioned outputs (where
+        // |ref| ~ abs_scale) yields combined ~1e-2 >> 1e-3 — the wrong kernel is caught.
+        assert!(
+            combined > 1e-3,
+            "AT-1790: a 1% systematic error must be CAUGHT by the combined gate even at a \
+             cancellation-prone shape (got {combined:.3e}); the gate is not a rubber stamp"
+        );
+    }
+
     /// `q4km_abs_dot_scale` returns the per-element sum of |products| and is >= |output|
     /// (the triangle inequality: |sum| <= sum|·|), so it is a valid condition-aware denom.
     #[test]

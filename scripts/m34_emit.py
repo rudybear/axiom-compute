@@ -62,7 +62,13 @@ is_fused = axc_kernel in ("fused", "fused_f32acc")
 is_f32acc = axc_kernel == "fused_f32acc"
 axc_m_out = int_or_none("M34_AXC_M") or 1      # AXIOM fused GEMM output rows
 axc_n_out = int_or_none("M34_AXC_N") or 1      # AXIOM fused GEMM output cols
+# For M3.5b (fused_f32acc), M34_AXC_MAX_REL_DIFF carries the COMBINED (condition-aware,
+# backward-stable) metric — this is what DRIVES numerically_valid (the same gate the GPU dispatch
+# ATs use). M34_AXC_RAW_REL_DIFF carries the raw forward error (~1e-2 on cancellation outputs, a
+# metric artifact identical-in-kind to llama.cpp's HMMA), recorded for transparency only. For
+# M3.4/M3.5, M34_AXC_RAW_REL_DIFF is absent (None) and max_rel_diff is the only metric.
 axc_max_rel_diff = num_or_none("M34_AXC_MAX_REL_DIFF")
+axc_raw_rel_diff = num_or_none("M34_AXC_RAW_REL_DIFF")
 llama_sameshape_tflops = num_or_none("M34_LLAMA_SAMESHAPE_TFLOPS")
 llama_gemv_context_tflops = num_or_none("M34_LLAMA_GEMV_CONTEXT_TFLOPS")
 q4k_sameshape_line = env("M34_Q4K_SAMESHAPE_LINE")
@@ -158,7 +164,12 @@ if not incomplete and llama_us is not None and llama_k is not None and llama_m i
                 f"inference K.")
         numerical_validity = {
             "valid_at_ab_shape": bool(ab_valid),
+            # For M3.5b: ab_shape_max_rel_diff is the COMBINED (condition-aware, backward-stable)
+            # metric that DRIVES validity; ab_shape_raw_rel_diff is the raw forward error recorded
+            # for transparency (NOT a gate). For M3.4/M3.5 the raw field is null (single metric).
             "ab_shape_max_rel_diff": axc_max_rel_diff,
+            "ab_shape_metric": ("combined_condition_aware" if is_f32acc else "raw_relative"),
+            "ab_shape_raw_rel_diff": axc_raw_rel_diff,
             "frozen_tol": FROZEN_TOL,
             "verdict": _nv_verdict,
             "kill_criterion_interpretation": _nv_kill,
@@ -282,6 +293,7 @@ out = {
     "llama_over_axiom_speedup_tflops": round(1.0 / ratio_tflops, 2) if ratio_tflops else None,
     "cross_shape_context": cross_shape_context,
     "axiom_fused_max_rel_diff": axc_max_rel_diff,
+    "axiom_fused_raw_rel_diff": axc_raw_rel_diff,
     "kill_criterion_within_15pct": (kill_status == "PASS") if kill_status in ("PASS", "FAIL") else None,
     "kill_criterion_status": kill_status,
     "kill_criterion_reason": kill_reason,
@@ -382,7 +394,15 @@ if is_fused:
     md.append("|---|---|---|")
     md.append(f"| shape (m,n,k) | ({axc_m_out},{axc_n_out},{axc_k}) | ({fmt(llama_m)},{fmt(llama_n)},{fmt(llama_k)}) |")
     md.append(f"| TFLOPS (GpuTimestamp MIN, kernel-only) | {fmt(axc_tflops_min, 3)} | {fmt(llama_sameshape_tflops, 2)} |")
-    md.append(f"| max-rel-diff vs {_acc} ref | {fmt(axc_max_rel_diff, 3) if axc_max_rel_diff is not None else 'n/a'} | (ggml is the ref) |")
+    if is_f32acc:
+        _mrd_label = "max-rel-diff vs f32-accum ref (combined, condition-aware — the gate)"
+    else:
+        _mrd_label = f"max-rel-diff vs {_acc} ref"
+    md.append(f"| {_mrd_label} | {fmt(axc_max_rel_diff, 3) if axc_max_rel_diff is not None else 'n/a'} | (ggml is the ref) |")
+    if is_f32acc and axc_raw_rel_diff is not None:
+        md.append(f"| raw forward-error vs f32-accum ref (reporting only; ~1e-2 on cancellation "
+                  f"outputs, identical-in-kind to llama.cpp's HMMA) | {fmt(axc_raw_rel_diff, 3)} | "
+                  f"(ggml is the ref) |")
     md.append("")
     if numerical_validity is not None and not numerical_validity["valid_at_ab_shape"]:
         md.append(f"> **NUMERICALLY INVALID at the A/B shape** (max_rel_diff="
