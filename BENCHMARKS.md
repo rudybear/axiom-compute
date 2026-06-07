@@ -112,25 +112,28 @@ M3.5b switches the M3.5 fused kernel's loop-carried accumulators from f16 to **f
 
 > **AUDIT (Coder): ZERO production coopmat code changed.** The type-system, codegen, metadata, runtime preflight, and OpPhi were ALREADY mixed-precision-correct (the M3.1 design dividend — coopmat shapes carry independent a/b/c/result types). AT-1787 (CI, no GPU) proves the f32-accumulator kernel compiles, passes spirv-val, has a **byte-identical capability set** to the M3.5 fused kernel (no new capability — an f32 coopmat component needs only CooperativeMatrixKHR + Shader; Float16 remains for the f16 A/B types), and emits the coopmat metadata shape {16,16,16, F16,F16,F32,F32, Subgroup}.
 
-**The SAME-SHAPE A/B is now a fast-AND-correct fight.** AXIOM f32-accumulator fused GEMM at (m=4096, n=512, k=14336) vs llama.cpp Q4_K MUL_MAT at the IDENTICAL shape = **101.48 TFLOPS** (live-parsed, never hardcoded). Because AXIOM is now numerically VALID at k=14336, the throughput ratio is a genuine usable-kernel comparison (not fast-but-wrong).
+**The SAME-SHAPE A/B is now a fast-AND-correct fight.** AXIOM f32-accumulator fused GEMM at (m=4096, n=512, k=14336) vs llama.cpp Q4_K MUL_MAT at the IDENTICAL shape = **101.88 TFLOPS** (live-parsed, never hardcoded). Because AXIOM is now numerically VALID at k=14336, the throughput ratio is a genuine usable-kernel comparison (not fast-but-wrong).
 
 | metric | AXIOM (f32-accumulator fused Q4_K_M RB coopmat GEMM) | llama.cpp (Q4_K MUL_MAT n=512) |
 |---|---|---|
 | shape (m,n,k) | 4096 × 512 × 14336 | 4096 × 512 × 14336 |
-| TFLOPS (GpuTimestamp MIN, kernel-only) | _(NVIDIA orchestrator run; expected ≤ M3.5's 11.27 — f32 accumulators cost registers/bandwidth)_ | **101.48** |
-| max-rel-diff vs f32-accum ref (combined, condition-aware — the gate) | _(orchestrator; expected ≤ 1e-3 — **NUMERICALLY VALID** at k=14336)_ | (ggml is the reference) |
-| raw forward-error vs f32-accum ref (reporting only) | _(orchestrator; ~1e-2 on cancellation outputs — identical-in-kind to llama.cpp's HMMA, NOT a gate)_ | (ggml is the reference) |
+| TFLOPS (GpuTimestamp MIN, kernel-only) | **10.91** | **101.88** |
+| max-rel-diff vs f32-accum ref (combined, condition-aware — the gate) | **2.05e-6 — NUMERICALLY VALID** (≤ frozen 1e-3) | (ggml is the reference) |
+| raw forward-error vs f32-accum ref (reporting only) | 2.10 (cancellation outputs — identical-in-kind to llama.cpp's HMMA, NOT a gate) | (ggml is the reference) |
+
+**Measured result (honest):** AXIOM f32-accumulator fused GEMM **10.91 TFLOPS** vs llama **101.88 TFLOPS** same-shape → **AXIOM ≈ 9.3× BEHIND on throughput** (ratio 0.107), and **numerically VALID at inference K** (combined max-rel-diff 2.05e-6 ≤ frozen 1e-3). This is the M3.5b win: vs M3.5's fast-but-WRONG f16 (11.27 TFLOPS, max-rel-diff 29.07 garbage at k=14336), M3.5b is **fast-AND-correct at essentially no throughput cost** (10.91 vs 11.27 — the f32 accumulator's register/bandwidth tax is ~3%). The kill-criterion (within 15% on NVIDIA) does **not** fire — AXIOM is 9.3× behind — but this is now a genuine **usable-kernel** baseline. Cross-shape context (NOT the headline): llama n=1 GEMV = 7.42 TFLOPS (the SAME llama kernel runs 13.7× faster at n=512, so an AXIOM-GEMM-vs-llama-GEMV headline would flatter AXIOM ~13× — forbidden).
 
 **f32-accumulator TFLOPS at cube sizes (AT-1783, honest, no asserted ratio; max-rel-diff now ≤ 1e-3 at every size):**
 
-| size (M=N=K) | TFLOPS | % of 125-TFLOPS estimate | max-rel-diff |
+| size (M=N=K) | TFLOPS | % of 125-TFLOPS estimate | max-rel-diff (combined) |
 |---|---|---|---|
-| 256 | _(NVIDIA orchestrator run)_ | _(orchestrator)_ | _(orchestrator; ≤ 1e-3 VALID)_ |
-| 512 | _(orchestrator)_ | _(orchestrator)_ | _(orchestrator; ≤ 1e-3 VALID — was 3.6e-3 with f16)_ |
-| 768 | _(orchestrator)_ | _(orchestrator)_ | _(orchestrator; ≤ 1e-3 VALID)_ |
-| 1024 | _(orchestrator)_ | _(orchestrator)_ | _(orchestrator; ≤ 1e-3 VALID)_ |
+| 256 | 0.59 | 0.47% | 5.3e-7 VALID |
+| 512 | 2.74 | 2.19% | 6.7e-7 VALID (was 3.6e-3 with f16) |
+| 768 | 4.81 | 3.85% | 7.9e-7 VALID |
+| 1024 | 7.93 | 6.35% | 1.1e-6 VALID |
+| 4096×512×14336 (A/B) | 10.91 | 8.73% | 2.05e-6 VALID (f16 was 29.07 — garbage) |
 
-**Honest framing:** AXIOM is now a **USABLE** Q4_K_M kernel — numerically valid at inference K — but still behind llama on throughput (the kill-criterion within-15% does NOT fire; the f32 accumulator costs registers + f32 store bandwidth vs f16, so the TFLOPS may dip below M3.5's 11.27). The exact behind-factor (X×) and TFLOPS are MEASURED by the NVIDIA orchestrator run; `numerically_valid` in the emitted JSON is driven solely by the measured **combined condition-aware** metric ≤ frozen 1e-3, never hardcoded (the raw forward error is recorded alongside for transparency but does NOT gate). The kernel, oracle, GPU tests, bench, A/B harness, and all CPU-only regression tests (AT-1785/1786/1788/1789) are landed and CI-green (compile + spirv-val + no-new-capability + identical-cap-set + metadata-shape + CPU oracle + typecheck/preflight/store regressions).
+**Honest framing:** AXIOM is now a **USABLE** Q4_K_M kernel — numerically valid at inference K — but still **9.3× behind** llama on throughput (the kill-criterion within-15% does NOT fire; the f32 accumulator costs ~3% vs M3.5's f16 11.27 TFLOPS). `numerically_valid` in the emitted JSON is driven solely by the measured **combined condition-aware** metric ≤ frozen 1e-3, never hardcoded (the raw forward error 2.10 is recorded alongside for transparency but does NOT gate). The kernel, oracle, GPU tests, bench, A/B harness, and all CPU-only regression tests (AT-1785/1786/1788/1789/1790) are landed and CI-green (compile + spirv-val + no-new-capability + identical-cap-set + metadata-shape + CPU oracle + typecheck/preflight/store regressions + mutation coverage). Remaining throughput gap (if ALU-bound): scale-caching across the 16 tile_k K-blocks of a superblock to cut dequant overhead.
 
 **Reproduce:** `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json AXC_ENABLE_GPU_BENCHES=1 scripts/m34_llamacpp_ab.sh --fused-f32acc` (writes `.pipeline/benchmarks/m34/ab_results_fused_f32acc.json` + `.md`; the M3.5 `ab_results_fused.json` and the frozen-matvec `ab_results.json` are retained).
 
