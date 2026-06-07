@@ -5446,6 +5446,125 @@ mod tests {
         );
     }
 
+    // ── M3.5b mixed-precision coopmat typecheck tests (AT-1785/1786/1789) ─────────
+
+    /// AT-1785: mixed-precision coopmat_mul_add(a:f16, b:f16, c:f32) typechecks to
+    /// matrix[f32,16,16,accumulator] with NO ABElementMismatch and NO error (the f16×f16→f32
+    /// HMMA). The accumulator's element type is validated INDEPENDENTLY of A/B and becomes the
+    /// result type (result_key = c_key). This locks in the M3.5b finding that the type system
+    /// is already mixed-precision-capable; a regression that rejected f16/f16/f32 would fail here.
+    #[test]
+    fn tc_coopmat_mul_add_mixed_f16_f16_f32_ok() {
+        let (_, errors) = tc_body(
+            "let a: matrix[f16, 16, 16, a] = coopmat_zero(); \
+             let b: matrix[f16, 16, 16, b] = coopmat_zero(); \
+             let c: matrix[f32, 16, 16, accumulator] = coopmat_zero(); \
+             let d: matrix[f32, 16, 16, accumulator] = coopmat_mul_add(a, b, c); \
+             return;"
+        );
+        assert!(
+            errors.is_empty(),
+            "AT-1785: mixed-precision coopmat_mul_add(a:f16,b:f16,c:f32) must typecheck with \
+             NO errors (f16×f16→f32 HMMA); got: {errors:?}"
+        );
+    }
+
+    /// AT-1785 (no-regression half): the frozen ALL-f16 coopmat_mul_add still typechecks clean.
+    #[test]
+    fn tc_coopmat_mul_add_all_f16_still_ok() {
+        let (_, errors) = tc_body(
+            "let a: matrix[f16, 16, 16, a] = coopmat_zero(); \
+             let b: matrix[f16, 16, 16, b] = coopmat_zero(); \
+             let c: matrix[f16, 16, 16, accumulator] = coopmat_zero(); \
+             let d: matrix[f16, 16, 16, accumulator] = coopmat_mul_add(a, b, c); \
+             return;"
+        );
+        assert!(
+            errors.is_empty(),
+            "AT-1785: the frozen all-f16 coopmat_mul_add must STILL typecheck (no regression); \
+             got: {errors:?}"
+        );
+    }
+
+    /// AT-1786 (RETAINED hard gate): coopmat_mul_add(a:f16, b:f32, c:f32) STILL errors with
+    /// ABElementMismatch. Only the ACCUMULATOR may differ in element type; A and B must match
+    /// EACH OTHER. This guards against any unnecessary typecheck relax weakening the
+    /// a_key.elem==b_key.elem check (the M3.5b coder_handoff_notes explicitly forbid such a relax).
+    #[test]
+    fn tc_coopmat_mul_add_ab_mismatch_still_rejected() {
+        let (_, errors) = tc_body(
+            "let a: matrix[f16, 16, 16, a] = coopmat_zero(); \
+             let b: matrix[f32, 16, 16, b] = coopmat_zero(); \
+             let c: matrix[f32, 16, 16, accumulator] = coopmat_zero(); \
+             let d: matrix[f32, 16, 16, accumulator] = coopmat_mul_add(a, b, c); \
+             return;"
+        );
+        let mismatch_count = errors.iter().filter(|e| matches!(
+            e,
+            TypecheckError::CoopMatrixShapeMismatch {
+                kind: crate::coopmat::CoopMatrixShapeKind::ABElementMismatch {
+                    a_elem: crate::ty::ScalarTy::F16,
+                    b_elem: crate::ty::ScalarTy::F32,
+                },
+                ..
+            }
+        )).count();
+        assert_eq!(
+            mismatch_count, 1,
+            "AT-1786: coopmat_mul_add(a:f16, b:f32, c:f32) must produce exactly one \
+             ABElementMismatch{{a_elem:F16,b_elem:F32}} (A/B must match each other; only the \
+             accumulator may differ); got: {errors:?}"
+        );
+    }
+
+    /// AT-1789 (MANDATORY, CPU-only): coopmat_store of an f32 accumulator
+    /// (matrix[f32,16,16,accumulator]) into a buffer[f16] MUST error
+    /// CoopMatStoreElementTypeMismatch (matrix.elem=F32 != buffer.elem=F16). This permanently
+    /// locks in WHY the M3.5b kernel changes C: buffer[f16]->buffer[f32].
+    #[test]
+    fn tc_coopmat_store_f32_accum_into_buffer_f16_rejected() {
+        let full = "@kernel @workgroup(1,1,1) fn k(out: buffer[f16]) -> void { \
+                    let m: matrix[f32, 16, 16, accumulator] = coopmat_zero(); \
+                    coopmat_store(m, out, 0u32, 16u32); \
+                    return; }";
+        let (ast, lex_errs, _parse_errs) = parse(full);
+        assert!(lex_errs.is_empty(), "lex: {lex_errs:?}");
+        let axc_parser::Item::Kernel(ref kd) = ast.items[0].node;
+        let params = crate::lower::lower_params_for_test(&kd.params);
+        let (_, errors, _) = typecheck_kernel_body(&kd.body.node, &params);
+        let mismatch_count = errors.iter().filter(|e| matches!(
+            e,
+            TypecheckError::CoopMatStoreElementTypeMismatch { matrix_elem, buffer_elem, .. }
+                if *matrix_elem == "f32" && *buffer_elem == "f16"
+        )).count();
+        assert_eq!(
+            mismatch_count, 1,
+            "AT-1789: coopmat_store(matrix[f32,..,accumulator], buffer[f16], ..) must produce \
+             exactly one CoopMatStoreElementTypeMismatch{{matrix=f32, buffer=f16}}; got: {errors:?}"
+        );
+    }
+
+    /// AT-1789 (positive mirror): coopmat_store of an f32 accumulator into buffer[f32] typechecks
+    /// clean (the M3.5b kernel's actual store; covered transitively by AT-1787's clean compile,
+    /// asserted here directly for a fast CPU-only regression).
+    #[test]
+    fn tc_coopmat_store_f32_accum_into_buffer_f32_ok() {
+        let full = "@kernel @workgroup(1,1,1) fn k(out: buffer[f32]) -> void { \
+                    let m: matrix[f32, 16, 16, accumulator] = coopmat_zero(); \
+                    coopmat_store(m, out, 0u32, 16u32); \
+                    return; }";
+        let (ast, lex_errs, _parse_errs) = parse(full);
+        assert!(lex_errs.is_empty(), "lex: {lex_errs:?}");
+        let axc_parser::Item::Kernel(ref kd) = ast.items[0].node;
+        let params = crate::lower::lower_params_for_test(&kd.params);
+        let (_, errors, _) = typecheck_kernel_body(&kd.body.node, &params);
+        assert!(
+            errors.is_empty(),
+            "AT-1789: coopmat_store(matrix[f32,..,accumulator], buffer[f32], ..) must typecheck \
+             clean; got: {errors:?}"
+        );
+    }
+
     // AT-1775: f32_to_f16 builtin typecheck — happy path produces an f16 binding.
     #[test]
     fn at_1775_f32_to_f16_happy_returns_f16() {

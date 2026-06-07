@@ -1,0 +1,220 @@
+{
+  "verdict": "PROPOSED",
+  "revision": "r1",
+  "revision_changelog": [
+    "r1 (2026-06-06): Addressed the pessimistic reviewer's SOLE blocking ask (NEEDS_REVISION -> the reviewer's stated exact APPROVE conditions). Both reviewers CONFIRMED the central 'already mixed-precision-capable' finding TRUE end-to-end (no typecheck/codegen/capability/preflight change). The ONLY changes in r1 are ADDITIVE tests; all r0 design content is KEPT verbatim.",
+    "r1 ADD-1: AT-1788 (mandatory, CPU-only, was r0 open_question 2 'add if absent') — a STANDALONE positive unit test of coopmat_shape_supported (crates/axc-runtime/src/coopmat.rs:326) asserting the mixed shape AType=F16,BType=F16,CType=F32,ResultType=F32,scope=Subgroup,saturating=false IS ACCEPTED when the device advertises that exact tuple, AND is REJECTED on a near-miss where the device offers only f16/f16/f16/f16 (c_type/result_type discrimination). AT-1561 (coopmat.rs:690) only tests near-miss REJECTION + all-f16 acceptance; without a positive f16/f16/f32/f32 accept test a matcher regression that rejected an f32 c_type/result_type would pass CI and surface only at GPU dispatch (Lavapipe skips dispatch). Promoted from open_question to a numbered acceptance test.",
+    "r1 CONFIRM-2: AT-1786 (coopmat_mul_add(a:f16,b:f32,c:f32) STILL REJECTED with ABElementMismatch) is RETAINED as a hard mandatory gate — guards against any unnecessary typecheck relax weakening the a_key.elem==b_key.elem (ABElementMismatch) check at typecheck.rs:2998-3005.",
+    "r1 ADD-3: AT-1789 (store-element-mismatch regression, CPU-only, was r0 edge_case 'add if cheap') — coopmat_store of an f32 accumulator into buffer[f16] MUST error CoopMatStoreElementTypeMismatch (typecheck.rs:3109 store requires matrix.elem==buffer.elem). Permanently locks in WHY the kernel's C must change buffer[f16]->buffer[f32]. Promoted to a numbered acceptance test.",
+    "r1: AT-ID range extended AT-1780..AT-1789 (was AT-1780..AT-1787). No production code change vs r0; no relax; no new capability; the f32 oracle / frozen 1e-3 / K=512 unconditional assert / K=14336 honest reporting / now-VALID A/B are all unchanged."
+  ],
+  "agent": "architect",
+  "milestone_id": "M3.5b-f32-accum-coopmat",
+  "summary": "Make the fused Q4_K_M->coopmat matmul NUMERICALLY CORRECT at inference K by switching the loop-carried accumulators from f16 to f32 (the canonical f16xf16->f32 HMMA). KEY FINDING: the type-system, codegen, metadata, and runtime-preflight pipeline is ALREADY mixed-precision-capable end-to-end (M3.1 made CoopMatKey/CoopMatrixShape/CoopMatShapeMeta carry independent a/b/c/result types; the mul_add typecheck ALREADY validates A.elem==B.elem WITHOUT requiring the accumulator to match; codegen emits the component type from each binding's OWN key.elem; the preflight matcher ALREADY checks result_type; the OpPhi path is type-agnostic). NO typecheck relax is strictly required and NO new SPIR-V capability is required. M3.5b is therefore: (1) a new f32-accumulator fused kernel, (2) an f32-accumulator CPU oracle, (3) bit-within-tol tests at K=256/512/14336, (4) an honest TFLOPS bench, (5) the now-VALID same-shape A/B re-run, plus DEFENSIVE additions: a regression test PROVING mixed-precision mul_add typechecks/compiles/spirv-vals, and an audit of every coopmat path for an f16==f32-assuming shortcut.",
+  "files_to_create": [
+    {
+      "path": "examples/q4km_matmul_rb_coopmat_f32acc.axc",
+      "purpose": "M3.5b fused Q4_K_M -> register-blocked coopmat matmul with f32 ACCUMULATOR (the canonical f16xf16->f32 HMMA). Byte-for-byte identical to examples/q4km_matmul_rb_coopmat.axc EXCEPT: (1) the 4 loop-carried accumulators are `matrix[f32, 16, 16, accumulator]` (not f16); (2) the output param `C: buffer[f32]` (not buffer[f16]) so coopmat_store of an f32 accumulator passes the CoopMatStoreElementTypeMismatch check; (3) the header comment documents the f32-accumulate numerics + the now-VALID-at-K=14336 claim. A/B matrices (a_mat_*, b_mat_*) STAY matrix[f16,16,16,a|b]; the shared a_tile/b_tile STAY shared[f16] and the Q4_K_M dequant->f32_to_f16 staging is VERBATIM. coopmat_mul_add(a:f16, b:f16, c:f32)->f32 is the ONLY mixed-precision change. The @strategy holes, RB 2x2 structure, OpPhi loop-carry, barriers, and superblock decode are FROZEN from M3.5.",
+      "public_api": [
+        "@kernel @workgroup(32,1,1) @cooperative_matrix",
+        "fn q4km_matmul_rb_coopmat_f32acc(q: readonly_buffer[u8], x: readonly_buffer[f16], C: buffer[f32], M: u32, N: u32, K: u32, n_blocks_per_row: u32) -> void",
+        "let mut acc_00: matrix[f32, 16, 16, accumulator] = coopmat_zero(); (x4)",
+        "acc_00 = coopmat_mul_add(a_mat_0, b_mat_0, acc_00); // f16 A, f16 B, f32 C -> f32"
+      ]
+    },
+    {
+      "path": "crates/axc-driver/tests/common_q4km_f32ref.rs",
+      "purpose": "M3.5b f32-ACCUMULATOR Q4_K_M CPU oracle (sibling of common_q4km_f16ref.rs). Computes y[row,col] = sum_k dequant_f32(q[row,k]) * x_f16[k,col] with: dequant in f32 (ggml/M2.6, byte-identical to the f16 oracle's dequant_q4km_row_f32 + get_scale_min_k4), each weight AND each x rounded f32->f16->f32 (the inputs that ENTER the tensor core are f16, matching the GPU a_tile/b_tile f16 staging), but the ACCUMULATION is pure f32 with NO per-tile rounding (mirroring the f32 coopmat accumulator). This is the ONLY arithmetic difference vs the f16 oracle (which rounds the running accumulator to f16 after each depth-16 tile). The frozen 1e-3 relative tolerance is NOT loosened. Re-exports max_rel_diff + the Q4KM constants (or includes common_q4km_f16ref helpers via a shared decode — see coder_handoff_notes for the no-duplication option).",
+      "public_api": [
+        "pub fn q4km_dequant_matmul_f32accum_cpu(q: &[u8], x_f16: &[u16], n_rows: usize, n_cols: usize, n_blocks_per_row: usize) -> Vec<f32>",
+        "pub fn max_rel_diff(gpu: &[f32], reference: &[f32]) -> f64  // identical formula to f16 oracle"
+      ]
+    },
+    {
+      "path": "crates/axc-driver/tests/dispatch_q4km_matmul_rb_f32acc.rs",
+      "purpose": "M3.5b GPU bit-within-tol correctness tests for the f32-accumulator fused kernel (AT-1780/1781/1782). Mirrors dispatch_q4km_matmul_rb.rs but: (1) includes examples/q4km_matmul_rb_coopmat_f32acc.axc, (2) C is a buffer[f32] readback (4 bytes/elem, NOT f16 widening), (3) the oracle is common_q4km_f32ref::q4km_dequant_matmul_f32accum_cpu, (4) the within-tol gate is ASSERTED at K=256 AND K=512 (both must now PASS — K=512 FAILED in M3.5 with f16 accum; f32 accum must fix it) AND IDEALLY at K=14336 (the inference-K validity claim). GATE-K policy for K=14336: assert within 1e-3 if it holds; if NVIDIA's f32 accumulator still diverges (it must not, but HONEST), report the measured max_rel_diff separately and document. Lavapipe: coopmat typed-skip (DeviceFeatureUnsupported / CoopMatUnsupported), same as M3.5.",
+      "public_api": [
+        "#[ignore] fn at_1780_q4km_rb_coopmat_f32acc_bit_within_tol_k256()",
+        "#[ignore] fn at_1781_q4km_rb_coopmat_f32acc_bit_within_tol_k512()  // MUST pass (M3.5 f16 failed here)",
+        "#[ignore] fn at_1782_q4km_rb_coopmat_f32acc_bit_within_tol_k14336()  // inference-K validity"
+      ]
+    },
+    {
+      "path": "crates/axc-driver/benches/resident_q4km_matmul_rb_f32acc.rs",
+      "purpose": "M3.5b honest effective-TFLOPS bench for the f32-accumulator fused kernel + the now-VALID SAME-SHAPE A/B line (AT-1783 + AT-1784). Mirrors resident_q4km_matmul_rb.rs: multi-size TFLOPS (incl the pinned A/B shape m=4096,n=512,k=14336), effective_tflops = 2*M*N*K/kernel_seconds, % of the datasheet estimate, AND the measured max_rel_diff vs the F32 oracle at EVERY size (now WITHIN 1e-3 even at K=14336 — the whole point). Emits a machine-readable `AXC_Q4KM_AB_F32ACC` line (kernel_ns_*, K, flops, m, n, max_rel_diff, device) parsed by the A/B harness. f32 C readback (4 bytes/elem). HONEST: report tflops even if BELOW the f16-accumulator's 11.27 (f32 accumulator costs more registers/bandwidth).",
+      "public_api": [
+        "#[ignore] fn at_1783_q4km_rb_f32acc_tflops_multisize()",
+        "#[ignore] fn at_1784_q4km_rb_f32acc_sameshape_ab_line()  // AXC_Q4KM_AB_F32ACC machine-readable line",
+        "pub fn effective_q4km_tflops(m, n, k, kernel_ns) -> f64  // 2*M*N*K convention, identical to f16 bench"
+      ]
+    }
+  ],
+  "files_to_modify": [
+    {
+      "path": "crates/axc-hir/src/typecheck.rs",
+      "changes": "NO RELAX REQUIRED for mixed-precision mul_add (the existing logic at lines 2998-3014 already allows it: it checks A.elem==B.elem and validates the accumulator's OWN elem independently; result_key=c_key). ADD #[cfg(test)] DEFENSIVE regression tests: AT-1785 proving `coopmat_mul_add(matrix[f16,16,16,a], matrix[f16,16,16,b], matrix[f32,16,16,accumulator]) -> matrix[f32,16,16,accumulator]` typechecks (does NOT emit ABElementMismatch or any error) and that the all-f16 case STILL typechecks (no regression); AT-1786 (NEGATIVE, RETAINED hard gate): `coopmat_mul_add(a:f16, b:f32, c:f32)` MUST still error with ABElementMismatch (A/B must match each other — only the accumulator may differ); AT-1789 (NEGATIVE, r1): coopmat_store of `matrix[f32,16,16,accumulator]` into `buffer[f16]` MUST error CoopMatStoreElementTypeMismatch (the check at typecheck.rs:3109 requires matrix.elem==buffer.elem) — locks in why the kernel's C must become buffer[f32]. NO production code change in this file unless the audit (open_question 1) finds a hidden f16-assuming shortcut; in particular do NOT add an unnecessary typecheck relax (AT-1786 guards this)."
+    },
+    {
+      "path": "crates/axc-runtime/src/coopmat.rs",
+      "changes": "NO production code change (coopmat_shape_supported at line 326 already matches a/b/c/result_type independently — confirmed line 340 matches result_type). ADD a #[cfg(test)] MANDATORY positive accept test AT-1788 (sibling of AT-1561 at line 690): coopmat_shape_supported ACCEPTS required={m:16,n:16,k:16,a_type:F16,b_type:F16,c_type:F32,result_type:F32,scope:Subgroup,saturating:false} when the device advertises that exact tuple (feature_present=true), AND REJECTS the same required shape against a device offering ONLY f16/f16/f16/f16 (c_type/result_type near-miss). Pure-function, CPU-only, runs on CI (Lavapipe-independent). This closes the structural gap the pessimistic reviewer flagged as the SOLE blocker."
+    },
+    {
+      "path": "crates/axc-driver/tests/compile_shared_examples.rs",
+      "changes": "ADD a compile anchor (AT-1787, CI, no GPU): examples/q4km_matmul_rb_coopmat_f32acc.axc compiles to SPIR-V, passes spirv-val, and its capability set is a SUBSET of the M3.3c-coopmat ∪ M2.6-dequant union (confirm NO new capability beyond what M3.5 already emits — Float16/CooperativeMatrixKHR/Int8/Int16/StorageBuffer8BitAccess/VulkanMemoryModel; the f32 accumulator coopmat type needs ONLY CooperativeMatrixKHR+Shader, already present). Assert the emitted metadata coopmat shape = {m:16,n:16,k:16, a_type:F16, b_type:F16, c_type:F32, result_type:F32, scope:Subgroup}."
+    },
+    {
+      "path": "scripts/m34_llamacpp_ab.sh",
+      "changes": "ADD a `--fused-f32acc` mode (parallel to the existing `--fused`): selects AXC_BENCH=resident_q4km_matmul_rb_f32acc, AXC_PREFIX=AXC_Q4KM_AB_F32ACC, AXC_KERNEL=fused_f32acc, RESULTS_JSON=ab_results_fused_f32acc.json / RESULTS_MD=ab_results_fused_f32acc.md. The same-shape llama Q4_K MUL_MAT (m=4096,n=512,k=14336) parse is UNCHANGED (reused from --fused). The kill-criterion verdict line MUST now read the AXIOM max_rel_diff (AXC_MAX_REL_DIFF) and, when it is <= 1e-3 at the A/B K=14336, label the result a VALID (correct-AND-measured) baseline — NOT 'fast-but-WRONG'. The expected outcome is still FAIL on throughput (behind llama's 101.48 TFLOPS) but now a USABLE kernel (numerically correct at inference K). m34_emit.py: extend the verdict logic to emit a `numerically_valid: true|false` field driven by max_rel_diff <= frozen 1e-3, and surface it in the MD."
+    },
+    {
+      "path": "scripts/m34_emit.py",
+      "changes": "Honour the new --fused-f32acc artifact names + the numerically_valid field. When AXC_KERNEL=fused_f32acc AND M34_AXC_MAX_REL_DIFF <= 1e-3: set numerically_valid=true and the kill-criterion note to '~Nx behind on throughput but a VALID usable kernel (correct at k=14336)'. When max_rel_diff > 1e-3: numerically_valid=false + an HONEST 'still diverges' note (this MUST NOT happen on NVIDIA f16xf16->f32 — flagged for investigation if it does)."
+    },
+    {
+      "path": "ROADMAP.md",
+      "changes": "Update the 'llama.cpp Vulkan head-to-head A/B' and 'Q4_K_M coopmat fusion' rows: M3.5b lands the f32-accumulator fused kernel; AXIOM is now NUMERICALLY VALID at k=14336 (max_rel_diff <= 1e-3), so the same-shape A/B is a REAL fast-AND-correct fight (~Nx behind llama's 101.48 TFLOPS — N reported by the run, expected slightly worse than M3.5's ~9x due to f32 accumulator register/bandwidth cost). Mark M3.5b as the milestone that makes the fused kernel a genuine usable baseline."
+    },
+    {
+      "path": "DESIGN.md",
+      "changes": "Add §3.1.21 (M3.5b — f32-accumulator cooperative_matrix: the numerically-correct fused Q4_K_M at inference K). See design_md_additions for the full text. Append a CHANGELOG line dated 2026-06-06."
+    }
+  ],
+  "dependency_graph": {
+    "axc-hir::coopmat": ["axc-hir::ty"],
+    "axc-hir::typecheck": ["axc-hir::coopmat", "axc-hir::ty"],
+    "axc-runtime::coopmat (AT-1788 test)": ["axc-runtime::metadata"],
+    "axc-codegen::coopmat": ["axc-hir::coopmat", "rspirv"],
+    "axc-runtime::coopmat": ["axc-hir", "axc-runtime::metadata", "ash"],
+    "examples/q4km_matmul_rb_coopmat_f32acc.axc": ["axc-driver (compile)"],
+    "crates/axc-driver/tests/dispatch_q4km_matmul_rb_f32acc.rs": ["axc-driver", "common_q4km_f32ref", "half"],
+    "crates/axc-driver/benches/resident_q4km_matmul_rb_f32acc.rs": ["axc-driver", "common_q4km_f32ref", "half"]
+  },
+  "spirv_capabilities_required": ["Shader", "CooperativeMatrixKHR", "Float16", "Int8", "Int16", "StorageBuffer8BitAccess", "VulkanMemoryModel"],
+  "spirv_extensions_required": ["SPV_KHR_cooperative_matrix", "SPV_KHR_vulkan_memory_model", "SPV_KHR_8bit_storage", "SPV_KHR_16bit_storage"],
+  "spirv_capabilities_NOTE": "IDENTICAL set to M3.5 (q4km_matmul_rb_coopmat.axc). The f32-component OpTypeCooperativeMatrixKHR requires ONLY CooperativeMatrixKHR + Shader (both already present). The Float16 capability is still needed for the f16 A/B coopmat types and the shared[f16] staging. NO NEW CAPABILITY is introduced by the f32 accumulator — confirmed: an f32 cooperative-matrix component type is a plain Float32 + CooperativeMatrixKHR, no Float64 / no extra extension. spirv-val MUST stay clean.",
+  "technical_spec": "## M3.5b — f32-accumulator cooperative_matrix (mixed-precision HMMA)\n\n### 0. Root-cause recap (why M3.5 is invalid at inference K)\nM3.5's fused kernel uses `matrix[f16,16,16,accumulator]`. Each `coopmat_mul_add` accumulates a depth-16 product into an f16 accumulator, with the running sum rounded to f16 after every tile (the f16 oracle `common_q4km_f16ref.rs` mirrors this). At K=256 the accumulated magnitude stays small (within-tol 8.3e-4); at K=512 the f16 accumulator's ~3-decimal-digit mantissa loses bits (3.6e-3 > 1e-3); at K=14336 it is garbage (max_rel_diff ~= 29). The fix is the CANONICAL tensor-core op: f16 A x f16 B accumulated into an **f32** accumulator (`OpCooperativeMatrixMulAddKHR` with AType=Float16, BType=Float16, CType=Float32, ResultType=Float32). f32 has 24-bit mantissa: K=14336 accumulation stays within 1e-3.\n\n### 1. CRITICAL FINDING: the pipeline is ALREADY mixed-precision-capable (verified by reading source)\n\n**1.1 Typecheck (typecheck.rs check_coopmat_expr_call, MulAdd arm, lines 2922-3034).** It does NOT require the accumulator to match A/B. It validates, in order: use tags (A=MatrixA, B=MatrixB, C=Accumulator); K-dim (a.n==b.m); accumulator M (c.m==a.m); accumulator N (c.n==b.n); **A.elem==B.elem ONLY** (line 2998-3005, `ABElementMismatch`); and `is_allowed_coopmat_element(a.elem) && is_allowed_coopmat_element(c.elem)` — checking A and C SEPARATELY (line 3008). The result type is `result_key = c_key` (line 3017). Therefore `coopmat_mul_add(matrix[f16,..,a], matrix[f16,..,b], matrix[f32,..,accumulator])` ALREADY typechecks to `matrix[f32,..,accumulator]`. **No relax is required.** (The architect task hypothesised a relax MIGHT be needed; the read shows it is not — the M3.1 design already split A/B-match from accumulator-type. We add a DEFENSIVE regression test AT-1785 to lock this in, and a negative test AT-1786 that `coopmat_mul_add(a:f16,b:f32,c:f32)` still errors ABElementMismatch.)\n\n**1.2 Codegen (codegen/coopmat.rs).** `CoopMatTypeCache::get_or_emit` emits the `OpTypeCooperativeMatrixKHR` component type from `key.elem` (line 114). For the accumulator binding declared `matrix[f32,16,16,accumulator]`, the let-binding's `CoopMatKey.elem == F32` (built from the declared type in the Let/Assign typecheck arm, typecheck.rs:1245/1619 use the declared `elem_scalar`). So `coopmat_zero` (constant_null of the f32 coopmat type), `coopmat_mul_add` (result type = result_ty = the f32 accumulator key), and `coopmat_store` (stores the f32 matrix to a buffer[f32]) ALL emit the correct f32 component automatically. `observe_coopmat_elem_caps` sets `caps.float16` only when key.elem==F16 — for the f32 accumulator it adds nothing (Float16 is still set by the f16 A/B load types). `OpConstantNull` of an f32 coopmat type needs no Float16 cap (it is a 32-bit type). **No codegen change required.**\n\n**1.3 mul_add result type.** `emit_coopmat_mul_add` (line 173) takes `result_ty: CoopMatKey` (the accumulator's key, F32) and uses it for both the result type id and `cooperative_matrix_mul_add_khr(mat_type_id, ...)`. The A/B operand ids carry their own f16 coopmat types (from their f16 load result types). `CooperativeMatrixOperands::NONE_KHR` is correct (no signed/saturating flags — f16xf16->f32 float HMMA uses NONE). **No change.**\n\n**1.4 Metadata derivation (lower.rs derive_coopmat_shape, lines 447-492).** Sources `a_elem=a_key.elem`, `b_elem=b_key.elem`, `c_elem=c_key.elem`, `result_type=c_key.elem` from the typechecked mul_add operand keys. For the f32 accumulator: a_elem=F16, b_elem=F16, c_elem=F32, result_type=F32. The driver (lib.rs hir_coopmat_shape_to_meta, lines 213-227) maps each independently to CoopMatScalarMeta (F16/F16/F32/F32). **No change.**\n\n**1.5 Runtime preflight (runtime/coopmat.rs).** `coopmat_required_shape_from_meta` builds the required shape from the sidecar (a/b/c/result all independent). `coopmat_shape_supported` (lines 326-344) checks `s.a_type==req.a_type && s.b_type==req.b_type && s.c_type==req.c_type && s.result_type==req.result_type && s.scope==req.scope && !s.saturating_accumulation`. It ALREADY matches the mixed f16/f16/f32/f32 shape against the device's enumerated tuples (and AT-1561 even tests f16/f16/f16/f32 discrimination). **No change.** NVIDIA's vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR enumerates the f16/f16/f32/f32 Subgroup tuple as the PRIMARY HMMA (16x16x16 with FLOAT16 a/b and FLOAT32 c/result is the canonical tensor-core combo) — the matcher will find it. The matcher checks ResultType (confirmed line 340).\n\n**1.6 OpPhi (codegen/body.rs lines 1183-1234).** The loop-carried coopmat phi discovers its type by walking the module for the pre-header value's `result_type` (the `coopmat_zero` OpConstantNull's type, lines 1196-1222). This is fully type-agnostic: for an f32 accumulator the OpConstantNull is of the f32 coopmat type, so the OpPhi result type is f32. **No change.** The latch value (the mul_add result, also f32) matches. spirv-val will accept it (both phi operands share the f32 coopmat type).\n\n### 2. The ONLY real code: the new f32-accumulator kernel\nClone examples/q4km_matmul_rb_coopmat.axc -> q4km_matmul_rb_coopmat_f32acc.axc with EXACTLY these diffs:\n1. `C: buffer[f16]` -> `C: buffer[f32]` (MANDATORY: coopmat_store of an f32 matrix into buffer[f16] correctly errors with CoopMatStoreElementTypeMismatch, typecheck.rs:3108-3115 — the store element-type check requires matrix.elem==buffer.elem).\n2. The 4 accumulators: `matrix[f16,16,16,accumulator]` -> `matrix[f32,16,16,accumulator]` (acc_00/01/10/11).\n3. A/B matrices, shared a_tile/b_tile, the Q4_K_M dequant->f32_to_f16 staging, the @strategy holes, the RB 2x2 structure, the barriers, the OpPhi K-loop, the coopmat_load calls — ALL VERBATIM.\n4. Header comment updated: f32 accumulator -> numerically valid at K=14336.\n\nNote: `coopmat_store(acc_00, C, ...)` now stores an f32 matrix; the store stride is N (elements), unchanged. The C buffer is 4 bytes/elem.\n\n### 3. The f32-accumulator CPU oracle (common_q4km_f32ref.rs)\nIdentical to common_q4km_f16ref.rs dequant + f16-rounding of inputs, BUT the accumulation loop is pure f32:\n```\nfor col: acc = 0.0f32; for k in 0..K { acc += w_f16[k] * round_f16(x[k,col]); } y[row,col] = acc;\n```\nNO depth-tile loop, NO per-tile f16 rounding of the running accumulator (that was the f16-accumulator-specific step). w_f16 = each dequant-f32 weight rounded f32->f16->f32 (matches the GPU a_tile f16 write); x rounded f32->f16->f32 (matches b_tile f16). This is the EXACT operation the f16xf16->f32 tensor core performs (f16 inputs, f32 accumulate). The frozen 1e-3 tol is unchanged.\nDISCLOSURE: the tensor core may accumulate the 16-deep partial product in extended precision then add to the f32 accumulator; a pure-f32 CPU sum is a tight upper bound on the error and should land well within 1e-3. If it does not, AT-1782 reports the measured value (HONEST).\n\n### 4. Tests + bench\nAT-1780/1781/1782 (dispatch, #[ignore]+GPU): K=256, K=512, K=14336 within frozen 1e-3 vs the F32 oracle. K=512 MUST pass (the M3.5 f16 failure). C readback as f32 (4 bytes/elem). Lavapipe coopmat typed-skip.\nAT-1783/1784 (bench, #[ignore]+GPU): multi-size honest TFLOPS + max_rel_diff at every size (now <=1e-3 even at K=14336) + the AXC_Q4KM_AB_F32ACC machine-readable A/B line at m=4096,n=512,k=14336.\nAT-1785/1786 (typecheck, CPU): mixed-precision mul_add typechecks; A/B-mismatch still errors.\nAT-1787 (compile anchor, CI no-GPU): kernel compiles + spirv-val clean + capability subset + metadata shape f16/f16/f32/f32.\n\n### 5. The now-VALID A/B re-run\n`scripts/m34_llamacpp_ab.sh --fused-f32acc` runs the f32-accumulator bench vs llama.cpp Q4_K MUL_MAT same-shape (m=4096,n=512,k=14336 = 101.48 TFLOPS). Because AXIOM is now numerically correct at k=14336 (max_rel_diff <= 1e-3), the throughput ratio is a REAL fast-AND-correct fight. Expected: still behind (kill-criterion FAIL on throughput) but a GENUINE usable baseline. The verdict surfaces numerically_valid=true.\n\n### 6. Memory + honesty\n50 GB cap asserted in the bench (same pre-check as resident_q4km_matmul_rb.rs). The f32 C buffer doubles output bytes vs f16 (still tiny vs the weight matrix). HONEST reporting: f32-accumulator TFLOPS may be below M3.5's 11.27 (extra accumulator registers + f32 store bandwidth); report whatever is measured. If NVIDIA somehow lacks f16/f16/f32/f32 (it does not) the preflight typed-skips and the test documents it.",
+  "acceptance_tests": [
+    {
+      "id": "AT-1780",
+      "description": "f32-accumulator fused Q4_K_M matmul is bit-within-frozen-1e-3 at K=256 (1 superblock), M=N=64",
+      "test_name": "at_1780_q4km_rb_coopmat_f32acc_bit_within_tol_k256",
+      "expected_behavior": "GPU output vs q4km_dequant_matmul_f32accum_cpu has max_rel_diff <= 1e-3; ASSERTED. Lavapipe: coopmat typed-skip.",
+      "verified_via": "cargo test -p axc-driver --test dispatch_q4km_matmul_rb_f32acc -- --ignored (AXC_ENABLE_GPU_TESTS=1, NVIDIA ICD)"
+    },
+    {
+      "id": "AT-1781",
+      "description": "f32-accumulator fused matmul is within 1e-3 at K=512 (2 superblocks) — the case that FAILED in M3.5 with f16 accum (3.6e-3) MUST now PASS",
+      "test_name": "at_1781_q4km_rb_coopmat_f32acc_bit_within_tol_k512",
+      "expected_behavior": "max_rel_diff <= 1e-3 at K=512, M=64, N=128; ASSERTED (no gate-cap — f32 accum must fix the f16 divergence). If it still exceeds 1e-3, the test FAILS (regression vs the milestone goal).",
+      "verified_via": "cargo test -p axc-driver --test dispatch_q4km_matmul_rb_f32acc -- --ignored"
+    },
+    {
+      "id": "AT-1782",
+      "description": "f32-accumulator fused matmul is within 1e-3 at K=14336 (inference K) — the validity claim",
+      "test_name": "at_1782_q4km_rb_coopmat_f32acc_bit_within_tol_k14336",
+      "expected_behavior": "max_rel_diff <= 1e-3 at the inference-K A/B shape; ASSERTED if it holds (it must with f32 accumulate). GATE-K HONESTY: if NVIDIA's f32 accumulator still diverges, the measured value is reported and the divergence documented (NOT silently capped) — but this MUST NOT happen for f16xf16->f32 HMMA.",
+      "verified_via": "cargo test -p axc-driver --test dispatch_q4km_matmul_rb_f32acc -- --ignored"
+    },
+    {
+      "id": "AT-1783",
+      "description": "Honest multi-size effective-TFLOPS for the f32-accumulator fused kernel + max_rel_diff at every size (now <=1e-3 even at K=14336)",
+      "test_name": "at_1783_q4km_rb_f32acc_tflops_multisize",
+      "expected_behavior": "tflops > 0 at each runnable size; max_rel_diff reported at every size and <= 1e-3 at all (the f32-accum validity); 50 GB cap + 2D grid pre-check enforced (skip on exceed). HONEST: tflops may be below the f16-accumulator's 11.27.",
+      "verified_via": "AXC_ENABLE_GPU_BENCHES=1 cargo bench -p axc-driver --bench resident_q4km_matmul_rb_f32acc"
+    },
+    {
+      "id": "AT-1784",
+      "description": "SAME-SHAPE A/B machine-readable line (AXC_Q4KM_AB_F32ACC) at m=4096,n=512,k=14336 — now numerically VALID",
+      "test_name": "at_1784_q4km_rb_f32acc_sameshape_ab_line",
+      "expected_behavior": "Emits `AXC_Q4KM_AB_F32ACC ... kernel_ns_min=.. K=14336 flops=.. m=4096 n=512 max_rel_diff=<=1e-3 device=..` parseable by m34_llamacpp_ab.sh --fused-f32acc. The A/B ratio is fast-AND-correct.",
+      "verified_via": "scripts/m34_llamacpp_ab.sh --fused-f32acc (NVIDIA ICD) -> ab_results_fused_f32acc.json with numerically_valid=true"
+    },
+    {
+      "id": "AT-1785",
+      "description": "Mixed-precision coopmat_mul_add(a:f16, b:f16, c:f32) typechecks to matrix[f32,..,accumulator] (no ABElementMismatch, no error); all-f16 mul_add STILL typechecks (no regression)",
+      "test_name": "tc_coopmat_mul_add_mixed_f16_f16_f32_ok",
+      "expected_behavior": "No typecheck errors for the mixed case; result is the f32 accumulator key. The frozen all-f16 case continues to typecheck.",
+      "verified_via": "cargo test -p axc-hir"
+    },
+    {
+      "id": "AT-1786",
+      "description": "coopmat_mul_add(a:f16, b:f32, c:f32) STILL errors ABElementMismatch — only the accumulator may differ; A and B must match each other",
+      "test_name": "tc_coopmat_mul_add_ab_mismatch_still_rejected",
+      "expected_behavior": "Exactly one ABElementMismatch{a_elem:F16,b_elem:F32} diagnostic; no codegen.",
+      "verified_via": "cargo test -p axc-hir"
+    },
+    {
+      "id": "AT-1787",
+      "description": "q4km_matmul_rb_coopmat_f32acc.axc compiles, spirv-val clean, capability subset of M3.5 union, metadata coopmat shape = f16/f16/f32/f32 Subgroup 16x16x16",
+      "test_name": "at_1787_q4km_f32acc_compiles_and_validates",
+      "expected_behavior": "compile_source_with_meta succeeds; spirv-val exit 0; emitted capabilities are a subset of {Shader,CooperativeMatrixKHR,Float16,Int8,Int16,StorageBuffer8BitAccess,VulkanMemoryModel} (NO new capability vs M3.5); meta.coopmat = {16,16,16,F16,F16,F32,F32,Subgroup}.",
+      "verified_via": "cargo test -p axc-driver --test compile_shared_examples (CI, no GPU)"
+    },
+    {
+      "id": "AT-1788",
+      "description": "MANDATORY (CPU-only) f16/f16/f32/f32 preflight ACCEPT test: coopmat_shape_supported ACCEPTS the mixed shape AType=F16,BType=F16,CType=F32,ResultType=F32,scope=Subgroup,saturating=false when the device advertises that exact tuple, AND REJECTS it on a near-miss where the device offers only f16/f16/f16/f16 (c_type/result_type discrimination). This is the M3.5b dispatch matcher's correctness proof, independent of any GPU. AT-1561 only proves near-miss REJECTION + all-f16 ACCEPTANCE; without this positive f16/f16/f32/f32 accept test a matcher regression that rejected an f32 c_type/result_type would pass CI and surface only at GPU dispatch (Lavapipe skips dispatch). Promoted from r0 open_question 2 to a numbered, mandatory acceptance test (the pessimistic reviewer's exact APPROVE condition).",
+      "test_name": "at_1788_coopmat_shape_supported_accepts_f16_f16_f32_f32",
+      "expected_behavior": "coopmat_shape_supported(required = {m:16,n:16,k:16, a_type:F16, b_type:F16, c_type:F32, result_type:F32, scope:Subgroup, saturating:false}, support = a device tuple list CONTAINING that exact shape with feature_present=true) == true. The SAME required shape against a device offering ONLY f16/f16/f16/f16 (c_type=F16, result_type=F16) == false (near-miss rejection on c_type/result_type). Pure-function unit test in crates/axc-runtime/src/coopmat.rs #[cfg(test)] — NO GPU, runs on CI.",
+      "verified_via": "cargo test -p axc-runtime (CI, no GPU)"
+    },
+    {
+      "id": "AT-1789",
+      "description": "MANDATORY (CPU-only) store-element-mismatch regression: coopmat_store of an f32 accumulator (matrix[f32,16,16,accumulator]) into a buffer[f16] MUST error CoopMatStoreElementTypeMismatch (typecheck.rs:3109 — the store element check requires matrix.elem==buffer.elem). This permanently locks in WHY the M3.5b kernel changes C: buffer[f16]->buffer[f32]; the f32 accumulator MUST store to buffer[f32]. Promoted from r0 edge_case ('add if cheap') to a numbered, mandatory acceptance test (the pessimistic reviewer's APPROVE condition #3).",
+      "test_name": "tc_coopmat_store_f32_accum_into_buffer_f16_rejected",
+      "expected_behavior": "Exactly one CoopMatStoreElementTypeMismatch diagnostic (matrix elem=F32 != buffer elem=F16); no codegen. The mirror positive (f32 accumulator stored to buffer[f32]) typechecks clean (covered transitively by AT-1787's clean compile of the f32acc kernel whose C is buffer[f32]).",
+      "verified_via": "cargo test -p axc-hir (CI, no GPU)"
+    }
+  ],
+  "correctness_oracle": "common_q4km_f32ref::q4km_dequant_matmul_f32accum_cpu: Q4_K_M dequant in f32 (ggml/M2.6 byte-identical), each weight AND each x rounded f32->f16->f32 (the f16 values entering the tensor core), accumulation in PURE f32 with NO per-tile rounding (the f32 coopmat accumulator). Compared via max_rel_diff (abs_diff / max(|ref|,1e-8)) against the GPU f32 output readback. Frozen relative tolerance 1e-3 (AT-1520/1521 value), NOT loosened. This is a tight upper bound on the HMMA error; the device tensor core may accumulate in equal-or-higher precision, so the within-1e-3 result is expected at all K including 14336. Disclosure: this is NVIDIA-coopmat-specific; a different vendor's f16xf16->f32 path may round differently and is documented if/when measured.",
+  "edge_cases": [
+    "coopmat_store of an f32 accumulator into a buffer[f16] MUST error CoopMatStoreElementTypeMismatch (matrix.elem=F32 != buffer.elem=F16, typecheck.rs:3108) — this is WHY the kernel changes C to buffer[f32]; add a negative regression if cheap.",
+    "coopmat_mul_add A and B element types MUST still match each other (ABElementMismatch) — only the accumulator (C/result) may differ in element type (AT-1786).",
+    "coopmat shape mismatch: c.m must equal a.m, c.n must equal b.n, a.n must equal b.m — UNCHANGED dimension checks (the f32 accumulator does not relax any dimension constraint; only the element type of the accumulator differs).",
+    "OpConstantNull of an f32 coopmat accumulator type must NOT trigger the Float16 capability (it is a 32-bit type); observe_coopmat_elem_caps correctly adds nothing for key.elem==F32. Float16 is still set by the f16 A/B load types.",
+    "OpPhi over the f32 coopmat accumulators: both phi operands (pre-header coopmat_zero null + latch mul_add result) share the f32 coopmat type; spirv-val must accept. The type-discovery walk finds the f32 coopmat type from the OpConstantNull's result_type.",
+    "Mixed metadata shape (a/b=F16, c/result=F32) must round-trip through the sidecar JSON and the preflight matcher unchanged; the matcher checks all four types AND result_type independently (already covered by AT-1561 for f16/f16/f16/f32 discrimination — add an f16/f16/f32/f32 acceptance case if not present).",
+    "K=14336 = 56 superblocks; ensure the bench's 50 GB cap pre-check accounts for the f32 C buffer (4 bytes/elem vs f16's 2) — C bytes double but stay negligible vs the u8 weight matrix.",
+    "Lavapipe: the f16/f16/f32/f32 Subgroup 16x16x16 shape is NOT enumerated -> coopmat_shape_supported returns false -> typed graceful skip (DeviceFeatureUnsupported / CoopMatUnsupported), identical to M3.5. Lavapipe tests MUST skip, not fail."
+  ],
+  "open_questions": [
+    "AUDIT (highest priority for the Coder before writing the kernel): grep every coopmat path for an implicit assumption that a_elem==c_elem (i.e. f16==accumulator). The reads above found NONE in typecheck/codegen/lower/runtime, but the Coder MUST confirm: (a) no place uses a_key.elem where it should use c_key.elem / result_type for the accumulator type or store; (b) the coopmat_store element check uses the matrix binding's OWN key.elem (it does, typecheck.rs:3108) not the A matrix's. If the audit finds a shortcut, fix it minimally and add a test.",
+    "RESOLVED in r1 -> AT-1788 (mandatory). The runtime preflight did NOT have a positive f16/f16/f32/f32 ACCEPT test (AT-1561 only tests near-miss rejection + all-f16 acceptance). r1 promotes this from an open question to numbered mandatory acceptance test AT-1788 (CPU-only positive accept + near-miss f16/f16/f16/f16 reject). This was the pessimistic reviewer's SOLE blocking ask.",
+    "CONFIRMED but flag for QA: the mul_add typecheck does NOT need relaxing (it already allows mixed). The architect task hypothesised a relax; QA must verify the Coder did NOT add an unnecessary relax that could WEAKEN the A/B-match check (AT-1786 guards this).",
+    "CONFIRMED: OpPhi for f32 coopmat accumulators is type-agnostic (discovers type from the pre-header value). No change needed — flag for QA to verify spirv-val passes on the f32-accumulator kernel's loop.",
+    "Will NVIDIA's tensor core land the f32-accumulate within 1e-3 at K=14336 against a pure-f32 CPU sum? Expected YES (f32 has 24-bit mantissa; the CPU sum is a tight bound). If AT-1782 measures > 1e-3, investigate input-rounding mismatch (does the GPU round x to f16 before or after the tile? the kernel stages x into shared[f16], so x IS f16 — the oracle must match) before loosening anything (the 1e-3 is FROZEN).",
+    "Should the f32-accumulator kernel REPLACE the f16 one in the default A/B, or run alongside? Recommendation: keep BOTH (the f16 one documents the precision frontier; the f32 one is the usable baseline). The --fused (f16) and --fused-f32acc modes coexist."
+  ],
+  "coder_handoff_notes": [
+    "AUDIT FIRST (before writing any code): grep every coopmat path for a HIDDEN f16==accumulator shortcut (any place that uses a_key.elem where it must use c_key.elem / result_type for the accumulator type, store, or metadata). Both design reviewers independently audited typecheck.rs:2998-3017, codegen/coopmat.rs:114/59-63, lower.rs:482-491, runtime/coopmat.rs:333-343, body.rs:1196-1222 and found ZERO shortcuts — but the Coder MUST re-confirm against the actual diff before relying on 'no production change'. If (and ONLY if) the audit finds a concrete shortcut, fix it minimally and add a test; otherwise touch NO production coopmat code.",
+    "Do NOT relax the mul_add typecheck — it already allows mixed precision (verified lines 2998-3014). Adding a relax risks weakening the a_key.elem==b_key.elem (ABElementMismatch) check at typecheck.rs:2998-3005. Add ONLY the regression tests; AT-1786 is the hard guard that no relax weakened the A/B-match — do NOT add an unnecessary typecheck relax.",
+    "r1 MANDATORY TESTS (the reviewer's exact APPROVE conditions): (a) AT-1788 — CPU-only positive accept of f16/f16/f32/f32 in coopmat_shape_supported (crates/axc-runtime/src/coopmat.rs #[cfg(test)], sibling of AT-1561 at coopmat.rs:690) PLUS the near-miss f16/f16/f16/f16 reject; (b) AT-1786 — coopmat_mul_add(a:f16,b:f32,c:f32) STILL errors ABElementMismatch (RETAINED, hard gate); (c) AT-1789 — coopmat_store of matrix[f32,..,accumulator] into buffer[f16] errors CoopMatStoreElementTypeMismatch (typecheck.rs:3109). All three are CPU-only / CI-runnable (no GPU) and MUST be present before QA.",
+    "Do NOT change codegen/coopmat.rs, lower.rs derive_coopmat_shape, or runtime/coopmat.rs unless the AUDIT (open_question 1) finds a concrete f16-assuming shortcut. The reads show the pipeline is already mixed-precision-correct.",
+    "The kernel diff is MINIMAL: clone q4km_matmul_rb_coopmat.axc, change C to buffer[f32], change the 4 accumulators to matrix[f32,16,16,accumulator]. Everything else VERBATIM. Keep the @strategy holes identical.",
+    "The f32 oracle is the f16 oracle MINUS the per-tile f16 rounding of the accumulator. To avoid duplicating dequant_q4km_row_f32/get_scale_min_k4, consider a shared `mod common_q4km_decode` OR copy the two helpers with a comment (the f16 oracle already documents the 2-copies-is-acceptable pattern for small constants). Prefer reuse if a clean `include!`/`mod` path exists in the test harness; otherwise copy + cite.",
+    "Tests: C readback is f32 (4 bytes/elem) — do NOT widen f16. Assert K=256 AND K=512 within 1e-3 (K=512 is the M3.5 failure that MUST now pass). K=14336 asserted if it holds, reported honestly otherwise.",
+    "Bench: reuse the resident_q4km_matmul_rb.rs structure (upload-once/dispatch-N/kernel-only timing, effective_tflops=2*M*N*K/s, 50 GB cap, 2D grid pre-check). Emit AXC_Q4KM_AB_F32ACC. Include the pinned A/B shape m=4096,n=512,k=14336.",
+    "A/B script: add --fused-f32acc as a sibling of --fused. Reuse the same-shape llama parse. m34_emit.py: add numerically_valid (max_rel_diff <= 1e-3).",
+    "No unwrap in lib crates (anti-pattern). Tests/benches may use expect with messages. Explicit types everywhere (anti-pattern #1). Explicit return (#2). No >> (#8 — use lshr/shr in any new shift, though the kernel reuses M3.5's already-compliant code).",
+    "AT-IDs: M3.5b range AT-1780..AT-1787. Keep them contiguous and document each in the test/bench header.",
+    "spirv-val MUST stay clean on the f32-accumulator kernel (AT-1787). clippy clean across the workspace.",
+    "Lavapipe: coopmat tests typed-skip (do NOT fail) — reuse the M3.5 skip pattern (catch DeviceFeatureUnsupported / CoopMatUnsupported)."
+  ],
+  "design_md_additions": "## 3.1.21 M3.5b — f32-accumulator cooperative_matrix (the numerically-correct fused Q4_K_M at inference K)\n\nM3.5 (§3.1.20) fused Q4_K_M dequant into the register-blocked coopmat matmul and reached 11.27 TFLOPS same-shape (~9x behind llama.cpp's 101.48 TFLOPS Q4_K MUL_MAT at m=4096,n=512,k=14336), down from M3.4's ~87,000x cross-shape gap. BUT M3.5 used an f16 coopmat accumulator (`matrix[f16,16,16,accumulator]`), which is numerically INVALID at inference K: within the frozen 1e-3 only at K<=256 (8.3e-4), diverging at K=512 (3.6e-3), garbage at k=14336 (max_rel_diff ~= 29). f16's ~3-decimal-digit mantissa cannot accumulate a 14336-deep dot product. Fast-but-WRONG is not a usable kernel.\n\nM3.5b switches the accumulator to f32 — the CANONICAL tensor-core op: f16 A x f16 B accumulated into f32 (`OpCooperativeMatrixMulAddKHR` with AType=Float16, BType=Float16, CType=Float32, ResultType=Float32, scope=Subgroup). This is NVIDIA's primary HMMA and is enumerated by vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR. f32's 24-bit mantissa keeps the k=14336 accumulation within 1e-3.\n\n### Mixed-precision was ALREADY in the type system (M3.1 design dividend)\nThe M3.1 cooperative-matrix model (§3.1.13) made every coopmat shape carry INDEPENDENT a/b/c/result element types (CoopMatKey.result_type, CoopMatrixShape.{a_elem,b_elem,c_elem,result_type}, CoopMatShapeMeta, CoopMatRequiredShape). As a consequence the entire pipeline is already mixed-precision-correct:\n- **Typecheck**: coopmat_mul_add validates A.elem==B.elem ONLY; the accumulator's element type is validated independently and becomes the result type. f16xf16->f32 typechecks unchanged; A/B must still match each other.\n- **Codegen**: the OpTypeCooperativeMatrixKHR component type comes from each binding's own key.elem, so the f32 accumulator emits a Float32-component coopmat type automatically. coopmat_zero/mul_add/store and the loop-carried OpPhi are all type-agnostic. NO new SPIR-V capability — an f32 coopmat component needs only CooperativeMatrixKHR+Shader (already present); Float16 is still required for the f16 A/B types.\n- **Runtime preflight**: coopmat_shape_supported already matches a_type/b_type/c_type/result_type independently (it even discriminates f16/f16/f16/f32). The mixed f16/f16/f32/f32 shape matches NVIDIA's enumerated HMMA tuple; Lavapipe (no coopmat) typed-skips.\n\nM3.5b therefore required NO type-system or codegen change — only a new kernel (`examples/q4km_matmul_rb_coopmat_f32acc.axc`: C->buffer[f32], 4 accumulators->matrix[f32,16,16,accumulator], everything else verbatim), an f32-accumulator CPU oracle (dequant f32, inputs rounded to f16, accumulate in pure f32), and the now-VALID same-shape A/B re-run. Defensive regression tests lock in the mixed-precision typecheck (AT-1785) and the still-required A/B-match (AT-1786).\n\n### Result\nThe fused Q4_K_M f32-accumulator matmul is bit-within-frozen-1e-3 at K=256, K=512 (the M3.5 f16 failure, now fixed), and k=14336 (inference K). The same-shape A/B vs llama.cpp's 101.48 TFLOPS is now a fast-AND-correct fight: still behind on throughput (kill-criterion FAIL; f32 accumulator costs registers/bandwidth vs f16) but a GENUINE usable baseline — numerically correct at inference K. Tests AT-1780..AT-1787; A/B via scripts/m34_llamacpp_ab.sh --fused-f32acc.",
+  "self_check": {
+    "read_claude_md": true,
+    "read_design_md": true,
+    "no_implementation_code": true,
+    "spirv_lowering_specified_for_every_annotation": true,
+    "anti_patterns_respected": true,
+    "at_ids_in_m35b_range": "AT-1780..AT-1789",
+    "r1_revision": true,
+    "r1_added_tests": ["AT-1788 (mandatory CPU-only f16/f16/f32/f32 preflight ACCEPT + near-miss reject)", "AT-1786 (RETAINED: A/B-mismatch still rejected)", "AT-1789 (mandatory CPU-only store f32-accum->buffer[f16] rejected)"],
+    "r1_all_r0_content_kept": true,
+    "r1_no_production_code_change": true,
+    "fifty_gb_cap_addressed": true,
+    "no_new_capability_confirmed": true,
+    "mixed_precision_typecheck_already_supported": true,
+    "preflight_matches_resulttype": true,
+    "opphi_type_agnostic_for_f32_coopmat": true
+  }
+}

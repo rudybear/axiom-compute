@@ -752,6 +752,100 @@ mod tests {
             "all-f16 non-saturating Subgroup shape must match");
     }
 
+    // ── AT-1788 (M3.5b): mixed f16/f16/f32/f32 preflight ACCEPT + near-miss reject ───
+
+    /// AT-1788 (MANDATORY, CPU-only): the M3.5b f16×f16→f32 HMMA dispatch matcher's
+    /// correctness proof, independent of any GPU.
+    ///
+    /// `coopmat_shape_supported` ACCEPTS required={m:16,n:16,k:16, a:F16,b:F16,c:F32,result:F32,
+    /// Subgroup, !saturating} when the device advertises that EXACT tuple, AND REJECTS the same
+    /// required shape against a device that offers ONLY f16/f16/f16/f16 (c_type/result_type
+    /// near-miss). AT-1561 proves near-miss REJECTION + all-f16 ACCEPTANCE; without this positive
+    /// f16/f16/f32/f32 accept test a matcher regression that rejected an f32 c_type/result_type
+    /// would pass CI and surface only at GPU dispatch (Lavapipe skips dispatch).
+    #[test]
+    fn at_1788_coopmat_shape_supported_accepts_f16_f16_f32_f32() {
+        // The M3.5b required shape: f16 A/B, f32 accumulator + result.
+        let req_mixed = CoopMatRequiredShape {
+            m: 16, n: 16, k: 16,
+            a_type: CoopMatComponentType::Float16,
+            b_type: CoopMatComponentType::Float16,
+            c_type: CoopMatComponentType::Float32,
+            result_type: CoopMatComponentType::Float32,
+            scope: CoopMatScope::Subgroup,
+        };
+
+        // Device A: advertises the EXACT mixed tuple (NVIDIA's primary HMMA) — must ACCEPT.
+        let device_with_mixed = CoopMatSupport {
+            feature_present: true,
+            shapes: vec![
+                // A distractor all-f16 shape (must not be the one that matches).
+                CoopMatShapeSupport {
+                    m: 16, n: 16, k: 16,
+                    a_type: CoopMatComponentType::Float16,
+                    b_type: CoopMatComponentType::Float16,
+                    c_type: CoopMatComponentType::Float16,
+                    result_type: CoopMatComponentType::Float16,
+                    scope: CoopMatScope::Subgroup,
+                    saturating_accumulation: false,
+                },
+                // The exact mixed f16/f16/f32/f32 tuple.
+                CoopMatShapeSupport {
+                    m: 16, n: 16, k: 16,
+                    a_type: CoopMatComponentType::Float16,
+                    b_type: CoopMatComponentType::Float16,
+                    c_type: CoopMatComponentType::Float32,
+                    result_type: CoopMatComponentType::Float32,
+                    scope: CoopMatScope::Subgroup,
+                    saturating_accumulation: false,
+                },
+            ],
+        };
+        assert!(
+            coopmat_shape_supported(&req_mixed, &device_with_mixed),
+            "AT-1788: the mixed f16/f16/f32/f32 Subgroup 16x16x16 shape MUST be accepted when \
+             the device advertises that exact tuple"
+        );
+
+        // Device B: offers ONLY f16/f16/f16/f16 — must REJECT the mixed requirement (c_type and
+        // result_type near-miss: F16 != F32).
+        let device_only_all_f16 = CoopMatSupport {
+            feature_present: true,
+            shapes: vec![CoopMatShapeSupport {
+                m: 16, n: 16, k: 16,
+                a_type: CoopMatComponentType::Float16,
+                b_type: CoopMatComponentType::Float16,
+                c_type: CoopMatComponentType::Float16,
+                result_type: CoopMatComponentType::Float16,
+                scope: CoopMatScope::Subgroup,
+                saturating_accumulation: false,
+            }],
+        };
+        assert!(
+            !coopmat_shape_supported(&req_mixed, &device_only_all_f16),
+            "AT-1788: the mixed f16/f16/f32/f32 requirement MUST be rejected against a device \
+             that offers only f16/f16/f16/f16 (c_type/result_type near-miss)"
+        );
+
+        // Device C: feature absent — must REJECT even though it lists the mixed shape.
+        let device_feature_absent = CoopMatSupport {
+            feature_present: false,
+            shapes: vec![CoopMatShapeSupport {
+                m: 16, n: 16, k: 16,
+                a_type: CoopMatComponentType::Float16,
+                b_type: CoopMatComponentType::Float16,
+                c_type: CoopMatComponentType::Float32,
+                result_type: CoopMatComponentType::Float32,
+                scope: CoopMatScope::Subgroup,
+                saturating_accumulation: false,
+            }],
+        };
+        assert!(
+            !coopmat_shape_supported(&req_mixed, &device_feature_absent),
+            "AT-1788: the mixed shape MUST be rejected when feature_present=false"
+        );
+    }
+
     // ── coopmat_required_shape_from_meta ──────────────────────────────────────
 
     /// Verify coopmat_required_shape_from_meta maps all fields correctly.

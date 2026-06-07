@@ -464,3 +464,86 @@ fn at_1773_q4km_rb_coopmat_no_new_capability_beyond_union() {
          fused_exts={fused_exts:?} union_exts={union_exts:?}"
     );
 }
+
+// ── AT-1787: f32-accumulator fused Q4_K_M coopmat matmul — compile + spirv-val + ──────
+//            no-new-capability vs M3.5 + metadata shape f16/f16/f32/f32 ───────────────
+
+/// AT-1787 (M3.5b, CI no-GPU): the f32-accumulator fused kernel
+/// (q4km_matmul_rb_coopmat_f32acc.axc) compiles, passes spirv-val, declares NO capability
+/// or extension beyond what the M3.5 fused kernel (q4km_matmul_rb_coopmat.axc) declares
+/// (the f32 accumulator adds NOTHING — a Float32 coopmat component needs only
+/// CooperativeMatrixKHR + Shader, both already present), and its emitted coopmat metadata
+/// shape is {16,16,16, a=F16, b=F16, c=F32, result=F32, Subgroup}.
+#[test]
+fn at_1787_q4km_f32acc_compiles_and_validates() {
+    use std::collections::BTreeSet;
+    use axc_runtime::{CoopMatScalarMeta, CoopMatScopeMeta};
+
+    let f32acc_src = include_str!("../../../examples/q4km_matmul_rb_coopmat_f32acc.axc");
+    let f16_src = include_str!("../../../examples/q4km_matmul_rb_coopmat.axc");
+
+    let assignments = rb2x2_assignments();
+
+    // Compile the f32acc kernel WITH metadata (we assert the coopmat shape below) and
+    // spirv-val it. compile_words spirv-vals the f16 baseline.
+    let (f32acc_bytes, meta) = compile_source_with_assignments(f32acc_src, &assignments)
+        .unwrap_or_else(|e| panic!("q4km_matmul_rb_coopmat_f32acc.axc: compile failed: {e:?}"));
+    let f32acc_words = words_and_validate(f32acc_bytes, "q4km_matmul_rb_coopmat_f32acc.axc");
+    let f16_words = compile_words(f16_src, Some(&assignments), "q4km_matmul_rb_coopmat.axc");
+
+    // No capability/extension beyond the M3.5 fused kernel's set (the f32 accumulator
+    // introduces NO new capability — AT-1787 / spirv_capabilities_NOTE).
+    let (f32acc_caps, f32acc_exts) = capability_extension_sets(&f32acc_words);
+    let (f16_caps, f16_exts) = capability_extension_sets(&f16_words);
+
+    let extra_caps: Vec<u32> = f32acc_caps.difference(&f16_caps).copied().collect();
+    assert!(
+        extra_caps.is_empty(),
+        "AT-1787: f32-acc kernel declares capabilities NOT in the M3.5 fused kernel's set: \
+         {extra_caps:?} (f32acc={f32acc_caps:?}, f16={f16_caps:?})"
+    );
+    let extra_exts: Vec<String> = f32acc_exts.difference(&f16_exts).cloned().collect();
+    assert!(
+        extra_exts.is_empty(),
+        "AT-1787: f32-acc kernel declares extensions NOT in the M3.5 fused kernel's set: \
+         {extra_exts:?} (f32acc={f32acc_exts:?}, f16={f16_exts:?})"
+    );
+    // Both directions: the f32-acc cap set must EQUAL the f16 set (no new cap; and Float16
+    // is still required for the f16 A/B types — the f32 accumulator does not drop it).
+    let dropped_caps: Vec<u32> = f16_caps.difference(&f32acc_caps).copied().collect();
+    assert!(
+        dropped_caps.is_empty(),
+        "AT-1787: f32-acc kernel DROPPED capabilities present in M3.5 (Float16 must remain \
+         for the f16 A/B types): {dropped_caps:?}"
+    );
+    const FLOAT16_CAP: u32 = 9;
+    assert!(
+        f32acc_caps.contains(&FLOAT16_CAP),
+        "AT-1787: f32-acc kernel must STILL declare OpCapability Float16 (f16 A/B types)"
+    );
+
+    // Sanity: capability sets are byte-for-byte equal (the whole no-new-capability point).
+    let f32acc_set: BTreeSet<u32> = f32acc_caps.iter().copied().collect();
+    let f16_set: BTreeSet<u32> = f16_caps.iter().copied().collect();
+    assert_eq!(
+        f32acc_set, f16_set,
+        "AT-1787: f32-acc and M3.5 fused kernel must have IDENTICAL capability sets"
+    );
+
+    // Emitted coopmat metadata shape must be the mixed f16/f16/f32/f32 16x16x16 Subgroup.
+    let coopmat = meta.coopmat.as_ref()
+        .expect("AT-1787: f32-acc kernel must emit coopmat metadata");
+    assert_eq!(coopmat.m, 16, "AT-1787: coopmat.m");
+    assert_eq!(coopmat.n, 16, "AT-1787: coopmat.n");
+    assert_eq!(coopmat.k, 16, "AT-1787: coopmat.k");
+    assert_eq!(coopmat.a_type, CoopMatScalarMeta::F16, "AT-1787: A type must be F16");
+    assert_eq!(coopmat.b_type, CoopMatScalarMeta::F16, "AT-1787: B type must be F16");
+    assert_eq!(coopmat.c_type, CoopMatScalarMeta::F32, "AT-1787: C type must be F32");
+    assert_eq!(coopmat.result_type, CoopMatScalarMeta::F32, "AT-1787: result type must be F32");
+    assert_eq!(coopmat.scope, CoopMatScopeMeta::Subgroup, "AT-1787: scope must be Subgroup");
+
+    eprintln!(
+        "AT-1787 PASS: q4km_matmul_rb_coopmat_f32acc.axc compiles + spirv-val clean; \
+         caps == M3.5 fused ({f32acc_caps:?}); meta.coopmat = {{16,16,16, F16,F16,F32,F32, Subgroup}}"
+    );
+}

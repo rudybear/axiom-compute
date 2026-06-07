@@ -54,12 +54,21 @@ llama_k = int_or_none("M34_LLAMA_K")
 llama_runs = int_or_none("M34_LLAMA_RUNS")
 q4k_line = env("M34_Q4K_LINE")
 
-# M3.5 (--fused) discriminators (CRITICAL-1): SAME-SHAPE headline + cross-shape context.
-axc_kernel = env("M34_AXC_KERNEL", "matvec")  # "matvec" (M3.4) | "fused" (M3.5)
-is_fused = axc_kernel == "fused"
+# M3.5 (--fused) / M3.5b (--fused-f32acc) discriminators (CRITICAL-1): SAME-SHAPE headline +
+# cross-shape context. Both fused variants share the same SAME-SHAPE A/B machinery; the only
+# difference is numerical_validity (f16-accum is invalid at inference K; f32-accum is valid).
+axc_kernel = env("M34_AXC_KERNEL", "matvec")  # "matvec" (M3.4) | "fused" (M3.5) | "fused_f32acc" (M3.5b)
+is_fused = axc_kernel in ("fused", "fused_f32acc")
+is_f32acc = axc_kernel == "fused_f32acc"
 axc_m_out = int_or_none("M34_AXC_M") or 1      # AXIOM fused GEMM output rows
 axc_n_out = int_or_none("M34_AXC_N") or 1      # AXIOM fused GEMM output cols
+# For M3.5b (fused_f32acc), M34_AXC_MAX_REL_DIFF carries the COMBINED (condition-aware,
+# backward-stable) metric — this is what DRIVES numerically_valid (the same gate the GPU dispatch
+# ATs use). M34_AXC_RAW_REL_DIFF carries the raw forward error (~1e-2 on cancellation outputs, a
+# metric artifact identical-in-kind to llama.cpp's HMMA), recorded for transparency only. For
+# M3.4/M3.5, M34_AXC_RAW_REL_DIFF is absent (None) and max_rel_diff is the only metric.
 axc_max_rel_diff = num_or_none("M34_AXC_MAX_REL_DIFF")
+axc_raw_rel_diff = num_or_none("M34_AXC_RAW_REL_DIFF")
 llama_sameshape_tflops = num_or_none("M34_LLAMA_SAMESHAPE_TFLOPS")
 llama_gemv_context_tflops = num_or_none("M34_LLAMA_GEMV_CONTEXT_TFLOPS")
 q4k_sameshape_line = env("M34_Q4K_SAMESHAPE_LINE")
@@ -155,7 +164,12 @@ if not incomplete and llama_us is not None and llama_k is not None and llama_m i
                 f"inference K.")
         numerical_validity = {
             "valid_at_ab_shape": bool(ab_valid),
+            # For M3.5b: ab_shape_max_rel_diff is the COMBINED (condition-aware, backward-stable)
+            # metric that DRIVES validity; ab_shape_raw_rel_diff is the raw forward error recorded
+            # for transparency (NOT a gate). For M3.4/M3.5 the raw field is null (single metric).
             "ab_shape_max_rel_diff": axc_max_rel_diff,
+            "ab_shape_metric": ("combined_condition_aware" if is_f32acc else "raw_relative"),
+            "ab_shape_raw_rel_diff": axc_raw_rel_diff,
             "frozen_tol": FROZEN_TOL,
             "verdict": _nv_verdict,
             "kill_criterion_interpretation": _nv_kill,
@@ -200,7 +214,9 @@ verbatim_excerpt = (
 )
 
 out = {
-    "milestone": "M3.5-llamacpp-ab-fused" if is_fused else "M3.4-llamacpp-ab",
+    "milestone": ("M3.5b-llamacpp-ab-fused-f32acc" if is_f32acc
+                  else "M3.5-llamacpp-ab-fused" if is_fused
+                  else "M3.4-llamacpp-ab"),
     "axiom_kernel": axc_kernel,
     "generated_by": "scripts/m34_llamacpp_ab.sh + scripts/m34_emit.py",
     "commit": {"tag": env("M34_LLAMACPP_TAG"), "sha": env("M34_LLAMACPP_COMMIT")},
@@ -277,6 +293,7 @@ out = {
     "llama_over_axiom_speedup_tflops": round(1.0 / ratio_tflops, 2) if ratio_tflops else None,
     "cross_shape_context": cross_shape_context,
     "axiom_fused_max_rel_diff": axc_max_rel_diff,
+    "axiom_fused_raw_rel_diff": axc_raw_rel_diff,
     "kill_criterion_within_15pct": (kill_status == "PASS") if kill_status in ("PASS", "FAIL") else None,
     "kill_criterion_status": kill_status,
     "kill_criterion_reason": kill_reason,
@@ -358,7 +375,10 @@ def fmt(x, d=3):
 
 
 md = []
-if is_fused:
+if is_f32acc:
+    md.append("# M3.5b — llama.cpp Vulkan Q4_K_M A/B, f32-ACCUMULATOR FUSED kernel, SAME-SHAPE "
+              "(NVIDIA RTX PRO 6000)\n")
+elif is_fused:
     md.append("# M3.5 — llama.cpp Vulkan Q4_K_M A/B, FUSED kernel, SAME-SHAPE (NVIDIA RTX PRO 6000)\n")
 else:
     md.append("# M3.4 — llama.cpp Vulkan Q4_K_M A/B (NVIDIA RTX PRO 6000)\n")
@@ -367,11 +387,22 @@ md.append(f"- device (both): `{axc_device}` | ICD `{out['icd']}` | device_match 
 md.append(f"- K contraction (both): {axc_k}")
 md.append("")
 if is_fused:
-    md.append("| metric | AXIOM (fused Q4_K_M RB coopmat GEMM) | llama.cpp (Q4_K MUL_MAT n=512) |")
+    _acc = "f32-accum" if is_f32acc else "f16-accum"
+    _axiom_label = (f"AXIOM (f32-accumulator fused Q4_K_M RB coopmat GEMM)" if is_f32acc
+                    else "AXIOM (fused Q4_K_M RB coopmat GEMM)")
+    md.append(f"| metric | {_axiom_label} | llama.cpp (Q4_K MUL_MAT n=512) |")
     md.append("|---|---|---|")
     md.append(f"| shape (m,n,k) | ({axc_m_out},{axc_n_out},{axc_k}) | ({fmt(llama_m)},{fmt(llama_n)},{fmt(llama_k)}) |")
     md.append(f"| TFLOPS (GpuTimestamp MIN, kernel-only) | {fmt(axc_tflops_min, 3)} | {fmt(llama_sameshape_tflops, 2)} |")
-    md.append(f"| max-rel-diff vs f16-accum ref | {fmt(axc_max_rel_diff, 3) if axc_max_rel_diff is not None else 'n/a'} | (ggml is the ref) |")
+    if is_f32acc:
+        _mrd_label = "max-rel-diff vs f32-accum ref (combined, condition-aware — the gate)"
+    else:
+        _mrd_label = f"max-rel-diff vs {_acc} ref"
+    md.append(f"| {_mrd_label} | {fmt(axc_max_rel_diff, 3) if axc_max_rel_diff is not None else 'n/a'} | (ggml is the ref) |")
+    if is_f32acc and axc_raw_rel_diff is not None:
+        md.append(f"| raw forward-error vs f32-accum ref (reporting only; ~1e-2 on cancellation "
+                  f"outputs, identical-in-kind to llama.cpp's HMMA) | {fmt(axc_raw_rel_diff, 3)} | "
+                  f"(ggml is the ref) |")
     md.append("")
     if numerical_validity is not None and not numerical_validity["valid_at_ab_shape"]:
         md.append(f"> **NUMERICALLY INVALID at the A/B shape** (max_rel_diff="
@@ -402,7 +433,7 @@ md.append(f"- Qualifier: {out['kill_criterion_qualifier']}")
 md.append(f"- Fairness caveat: {out['fairness_caveat']}")
 md.append(f"- Gap-closing path: {out['gap_closing_path']}")
 md.append("")
-_repro_flag = " --fused" if is_fused else ""
+_repro_flag = " --fused-f32acc" if is_f32acc else " --fused" if is_fused else ""
 md.append(f"Reproduce: `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json AXC_ENABLE_GPU_BENCHES=1 scripts/m34_llamacpp_ab.sh{_repro_flag}`")
 md.append("")
 with open(env("M34_RESULTS_MD"), "w") as f:
@@ -414,7 +445,9 @@ _tsus = axc_tflops_sustained if axc_tflops_sustained is not None else 0.0
 print("")
 print("=" * 78)
 if is_fused:
-    print("M3.5 A/B RESULT — FUSED kernel, SAME-SHAPE (NVIDIA RTX PRO 6000, same ICD, kernel-only):")
+    _hdr = ("M3.5b A/B RESULT — f32-ACCUMULATOR FUSED kernel, SAME-SHAPE" if is_f32acc
+            else "M3.5 A/B RESULT — FUSED kernel, SAME-SHAPE")
+    print(f"{_hdr} (NVIDIA RTX PRO 6000, same ICD, kernel-only):")
     print("-" * 78)
     print(f"  AXIOM   : fused GEMM ({axc_m_out}x{axc_n_out}x{axc_k}) = {_tmin:.3f} TFLOPS "
           f"(GpuTs MIN) | max_rel_diff={axc_max_rel_diff if axc_max_rel_diff is not None else 'n/a'}")

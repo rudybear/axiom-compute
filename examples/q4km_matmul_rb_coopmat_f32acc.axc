@@ -1,0 +1,229 @@
+// examples/q4km_matmul_rb_coopmat_f32acc.axc
+//
+// M3.5b: Q4_K_M dequant FUSED into the register-blocked coopmat matmul, with an
+// f32 ACCUMULATOR — the canonical f16×f16→f32 HMMA tensor-core op.
+//
+// This is q4km_matmul_rb_coopmat.axc (M3.5) with EXACTLY two diffs:
+//   (a) `C: buffer[f16]` → `C: buffer[f32]` (coopmat_store of an f32 accumulator into
+//       buffer[f16] is a HARD ERROR — CoopMatStoreElementTypeMismatch; the f32 store
+//       destination MUST be buffer[f32]).
+//   (b) the 4 loop-carried accumulators `matrix[f16,16,16,accumulator]` →
+//       `matrix[f32,16,16,accumulator]`.
+// Everything else — the M2.6 Q4_K_M dequant→f32_to_f16→shared[f16] staging, the RB 2×2
+// structure, the barriers, the OpPhi K-loop, the coopmat loads, the strategy holes —
+// is the M3.5 structure VERBATIM. The A/B matrices STAY matrix[f16,16,16,a|b] and the
+// shared a_tile/b_tile STAY shared[f16]; only the accumulator's element type changes.
+//
+// WHY f32 ACCUMULATOR: M3.5's f16 accumulator (matrix[f16,16,16,accumulator]) rounds the
+// running sum to f16 after every depth-16 tile. f16's ~3-decimal-digit mantissa is numerically
+// VALID only at K<=256 (max_rel_diff 8.3e-4); it diverges at K=512 (3.6e-3 > 1e-3) and is
+// garbage at the inference K=14336 (max_rel_diff ~= 29). The CANONICAL tensor-core op is
+// f16 A × f16 B accumulated into an f32 accumulator (OpCooperativeMatrixMulAddKHR with
+// AType=Float16, BType=Float16, CType=Float32, ResultType=Float32, scope=Subgroup). f32's
+// 24-bit mantissa keeps the K=14336 accumulation within the FROZEN 1e-3 → numerically VALID
+// at inference K. This is NVIDIA's PRIMARY HMMA tuple (enumerated by
+// vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR).
+//
+// NO NEW SPIR-V CAPABILITY: an f32 cooperative-matrix component type is a plain Float32 +
+// CooperativeMatrixKHR (both already present). Float16 is still required for the f16 A/B
+// coopmat types and the shared[f16] staging. The capability set is IDENTICAL to M3.5.
+//
+// LAYOUT (per HN-11, identical to q4km_matmul_rb_coopmat.axc):
+//   q: weight matrix A as M consecutive weight-rows, row-major.
+//      weight-row `row` = bytes [row*n_blocks_per_row*144 .. (row+1)*n_blocks_per_row*144]
+//      Each 144-byte block is a Q4_K_M superblock (256 weights).
+//   x: activation/B matrix, f16, row-major: x[k_row * N + col], k_row in 0..K.
+//   C: output, f32, row-major: C[m_row * N + col]   (4 bytes/elem — was f16 in M3.5).
+//   M = weight rows, N = x cols, K = contraction = n_blocks_per_row * 256.
+//
+// SUPERBLOCK-TO-TILE MAPPING (tile_k=16 < 256 weights/superblock):
+//   For target A element (a_row in 0..32, a_col in 0..16) of this k_block:
+//     row = block_row*32 + a_row            (global weight row)
+//     k   = k_block*16  + a_col             (global contraction index)
+//     sb       = k / 256                    (superblock index within the row)
+//     wk       = k - sb*256                 (index within the superblock, 0..255)
+//     chunk    = wk / 64                    (0..3 — four 64-element chunks)
+//     wc       = wk - chunk*64              (0..63 — index within the chunk)
+//     l        = wc % 32                    (0..31 — byte index within the 32-byte half)
+//     is_hi    = wc >= 32                   (lo nibble for wc<32, hi nibble for wc>=32)
+//     is       = chunk*2 + (is_hi ? 1 : 0)  (sub-block 0..7 for get_scale_min_k4)
+//   The byte-logic (get_scale_min_k4 + d/dmin + nibble) is the byte-identical
+//   FROZEN M2.6 logic (q4km_dequant_matmul.axc lines 41-104), specialized to the
+//   single (sub-block, nibble) this element needs.
+//
+// NUMERICS: the dequant is f32 (matching ggml), with a SINGLE f32->f16 rounding at the
+//   a_tile write; x is staged f16; the coopmat accumulator is f32. The CPU oracle
+//   (common_q4km_f32ref.rs) MATCHES: dequant f32, round weights+x f32->f16, then
+//   accumulate in PURE F32 (NO per-tile rounding of the running accumulator). GPU and oracle
+//   agree to the f32 accumulation-order noise floor (~3e-7). The PASS/FAIL gate is the
+//   CONDITION-AWARE metric |gpu-ref| / max(|ref|, sum_k|w_k·x_k|) <= FROZEN 1e-3 (the
+//   backward-stable dot-product criterion): a near-zero CANCELLATION output (|ref| << the
+//   accumulation scale sum|w·x|) cannot resolve relative error below f32 reordering noise, so
+//   the raw |gpu-ref|/|ref| there is a metric artifact (~1e-2), NOT a kernel error. The 1e-3
+//   is NOT loosened — well-conditioned outputs are still held to the full relative tolerance.
+//   Validated at K=256, K=512, AND K=14336 (the inference-K claim).
+//
+// CAPABILITIES: IDENTICAL to q4km_matmul_rb_coopmat.axc (Float16, CooperativeMatrixKHR,
+//   Int8, StorageBuffer8BitAccess, SPV_KHR_8bit_storage, Int16). The f32 accumulator adds
+//   NOTHING. AT-1787 asserts the cap set == the M3.5 fused kernel's caps.
+//
+// BENCHMARKED BY: crates/axc-driver/benches/resident_q4km_matmul_rb_f32acc.rs (AT-1783/1784).
+// BIT-WITHIN-TOL TESTS: crates/axc-driver/tests/dispatch_q4km_matmul_rb_f32acc.rs (AT-1780/1781/1782).
+// COMPILE ANCHOR: AT-1787 in compile_shared_examples.rs (CI, no GPU).
+//
+// Anti-pattern #2: explicit `return;`.
+// Anti-pattern #8: no `>>` (use shr/lshr for shifts).
+
+@kernel
+@workgroup(32, 1, 1)
+@cooperative_matrix
+@strategy { rb_m: ?[2], rb_n: ?[2], tile_k: ?[16], a_block_size: ?[512], b_block_size: ?[512] }
+@intent("Q4_K_M dequant fused into register-blocked 2x2 coopmat matmul, f32 accumulator (AT-1780..1784)")
+@complexity(O(n))
+fn q4km_matmul_rb_coopmat_f32acc(
+    q: readonly_buffer[u8],
+    x: readonly_buffer[f16],
+    C: buffer[f32],
+    M: u32,
+    N: u32,
+    K: u32,
+    n_blocks_per_row: u32
+) -> void {
+    // Shared staging tiles for the 2x2 block (identical sizing to M3.5; A/B stay f16).
+    shared a_tile: shared[f16, ?a_block_size];
+    shared b_tile: shared[f16, ?b_block_size];
+
+    // Block coordinates (ASYMMETRIC, identical to M3.5).
+    let block_col: u32 = gid(0u32) / 32u32;
+    let block_row: u32 = gid(1u32);
+
+    // Lane index within the subgroup for cooperative staging.
+    let lane: u32 = subgroup_invocation_id();
+
+    // Output tile coordinates within the 2x2 block.
+    let tile_row_0: u32 = block_row * 2u32;
+    let tile_row_1: u32 = block_row * 2u32 + 1u32;
+    let tile_col_0: u32 = block_col * 2u32;
+    let tile_col_1: u32 = block_col * 2u32 + 1u32;
+
+    // 4 loop-carried f32 coopmat accumulators (the M3.5b change: f16 -> f32).
+    let mut acc_00: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_01: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_10: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_11: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+
+    // Staging iterations per thread.
+    let a_iters: u32 = ?a_block_size / 32u32;
+    let b_iters: u32 = ?b_block_size / 32u32;
+
+    // Number of K-blocks.
+    let num_k_blocks: u32 = K / ?tile_k;
+
+    // K-loop: 4 coopmat accumulators are loop-carried (N-phi path).
+    for k_block in range(0u32, num_k_blocks) {
+
+        // ── Dequant A[block_row*32..+32, k_block*16..+16] into a_tile (shared[f16]) ─
+        // Each lane stages a_iters = 16 A elements. ei_a covers 0..511 exactly once.
+        for a_iter in range(0u32, a_iters) {
+            let ei_a: u32 = a_iter * 32u32 + lane;
+            let a_row: u32 = ei_a / 16u32;
+            let a_col: u32 = ei_a - a_row * 16u32;
+            let g_row: u32 = block_row * 32u32 + a_row;
+            let g_k: u32 = k_block * ?tile_k + a_col;
+
+            // Superblock-to-tile decode for this (g_row, g_k) weight.
+            let sb: u32 = g_k / 256u32;
+            let wk: u32 = g_k - sb * 256u32;
+            let chunk: u32 = wk / 64u32;
+            let wc: u32 = wk - chunk * 64u32;
+            let l: u32 = wc - (wc / 32u32) * 32u32;
+            let is_hi: u32 = wc / 32u32;            // 0 = lo nibble, 1 = hi nibble
+            let is: u32 = chunk * 2u32 + is_hi;     // sub-block index 0..7
+
+            // Byte offset of superblock sb in weight-row g_row.
+            let base: u32 = g_row * n_blocks_per_row * 144u32 + sb * 144u32;
+            // Super-scale d and super-min dmin (f16, bytes [base..base+4]).
+            let d_bits: u32 = ptr_read_u16_zext(q, base);
+            let dmin_bits: u32 = ptr_read_u16_zext(q, base + 2u32);
+            let d: f32 = f16_bits_to_f32(d_bits);
+            let dmin: f32 = f16_bits_to_f32(dmin_bits);
+            let scales_base: u32 = base + 4u32;
+            let qs_base: u32 = base + 16u32;
+
+            // Inline get_scale_min_k4 for sub-block `is` (byte-identical to M2.6).
+            let mut sc: u32 = 0u32;
+            let mut mm: u32 = 0u32;
+            if is < 4u32 {
+                sc = band(ptr_read_u8_zext(q, scales_base + is), 63u32);
+                mm = band(ptr_read_u8_zext(q, scales_base + is + 4u32), 63u32);
+            } else {
+                let lo4_sc: u32 = band(ptr_read_u8_zext(q, scales_base + is + 4u32), 0x0Fu32);
+                let hi2_sc: u32 = band(lshr(ptr_read_u8_zext(q, scales_base + is - 4u32), 6u32), 0x03u32);
+                sc = bor(lo4_sc, shl(hi2_sc, 4u32));
+                let lo4_m: u32 = band(lshr(ptr_read_u8_zext(q, scales_base + is + 4u32), 4u32), 0x0Fu32);
+                let hi2_m: u32 = band(lshr(ptr_read_u8_zext(q, scales_base + is), 6u32), 0x03u32);
+                mm = bor(lo4_m, shl(hi2_m, 4u32));
+            }
+
+            // Per-sub-block scale and min coefficients.
+            let dsc: f32 = d * f32_from_u32(sc);
+            let dmm: f32 = dmin * f32_from_u32(mm);
+
+            // Byte holding this element's nibble: qs_base + chunk*32 + l.
+            // lo nibble for is_hi==0, hi nibble for is_hi==1.
+            let byte: u32 = ptr_read_u8_zext(q, qs_base + chunk * 32u32 + l);
+            let mut nib: u32 = band(byte, 0x0Fu32);
+            if is_hi >= 1u32 {
+                nib = band(lshr(byte, 4u32), 0x0Fu32);
+            }
+
+            // Dequant in f32, narrow to f16 (the single f32->f16 rounding; A/B stay f16).
+            let w: f16 = f32_to_f16(dsc * f32_from_u32(nib) - dmm);
+            a_tile[ei_a] = w;
+        }
+
+        // ── Stage B (x) tile into b_tile — VERBATIM M3.5 (x is already f16) ──────
+        for b_iter in range(0u32, b_iters) {
+            let ei_b: u32 = b_iter * 32u32 + lane;
+            let b_row: u32 = ei_b / 32u32;
+            let b_col: u32 = ei_b - b_row * 32u32;
+            let b_global_row: u32 = k_block * ?tile_k + b_row;
+            let b_global_col: u32 = block_col * 32u32 + b_col;
+            let b_global: u32 = b_global_row * N + b_global_col;
+            b_tile[ei_b] = x[b_global];
+        }
+
+        // Barrier: staging complete before coopmat loads.
+        workgroup_barrier();
+
+        // ── Coopmat loads (f16 A/B) + 4 mul_adds into f32 accumulators (HMMA) ─────
+        let a_mat_0: matrix[f16, 16, 16, a] = coopmat_load(a_tile, 0u32, 16u32);
+        let a_mat_1: matrix[f16, 16, 16, a] = coopmat_load(a_tile, 256u32, 16u32);
+
+        let b_mat_0: matrix[f16, 16, 16, b] = coopmat_load(b_tile, 0u32, 32u32);
+        let b_mat_1: matrix[f16, 16, 16, b] = coopmat_load(b_tile, 16u32, 32u32);
+
+        // f16 A × f16 B → f32 accumulator (mixed-precision HMMA; A.elem==B.elem==f16,
+        // accumulator elem==f32, result elem==f32).
+        acc_00 = coopmat_mul_add(a_mat_0, b_mat_0, acc_00);
+        acc_01 = coopmat_mul_add(a_mat_0, b_mat_1, acc_01);
+        acc_10 = coopmat_mul_add(a_mat_1, b_mat_0, acc_10);
+        acc_11 = coopmat_mul_add(a_mat_1, b_mat_1, acc_11);
+
+        // WAR barrier: before the next k_block overwrites a_tile / b_tile.
+        workgroup_barrier();
+    }
+
+    // ── Store the 4 accumulated f32 tiles to C (buffer[f32]) — element-type matched ──
+    let c_base_00: u32 = (tile_row_0 * 16u32) * N + (tile_col_0 * 16u32);
+    let c_base_01: u32 = (tile_row_0 * 16u32) * N + (tile_col_1 * 16u32);
+    let c_base_10: u32 = (tile_row_1 * 16u32) * N + (tile_col_0 * 16u32);
+    let c_base_11: u32 = (tile_row_1 * 16u32) * N + (tile_col_1 * 16u32);
+
+    coopmat_store(acc_00, C, c_base_00, N);
+    coopmat_store(acc_01, C, c_base_01, N);
+    coopmat_store(acc_10, C, c_base_10, N);
+    coopmat_store(acc_11, C, c_base_11, N);
+
+    return;
+}

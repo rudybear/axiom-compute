@@ -1,0 +1,55 @@
+{
+  "verdict": "NEEDS_REVISION",
+  "agent": "pessimistic_design_reviewer",
+  "milestone_id": "M3.5b-f32-accum-coopmat",
+  "claim_verification": {
+    "already_mixed_precision_capable": "CONFIRMED TRUE end-to-end against actual source. No typecheck/codegen/capability change is required; the M3.1 design split A/B-element-match from the accumulator/result element type at every layer.",
+    "evidence": {
+      "typecheck_mul_add": "typecheck.rs:2998-3017 — the ONLY element-equality check is A.elem==B.elem (line 2999, ABElementMismatch). The accumulator's element type is validated INDEPENDENTLY via is_allowed_coopmat_element(a_key.elem) && is_allowed_coopmat_element(c_key.elem) (line 3008, A and C checked separately). result_key = c_key (line 3017). There is NO hidden C.elem==A.elem requirement. f16xf16->f32 typechecks to matrix[f32,..,accumulator] unchanged.",
+      "codegen_component_type": "coopmat.rs:114 — get_or_emit derives elem_type_id = type_cache.scalar_id(b, key.elem) from EACH binding's own key.elem. An f32 accumulator key emits a Float32-component OpTypeCooperativeMatrixKHR. emit_coopmat_zero (160) and emit_coopmat_mul_add (186) both pass result_ty (= the f32 accumulator key) as the result coopmat type; the A/B operand ids carry their own f16 coopmat types. mul_add operands = NONE_KHR (189), correct for float HMMA.",
+      "no_new_capability": "observe_coopmat_elem_caps (coopmat.rs:59-63) sets caps.float16 ONLY when key.elem==F16. For the f32 accumulator it adds nothing; Float16 stays set by the f16 A/B load types. An f32 coopmat component needs only CooperativeMatrixKHR+Shader (both already emitted). Confirmed identical capability set to M3.5.",
+      "opphi_type_agnostic": "body.rs:1196-1222 — the loop-carried phi discovers its result type by walking the module for pre_header_val_id's result_type (the coopmat_zero OpConstantNull's type). Fully type-agnostic: f32 accumulator -> f32 phi. Both phi operands (null + mul_add latch) share the f32 coopmat type.",
+      "preflight_matches_result_type": "runtime/coopmat.rs:333-343 — coopmat_shape_supported checks a_type && b_type && c_type && result_type && scope && !saturating_accumulation. ResultType IS matched (line 340). The f16/f16/f32/f32 shape is matched independently, not assumed all-f16.",
+      "metadata_independent": "lower.rs:482-491 derive_coopmat_shape sources a_elem=a_key.elem, b_elem=b_key.elem, c_elem=c_key.elem, result_type=c_key.elem (line 489). driver lib.rs:218-221 maps all four independently to CoopMatScalarMeta. No a_elem shortcut for the accumulator/result anywhere.",
+      "store_uses_own_elem": "typecheck.rs:3108 — the coopmat_store element check uses matrix_key.elem (the stored matrix's OWN elem), so an f32 accumulator into buffer[f16] correctly errors CoopMatStoreElementTypeMismatch; the kernel's C->buffer[f32] change is therefore mandatory and correctly scoped.",
+      "oracle_must_accumulate_f32": "common_q4km_f16ref.rs:133-146 accumulates in f16 with per-tile rounding (round_f32_to_f16_to_f32(acc + tile_partial), line 144). The architect correctly specifies the NEW common_q4km_f32ref oracle to drop the per-tile rounding and accumulate in pure f32, while STILL rounding weights and x to f16 (the inputs entering the tensor core). This matches the GPU's f16 A/B + f32-accumulate. Reusing the f16 oracle for M3.5b WOULD mismatch the f32 GPU — the new oracle is required and correctly described."
+    }
+  },
+  "critical_issues": [],
+  "warnings": [
+    "WARNING (must become a hard requirement — see missing_tests): the runtime preflight has NO positive ACCEPT test for the f16/f16/F32/f32 Subgroup 16x16x16 shape. AT-1561 (runtime/coopmat.rs:690-753) only proves (a) REJECTION of a near-miss (f32 result_type vs an all-f16 requirement) and (b) ACCEPTance of all-f16. The architect flags this in open_question 2 but lists the ACCEPT test as 'add if absent', not as a numbered acceptance test. The whole M3.5b dispatch path depends on coopmat_shape_supported MATCHING f16/f16/f32/f32 — a CPU-only positive unit test must lock this in independently of GPU availability (Lavapipe will skip the GPU path).",
+    "WARNING: the f32-accumulator OpConstantNull and the f32 coopmat type are NEW emitted SPIR-V shapes never previously exercised (M3.x always used f16 accumulators). AT-1787's spirv-val gate is the only proof they validate. Treat AT-1787 as load-bearing, not a formality: it must assert spirv-val exit 0 AND the metadata shape {16,16,16,F16,F16,F32,F32,Subgroup}, both as written.",
+    "WARNING (numerics honesty): the f32 CPU oracle is a pure-f32 sequential sum; the NVIDIA tensor core may accumulate the depth-16 partial in extended precision and/or in a different summation order. Both are within-1e-3 territory at k=14336, but if AT-1782 measures >1e-3 the architect's stated policy (investigate input-rounding/dequant-order, do NOT loosen the frozen 1e-3) MUST be honoured. Confirm the Coder cannot silently cap/skip k=14336 to pass.",
+    "WARNING (perf honesty): the f32 accumulator costs more registers + doubles store bandwidth; M3.5b TFLOPS may fall BELOW M3.5's 11.27. The bench/ROADMAP/A-B verdict must report the measured value with no spin and keep the kill-verdict FAIL on throughput (still behind llama's 101.48) while correctly relabelling the result as numerically VALID (not 'fast-but-wrong'). The architect specifies this; QA must enforce no spin."
+  ],
+  "principle_violations": [],
+  "spirv_concerns": [
+    "SPV_KHR_cooperative_matrix: a Float32-component OpTypeCooperativeMatrixKHR with MatrixAccumulatorKHR use, Subgroup scope, 16x16, requires only CooperativeMatrixKHR (+ the Shader/Float32 base). No Float64, no extra extension. Confirmed consistent with the unchanged capability set. spirv-val must stay clean (AT-1787)."
+  ],
+  "vendor_concerns": [
+    "The f16/f16/f32/f32 Subgroup 16x16x16 tuple is NVIDIA's canonical HMMA and is enumerated by vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR. Lavapipe enumerates NO coopmat shapes -> coopmat_shape_supported returns false -> typed graceful skip (DeviceFeatureUnsupported/CoopMatUnsupported). The architect specifies the typed-skip; confirm Lavapipe SKIPS, not FAILS, on AT-1780/1781/1782/1783/1784.",
+    "The within-1e-3 result at k=14336 is NVIDIA-tensor-core-specific and must be documented as such (the oracle header already carries this disclosure for the f16 path; the f32 oracle must carry an equivalent NVIDIA-specific disclosure)."
+  ],
+  "missing_tests": [
+    "MUST TEST (make mandatory, was 'add if absent'): a CPU-only positive ACCEPT unit test in runtime/coopmat.rs that coopmat_shape_supported(required=f16/f16/F32/f32 Subgroup 16x16x16, support containing that exact tuple) == true, AND that the same required shape is REJECTED when the device offers only f16/f16/f16/f16 (near-miss on c_type/result_type). This proves the dispatch matcher accepts the M3.5b shape without needing a GPU. AT-1561 does NOT cover this.",
+    "MUST TEST: AT-1786 (negative) — coopmat_mul_add(a:f16, b:f32, c:f32) MUST still emit exactly one ABElementMismatch{a_elem:F16,b_elem:F32}. This guards against the Coder weakening the A.elem==B.elem check while 'enabling' mixed precision. Keep it as a hard gate.",
+    "SHOULD TEST (cheap, recommended): a negative regression that coopmat_store of matrix[f32,..,accumulator] into buffer[f16] errors CoopMatStoreElementTypeMismatch (the architect lists this in edge_cases as 'add if cheap' — promote to a kept test; it documents WHY C must become buffer[f32]).",
+    "CONFIRM: AT-1781 (K=512) is ASSERTED with no gate-cap (it was the M3.5 f16 failure at 3.6e-3 and MUST now pass within 1e-3). AT-1782 (k=14336) asserted-if-holds with HONEST measured-value reporting otherwise — no silent cap."
+  ],
+  "questions_for_architect": [
+    "Will you elevate the f16/f16/f32/f32 preflight ACCEPT unit test from open_question 2 ('add if absent') to a numbered, mandatory acceptance test? This is the one structural gap: the dispatch matcher's correctness for the M3.5b shape is currently proven only transitively via a GPU test (which Lavapipe skips). It needs a standalone CPU-only positive test.",
+    "Confirm m34_emit.py's numerically_valid field is driven by the AXIOM-measured max_rel_diff vs the F32 oracle (not by an assumption), and that the kill-verdict stays FAIL-on-throughput even when numerically_valid=true."
+  ],
+  "summary": "The architect's central claim — that the type-system, codegen, metadata, OpPhi, and runtime preflight are ALREADY mixed-precision-capable and M3.5b needs NO typecheck/codegen/capability change — is VERIFIED TRUE against the actual source at every layer (typecheck.rs:2998-3017 checks A.elem==B.elem only and sets result_key=c_key; coopmat.rs:114 emits the component from each binding's own key.elem; coopmat.rs:59-63 adds Float16 only for F16 keys so the f32 accumulator introduces no new capability; body.rs:1196-1222 OpPhi is type-agnostic; runtime/coopmat.rs:333-343 matches all four types INCLUDING result_type; lower.rs:482-491 + lib.rs:218-221 carry a/b/c/result independently). There is NO hidden f16-all assumption, so the milestone is correctly scoped as small. The defensive tests AT-1785 (mixed-OK) and AT-1786 (A/B-mismatch-still-rejected) correctly prevent an unnecessary, dangerous relax that would weaken the A/B-match. The new f32 oracle is correctly specified to accumulate in PURE F32 (dropping the f16 oracle's per-tile rounding at common_q4km_f16ref.rs:144) while still rounding weights+x to f16, matching the GPU. The frozen 1e-3 is not loosened and the honest-reporting policy (perf may drop below 11.27; throughput still behind llama's 101.48; numerically VALID not fast-but-wrong) is sound. ONE structural gap blocks APPROVE: the runtime preflight has no standalone CPU-only POSITIVE accept test for the f16/f16/F32/f32 shape — AT-1561 only proves near-miss rejection + all-f16 acceptance. Because Lavapipe skips the GPU dispatch path, the matcher's correctness for the exact M3.5b shape would be unproven on CI without it. Elevate that accept test (and keep AT-1786 + the store-mismatch regression) to mandatory and this is an APPROVE. No correctness/SPIR-V/principle violations found.",
+  "self_check": {
+    "read_template": true,
+    "read_architect_json": true,
+    "verified_typecheck_mul_add_arm": true,
+    "verified_codegen_component_type": true,
+    "verified_opphi_type_agnostic": true,
+    "verified_preflight_matches_result_type": true,
+    "verified_oracle_needs_f32_accumulate": true,
+    "verified_no_new_capability": true,
+    "verified_llamacpp_not_committed": true
+  }
+}
