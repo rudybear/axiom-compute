@@ -1,0 +1,275 @@
+// examples/q4km_matmul_rb_coopmat_f32acc_cached.axc
+//
+// M3.6: Q4_K_M dequant SCALE-CACHING on top of the M3.5b f32-accumulator fused
+// register-blocked coopmat matmul (examples/q4km_matmul_rb_coopmat_f32acc.axc).
+//
+// PROBLEM (measured, §3.1.22): the M3.5b fused kernel runs only 4.81 TFLOPS at 768^3 vs
+// the PLAIN RB coopmat matmul's 31.2 TFLOPS — a ~6.5x ALU-bound dequant front-end tax. The
+// per-superblock dequant header (d/dmin widen) and the 8 (dsc,dmm) sub-block products are
+// CONSTANT over all 256 weights of a superblock, but M3.5b RECOMPUTES them for every staged
+// nibble of every k_block. With tile_k=16 a superblock spans 16 k_blocks, so the header is
+// recomputed 16x and each sub-block's scales 2x. The redundancy is TEMPORAL (across the
+// k_block loop), so a scalar hoist cannot capture it; a per-superblock SHARED cache does.
+//
+// MECHANISM (PURE SOURCE REWRITE — flat loop + conditional fill; NO new builtin/codegen/cap):
+//   Two new `shared[f32, 256]` arrays cache the 8 (dsc=d*sc, dmm=dmin*m) PRODUCTS for each of
+//   the 32 weight-rows the 2x2 block covers, for the superblock currently in flight:
+//       dsc_cache[row_local*8 + is], dmm_cache[row_local*8 + is]   (row_local 0..31, is 0..7
+//       -> 32*8 = 256 entries each; +2 KB shared, ~4 KB total with a_tile+b_tile).
+//
+//   The K-loop STAYS the FLAT single loop of M3.5b (`for k_block in range(0, num_k_blocks)`):
+//   the 4 f32 accumulators are reassigned UNCONDITIONALLY at its top level, so the EXISTING
+//   single-level OpPhi N-accumulator carry (M3.3c, AT-1731/1733) is preserved VERBATIM. There
+//   is NO nested coopmat carry. (r1's superblock-OUTER / k_block-INNER nested loop was a SILENT
+//   MISCOMPILE: detect_loop_carried_coopmat scans with descend_nested_loops=false, so an
+//   accumulator reassigned only in a nested loop gets NO outer OpPhi -> the pre-header operand
+//   stays pinned to coopmat_zero() -> the accumulator RESETS to zero every superblock; only the
+//   last 256 of K survive; spirv-val passes it -> valid-but-WRONG. The flat loop eliminates this.)
+//
+//   The ONLY structural addition vs M3.5b is a WORKGROUP-UNIFORM cooperative cache-FILL at the
+//   TOP of the loop body, gated on `if (k_block - (k_block/16)*16 == 0)` (== k_block % 16 == 0;
+//   fires once per superblock). It writes ONLY dsc_cache/dmm_cache (NEVER the coopmat
+//   accumulators), so it does NOT trip the AT-1708 LoopCarriedCoopMatConditionalReassignUnsupported
+//   guard (which fires only on a CONDITIONAL reassign of a COOPMAT binding). Each lane does 8
+//   fills (cache_i = fi*32 + lane covers 0..255 exactly once over 32 lanes), computing the
+//   byte-identical get_scale_min_k4 + d*sc / dmin*m ONCE per (row,is). The fill ends in a RAW
+//   workgroup_barrier() INSIDE the uniform branch.
+//
+//   Every k_block then STAGES A by READING dsc_cache/dmm_cache (NO header recompute, NO
+//   get_scale_min_k4 in the inner loop): the per-nibble dequant becomes
+//       w = f32_to_f16(dsc_cache[idx] * f32_from_u32(nib) - dmm_cache[idx])
+//   the SAME multiply-then-subtract ORDER as M3.5b line 181, with dsc/dmm read from shared
+//   instead of recomputed. B staging, the post-staging barrier, the coopmat loads, the 4
+//   mul_adds, the single-level OpPhi K-carry, the end-of-body WAR barrier, and coopmat_store
+//   are VERBATIM M3.5b.
+//
+// BARRIERS + UNIFORMITY:
+//   k_block is the induction variable of the single loop -> identical across all 32 lanes ->
+//   `k_block % 16 == 0` is WORKGROUP-UNIFORM -> all lanes take the branch together -> the
+//   barrier inside it is reached by every invocation (NOT divergent control flow -> NOT Vulkan
+//   UB). RAW barrier: at the end of the fill, inside the uniform branch, orders cache WRITE ->
+//   cache READ (A staging). WAR barrier: the existing UNCONDITIONAL end-of-body workgroup_barrier
+//   (M3.5b line 214) completes the prior k_block's coopmat consumption AND the prior superblock's
+//   last cache read BEFORE the next superblock's fill overwrites the caches — it doubles as the
+//   cache WAR; no extra barrier is needed. No barrier sits in divergent flow.
+//
+// SHARED BOUNDS — a_block_size PINNED at 512:
+//   The cache index `row_local*8 + is` must stay < 256. With a_block_size = 512,
+//   a_row = ei_a/16 (ei_a 0..511) gives row_local in 0..31 (32*8 = 256 exact). a_block_size is
+//   a single-value `@strategy` hole `?[512]`, so the autotuner CANNOT exceed it; a larger value
+//   would push the index past 255 and OOB the 256-entry caches with races. The 32-row pin is a
+//   HARD invariant of the 256-entry cache layout — if a future milestone autotunes a_block_size,
+//   the caches must be resized to match.
+//
+// NUMERICS — pure reassociation, FROZEN 1e-3 unchanged:
+//   Caching only HOISTS the SAME products; dsc/dmm are computed by the byte-identical
+//   get_scale_min_k4 on the SAME superblock bytes, and the per-nibble dequant is the SAME f32
+//   expression (SAME multiply-then-subtract order, M3.5b line 181) with dsc/dmm read from shared.
+//   The accumulation order (single-level K-loop, same coopmat tile order) is UNCHANGED. So this
+//   kernel is BEHAVIORALLY identical to M3.5b: the combined condition-aware metric stays <= the
+//   FROZEN 1e-3 at K=256/512/14336 (AT-1800/1801/1802), and the cross-kernel bit-identity test
+//   (AT-1803, max|y_cached - y_baseline| == 0) asserts the two GPU outputs match bit-for-bit.
+//
+// CAPABILITIES: IDENTICAL to q4km_matmul_rb_coopmat_f32acc.axc (the cache is plain Workgroup-
+//   storage shared[f32]; Float32 + the Workgroup storage class are already present; the
+//   conditional fill is ordinary OpBranchConditional + uniform OpControlBarrier). AT-1806
+//   asserts the cap set == the M3.5b kernel's caps (a single benign shared[f32] layout-decoration
+//   delta is pre-permitted).
+//
+// BENCHMARKED BY: crates/axc-driver/benches/resident_q4km_matmul_rb_f32acc_cached.rs (AT-1804/1805).
+// BIT-WITHIN-TOL TESTS: crates/axc-driver/tests/dispatch_q4km_matmul_rb_f32acc_cached.rs (AT-1800/1801/1802).
+// CROSS-KERNEL BIT-IDENTITY: crates/axc-driver/tests/dispatch_q4km_f32acc_cached_equiv.rs (AT-1803).
+// COMPILE ANCHOR: AT-1806 in compile_shared_examples.rs (CI, no GPU).
+//
+// Anti-pattern #2: explicit `return;`.
+// Anti-pattern #8: no `>>` (use shr/lshr for shifts); k_block % 16 expressed as k_block - (k_block/16)*16.
+
+@kernel
+@workgroup(32, 1, 1)
+@cooperative_matrix
+@strategy { rb_m: ?[2], rb_n: ?[2], tile_k: ?[16], a_block_size: ?[512], b_block_size: ?[512] }
+@intent("Q4_K_M dequant scale-caching on the f32-accumulator 2x2 RB coopmat matmul (AT-1800..1805)")
+@complexity(O(n))
+fn q4km_matmul_rb_coopmat_f32acc_cached(
+    q: readonly_buffer[u8],
+    x: readonly_buffer[f16],
+    C: buffer[f32],
+    M: u32,
+    N: u32,
+    K: u32,
+    n_blocks_per_row: u32
+) -> void {
+    // Shared staging tiles for the 2x2 block (identical sizing to M3.5b; A/B stay f16).
+    shared a_tile: shared[f16, ?a_block_size];
+    shared b_tile: shared[f16, ?b_block_size];
+
+    // M3.6 NEW: per-superblock dequant-scale caches (8 sub-blocks x 32 weight-rows = 256 each).
+    // Indexed row_local*8 + is (row_local 0..31, is 0..7). a_block_size PINNED at 512 bounds it.
+    shared dsc_cache: shared[f32, 256];
+    shared dmm_cache: shared[f32, 256];
+
+    // Block coordinates (ASYMMETRIC, identical to M3.5b).
+    let block_col: u32 = gid(0u32) / 32u32;
+    let block_row: u32 = gid(1u32);
+
+    // Lane index within the subgroup for cooperative staging.
+    let lane: u32 = subgroup_invocation_id();
+
+    // Output tile coordinates within the 2x2 block.
+    let tile_row_0: u32 = block_row * 2u32;
+    let tile_row_1: u32 = block_row * 2u32 + 1u32;
+    let tile_col_0: u32 = block_col * 2u32;
+    let tile_col_1: u32 = block_col * 2u32 + 1u32;
+
+    // 4 loop-carried f32 coopmat accumulators (single-level OpPhi K-carry, VERBATIM M3.5b).
+    let mut acc_00: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_01: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_10: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_11: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+
+    // Staging iterations per thread.
+    let a_iters: u32 = ?a_block_size / 32u32;
+    let b_iters: u32 = ?b_block_size / 32u32;
+
+    // Number of K-blocks.
+    let num_k_blocks: u32 = K / ?tile_k;
+
+    // K-loop: FLAT single level. The 4 coopmat accumulators are loop-carried (N-phi path),
+    // reassigned UNCONDITIONALLY at the top level -> single-level OpPhi (M3.3c), no nested carry.
+    for k_block in range(0u32, num_k_blocks) {
+        // Superblock currently in flight (UNIFORM across the workgroup: k_block is the loop
+        // induction variable, identical across all lanes).
+        let sb_idx: u32 = k_block / 16u32;
+
+        // ── COOPERATIVE SCALE-CACHE FILL — fires ONCE per superblock ──────────────────────
+        //   Predicate k_block % 16 == 0 (anti-pattern #8: expressed as k_block - sb_idx*16 == 0).
+        //   WORKGROUP-UNIFORM -> all 32 lanes take the branch together -> the barrier inside is
+        //   reached by every invocation -> NOT divergent control flow -> safe.
+        if k_block - sb_idx * 16u32 == 0u32 {
+            // 256 (row,is) entries over 32 lanes -> 8 fills/lane.
+            // cache_i = fi*32 + lane (fi 0..7, lane 0..31) covers 0..255 EXACTLY ONCE (AT-1620 class).
+            for fi in range(0u32, 8u32) {
+                let cache_i: u32 = fi * 32u32 + lane;          // 0..255
+                let row_local: u32 = cache_i / 8u32;           // 0..31
+                let is: u32 = cache_i - row_local * 8u32;      // 0..7
+                let g_row: u32 = block_row * 32u32 + row_local;
+
+                // Byte offset of superblock sb_idx in weight-row g_row.
+                let base: u32 = g_row * n_blocks_per_row * 144u32 + sb_idx * 144u32;
+                // Super-scale d and super-min dmin (f16, bytes [base..base+4]) — byte-identical M3.5b.
+                let d_bits: u32 = ptr_read_u16_zext(q, base);
+                let dmin_bits: u32 = ptr_read_u16_zext(q, base + 2u32);
+                let d: f32 = f16_bits_to_f32(d_bits);
+                let dmin: f32 = f16_bits_to_f32(dmin_bits);
+                let scales_base: u32 = base + 4u32;
+
+                // Inline get_scale_min_k4 for sub-block `is` (byte-identical to M3.5b lines 154-166).
+                let mut sc: u32 = 0u32;
+                let mut mm: u32 = 0u32;
+                if is < 4u32 {
+                    sc = band(ptr_read_u8_zext(q, scales_base + is), 63u32);
+                    mm = band(ptr_read_u8_zext(q, scales_base + is + 4u32), 63u32);
+                } else {
+                    let lo4_sc: u32 = band(ptr_read_u8_zext(q, scales_base + is + 4u32), 0x0Fu32);
+                    let hi2_sc: u32 = band(lshr(ptr_read_u8_zext(q, scales_base + is - 4u32), 6u32), 0x03u32);
+                    sc = bor(lo4_sc, shl(hi2_sc, 4u32));
+                    let lo4_m: u32 = band(lshr(ptr_read_u8_zext(q, scales_base + is + 4u32), 4u32), 0x0Fu32);
+                    let hi2_m: u32 = band(lshr(ptr_read_u8_zext(q, scales_base + is), 6u32), 0x03u32);
+                    mm = bor(lo4_m, shl(hi2_m, 4u32));
+                }
+
+                // Cache the per-sub-block PRODUCTS (SAME d*sc / dmin*m as M3.5b lines 169-170,
+                // computed ONCE here instead of per-nibble — pure hoist, identical bits).
+                dsc_cache[cache_i] = d * f32_from_u32(sc);
+                dmm_cache[cache_i] = dmin * f32_from_u32(mm);
+            }
+
+            // RAW barrier: cache WRITE (fill) -> cache READ (A staging). Inside the UNIFORM
+            // branch (every lane present) -> safe.
+            workgroup_barrier();
+        }
+
+        // ── Dequant A[block_row*32..+32, k_block*16..+16] into a_tile (shared[f16]) ─
+        // Each lane stages a_iters = 16 A elements. ei_a covers 0..511 exactly once.
+        for a_iter in range(0u32, a_iters) {
+            let ei_a: u32 = a_iter * 32u32 + lane;
+            let a_row: u32 = ei_a / 16u32;
+            let a_col: u32 = ei_a - a_row * 16u32;
+            let g_k: u32 = k_block * ?tile_k + a_col;
+
+            // Superblock-to-tile decode for this element's nibble (byte-identical M3.5b).
+            let sb: u32 = g_k / 256u32;
+            let wk: u32 = g_k - sb * 256u32;
+            let chunk: u32 = wk / 64u32;
+            let wc: u32 = wk - chunk * 64u32;
+            let l: u32 = wc - (wc / 32u32) * 32u32;
+            let is_hi: u32 = wc / 32u32;            // 0 = lo nibble, 1 = hi nibble
+            let is: u32 = chunk * 2u32 + is_hi;     // sub-block index 0..7
+
+            // M3.6: READ the cached (dsc, dmm) for (a_row, is) instead of recomputing the header
+            // + get_scale_min_k4. The (row_local, is) decode matches the fill: row_local = a_row
+            // (0..31 since a_block_size=512), is the superblock sub-block 0..7 -> idx 0..255.
+            let cache_idx: u32 = a_row * 8u32 + is;
+            let dsc: f32 = dsc_cache[cache_idx];
+            let dmm: f32 = dmm_cache[cache_idx];
+
+            // Byte holding this element's nibble: qs_base + chunk*32 + l (qs_base = base+16).
+            let base: u32 = (block_row * 32u32 + a_row) * n_blocks_per_row * 144u32 + sb * 144u32;
+            let qs_base: u32 = base + 16u32;
+            let byte: u32 = ptr_read_u8_zext(q, qs_base + chunk * 32u32 + l);
+            let mut nib: u32 = band(byte, 0x0Fu32);
+            if is_hi >= 1u32 {
+                nib = band(lshr(byte, 4u32), 0x0Fu32);
+            }
+
+            // Dequant in f32, narrow to f16 — SAME multiply-then-subtract ORDER as M3.5b line 181,
+            // with dsc/dmm read from the cache (pure reassociation; bit-identical result).
+            let w: f16 = f32_to_f16(dsc * f32_from_u32(nib) - dmm);
+            a_tile[ei_a] = w;
+        }
+
+        // ── Stage B (x) tile into b_tile — VERBATIM M3.5b (x is already f16) ──────
+        for b_iter in range(0u32, b_iters) {
+            let ei_b: u32 = b_iter * 32u32 + lane;
+            let b_row: u32 = ei_b / 32u32;
+            let b_col: u32 = ei_b - b_row * 32u32;
+            let b_global_row: u32 = k_block * ?tile_k + b_row;
+            let b_global_col: u32 = block_col * 32u32 + b_col;
+            let b_global: u32 = b_global_row * N + b_global_col;
+            b_tile[ei_b] = x[b_global];
+        }
+
+        // Barrier: staging complete before coopmat loads.
+        workgroup_barrier();
+
+        // ── Coopmat loads (f16 A/B) + 4 mul_adds into f32 accumulators (HMMA) ─────
+        let a_mat_0: matrix[f16, 16, 16, a] = coopmat_load(a_tile, 0u32, 16u32);
+        let a_mat_1: matrix[f16, 16, 16, a] = coopmat_load(a_tile, 256u32, 16u32);
+
+        let b_mat_0: matrix[f16, 16, 16, b] = coopmat_load(b_tile, 0u32, 32u32);
+        let b_mat_1: matrix[f16, 16, 16, b] = coopmat_load(b_tile, 16u32, 32u32);
+
+        // f16 A × f16 B → f32 accumulator (mixed-precision HMMA).
+        acc_00 = coopmat_mul_add(a_mat_0, b_mat_0, acc_00);
+        acc_01 = coopmat_mul_add(a_mat_0, b_mat_1, acc_01);
+        acc_10 = coopmat_mul_add(a_mat_1, b_mat_0, acc_10);
+        acc_11 = coopmat_mul_add(a_mat_1, b_mat_1, acc_11);
+
+        // WAR barrier: before the next k_block overwrites a_tile / b_tile AND (next superblock)
+        // the scale caches. VERBATIM M3.5b line 214 — doubles as the cache WAR.
+        workgroup_barrier();
+    }
+
+    // ── Store the 4 accumulated f32 tiles to C (buffer[f32]) — element-type matched ──
+    let c_base_00: u32 = (tile_row_0 * 16u32) * N + (tile_col_0 * 16u32);
+    let c_base_01: u32 = (tile_row_0 * 16u32) * N + (tile_col_1 * 16u32);
+    let c_base_10: u32 = (tile_row_1 * 16u32) * N + (tile_col_0 * 16u32);
+    let c_base_11: u32 = (tile_row_1 * 16u32) * N + (tile_col_1 * 16u32);
+
+    coopmat_store(acc_00, C, c_base_00, N);
+    coopmat_store(acc_01, C, c_base_01, N);
+    coopmat_store(acc_10, C, c_base_10, N);
+    coopmat_store(acc_11, C, c_base_11, N);
+
+    return;
+}
