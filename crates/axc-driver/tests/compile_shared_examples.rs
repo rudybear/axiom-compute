@@ -946,3 +946,196 @@ fn at_1906_matmul_rb_db_no_new_capability() {
         meta.shared_memory_bytes
     );
 }
+
+
+// ── AT-2006 (M3.8, CI no-GPU): LARGER REGISTER TILES (4x2 / 4x4) compile + spirv-val + ──
+//    no-new-capability vs the M3.6 cached kernel + shared_memory_bytes anchor (7168 / 8192)
+//    + OpPhi count == 8 / 16 (single-level N-accumulator carry intact).
+//
+// NR-3 FAIL-FAST: the 4x4 (16-accumulator) compile + spirv-val + OpPhi==16 is the load-bearing
+// first-line gate (any genuine codegen gap STOPS work and escalates to the Architect). It passed:
+// 16 OpPhi in ONE loop header, spirv-val clean, shared==8192.
+
+fn rb4x2_assignments() -> StrategyMap {
+    let mut m = StrategyMap::new();
+    m.insert("rb_m".to_owned(), 4_i64);
+    m.insert("rb_n".to_owned(), 2_i64);
+    m.insert("tile_k".to_owned(), 16_i64);
+    m.insert("a_block_size".to_owned(), 1024_i64);
+    m.insert("b_block_size".to_owned(), 512_i64);
+    m
+}
+
+fn rb4x4_assignments() -> StrategyMap {
+    let mut m = StrategyMap::new();
+    m.insert("rb_m".to_owned(), 4_i64);
+    m.insert("rb_n".to_owned(), 4_i64);
+    m.insert("tile_k".to_owned(), 16_i64);
+    m.insert("a_block_size".to_owned(), 1024_i64);
+    m.insert("b_block_size".to_owned(), 1024_i64);
+    m
+}
+
+/// AT-2006 shared logic for one big-RB variant. Asserts: compiles, spirv-val clean, coopmat
+/// metadata shape == M3.6, capability/extension set == the M3.6 cached kernel's, OpPhi count ==
+/// `expected_phis` (the N-accumulator single-level carry — all in ONE loop-header block), and
+/// shared_memory_bytes == `expected_shared`.
+fn at_2006_variant(
+    variant_src: &str,
+    variant_name: &str,
+    assignments: &StrategyMap,
+    expected_phis: usize,
+    expected_shared: u32,
+) {
+    use std::collections::BTreeSet;
+    use axc_runtime::{CoopMatScalarMeta, CoopMatScopeMeta};
+
+    let cached_src = include_str!("../../../examples/q4km_matmul_rb_coopmat_f32acc_cached.axc");
+    let cached_assignments = rb2x2_assignments();
+
+    let (variant_bytes, meta) = compile_source_with_assignments(variant_src, assignments)
+        .unwrap_or_else(|e| panic!("{variant_name}: compile failed: {e:?}"));
+    let variant_words = words_and_validate(variant_bytes, variant_name);
+
+    let (cached_bytes, _cm) = compile_source_with_assignments(cached_src, &cached_assignments)
+        .unwrap_or_else(|e| panic!("q4km_matmul_rb_coopmat_f32acc_cached.axc: compile failed: {e:?}"));
+    let cached_words = words_and_validate(cached_bytes, "q4km_matmul_rb_coopmat_f32acc_cached.axc");
+
+    // (c) Capability set BYTE-IDENTICAL to the M3.6 cached kernel (no new capability).
+    let (variant_caps, variant_exts) = capability_extension_sets(&variant_words);
+    let (cached_caps, cached_exts) = capability_extension_sets(&cached_words);
+
+    let extra_caps: Vec<u32> = variant_caps.difference(&cached_caps).copied().collect();
+    assert!(
+        extra_caps.is_empty(),
+        "AT-2006 ({variant_name}): declares capabilities NOT in the M3.6 cached set: \
+         {extra_caps:?} (variant={variant_caps:?}, cached={cached_caps:?})"
+    );
+    let dropped_caps: Vec<u32> = cached_caps.difference(&variant_caps).copied().collect();
+    assert!(
+        dropped_caps.is_empty(),
+        "AT-2006 ({variant_name}): DROPPED capabilities present in M3.6 cached: {dropped_caps:?}"
+    );
+    let variant_set: BTreeSet<u32> = variant_caps.iter().copied().collect();
+    let cached_set: BTreeSet<u32> = cached_caps.iter().copied().collect();
+    assert_eq!(
+        variant_set, cached_set,
+        "AT-2006 ({variant_name}): capability set must equal the M3.6 cached kernel's \
+         (larger register tiles introduce NO new capability)"
+    );
+
+    // Extensions: a single benign shared-layout-decoration delta is pre-permitted (as AT-1806/1906).
+    let extra_exts: Vec<String> = variant_exts.difference(&cached_exts).cloned().collect();
+    let dropped_exts: Vec<String> = cached_exts.difference(&variant_exts).cloned().collect();
+    if !extra_exts.is_empty() || !dropped_exts.is_empty() {
+        eprintln!(
+            "AT-2006 ({variant_name}) NOTE: extension delta vs M3.6 cached: extra={extra_exts:?} \
+             dropped={dropped_exts:?} — pre-permitted iff benign shared-layout-decoration class."
+        );
+    }
+    assert!(
+        extra_exts.len() <= 1 && dropped_exts.len() <= 1,
+        "AT-2006 ({variant_name}): at most ONE benign shared-layout extension delta is \
+         pre-permitted; extra={extra_exts:?} dropped={dropped_exts:?}"
+    );
+
+    // Coopmat metadata shape unchanged: {16,16,16, F16,F16,F32,F32, Subgroup}.
+    let coopmat = meta.coopmat.as_ref()
+        .unwrap_or_else(|| panic!("AT-2006 ({variant_name}): must emit coopmat metadata"));
+    assert_eq!(coopmat.m, 16, "AT-2006 ({variant_name}): coopmat.m");
+    assert_eq!(coopmat.n, 16, "AT-2006 ({variant_name}): coopmat.n");
+    assert_eq!(coopmat.k, 16, "AT-2006 ({variant_name}): coopmat.k");
+    assert_eq!(coopmat.a_type, CoopMatScalarMeta::F16, "AT-2006 ({variant_name}): A type F16");
+    assert_eq!(coopmat.b_type, CoopMatScalarMeta::F16, "AT-2006 ({variant_name}): B type F16");
+    assert_eq!(coopmat.c_type, CoopMatScalarMeta::F32, "AT-2006 ({variant_name}): C type F32");
+    assert_eq!(coopmat.result_type, CoopMatScalarMeta::F32, "AT-2006 ({variant_name}): result F32");
+    assert_eq!(coopmat.scope, CoopMatScopeMeta::Subgroup, "AT-2006 ({variant_name}): scope Subgroup");
+
+    // OpPhi count == the N-accumulator single-level carry, AND all in ONE loop-header block.
+    let phis = count_op_phi(&variant_words);
+    assert_eq!(
+        phis, expected_phis,
+        "AT-2006 ({variant_name}): OpPhi count must be {expected_phis} (the {expected_phis} \
+         loop-carried coopmat accumulators, single-level N-carry); got {phis}"
+    );
+    let phi_runs = op_phi_block_runs(&variant_words);
+    assert!(
+        phi_runs.contains(&expected_phis),
+        "AT-2006 ({variant_name}): all {expected_phis} OpPhi must sit in ONE loop-header block \
+         (single-level carry); got per-block runs {phi_runs:?}"
+    );
+
+    // shared_memory_bytes anchor.
+    assert_eq!(
+        meta.shared_memory_bytes, expected_shared,
+        "AT-2006 ({variant_name}): shared_memory_bytes must be {expected_shared}; got {}",
+        meta.shared_memory_bytes
+    );
+    assert!(
+        expected_shared <= 16384,
+        "AT-2006 ({variant_name}): shared_memory_bytes {expected_shared} must be <= 16384 \
+         (portable maxComputeSharedMemorySize floor)"
+    );
+
+    eprintln!(
+        "AT-2006 ({variant_name}) PASS: compiles + spirv-val clean; caps == M3.6 cached \
+         ({variant_caps:?}); coopmat {{16,16,16,F16,F16,F32,F32,Subgroup}}; OpPhi={phis} \
+         (one loop header); shared_memory_bytes={expected_shared}"
+    );
+}
+
+/// Count OpPhi (245) per basic block: returns the length of each CONSECUTIVE OpPhi run that
+/// leads a basic block (an OpLabel starts a block; OpPhi must immediately follow). A single
+/// loop-header block carrying N accumulators yields a run of N.
+fn op_phi_block_runs(words: &[u32]) -> Vec<usize> {
+    const OP_PHI: u32 = 245;
+    const OP_LABEL: u32 = 248;
+    let mut runs: Vec<usize> = Vec::new();
+    let mut i = 5usize;
+    let mut cur = 0usize;
+    let mut after_label = false;
+    while i < words.len() {
+        let op = words[i] & 0xFFFF;
+        let wc = (words[i] >> 16) as usize;
+        if wc == 0 {
+            break;
+        }
+        if op == OP_LABEL {
+            if cur > 0 {
+                runs.push(cur);
+            }
+            cur = 0;
+            after_label = true;
+        } else if op == OP_PHI && after_label {
+            cur += 1;
+        } else {
+            if cur > 0 {
+                runs.push(cur);
+            }
+            cur = 0;
+            after_label = false;
+        }
+        i += wc;
+    }
+    if cur > 0 {
+        runs.push(cur);
+    }
+    runs
+}
+
+/// AT-2006 (4x2): 8-accumulator variant. shared = (1024+512)*2 + 2*512*4 = 3072 + 4096 = 7168.
+#[test]
+fn at_2006_bigrb_4x2_compile_validates() {
+    let src = include_str!("../../../examples/q4km_matmul_rb_coopmat_f32acc_cached_4x2.axc");
+    let expected_shared: u32 = (1024 + 512) * 2 + 2 * 512 * 4; // 3072 + 4096 = 7168
+    at_2006_variant(src, "4x2", &rb4x2_assignments(), 8, expected_shared);
+}
+
+/// AT-2006 (4x4): 16-accumulator variant (NR-3 fail-fast anchor). shared = (1024+1024)*2 +
+/// 2*512*4 = 4096 + 4096 = 8192. OpPhi == 16 in one loop header.
+#[test]
+fn at_2006_bigrb_4x4_compile_validates() {
+    let src = include_str!("../../../examples/q4km_matmul_rb_coopmat_f32acc_cached_4x4.axc");
+    let expected_shared: u32 = (1024 + 1024) * 2 + 2 * 512 * 4; // 4096 + 4096 = 8192
+    at_2006_variant(src, "4x4", &rb4x4_assignments(), 16, expected_shared);
+}

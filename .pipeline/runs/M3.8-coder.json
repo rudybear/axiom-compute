@@ -1,0 +1,73 @@
+{
+  "verdict": "IMPLEMENTED",
+  "agent": "coder",
+  "milestone_id": "M3.8-matmul-core-larger-register-tiles",
+  "revision_implemented": "r2",
+  "branch": "coder/M38-20260607/M3.8-larger-register-tiles",
+  "nr3_fail_fast_result": {
+    "status": "PASS",
+    "detail": "STEP 1 (NR-3): the 4x4 (16-accumulator) kernel was written FIRST and compiled via compile_source_with_assignments (the canonical test path), passed spirv-val (spirv_tools crate validator, Vulkan_1_1), and emitted EXACTLY 16 OpPhi located in ONE basic block (the K-loop header) — confirmed both by total module OpPhi count (16) and by a per-basic-block consecutive-OpPhi-run scan returning [16]. shared_memory_bytes==8192, 3 OpControlBarrier, capability set byte-identical to the M3.6 cached kernel. No codegen gap; NO escalation needed. The 4x2 variant + the AT-2000..2006 suite were built only AFTER this passed.",
+    "escalation": "none"
+  },
+  "naming_note": "Followed the APPROVED design (files_to_create) names q4km_matmul_rb_coopmat_f32acc_cached_4x4.axc / _4x2.axc and a SINGLE combined bench resident_q4km_matmul_rb_f32acc_cached_bigrb.rs (the design specifies one bench measuring both variants and picking the winner — required for the >=1.15x gate). The orchestrator task message used alternate names (_rb44/_rb42 kernels + two separate benches); the design JSON is the authoritative approved spec, so its names were used. The script flags follow the orchestrator task: --fused-f32acc-rb44 / --fused-f32acc-rb42.",
+  "files_created": [
+    "examples/q4km_matmul_rb_coopmat_f32acc_cached_4x4.axc",
+    "examples/q4km_matmul_rb_coopmat_f32acc_cached_4x2.axc",
+    "crates/axc-driver/benches/resident_q4km_matmul_rb_f32acc_cached_bigrb.rs",
+    "crates/axc-driver/tests/dispatch_q4km_matmul_rb_f32acc_cached_bigrb.rs",
+    "crates/axc-driver/tests/dispatch_q4km_f32acc_cached_bigrb_equiv.rs"
+  ],
+  "files_modified": [
+    "crates/axc-driver/tests/compile_shared_examples.rs",
+    "crates/axc-driver/Cargo.toml",
+    "scripts/m34_llamacpp_ab.sh",
+    "scripts/m34_emit.py",
+    "DESIGN.md"
+  ],
+  "structural_invariants_enforced": {
+    "flat_single_k_loop": "Both kernels use ONE flat `for k_block` loop; all N accumulators (16 for 4x4, 8 for 4x2) reassigned UNCONDITIONALLY at the loop body top level -> single-level OpPhi N-carry (count confirmed 16 / 8). No nested loop carries any accumulator (descend_nested_loops=false path never exercised).",
+    "scale_cache_fill_writes_only_caches": "The if(k_block%16==0) conditional fill writes ONLY dsc_cache/dmm_cache (shared[f32,512]); it NEVER reassigns a coopmat binding -> no AT-1708 LoopCarriedCoopMatConditionalReassignUnsupported.",
+    "barriers_top_level": "3 UNCONDITIONAL workgroup_barrier() per k_block, all at conditional_depth==0 (none inside any if) -> no BarrierInDivergentContext. OpControlBarrier count == 3 (same as M3.6).",
+    "mechanical_offsets": "A-row coopmat_load offsets 0/256/512/768 (i*256, stride 16). B: 4x2 offsets 0/16 stride 32 (VERBATIM M3.6); 4x4 offsets 0/16/32/48 stride 64. Scale-cache index a_row*8+is (a_row 0..63, max 511); fill 16 fills/lane (cache_i=fi*32+lane covers 0..511). equiv assert tightened to %64.",
+    "bit_identity_arithmetic": "Larger blocking adds MORE output tiles per workgroup but does NOT regroup accumulation WITHIN any 16x16 tile; same per-tile coopmat decomposition, same single-level flat-K accumulation order, same multiply-then-subtract dequant with dsc/dmm read from the resized cache -> bit-identical to M3.6 per output element (AT-2003 EXPECTED n_diff==0)."
+  },
+  "shared_memory_bytes": {
+    "4x2": 7168,
+    "4x4": 8192,
+    "note": "4x2 = (1024+512)*2 + 2*512*4 = 3072+4096; 4x4 = (1024+1024)*2 + 2*512*4 = 4096+4096. Both <= 16384 portable floor. Asserted by AT-2006."
+  },
+  "tests_written": [
+    "at_2006_bigrb_4x2_compile_validates (compile + spirv-val + caps==M3.6 + OpPhi==8 in one header + shared==7168)",
+    "at_2006_bigrb_4x4_compile_validates (NR-3 anchor: compile + spirv-val + caps==M3.6 + OpPhi==16 in one header + shared==8192)",
+    "at_2000_bigrb_k256 (#[ignore], both variants, combined<=1e-3, K=256 M=128 N=128)",
+    "at_2001_bigrb_k512 (#[ignore], both variants, K=512 M=128 N=128, cross-superblock cache WAR)",
+    "at_2002_bigrb_k14336 (#[ignore], both variants, inference K, the true correctness gate)",
+    "at_2003_bigrb_4x2_equiv_{k256,k512,k14336} (#[ignore], bit-identity vs M3.6 + NR-1 combined report)",
+    "at_2003_bigrb_4x4_equiv_{k256,k512,k14336} (#[ignore], bit-identity vs M3.6 + NR-1 combined report)"
+  ],
+  "benches_written": [
+    "dispatch_resident_q4km_matmul_rb_f32acc_cached_bigrb (AT-2004/2005: both variants @ 256/512/768/1024 + A/B; emits AXC_Q4KM_AB_F32ACC_BIGRB_4X2 / _4X4; prints winner + >=49.3 gate + shared bytes)"
+  ],
+  "nr2_per_variant_grid_guard": "Implemented in the bench + both dispatch tests: 4x2 requires M%64==0 && N%32==0; 4x4 requires M%64==0 && N%64==0. Non-conforming sizes SKIP-WITH-LOG (typed log line, NOT dispatched -> unconditional loads never OOB). Does NOT inherit the cloned harness %32-only guard. The equiv test additionally requires %64 (both grids tile cleanly).",
+  "nr1_correctness_anchor_fallback": "AT-2003 asserts n_diff==0 (EXPECTED first-line gate) AND reports the variant's combined-vs-oracle metric so the orchestrator can apply the NR-1 fallback (a byte-diff with combined<=1e-3 is a driver-HMMA-reassociation artifact, NOT a kernel bug). The frozen 1e-3 is NEVER loosened anywhere.",
+  "cargo_check_status": "pass (workspace --all-targets)",
+  "cargo_clippy_status": "pass (workspace --all-targets -D warnings, clean)",
+  "cargo_test_status": "pass — full workspace green; compile_shared_examples 16 passed (was 14, +2 AT-2006); new bigrb dispatch + equiv test binaries compile and their GPU tests are #[ignore]-gated (3 + 6 ignored respectively); 0 failures workspace-wide.",
+  "spirv_val_status": "pass — both 4x2 and 4x4 SPIR-V validate clean via the spirv_tools crate validator (Vulkan_1_1) in AT-2006 (this repo's canonical spirv-val path; no standalone spirv-val binary present in the environment).",
+  "production_codegen_change": "NONE — pure source + tests + bench + script/docs. detect_loop_carried_coopmat confirmed N-agnostic empirically (16 phis emitted, one header). No typecheck/runtime/codegen modification.",
+  "gpu_benches_run": false,
+  "gpu_benches_note": "Per the constraints, the #[ignore] GPU tests and the GPU bench (AT-2000..2005) were NOT run here — the orchestrator runs those on the NVIDIA RTX PRO 6000. CI-side compile/spirv-val/OpPhi/shared-bytes (AT-2006) all pass locally.",
+  "self_assessment": {
+    "spec_coverage": "All architect r2 items implemented: both variant kernels (4x4 first per NR-3), AT-2000..2006, the combined bench, Cargo.toml registration, script + emit plumbing, DESIGN 3.1.24 updated to IMPLEMENTED with the NR-3 result.",
+    "known_limitations": [
+      "Partial-tile masking is OUT OF SCOPE (matching M3.6/M3.7); the NR-2 per-variant skip-with-log guard prevents OOB on non-conforming sizes. All current measured sizes conform.",
+      "The PRIMARY >=49.3 TFLOPS exit gate and the AT-2000..2005 correctness/perf measurements require the orchestrator's NVIDIA run; register-pressure occupancy is the provisioned honest-negative (bench measures both variants and reports the winner or an all-negative)."
+    ],
+    "deviations": [
+      "Followed the APPROVED design's single combined bench + _4x4/_4x2 kernel names rather than the orchestrator message's separate-bench/_rb44-_rb42 names (design JSON is authoritative). Script flags follow the orchestrator message (--fused-f32acc-rb44/-rb42)."
+    ]
+  },
+  "git_commits": [
+    "feat(M3.8): larger register tiles (4x4/4x2) — pure-source big-RB coopmat matmul variants + AT-2000..2006"
+  ]
+}
