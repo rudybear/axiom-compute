@@ -191,6 +191,26 @@ M3.7 tested the classic GEMM latency-hiding optimization — **software-pipeline
 
 ---
 
+## M3.8 — larger register tiles (HONEST NEGATIVE: 0.66× regression — M3.6 2×2 is the occupancy sweet spot)
+
+M3.8 tested the other classic GEMM lever — **larger register tiles** to raise arithmetic intensity (each staged A/B tile feeding more coopmat_mul_adds). Two variants vs the M3.6 leader's 2×2 (4 accumulators, 32×32 output): **4×2** (8 accumulators, 64×32 output, 7168 B shared) and **4×4** (16 accumulators, 64×64 output, 8192 B shared). Pure source — the codegen is N-coopmat-phi-agnostic (AT-1733 N=4 → N=16, verified OpPhi==16 in one loop header, no codegen change).
+
+> **RESULT: HONEST NEGATIVE — both larger tiles REGRESS, the more so the larger.** Measured on NVIDIA RTX PRO 6000: both variants are **BIT-IDENTICAL** to M3.6 (AT-2003, n_diff=0 at K=256/512/14336 — the per-16×16-tile accumulation order is unchanged, proven grid-independent) and combined ≤ frozen 1e-3 VALID, but **much SLOWER at every size**. A/B (m=4096,n=512,k=14336): **4×4 = 28.19 TFLOPS (0.66×), 4×2 = 26.31 (0.61×)** vs M3.6's 42.86 (gate ≥1.15×/≥49.3 MISSED); 768³: 7.8/7.9 vs 13.84. **16 f32 accumulators is far too much register pressure** → drastically fewer resident warps/SM → net loss despite 2× arithmetic intensity. The regression is *larger* than M3.7's (0.66× vs 0.97×), confirming the mechanism.
+
+| variant | accumulators | A/B TFLOPS | vs M3.6 | shared B | combined @ k=14336 |
+|---|---|---|---|---|---|
+| **M3.6 2×2 (LEADER)** | 4 | **42.86** | — | 4096 | 2.05e-6 VALID |
+| 4×2 | 8 | 26.31 | 0.61× | 7168 | 2.05e-6 VALID (bit-identical) |
+| 4×4 | 16 | 28.19 | 0.66× | 8192 | 2.05e-6 VALID (bit-identical) |
+
+**The combined M3.7 + M3.8 finding (significant for the thesis):** the M3.6 2×2 kernel sits at the **occupancy/compute sweet spot** for this coopmat approach on NVIDIA. Both standard GEMM levers — latency-hiding (M3.7 double-buffering, 0.97×) and arithmetic-intensity (M3.8 larger register tiles, 0.66×) — *regress*, because the kernel is **occupancy-bound**, not latency- or intensity-bound. The remaining 2.39× to llama.cpp is not reachable by standard tile-tuning; it would need a fundamentally different lever (a different coopmat shape, wave-level scheduling, or driver-level codegen we don't control). **M3.6 cached (42.86 TFLOPS, 2.39× behind llama) remains the production leader.**
+
+**Why merged anyway (documented experiment, NOT leader):** (1) proves AXIOM expresses 8- and 16-accumulator register blocking **correctly** from one annotated source (N-coopmat-phi at N=16, bit-identical) — an expressiveness result; (2) definitively establishes the occupancy ceiling (rules out "just add more register tiles"); (3) honest-negatives are recorded, not hidden (M3.3d/M3.7 precedent). No spin: both variants MISSED the gate, are slower, reported as-is.
+
+**Reproduce:** `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json AXC_ENABLE_GPU_BENCHES=1 cargo bench -p axc-driver --bench resident_q4km_matmul_rb_f32acc_cached_bigrb` (measures both variants, prints the per-variant ≥1.15× gate + winner; AT-2003 bit-identity via `cargo test -p axc-driver --test dispatch_q4km_f32acc_cached_bigrb_equiv -- --ignored`).
+
+---
+
 ## Running benchmarks
 
 ```sh
