@@ -111,6 +111,17 @@ name = "resident_q4km_matmul_rb_f32acc_db"
 path = "benches/resident_q4km_matmul_rb_f32acc_db.rs"
 harness = false
 
+# M3.8: honest effective-TFLOPS bench for BOTH LARGER-REGISTER-TILE variants (4x2 = 8 accumulators
+# / 4x4 = 16 accumulators) of the M3.6 scale-cached f32-accumulator fused Q4_K_M coopmat matmul
+# (AT-2004) + the SAME-SHAPE A/B lines AXC_Q4KM_AB_F32ACC_BIGRB_4X2 / _4X4 (AT-2005). Clone of
+# resident_q4km_matmul_rb_f32acc_cached; same honesty contract (combined metric drives
+# VALID/INVALID); NR-2 per-variant grid guard; prints the winner + the >=1.15x / >=49.3 TFLOPS
+# gate + shared_memory_bytes. Bench ID: dispatch_resident_q4km_matmul_rb_f32acc_cached_bigrb. GPU-gated.
+[[bench]]
+name = "resident_q4km_matmul_rb_f32acc_cached_bigrb"
+path = "benches/resident_q4km_matmul_rb_f32acc_cached_bigrb.rs"
+harness = false
+
 
 [features]
 # M2.2 AT-714: fault-injection feature for regression-gate CI validation.

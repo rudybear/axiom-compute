@@ -1,0 +1,213 @@
+// examples/q4km_matmul_rb_coopmat_f32acc_cached_4x2.axc
+//
+// M3.8: LARGER REGISTER TILES (4x2 = 8 accumulators) on top of the M3.6 leader
+// (examples/q4km_matmul_rb_coopmat_f32acc_cached.axc, 2x2 = 4 accumulators, 42.86 TFLOPS at A/B).
+//
+// The MODERATE middle ground between M3.6 (4 accumulators, AI=1.0) and the 4x4 variant
+// (16 accumulators, AI=2.0). 8 f32 accumulators = 64 f32/lane of accumulator register pressure
+// (vs 4x4's 128 f32/lane) — lower occupancy risk, AI = 1.33.
+//
+// 4x2 STRUCTURE:
+//   - @workgroup(32,1,1) = 1 subgroup. Grid = (N/32, M/64, 1). One workgroup computes a 4x2
+//     BLOCK of 16x16 output tiles = a 64x32 C sub-matrix (8 named accumulators acc_00..acc_31).
+//   - a_tile[f16,1024]: 64 A-rows x 16 K-cols (4 row-tiles stacked at stride 16). a_iters=32.
+//   - b_tile[f16,512]: 16 K-rows x 32 cols (stride 32) — VERBATIM M3.6 B. b_iters=16.
+//   - dsc_cache/dmm_cache RESIZED to shared[f32,512] each: 64 A-rows x 8 sub-blocks = 512 entries;
+//     cache_idx = a_row*8 + is, a_row 0..63 -> max 63*8+7 = 511 exact. a_block_size PINNED at 1024.
+//   - 4 A coopmat_loads (offsets 0/256/512/768 = i*256, stride 16) + 2 B coopmat_loads
+//     (offsets 0/16 = j*16, stride 32 — VERBATIM M3.6) reused across 8 coopmat_mul_adds.
+//     AI = 8/(4+2) = 1.33; A reuse 2x, B reuse 4x.
+//   - 8 coopmat_store to c_base_ij = (tile_row_i*16)*N + (tile_col_j*16), stride N.
+//   - Shared total = (1024+512)*2 + (512+512)*4 = 3072 + 4096 = 7168 bytes/WG (<= 16384 portable min).
+//
+// BIT-IDENTITY-TO-M3.6 ANCHOR (AT-2003): larger register blocking adds MORE output tiles per
+//   workgroup but does NOT regroup the accumulation WITHIN any 16x16 output tile — each output
+//   element accumulates the SAME K-depth dot in the SAME single-level flat-K-loop order with the
+//   SAME per-tile coopmat decomposition and the SAME dequant expression as M3.6 -> AT-2003
+//   n_diff==0 is EXPECTED.
+//
+// TRAPS AVOIDED (VERBATIM M3.6 discipline): SINGLE FLAT K-loop; all 8 accumulators reassigned
+//   UNCONDITIONALLY at the top level (single-level OpPhi, no nested carry); the conditional
+//   scale-cache fill writes ONLY the caches (no AT-1708); 3 unconditional barriers all at
+//   conditional_depth==0 (no BarrierInDivergentContext).
+//
+// NUMERICS — FROZEN 1e-3 unchanged. Anti-pattern #2: explicit `return;`. Anti-pattern #8: no `>>`.
+
+@kernel
+@workgroup(32, 1, 1)
+@cooperative_matrix
+@strategy { rb_m: ?[4], rb_n: ?[2], tile_k: ?[16], a_block_size: ?[1024], b_block_size: ?[512] }
+@intent("M3.8 4x2 larger-register-tile (8-accumulator) Q4_K_M scale-cached f32-acc coopmat matmul (AT-2000..2006)")
+@complexity(O(n))
+fn q4km_matmul_rb_coopmat_f32acc_cached_4x2(
+    q: readonly_buffer[u8],
+    x: readonly_buffer[f16],
+    C: buffer[f32],
+    M: u32,
+    N: u32,
+    K: u32,
+    n_blocks_per_row: u32
+) -> void {
+    // Shared staging tiles for the 4x2 block: A = 64 rows x 16 K-cols, B = 16 K-rows x 32 cols.
+    shared a_tile: shared[f16, ?a_block_size];
+    shared b_tile: shared[f16, ?b_block_size];
+
+    // M3.8 RESIZED per-superblock dequant-scale caches: 8 sub-blocks x 64 weight-rows = 512 each.
+    shared dsc_cache: shared[f32, 512];
+    shared dmm_cache: shared[f32, 512];
+
+    // Block coordinates. block_col is a 32-col B block; block_row is a 64-row A block.
+    let block_col: u32 = gid(0u32) / 32u32;
+    let block_row: u32 = gid(1u32);
+
+    let lane: u32 = subgroup_invocation_id();
+
+    // Output tile coordinates within the 4x2 block (tile_row_i = block_row*4 + i; tile_col_j = block_col*2 + j).
+    let tile_row_0: u32 = block_row * 4u32;
+    let tile_row_1: u32 = block_row * 4u32 + 1u32;
+    let tile_row_2: u32 = block_row * 4u32 + 2u32;
+    let tile_row_3: u32 = block_row * 4u32 + 3u32;
+    let tile_col_0: u32 = block_col * 2u32;
+    let tile_col_1: u32 = block_col * 2u32 + 1u32;
+
+    // 8 loop-carried f32 coopmat accumulators (single-level OpPhi K-carry, N-agnostic codegen).
+    let mut acc_00: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_01: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_10: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_11: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_20: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_21: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_30: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_31: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+
+    // Staging iterations per thread.
+    let a_iters: u32 = ?a_block_size / 32u32;   // 1024/32 = 32
+    let b_iters: u32 = ?b_block_size / 32u32;   // 512/32 = 16
+
+    let num_k_blocks: u32 = K / ?tile_k;
+
+    // K-loop: FLAT single level. The 8 coopmat accumulators are loop-carried (N-phi path),
+    // reassigned UNCONDITIONALLY at the top level -> single-level OpPhi, no nested carry.
+    for k_block in range(0u32, num_k_blocks) {
+        let sb_idx: u32 = k_block / 16u32;
+
+        // ── COOPERATIVE SCALE-CACHE FILL — fires ONCE per superblock (k_block % 16 == 0) ──
+        //   512 entries over 32 lanes -> 16 fills/lane; cache_i = fi*32 + lane covers 0..511 once.
+        if k_block - sb_idx * 16u32 == 0u32 {
+            for fi in range(0u32, 16u32) {
+                let cache_i: u32 = fi * 32u32 + lane;          // 0..511
+                let row_local: u32 = cache_i / 8u32;           // 0..63
+                let is: u32 = cache_i - row_local * 8u32;      // 0..7
+                let g_row: u32 = block_row * 64u32 + row_local;
+
+                let base: u32 = g_row * n_blocks_per_row * 144u32 + sb_idx * 144u32;
+                let d_bits: u32 = ptr_read_u16_zext(q, base);
+                let dmin_bits: u32 = ptr_read_u16_zext(q, base + 2u32);
+                let d: f32 = f16_bits_to_f32(d_bits);
+                let dmin: f32 = f16_bits_to_f32(dmin_bits);
+                let scales_base: u32 = base + 4u32;
+
+                let mut sc: u32 = 0u32;
+                let mut mm: u32 = 0u32;
+                if is < 4u32 {
+                    sc = band(ptr_read_u8_zext(q, scales_base + is), 63u32);
+                    mm = band(ptr_read_u8_zext(q, scales_base + is + 4u32), 63u32);
+                } else {
+                    let lo4_sc: u32 = band(ptr_read_u8_zext(q, scales_base + is + 4u32), 0x0Fu32);
+                    let hi2_sc: u32 = band(lshr(ptr_read_u8_zext(q, scales_base + is - 4u32), 6u32), 0x03u32);
+                    sc = bor(lo4_sc, shl(hi2_sc, 4u32));
+                    let lo4_m: u32 = band(lshr(ptr_read_u8_zext(q, scales_base + is + 4u32), 4u32), 0x0Fu32);
+                    let hi2_m: u32 = band(lshr(ptr_read_u8_zext(q, scales_base + is), 6u32), 0x03u32);
+                    mm = bor(lo4_m, shl(hi2_m, 4u32));
+                }
+
+                dsc_cache[cache_i] = d * f32_from_u32(sc);
+                dmm_cache[cache_i] = dmin * f32_from_u32(mm);
+            }
+        }
+
+        // RAW barrier (HOISTED, UNCONDITIONAL, conditional_depth==0): orders cache WRITE -> READ.
+        workgroup_barrier();
+
+        // ── Dequant A[block_row*64..+64, k_block*16..+16] into a_tile (shared[f16]) ─
+        // Each lane stages a_iters = 32 A elements. ei_a covers 0..1023 exactly once.
+        for a_iter in range(0u32, a_iters) {
+            let ei_a: u32 = a_iter * 32u32 + lane;
+            let a_row: u32 = ei_a / 16u32;                  // 0..63
+            let a_col: u32 = ei_a - a_row * 16u32;
+            let g_k: u32 = k_block * ?tile_k + a_col;
+
+            let sb: u32 = g_k / 256u32;
+            let wk: u32 = g_k - sb * 256u32;
+            let chunk: u32 = wk / 64u32;
+            let wc: u32 = wk - chunk * 64u32;
+            let l: u32 = wc - (wc / 32u32) * 32u32;
+            let is_hi: u32 = wc / 32u32;
+            let is: u32 = chunk * 2u32 + is_hi;
+
+            let cache_idx: u32 = a_row * 8u32 + is;
+            let dsc: f32 = dsc_cache[cache_idx];
+            let dmm: f32 = dmm_cache[cache_idx];
+
+            let base: u32 = (block_row * 64u32 + a_row) * n_blocks_per_row * 144u32 + sb * 144u32;
+            let qs_base: u32 = base + 16u32;
+            let byte: u32 = ptr_read_u8_zext(q, qs_base + chunk * 32u32 + l);
+            let mut nib: u32 = band(byte, 0x0Fu32);
+            if is_hi >= 1u32 {
+                nib = band(lshr(byte, 4u32), 0x0Fu32);
+            }
+
+            let w: f16 = f32_to_f16(dsc * f32_from_u32(nib) - dmm);
+            a_tile[ei_a] = w;
+        }
+
+        // ── Stage B (x) tile into b_tile — 16 K-rows x 32 cols (stride 32) — VERBATIM M3.6 ──
+        for b_iter in range(0u32, b_iters) {
+            let ei_b: u32 = b_iter * 32u32 + lane;
+            let b_row: u32 = ei_b / 32u32;
+            let b_col: u32 = ei_b - b_row * 32u32;
+            let b_global_row: u32 = k_block * ?tile_k + b_row;
+            let b_global_col: u32 = block_col * 32u32 + b_col;
+            let b_global: u32 = b_global_row * N + b_global_col;
+            b_tile[ei_b] = x[b_global];
+        }
+
+        // Barrier: staging complete before coopmat loads.
+        workgroup_barrier();
+
+        // ── 4 A coopmat loads + 2 B coopmat loads (f16) ────────────────────────────
+        let a_mat_0: matrix[f16, 16, 16, a] = coopmat_load(a_tile, 0u32, 16u32);
+        let a_mat_1: matrix[f16, 16, 16, a] = coopmat_load(a_tile, 256u32, 16u32);
+        let a_mat_2: matrix[f16, 16, 16, a] = coopmat_load(a_tile, 512u32, 16u32);
+        let a_mat_3: matrix[f16, 16, 16, a] = coopmat_load(a_tile, 768u32, 16u32);
+
+        let b_mat_0: matrix[f16, 16, 16, b] = coopmat_load(b_tile, 0u32, 32u32);
+        let b_mat_1: matrix[f16, 16, 16, b] = coopmat_load(b_tile, 16u32, 32u32);
+
+        // ── 8 coopmat_mul_adds (HMMA): acc_ij = a_mat_i × b_mat_j + acc_ij ──────────
+        // ALL 8 accumulators reassigned UNCONDITIONALLY at this top level (single-level OpPhi).
+        acc_00 = coopmat_mul_add(a_mat_0, b_mat_0, acc_00);
+        acc_01 = coopmat_mul_add(a_mat_0, b_mat_1, acc_01);
+        acc_10 = coopmat_mul_add(a_mat_1, b_mat_0, acc_10);
+        acc_11 = coopmat_mul_add(a_mat_1, b_mat_1, acc_11);
+        acc_20 = coopmat_mul_add(a_mat_2, b_mat_0, acc_20);
+        acc_21 = coopmat_mul_add(a_mat_2, b_mat_1, acc_21);
+        acc_30 = coopmat_mul_add(a_mat_3, b_mat_0, acc_30);
+        acc_31 = coopmat_mul_add(a_mat_3, b_mat_1, acc_31);
+
+        // WAR barrier: before the next k_block overwrites a_tile/b_tile AND (next superblock) caches.
+        workgroup_barrier();
+    }
+
+    // ── Store the 8 accumulated f32 tiles to C (buffer[f32]) ────────────────────────
+    coopmat_store(acc_00, C, (tile_row_0 * 16u32) * N + (tile_col_0 * 16u32), N);
+    coopmat_store(acc_01, C, (tile_row_0 * 16u32) * N + (tile_col_1 * 16u32), N);
+    coopmat_store(acc_10, C, (tile_row_1 * 16u32) * N + (tile_col_0 * 16u32), N);
+    coopmat_store(acc_11, C, (tile_row_1 * 16u32) * N + (tile_col_1 * 16u32), N);
+    coopmat_store(acc_20, C, (tile_row_2 * 16u32) * N + (tile_col_0 * 16u32), N);
+    coopmat_store(acc_21, C, (tile_row_2 * 16u32) * N + (tile_col_1 * 16u32), N);
+    coopmat_store(acc_30, C, (tile_row_3 * 16u32) * N + (tile_col_0 * 16u32), N);
+    coopmat_store(acc_31, C, (tile_row_3 * 16u32) * N + (tile_col_1 * 16u32), N);
+
+    return;
+}

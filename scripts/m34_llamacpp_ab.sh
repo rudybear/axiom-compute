@@ -11,7 +11,7 @@
 #
 # Usage:
 #   VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json AXC_ENABLE_GPU_BENCHES=1 \
-#     scripts/m34_llamacpp_ab.sh [--skip-build] [--skip-llama] [--fused | --fused-f32acc | --fused-f32acc-cached | --fused-f32acc-db]
+#     scripts/m34_llamacpp_ab.sh [--skip-build] [--skip-llama] [--fused | --fused-f32acc | --fused-f32acc-cached | --fused-f32acc-db | --fused-f32acc-rb44 | --fused-f32acc-rb42]
 #
 # Modes:
 #   (default)        M3.4 single-row matvec vs llama Q4_K n=1 GEMV (cross-shape baseline).
@@ -44,6 +44,19 @@
 #                    shared footprint regresses occupancy or the GEMM is compute-bound). Runs the
 #                    resident_q4km_matmul_rb_f32acc_db bench (AXC_Q4KM_AB_F32ACC_DB line) and writes
 #                    ab_results_fused_f32acc_db.json.
+#   --fused-f32acc-rb44 / --fused-f32acc-rb42
+#                    M3.8 LARGER-REGISTER-TILE (4x4 = 16 accumulators / 4x2 = 8 accumulators) scale-
+#                    cached f32-accumulator fused GEMM vs llama Q4_K n=512 same-shape. SAME arithmetic
+#                    as --fused-f32acc-cached (more output tiles per workgroup, same per-16x16-tile
+#                    accumulation order — bit-identical anchor AT-2003), so SAME combined-driven
+#                    validity contract; raising the register-tile size raises arithmetic intensity to
+#                    amortize the dequant/staging front-end (the M3.7 occupancy/compute redirect). The
+#                    throughput delta vs --fused-f32acc-cached is the measured outcome (the
+#                    >=1.15x-over-42.86 = >=49.3 TFLOPS exit gate; HONEST-NEGATIVE if register pressure
+#                    regresses occupancy). BOTH flags run the SAME
+#                    resident_q4km_matmul_rb_f32acc_cached_bigrb bench (it emits both
+#                    AXC_Q4KM_AB_F32ACC_BIGRB_4X4 and _4X2 lines); the flag selects which prefix to
+#                    parse + the result JSON (ab_results_fused_f32acc_bigrb_4x4.json / _4x2.json).
 #
 # Env:
 #   LLAMACPP_DIR     (default vendor/llama.cpp)
@@ -75,6 +88,13 @@ FUSED=0       # M3.5: --fused switches to the SAME-SHAPE fused-kernel A/B (AT-17
 FUSED_F32ACC=0 # M3.5b: --fused-f32acc switches to the f32-accumulator fused-kernel A/B (AT-1784).
 FUSED_F32ACC_CACHED=0 # M3.6: --fused-f32acc-cached -> the dequant-scale-CACHED f32acc A/B (AT-1805).
 FUSED_F32ACC_DB=0 # M3.7: --fused-f32acc-db -> the DOUBLE-BUFFERED scale-cached f32acc A/B (AT-1905).
+# M3.8: --fused-f32acc-rb44 / --fused-f32acc-rb42 -> the LARGER-REGISTER-TILE A/B (AT-2005).
+# Both run the SAME resident_q4km_matmul_rb_f32acc_cached_bigrb bench (it emits BOTH the
+# AXC_Q4KM_AB_F32ACC_BIGRB_4X4 and _4X2 lines); the flag selects which prefix to parse + the
+# result-JSON name. The honest path computes each variant's throughput vs M3.6's 42.86 and llama's
+# 102.49 and applies the >=1.15x / >=49.3 TFLOPS gate (HONEST-NEGATIVE if register pressure regresses).
+FUSED_F32ACC_RB44=0
+FUSED_F32ACC_RB42=0
 for arg in "$@"; do
     case "$arg" in
         --skip-build) SKIP_BUILD=1 ;;
@@ -85,6 +105,9 @@ for arg in "$@"; do
         --fused-f32acc-cached) FUSED=1; FUSED_F32ACC=1; FUSED_F32ACC_CACHED=1 ;;
         # M3.7: double-buffered is an f32acc-mode variant (same SAME-SHAPE A/B, same combined/raw).
         --fused-f32acc-db) FUSED=1; FUSED_F32ACC=1; FUSED_F32ACC_DB=1 ;;
+        # M3.8: larger-register-tile variants (same SAME-SHAPE A/B, same combined/raw schema).
+        --fused-f32acc-rb44) FUSED=1; FUSED_F32ACC=1; FUSED_F32ACC_RB44=1 ;;
+        --fused-f32acc-rb42) FUSED=1; FUSED_F32ACC=1; FUSED_F32ACC_RB42=1 ;;
         *) echo "unknown arg: $arg" >&2; exit 2 ;;
     esac
 done
@@ -93,7 +116,13 @@ mkdir -p "$OUTDIR"
 RAW="${OUTDIR}/llamacpp_raw.txt"
 # M3.5 (--fused) and M3.5b (--fused-f32acc) each write a DISTINCT artifact; the frozen-matvec
 # ab_results.json and the f16-accum ab_results_fused.json are kept side-by-side.
-if [ "${FUSED_F32ACC_DB}" -eq 1 ]; then
+if [ "${FUSED_F32ACC_RB44}" -eq 1 ]; then
+    RESULTS_JSON="${OUTDIR}/ab_results_fused_f32acc_bigrb_4x4.json"
+    RESULTS_MD="${OUTDIR}/ab_results_fused_f32acc_bigrb_4x4.md"
+elif [ "${FUSED_F32ACC_RB42}" -eq 1 ]; then
+    RESULTS_JSON="${OUTDIR}/ab_results_fused_f32acc_bigrb_4x2.json"
+    RESULTS_MD="${OUTDIR}/ab_results_fused_f32acc_bigrb_4x2.md"
+elif [ "${FUSED_F32ACC_DB}" -eq 1 ]; then
     RESULTS_JSON="${OUTDIR}/ab_results_fused_f32acc_db.json"
     RESULTS_MD="${OUTDIR}/ab_results_fused_f32acc_db.md"
 elif [ "${FUSED_F32ACC_CACHED}" -eq 1 ]; then
@@ -255,7 +284,15 @@ if [ "${FUSED}" -eq 1 ]; then
 fi
 
 # ── 5. AXIOM side: run the AXIOM bench, parse its anchored line ───────────────────────────
-if [ "${FUSED_F32ACC_DB}" -eq 1 ]; then
+if [ "${FUSED_F32ACC_RB44}" -eq 1 ]; then
+    AXC_BENCH="resident_q4km_matmul_rb_f32acc_cached_bigrb"
+    AXC_PREFIX="AXC_Q4KM_AB_F32ACC_BIGRB_4X4"
+    AXC_KERNEL="fused_f32acc_bigrb_4x4"
+elif [ "${FUSED_F32ACC_RB42}" -eq 1 ]; then
+    AXC_BENCH="resident_q4km_matmul_rb_f32acc_cached_bigrb"
+    AXC_PREFIX="AXC_Q4KM_AB_F32ACC_BIGRB_4X2"
+    AXC_KERNEL="fused_f32acc_bigrb_4x2"
+elif [ "${FUSED_F32ACC_DB}" -eq 1 ]; then
     AXC_BENCH="resident_q4km_matmul_rb_f32acc_db"
     AXC_PREFIX="AXC_Q4KM_AB_F32ACC_DB"
     AXC_KERNEL="fused_f32acc_db"
