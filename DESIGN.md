@@ -827,6 +827,25 @@ The fused kernel compiles to spirv-val-clean SPIR-V whose capability/extension s
 
 ---
 
+## 3.1.21 M3.5b — f32-accumulator cooperative_matrix (the numerically-correct fused Q4_K_M at inference K)
+
+M3.5 (§3.1.20) fused Q4_K_M dequant into the register-blocked coopmat matmul and reached 11.27 TFLOPS same-shape (~9x behind llama.cpp's 101.48 TFLOPS Q4_K MUL_MAT at m=4096,n=512,k=14336), down from M3.4's ~87,000x cross-shape gap. BUT M3.5 used an f16 coopmat accumulator (`matrix[f16,16,16,accumulator]`), which is numerically INVALID at inference K: within the frozen 1e-3 only at K<=256 (8.3e-4), diverging at K=512 (3.6e-3), garbage at k=14336 (max_rel_diff ~= 29). f16's ~3-decimal-digit mantissa cannot accumulate a 14336-deep dot product. Fast-but-WRONG is not a usable kernel.
+
+M3.5b switches the accumulator to f32 — the CANONICAL tensor-core op: f16 A x f16 B accumulated into f32 (`OpCooperativeMatrixMulAddKHR` with AType=Float16, BType=Float16, CType=Float32, ResultType=Float32, scope=Subgroup). This is NVIDIA's primary HMMA and is enumerated by vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR. f32's 24-bit mantissa keeps the k=14336 accumulation within 1e-3.
+
+### Mixed-precision was ALREADY in the type system (M3.1 design dividend)
+The M3.1 cooperative-matrix model (§3.1.13) made every coopmat shape carry INDEPENDENT a/b/c/result element types (CoopMatKey.result_type, CoopMatrixShape.{a_elem,b_elem,c_elem,result_type}, CoopMatShapeMeta, CoopMatRequiredShape). As a consequence the entire pipeline is already mixed-precision-correct:
+- **Typecheck**: coopmat_mul_add validates A.elem==B.elem ONLY; the accumulator's element type is validated independently and becomes the result type. f16xf16->f32 typechecks unchanged; A/B must still match each other.
+- **Codegen**: the OpTypeCooperativeMatrixKHR component type comes from each binding's own key.elem, so the f32 accumulator emits a Float32-component coopmat type automatically. coopmat_zero/mul_add/store and the loop-carried OpPhi are all type-agnostic. NO new SPIR-V capability — an f32 coopmat component needs only CooperativeMatrixKHR+Shader (already present); Float16 is still required for the f16 A/B types.
+- **Runtime preflight**: coopmat_shape_supported already matches a_type/b_type/c_type/result_type independently (it even discriminates f16/f16/f16/f32). The mixed f16/f16/f32/f32 shape matches NVIDIA's enumerated HMMA tuple; Lavapipe (no coopmat) typed-skips.
+
+M3.5b therefore required NO type-system or codegen change — only a new kernel (`examples/q4km_matmul_rb_coopmat_f32acc.axc`: C->buffer[f32], 4 accumulators->matrix[f32,16,16,accumulator], everything else verbatim), an f32-accumulator CPU oracle (dequant f32, inputs rounded to f16, accumulate in pure f32), and the now-VALID same-shape A/B re-run. Defensive regression tests lock in the mixed-precision typecheck (AT-1785) and the still-required A/B-match (AT-1786).
+
+### Result
+The fused Q4_K_M f32-accumulator matmul is bit-within-frozen-1e-3 at K=256, K=512 (the M3.5 f16 failure, now fixed), and k=14336 (inference K). The same-shape A/B vs llama.cpp's 101.48 TFLOPS is now a fast-AND-correct fight: still behind on throughput (kill-criterion FAIL; f32 accumulator costs registers/bandwidth vs f16) but a GENUINE usable baseline — numerically correct at inference K. Tests AT-1780..AT-1787; A/B via scripts/m34_llamacpp_ab.sh --fused-f32acc.
+
+---
+
 ### 3.1 Types
 
 ```
