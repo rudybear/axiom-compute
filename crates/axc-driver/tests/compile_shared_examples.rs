@@ -668,3 +668,281 @@ fn at_1806_q4km_f32acc_cached_compiles_and_validates() {
         meta.shared_memory_bytes
     );
 }
+
+// ── AT-1906: M3.7 DOUBLE-BUFFERED (software-pipelined) scale-cached f32-accumulator fused ──
+//            Q4_K_M coopmat matmul — compile + spirv-val + no-new-capability vs M3.6 cached +
+//            metadata shape + DOUBLED shared (6144 bytes) + emitted-barrier-count +
+//            a_block_size_db/b_block_size_db=1024 PIN ─────────────────────────────────────
+
+/// RB 2×2 db strategy (a_block_size_db/b_block_size_db PINNED at 1024 = 2*512).
+fn rb2x2_db_assignments() -> StrategyMap {
+    let mut m = StrategyMap::new();
+    m.insert("rb_m".to_owned(), 2_i64);
+    m.insert("rb_n".to_owned(), 2_i64);
+    m.insert("tile_k".to_owned(), 16_i64);
+    m.insert("a_block_size_db".to_owned(), 1024_i64);
+    m.insert("b_block_size_db".to_owned(), 1024_i64);
+    m
+}
+
+/// Count OpControlBarrier (opcode 224, word_count 4) instructions in a SPIR-V word stream.
+fn count_op_control_barrier(words: &[u32]) -> usize {
+    const OP_CONTROL_BARRIER: u32 = 224;
+    let mut n = 0usize;
+    let mut i = 5usize; // skip header
+    while i < words.len() {
+        let opcode = words[i] & 0xFFFF;
+        let wc = (words[i] >> 16) as usize;
+        if wc == 0 {
+            break;
+        }
+        if opcode == OP_CONTROL_BARRIER {
+            n += 1;
+        }
+        i += wc;
+    }
+    n
+}
+
+/// Count OpPhi (opcode 245) instructions — the single-level loop-carried accumulator phis.
+fn count_op_phi(words: &[u32]) -> usize {
+    const OP_PHI: u32 = 245;
+    let mut n = 0usize;
+    let mut i = 5usize;
+    while i < words.len() {
+        let opcode = words[i] & 0xFFFF;
+        let wc = (words[i] >> 16) as usize;
+        if wc == 0 {
+            break;
+        }
+        if opcode == OP_PHI {
+            n += 1;
+        }
+        i += wc;
+    }
+    n
+}
+
+/// AT-1906 (M3.7, CI no-GPU): the DOUBLE-BUFFERED kernel
+/// (q4km_matmul_rb_coopmat_f32acc_db.axc) compiles, passes spirv-val, declares NO
+/// capability/extension outside the M3.6 cached kernel's set (parity-indexed shared, a larger
+/// shared[f16,1024] array, a prologue, and a runtime coopmat_load offset add NO capability),
+/// emits the same coopmat metadata shape {16,16,16, F16,F16,F32,F32, Subgroup} as M3.6, reports
+/// shared_memory_bytes == 6144 (DOUBLED tiles 4096 + caches 2048), and pins
+/// a_block_size_db/b_block_size_db at the single-value @strategy candidate `?[1024]`.
+///
+/// ALSO (the reviewer-requested SHOULD hardenings):
+///   - asserts the emitted OpControlBarrier count == 4 (2 prologue + 2 steady-state) — fewer than
+///     would indicate a dropped barrier, more than indicates an un-hoisted in-if barrier;
+///   - asserts OpPhi count == the M3.6 cached kernel's (single-level carry intact — a nested-loop
+///     carry would DROP phis -> silent miscompile).
+///
+/// NECESSARY but NOT SUFFICIENT: a missing-barrier race would ALSO pass spirv-val. The true
+/// correctness gate is the orchestrator's GPU run of AT-1903 + AT-1900/1901/1902.
+#[test]
+fn at_1906_q4km_f32acc_db_no_new_capability() {
+    use std::collections::BTreeSet;
+    use axc_runtime::{CoopMatScalarMeta, CoopMatScopeMeta};
+
+    let db_src = include_str!("../../../examples/q4km_matmul_rb_coopmat_f32acc_db.axc");
+    let cached_src = include_str!("../../../examples/q4km_matmul_rb_coopmat_f32acc_cached.axc");
+
+    let db_assignments = rb2x2_db_assignments();
+    let cached_assignments = rb2x2_assignments();
+
+    // Compile the db kernel WITH metadata + spirv-val it (load-bearing: the 2 prologue + 2
+    // steady-state barriers must all clear BarrierInDivergentContext at conditional_depth==0).
+    let (db_bytes, meta) = compile_source_with_assignments(db_src, &db_assignments)
+        .unwrap_or_else(|e| panic!("q4km_matmul_rb_coopmat_f32acc_db.axc: compile failed: {e:?}"));
+    let db_words = words_and_validate(db_bytes, "q4km_matmul_rb_coopmat_f32acc_db.axc");
+
+    let (cached_bytes, _cached_meta) = compile_source_with_assignments(cached_src, &cached_assignments)
+        .unwrap_or_else(|e| panic!("q4km_matmul_rb_coopmat_f32acc_cached.axc: compile failed: {e:?}"));
+    let cached_words = words_and_validate(cached_bytes, "q4km_matmul_rb_coopmat_f32acc_cached.axc");
+
+    // (c) Capability set BYTE-IDENTICAL to the M3.6 cached kernel (no new capability).
+    let (db_caps, db_exts) = capability_extension_sets(&db_words);
+    let (cached_caps, cached_exts) = capability_extension_sets(&cached_words);
+
+    let extra_caps: Vec<u32> = db_caps.difference(&cached_caps).copied().collect();
+    assert!(
+        extra_caps.is_empty(),
+        "AT-1906: db kernel declares capabilities NOT in the M3.6 cached kernel's set: \
+         {extra_caps:?} (db={db_caps:?}, cached={cached_caps:?})"
+    );
+    let dropped_caps: Vec<u32> = cached_caps.difference(&db_caps).copied().collect();
+    assert!(
+        dropped_caps.is_empty(),
+        "AT-1906: db kernel DROPPED capabilities present in M3.6 cached: {dropped_caps:?}"
+    );
+    let db_set: BTreeSet<u32> = db_caps.iter().copied().collect();
+    let cached_set: BTreeSet<u32> = cached_caps.iter().copied().collect();
+    assert_eq!(
+        db_set, cached_set,
+        "AT-1906: db and M3.6 cached kernel must have BYTE-IDENTICAL capability sets \
+         (parity-indexed shared + shared[f16,1024] introduce NO new capability)"
+    );
+    let extra_exts: Vec<String> = db_exts.difference(&cached_exts).cloned().collect();
+    assert!(
+        extra_exts.is_empty(),
+        "AT-1906: db kernel declares extensions NOT in the M3.6 cached kernel's set: {extra_exts:?}"
+    );
+
+    // (d) Coopmat metadata shape unchanged: {16,16,16, F16,F16,F32,F32, Subgroup}.
+    let coopmat = meta.coopmat.as_ref()
+        .expect("AT-1906: db kernel must emit coopmat metadata");
+    assert_eq!(coopmat.m, 16, "AT-1906: coopmat.m");
+    assert_eq!(coopmat.n, 16, "AT-1906: coopmat.n");
+    assert_eq!(coopmat.k, 16, "AT-1906: coopmat.k");
+    assert_eq!(coopmat.a_type, CoopMatScalarMeta::F16, "AT-1906: A type must be F16");
+    assert_eq!(coopmat.b_type, CoopMatScalarMeta::F16, "AT-1906: B type must be F16");
+    assert_eq!(coopmat.c_type, CoopMatScalarMeta::F32, "AT-1906: C type must be F32");
+    assert_eq!(coopmat.result_type, CoopMatScalarMeta::F32, "AT-1906: result type must be F32");
+    assert_eq!(coopmat.scope, CoopMatScopeMeta::Subgroup, "AT-1906: scope must be Subgroup");
+
+    // (b) shared_memory_bytes == DOUBLED tiles + caches:
+    //     a_tile(1024 f16) + b_tile(1024 f16) = (1024+1024)*2 = 4096 B,
+    //     PLUS dsc_cache(256 f32) + dmm_cache(256 f32) = 2*256*4 = 2048 B -> 6144 B.
+    let expected_shared_bytes: u32 = (1024 + 1024) * 2 + 2 * 256 * 4; // 4096 + 2048 = 6144
+    assert_eq!(
+        meta.shared_memory_bytes, expected_shared_bytes,
+        "AT-1906: shared_memory_bytes must be {expected_shared_bytes} \
+         (DOUBLED tiles a_tile+b_tile = (1024+1024)*2 = 4096 B, PLUS dsc_cache+dmm_cache = \
+         2*256*4 = 2048 B); got {} — the doubled-tile occupancy cost must be accounted",
+        meta.shared_memory_bytes
+    );
+
+    // SHOULD hardening 1: the emitted OpControlBarrier count == 4 (2 prologue + 2 steady-state).
+    // M3.6 cached has 3 (all in-loop); the db prologue adds 2 and the steady state drops to 2,
+    // netting 4 textual barriers. A count != 4 indicates a dropped barrier (race risk) or an
+    // un-hoisted in-if barrier (which would have failed BarrierInDivergentContext anyway).
+    let db_barriers = count_op_control_barrier(&db_words);
+    assert_eq!(
+        db_barriers, 4,
+        "AT-1906: db kernel must emit exactly 4 OpControlBarrier (2 PROLOGUE + 2 steady-state); \
+         got {db_barriers}. Fewer => a dropped barrier (data-race risk, AT-1903 is the real \
+         detector); more => an un-hoisted barrier. The M3.6 cached kernel emits {} (3, all in-loop).",
+        count_op_control_barrier(&cached_words)
+    );
+
+    // SHOULD hardening 2: OpPhi count == the M3.6 cached kernel's (single-level carry intact).
+    // A nested-loop accumulator carry would DROP the outer phis (descend_nested_loops=false) ->
+    // a silent per-iteration reset miscompile (the M3.6 r1 trap).
+    let db_phis = count_op_phi(&db_words);
+    let cached_phis = count_op_phi(&cached_words);
+    assert_eq!(
+        db_phis, cached_phis,
+        "AT-1906: db OpPhi count ({db_phis}) must EQUAL the M3.6 cached count ({cached_phis}) — \
+         the 4 f32 accumulators must be carried by the SAME single-level OpPhi (no nested-loop \
+         carry, which would drop phis -> silent reset miscompile)"
+    );
+
+    // (e) a_block_size_db / b_block_size_db PIN: the autotuner must only ever pick 1024 (= 2*512,
+    // the two parity slabs). The pin is the SINGLE-VALUE @strategy candidate list `?[1024]`.
+    let strategy_decl = db_src
+        .lines()
+        .find(|l| l.trim_start().starts_with("@strategy"))
+        .expect("AT-1906: db kernel must declare an @strategy block");
+    assert!(
+        strategy_decl.contains("a_block_size_db: ?[1024]"),
+        "AT-1906: a_block_size_db MUST be PINNED to the single-value @strategy candidate `?[1024]` \
+         (= 2*512 parity slabs; the cache index a_row*8+is stays < 256); got @strategy: {strategy_decl}"
+    );
+    assert!(
+        strategy_decl.contains("b_block_size_db: ?[1024]"),
+        "AT-1906: b_block_size_db MUST be PINNED to the single-value @strategy candidate `?[1024]`; \
+         got @strategy: {strategy_decl}"
+    );
+
+    eprintln!(
+        "AT-1906 PASS: q4km_matmul_rb_coopmat_f32acc_db.axc compiles + spirv-val clean; \
+         caps == M3.6 cached ({db_caps:?}); meta.coopmat = {{16,16,16, F16,F16,F32,F32, Subgroup}}; \
+         shared_memory_bytes={} (DOUBLED tiles 4096 + caches 2048 = 6144); \
+         OpControlBarrier={db_barriers} (2 prologue + 2 steady-state); OpPhi={db_phis} \
+         (== cached {cached_phis}, single-level carry); a_block_size_db/b_block_size_db=1024 PIN enforced",
+        meta.shared_memory_bytes
+    );
+}
+
+/// AT-1906 (CI no-GPU, OPTIONAL plain-matmul _db variant): the plain double-buffered RB coopmat
+/// matmul (matmul_rb_coopmat_db.axc) compiles, passes spirv-val, reports shared_memory_bytes ==
+/// 4096 (DOUBLED tiles, no scale cache), emits OpControlBarrier == 3 (1 prologue + 2 steady-state),
+/// preserves the single-level OpPhi carry vs M3.3c, declares NO capability beyond M3.3c, and pins
+/// a_block_size_db/b_block_size_db at 1024. Isolates the matmul-core latency-overlap structure.
+#[test]
+fn at_1906_matmul_rb_db_no_new_capability() {
+    use std::collections::BTreeSet;
+
+    let db_src = include_str!("../../../examples/matmul_rb_coopmat_db.axc");
+    let m33c_src = include_str!("../../../examples/matmul_rb_coopmat.axc");
+
+    let db_assignments = rb2x2_db_assignments();
+    let m33c_assignments = rb2x2_assignments();
+
+    let (db_bytes, meta) = compile_source_with_assignments(db_src, &db_assignments)
+        .unwrap_or_else(|e| panic!("matmul_rb_coopmat_db.axc: compile failed: {e:?}"));
+    let db_words = words_and_validate(db_bytes, "matmul_rb_coopmat_db.axc");
+
+    let (m33c_bytes, _m33c_meta) = compile_source_with_assignments(m33c_src, &m33c_assignments)
+        .unwrap_or_else(|e| panic!("matmul_rb_coopmat.axc: compile failed: {e:?}"));
+    let m33c_words = words_and_validate(m33c_bytes, "matmul_rb_coopmat.axc");
+
+    // No new capability beyond M3.3c (parity-indexed shared + shared[f16,1024] add nothing).
+    let (db_caps, db_exts) = capability_extension_sets(&db_words);
+    let (m33c_caps, m33c_exts) = capability_extension_sets(&m33c_words);
+    let extra_caps: Vec<u32> = db_caps.difference(&m33c_caps).copied().collect();
+    assert!(
+        extra_caps.is_empty(),
+        "AT-1906 (plain): _db declares capabilities NOT in M3.3c: {extra_caps:?}"
+    );
+    let db_set: BTreeSet<u32> = db_caps.iter().copied().collect();
+    let m33c_set: BTreeSet<u32> = m33c_caps.iter().copied().collect();
+    assert_eq!(
+        db_set, m33c_set,
+        "AT-1906 (plain): _db and M3.3c must have BYTE-IDENTICAL capability sets"
+    );
+    let extra_exts: Vec<String> = db_exts.difference(&m33c_exts).cloned().collect();
+    assert!(extra_exts.is_empty(), "AT-1906 (plain): _db declares new extensions: {extra_exts:?}");
+
+    // shared_memory_bytes == DOUBLED tiles only (no scale cache): (1024+1024)*2 = 4096 B.
+    let expected_shared_bytes: u32 = (1024 + 1024) * 2; // 4096
+    assert_eq!(
+        meta.shared_memory_bytes, expected_shared_bytes,
+        "AT-1906 (plain): shared_memory_bytes must be {expected_shared_bytes} \
+         (DOUBLED tiles (1024+1024)*2, NO scale cache); got {}", meta.shared_memory_bytes
+    );
+
+    // OpControlBarrier == 3 (1 prologue + 2 steady-state); OpPhi == M3.3c (single-level carry).
+    let db_barriers = count_op_control_barrier(&db_words);
+    assert_eq!(
+        db_barriers, 3,
+        "AT-1906 (plain): _db must emit 3 OpControlBarrier (1 PROLOGUE + 2 steady-state); \
+         got {db_barriers} (M3.3c emits {})", count_op_control_barrier(&m33c_words)
+    );
+    let db_phis = count_op_phi(&db_words);
+    let m33c_phis = count_op_phi(&m33c_words);
+    assert_eq!(
+        db_phis, m33c_phis,
+        "AT-1906 (plain): _db OpPhi count ({db_phis}) must EQUAL M3.3c ({m33c_phis}) — \
+         single-level 4-accumulator carry preserved"
+    );
+
+    // 1024 pin.
+    let strategy_decl = db_src.lines()
+        .find(|l| l.trim_start().starts_with("@strategy"))
+        .expect("AT-1906 (plain): _db must declare an @strategy block");
+    assert!(
+        strategy_decl.contains("a_block_size_db: ?[1024]") &&
+        strategy_decl.contains("b_block_size_db: ?[1024]"),
+        "AT-1906 (plain): a_block_size_db/b_block_size_db MUST be PINNED to `?[1024]`; \
+         got @strategy: {strategy_decl}"
+    );
+
+    eprintln!(
+        "AT-1906 (plain) PASS: matmul_rb_coopmat_db.axc compiles + spirv-val clean; \
+         caps == M3.3c; shared_memory_bytes={} (DOUBLED tiles, no cache); \
+         OpControlBarrier={db_barriers} (1 prologue + 2 steady-state); OpPhi={db_phis} \
+         (== M3.3c {m33c_phis}); a_block_size_db/b_block_size_db=1024 PIN",
+        meta.shared_memory_bytes
+    );
+}
