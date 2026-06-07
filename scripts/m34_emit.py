@@ -57,9 +57,11 @@ q4k_line = env("M34_Q4K_LINE")
 # M3.5 (--fused) / M3.5b (--fused-f32acc) discriminators (CRITICAL-1): SAME-SHAPE headline +
 # cross-shape context. Both fused variants share the same SAME-SHAPE A/B machinery; the only
 # difference is numerical_validity (f16-accum is invalid at inference K; f32-accum is valid).
-axc_kernel = env("M34_AXC_KERNEL", "matvec")  # "matvec" (M3.4) | "fused" (M3.5) | "fused_f32acc" (M3.5b)
-is_fused = axc_kernel in ("fused", "fused_f32acc")
-is_f32acc = axc_kernel == "fused_f32acc"
+axc_kernel = env("M34_AXC_KERNEL", "matvec")  # "matvec" (M3.4) | "fused" (M3.5) | "fused_f32acc" (M3.5b) | "fused_f32acc_cached" (M3.6)
+is_fused = axc_kernel in ("fused", "fused_f32acc", "fused_f32acc_cached")
+# M3.6 cached is an f32acc variant: SAME SAME-SHAPE A/B machinery, SAME combined-driven validity
+# (the dequant-scale cache is pure reassociation — bit-identical to fused_f32acc, AT-1803).
+is_f32acc = axc_kernel in ("fused_f32acc", "fused_f32acc_cached")
 axc_m_out = int_or_none("M34_AXC_M") or 1      # AXIOM fused GEMM output rows
 axc_n_out = int_or_none("M34_AXC_N") or 1      # AXIOM fused GEMM output cols
 # For M3.5b (fused_f32acc), M34_AXC_MAX_REL_DIFF carries the COMBINED (condition-aware,

@@ -32,8 +32,8 @@
 //   accumulators), so it does NOT trip the AT-1708 LoopCarriedCoopMatConditionalReassignUnsupported
 //   guard (which fires only on a CONDITIONAL reassign of a COOPMAT binding). Each lane does 8
 //   fills (cache_i = fi*32 + lane covers 0..255 exactly once over 32 lanes), computing the
-//   byte-identical get_scale_min_k4 + d*sc / dmin*m ONCE per (row,is). The fill ends in a RAW
-//   workgroup_barrier() INSIDE the uniform branch.
+//   byte-identical get_scale_min_k4 + d*sc / dmin*m ONCE per (row,is). The fill body contains NO
+//   barrier; the RAW barrier is HOISTED out (r3 OPT-B, see BARRIERS below).
 //
 //   Every k_block then STAGES A by READING dsc_cache/dmm_cache (NO header recompute, NO
 //   get_scale_min_k4 in the inner loop): the per-nibble dequant becomes
@@ -43,21 +43,25 @@
 //   mul_adds, the single-level OpPhi K-carry, the end-of-body WAR barrier, and coopmat_store
 //   are VERBATIM M3.5b.
 //
-// BARRIERS + UNIFORMITY:
+// BARRIERS + UNIFORMITY (r3 OPT-B — 3 UNCONDITIONAL barriers per k_block, all conditional_depth==0):
 //   k_block is the induction variable of the single loop -> identical across all 32 lanes ->
-//   `k_block % 16 == 0` is WORKGROUP-UNIFORM -> all lanes take the branch together -> the
-//   barrier inside it is reached by every invocation (NOT divergent control flow -> NOT Vulkan
-//   UB). RAW barrier: at the end of the fill, inside the uniform branch, orders cache WRITE ->
-//   cache READ (A staging). WAR barrier: the existing UNCONDITIONAL end-of-body workgroup_barrier
-//   (M3.5b line 214) completes the prior k_block's coopmat consumption AND the prior superblock's
-//   last cache read BEFORE the next superblock's fill overwrites the caches — it doubles as the
-//   cache WAR; no extra barrier is needed. No barrier sits in divergent flow.
+//   `k_block % 16 == 0` is WORKGROUP-UNIFORM -> all lanes take the fill branch together. The fill
+//   body writes ONLY shared and contains NO barrier (the AXIOM typechecker's BarrierInDivergentContext
+//   guard, typecheck.rs:2465, blanket-rejects ANY barrier inside ANY if-body — no uniformity carve-out).
+//   (1) RAW barrier (HOISTED, NEW vs M3.5b): UNCONDITIONAL, immediately AFTER the if-fill and BEFORE
+//       A staging. On a fill k_block it orders cache WRITE -> cache READ; on the 15/16 non-fill
+//       k_blocks it is a redundant-but-correct uniform barrier (the honest +1-barrier cost).
+//   (2) post-staging barrier (VERBATIM M3.5b): staging complete before coopmat loads.
+//   (3) WAR barrier (VERBATIM M3.5b end-of-body): completes the prior k_block's coopmat consumption
+//       AND the prior superblock's last cache read BEFORE the next superblock's fill overwrites the
+//       caches — it doubles as the cache WAR; verified correct across the k_block=15->16 superblock
+//       boundary. No barrier sits inside any if-body or any divergent flow.
 //
 // SHARED BOUNDS — a_block_size PINNED at 512:
 //   The cache index `row_local*8 + is` must stay < 256. With a_block_size = 512,
 //   a_row = ei_a/16 (ei_a 0..511) gives row_local in 0..31 (32*8 = 256 exact). a_block_size is
-//   a single-value `@strategy` hole `?[512]`, so the autotuner CANNOT exceed it; a larger value
-//   would push the index past 255 and OOB the 256-entry caches with races. The 32-row pin is a
+//   a single-value strategy hole (pinned to 512), so the autotuner CANNOT exceed it; a larger
+//   value would push the index past 255 and OOB the 256-entry caches with races. The 32-row pin is a
 //   HARD invariant of the 256-entry cache layout — if a future milestone autotunes a_block_size,
 //   the caches must be resized to match.
 //
@@ -183,11 +187,20 @@ fn q4km_matmul_rb_coopmat_f32acc_cached(
                 dsc_cache[cache_i] = d * f32_from_u32(sc);
                 dmm_cache[cache_i] = dmin * f32_from_u32(mm);
             }
-
-            // RAW barrier: cache WRITE (fill) -> cache READ (A staging). Inside the UNIFORM
-            // branch (every lane present) -> safe.
-            workgroup_barrier();
+            // r3 (OPT-B): NO barrier inside this if-body. The fill writes ONLY the two shared[f32,256]
+            // caches; the RAW barrier is HOISTED to the unconditional line below (see WHY there).
         }
+
+        // RAW barrier (r3 OPT-B HOISTED): UNCONDITIONAL, once per k_block, at the TOP LEVEL of the
+        // loop body (conditional_depth==0), AFTER the conditional fill block and BEFORE A staging.
+        // WHY UNCONDITIONAL: the AXIOM typechecker's BarrierInDivergentContext guard (typecheck.rs:2465)
+        // blanket-rejects ANY workgroup_barrier() inside ANY if-body (NO uniformity carve-out), so the
+        // r2 in-if placement does not compile. Hoisting it here passes the guard (conditional_depth==0)
+        // AND is strictly non-divergent (every lane reaches it every k_block -> no Vulkan divergent-barrier
+        // UB). On a fill k_block it orders cache WRITE (fill) -> cache READ (A staging); on the other
+        // 15/16 non-fill k_blocks it is a redundant-but-correct uniform barrier (the honest +1-barrier cost
+        // vs M3.5b: 3 per-k_block barriers now [this + post-staging + end-of-body WAR] vs M3.5b's 2).
+        workgroup_barrier();
 
         // ── Dequant A[block_row*32..+32, k_block*16..+16] into a_tile (shared[f16]) ─
         // Each lane stages a_iters = 16 A elements. ei_a covers 0..511 exactly once.

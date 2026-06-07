@@ -91,6 +91,16 @@ name = "resident_q4km_matmul_rb_f32acc"
 path = "benches/resident_q4km_matmul_rb_f32acc.rs"
 harness = false
 
+# M3.6: honest effective-TFLOPS bench for the DEQUANT-SCALE-CACHED f32-ACCUMULATOR FUSED
+# Q4_K_M register-blocked coopmat matmul (AT-1804) + the SAME-SHAPE A/B line emitting
+# AXC_Q4KM_AB_F32ACC_CACHED (AT-1805). Sibling of resident_q4km_matmul_rb_f32acc; same honesty
+# contract (combined metric drives VALID/INVALID). Bench ID:
+# dispatch_resident_q4km_matmul_rb_f32acc_cached. GPU-gated.
+[[bench]]
+name = "resident_q4km_matmul_rb_f32acc_cached"
+path = "benches/resident_q4km_matmul_rb_f32acc_cached.rs"
+harness = false
+
 
 [features]
 # M2.2 AT-714: fault-injection feature for regression-gate CI validation.
