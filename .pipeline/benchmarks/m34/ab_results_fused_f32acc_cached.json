@@ -1,0 +1,99 @@
+{
+  "milestone": "M3.5b-llamacpp-ab-fused-f32acc",
+  "axiom_kernel": "fused_f32acc_cached",
+  "generated_by": "scripts/m34_llamacpp_ab.sh + scripts/m34_emit.py",
+  "commit": {
+    "tag": "b9542",
+    "sha": "6b80c74f285390368b3c99c5e750f19e9b096e98"
+  },
+  "icd": "/usr/share/vulkan/icd.d/nvidia_icd.json",
+  "device": {
+    "axiom": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+    "llamacpp": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+    "vulkaninfo": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+  },
+  "device_match": {
+    "byte_identical": true,
+    "rtx_pro_6000_substring": true
+  },
+  "dims": {
+    "K_contraction": 14336,
+    "llama_m": 4096,
+    "llama_n": 512,
+    "llama_k": 14336,
+    "note": "SAME-SHAPE GEMM-vs-GEMM: AXIOM's FUSED kernel computes the full m=4096, n=512 GEMM (axiom.fused_output_m=4096, fused_output_n=512), and llama.cpp Q4_K MUL_MAT computes the IDENTICAL m=4096, n=512, k=14336. Throughput (TFLOPS) is the work-normalized metric (2*m*n*k MACs, dequant excluded, both sides)."
+  },
+  "llamacpp_timer_boundary": {
+    "source_file": "tests/test-backend-ops.cpp",
+    "sha": "6b80c74f285390368b3c99c5e750f19e9b096e98",
+    "measurement": "CPU wall-clock (ggml_time_us) bracketing ggml_backend_graph_compute over a graph that DUPLICATES the op n_runs times",
+    "per_op_or_amortized": "batched-amortized: avg_time_us = total_time_us / total_runs",
+    "min_mean_or_sustained": "sustained MEAN (loops until total_time_us >= 1s; reports the mean per-op time, NOT min)",
+    "warmup": "ONE ggml_backend_graph_compute warmup discarded before timing",
+    "overhead_subtracted": "none",
+    "n_runs_basis": "FLOP-targeted for MUL_MAT: ~100 GFLOP target / op_flops, so many op copies per graph",
+    "source_excerpt": "// run\nint64_t total_time_us = 0;\nint total_runs = 0;\ndo {\n    int64_t start_time = ggml_time_us();\n    ggml_status status = ggml_backend_graph_compute(backend, gf);\n    ...\n    int64_t end_time = ggml_time_us();\n    total_time_us += end_time - start_time;\n    total_runs += n_runs;\n} while (total_time_us < 1000*1000); // run for at least 1 second\ndouble avg_time_us = (double) total_time_us / total_runs;\ndouble calculated_flops = (op_flops(out) * total_runs) / (total_time_us / 1e6);"
+  },
+  "axiom": {
+    "kernel_ns_min": 1402848,
+    "kernel_ns_mean": 1402848,
+    "kernel_ns_median": 1402848,
+    "sustained_ns": 1402848,
+    "us_min": 1402.848,
+    "us_sustained": 1402.848,
+    "tflops_min_gputimestamp": 42.862478,
+    "tflops_sustained_cpuwall": 42.862478,
+    "timing_source": "GpuTimestamp",
+    "flops_per_dispatch": 60129542144,
+    "flops_convention": "matmul MACs, dequant EXCLUDED (2*M*N*K, M=4096, N=512)",
+    "fused_output_m": 4096,
+    "fused_output_n": 512,
+    "fused_max_rel_diff": 2.053294e-06,
+    "note": "FUSED Q4_K_M dequant + 2x2 register-blocked coopmat matmul; full (N/32,M/32,1) grid (NOT the single-row matvec). GpuTimestamp MIN is the kernel-only number."
+  },
+  "llamacpp": {
+    "selected_line": "  MUL_MAT(type_a=q4_K,type_b=f32,m=4096,n=512,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):               1706 runs -   586.68 us/run -  60.13 GFLOP/run - 102.49 TFLOPS",
+    "us_per_run": 586.68,
+    "tflops": 102.49,
+    "n_runs": 1706,
+    "m": 4096,
+    "n": 512,
+    "k": 14336
+  },
+  "flop_consistency": {
+    "checked": true,
+    "ok": true,
+    "reported_tflops": 102.49,
+    "recomputed_tflops": 102.4912,
+    "disagreement_frac": 1e-05,
+    "convention": "2*m*n*k matmul MACs only (dequant excluded), both sides"
+  },
+  "ratio_boundary_label": "SAME-SHAPE GEMM-vs-GEMM: AXIOM fused GEMM (GpuTimestamp MIN, kernel-only) vs llama.cpp Q4_K MUL_MAT at the IDENTICAL m=4096,n=512,k=14336 (102.49 TFLOPS). Headline + verdict computed from the same-shape llama number; the n=1 GEMV is cross-shape context only.",
+  "headline_basis": "same_shape_gemm m=4096,n=512,k=14336",
+  "headline_ratio": 0.41821,
+  "ratio_axiom_over_llama_tflops": 0.41821,
+  "llama_over_axiom_speedup_tflops": 2.39,
+  "cross_shape_context": {
+    "axiom_gemm_tflops": 42.8625,
+    "llama_n1_gemv_tflops": 7.38,
+    "axiom_over_llama_n1_ratio": 5.8079,
+    "note": "cross-shape, NOT the kill criterion \u2014 llama's n=1 is a memory-bound GEMV at ~13.7x lower arithmetic intensity than its own n=512 GEMM; headlining AXIOM-GEMM vs llama-n1-GEMV would flatter AXIOM ~13x."
+  },
+  "axiom_fused_max_rel_diff": 2.053294e-06,
+  "axiom_fused_raw_rel_diff": 2.097962,
+  "kill_criterion_within_15pct": false,
+  "kill_criterion_status": "FAIL",
+  "kill_criterion_reason": "",
+  "numerical_validity": {
+    "valid_at_ab_shape": true,
+    "ab_shape_max_rel_diff": 2.053294e-06,
+    "ab_shape_metric": "combined_condition_aware",
+    "ab_shape_raw_rel_diff": 2.097962,
+    "frozen_tol": 0.001,
+    "verdict": "numerically VALID at the A/B shape: max_rel_diff=2.05e-06 <= frozen 0.001. The throughput ratio below is a usable-kernel comparison.",
+    "kill_criterion_interpretation": "Throughput gap closed (M3.4 ~87,000x -> M3.5 same-shape) AND numerically valid at the A/B shape \u2014 a usable-kernel comparison."
+  },
+  "kill_criterion_qualifier": "M3.5 SAME-SHAPE fused GEMM vs llama's same-shape Q4_K MUL_MAT (102.49 TFLOPS). AXIOM measured 42.86 TFLOPS = ~2x BEHIND on throughput \u2014 a MASSIVE improvement from M3.4's ~87,000x cross-shape matvec. DESIGN \u00a75 kill-criterion is 'within 15% on ANY vendor'; this does NOT fire (AXIOM behind). AMD/Intel pending hardware (EB.1).",
+  "fairness_caveat": "Same machine, same ICD, kernel-only-vs-kernel-only, SAME SHAPE (m=4096,n=512,k=14336 both sides), FLOP convention identical (2*m*n*k matmul MACs, dequant excluded). AXIOM's fused kernel is numerically VALID at this A/B shape (max_rel_diff=2.05e-06 <= frozen 1e-3); the ratio is a usable-kernel comparison. Ratio reported AS MEASURED for a numerically-VALID result at the A/B K. The n=1 GEMV (llama 7.38 TFLOPS) is cross-shape CONTEXT ONLY \u2014 never the headline (the SAME llama kernel runs 13.7x faster at n=512), so headlining AXIOM-GEMM vs llama-n1-GEMV would flatter AXIOM ~13x; that is forbidden (CRITICAL-1).",
+  "gap_closing_path": "M3.5 closed the M3.4 ~87,000x cross-shape THROUGHPUT gap to a single-digit same-shape ratio. Remaining gap (if ALU-bound): scale-caching across the 16 tile_k K-blocks of a superblock (OQ-3 -> M3.5b) to cut ALU-bound dequant overhead."
+}

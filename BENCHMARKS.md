@@ -139,6 +139,39 @@ M3.5b switches the M3.5 fused kernel's loop-carried accumulators from f16 to **f
 
 ---
 
+## M3.6 — Q4_K_M dequant scale-caching (gap to llama 9.3× → 2.39×, bit-identical to M3.5b)
+
+M3.6 caches the per-superblock Q4_K_M dequant scales. The M3.5b fused kernel recomputed `get_scale_min_k4` + the `d·sc`/`dmin·m` products **per-nibble**, redundantly across the 16 coopmat k_blocks of every 256-element superblock (header recomputed 16×, scales 2×). M3.6 computes the 8 `(d·sc, dmin·m)` pairs ONCE per superblock into two `shared[f32,256]` caches (cooperative fill gated on a workgroup-uniform `if (k_block % 16 == 0)`, an unconditional RAW barrier hoisted to top-level after the fill — OPT-B, since the `BarrierInDivergentContext` typecheck guard rejects barriers inside `if`), and reuses them across all 16 k_blocks. The flat single K-loop + single-level OpPhi accumulator carry is **verbatim M3.5b** (the r1 nested-loop restructure was rejected at design review — it would have reset the accumulator every superblock).
+
+> **BIT-IDENTICAL to M3.5b — caching is pure reassociation (compute-once, not reorder).** AT-1803 asserts the cached GPU output equals the M3.5b GPU output **bit-for-bit** (raw f32 bits, `n_diff == 0`) at K=256/512/14336 — measured PASS on NVIDIA. So M3.6 inherits M3.5b's numerical validity exactly: the combined condition-aware metric is unchanged (K=256=5.3e-7, K=512=6.7e-7, K=14336=2.05e-6, all ≤ frozen 1e-3). **Correctness cost of the optimization: zero.** No production codegen/typecheck/runtime changed (pure source — the type system was already mixed-precision + shared-memory capable); +2 KB shared/workgroup; +1 barrier per k_block (2→3, the honestly-disclosed cost).
+
+**The SAME-SHAPE A/B — gap collapses ~4×.** AXIOM cached fused GEMM (m=4096, n=512, k=14336) vs llama.cpp Q4_K MUL_MAT at the IDENTICAL shape:
+
+| metric | AXIOM (M3.6 cached f32-accum fused Q4_K_M RB coopmat GEMM) | llama.cpp (Q4_K MUL_MAT n=512) |
+|---|---|---|
+| shape (m,n,k) | 4096 × 512 × 14336 | 4096 × 512 × 14336 |
+| TFLOPS (GpuTimestamp MIN, kernel-only) | **42.86** | **102.49** |
+| max-rel-diff vs f32-accum ref (combined, condition-aware — the gate) | **2.05e-6 — NUMERICALLY VALID** (≤ frozen 1e-3; bit-identical to M3.5b) | (ggml is the reference) |
+| raw forward-error (reporting only, not a gate) | 2.10 (cancellation outputs — identical-in-kind to llama's HMMA) | (ggml is the reference) |
+
+**Measured result (honest):** AXIOM cached **42.86 TFLOPS** vs llama **102.49 TFLOPS** same-shape → **llama 2.39× faster** (ratio 0.418), numerically VALID at inference K. This collapses the M3.5b gap (10.91 TFLOPS → **9.3× behind**) to **2.39× behind** — a **3.93× same-kernel speedup at zero correctness cost.** The dequant-front-end-is-the-bottleneck hypothesis is **confirmed** (not the honest-negative outcome the design provisioned for). Kill-criterion (within 15% on NVIDIA) still does **not** fire — AXIOM is 2.39× behind — but the gap is now in striking distance.
+
+**Cached TFLOPS at cube sizes (AT-1804/1805, honest; combined ≤ 1e-3 at every size, bit-identical to M3.5b):**
+
+| size (M=N=K) | M3.5b fused | M3.6 cached | speedup | % of 125-est | max-rel-diff (combined) |
+|---|---|---|---|---|---|
+| 256 | 0.59 | 1.49 | 2.5× | 1.19% | 5.3e-7 VALID |
+| 512 | 2.74 | 6.57 | 2.4× | 5.26% | 6.7e-7 VALID |
+| **768** | **4.81** | **13.84** | **2.88× [GATE-MET ≥1.5×]** | 11.07% | 7.9e-7 VALID |
+| 1024 | 7.93 | 23.28 | 2.9× | 18.6% | 1.1e-6 VALID |
+| 4096×512×14336 (A/B) | 10.91 | 42.86 | 3.93× | 34.3% | 2.05e-6 VALID |
+
+**Honest framing:** dequant scale-caching is the largest single-step throughput win in the campaign — it narrows the Q4_K_M gap to hand-tuned llama.cpp from ~9× to ~2.4× on NVIDIA with the output staying **bit-for-bit identical** to the already-validated M3.5b kernel (AT-1803), and it required NO new language/codegen feature. The exit gate (768³ ≥ 1.5× M3.5b's 4.81) was crushed at **2.88×**. `numerically_valid` is driven solely by the measured combined metric ≤ frozen 1e-3 (raw recorded for transparency, not gating). The remaining ~2.4× to llama is the next target (e.g. tile_k>16 sub-K-loop, double-buffered staging, or the AMD/Intel half where llama.cpp is known-weak — EB.1, hardware-blocked here).
+
+**Reproduce:** `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json AXC_ENABLE_GPU_BENCHES=1 scripts/m34_llamacpp_ab.sh --fused-f32acc-cached` (writes `.pipeline/benchmarks/m34/ab_results_fused_f32acc_cached.json` + `.md`).
+
+---
+
 ## Running benchmarks
 
 ```sh

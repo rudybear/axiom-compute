@@ -11,7 +11,7 @@
 #
 # Usage:
 #   VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json AXC_ENABLE_GPU_BENCHES=1 \
-#     scripts/m34_llamacpp_ab.sh [--skip-build] [--skip-llama] [--fused | --fused-f32acc]
+#     scripts/m34_llamacpp_ab.sh [--skip-build] [--skip-llama] [--fused | --fused-f32acc | --fused-f32acc-cached]
 #
 # Modes:
 #   (default)        M3.4 single-row matvec vs llama Q4_K n=1 GEMV (cross-shape baseline).
@@ -25,6 +25,15 @@
 #                    never hardcoded; the RAW forward error (~1e-2 on cancellation outputs, a
 #                    metric artifact identical-in-kind to llama.cpp's HMMA) is recorded for
 #                    transparency but does NOT gate validity.
+#   --fused-f32acc-cached
+#                    M3.6 DEQUANT-SCALE-CACHED f32-accumulator fused GEMM vs llama Q4_K n=512
+#                    same-shape. Pure reassociation of --fused-f32acc (bit-identical output,
+#                    AT-1803), so SAME combined-driven validity contract; the cache trades 15/16
+#                    of the dequant-scale ALU recompute for +1 unconditional barrier/k_block — the
+#                    throughput delta vs --fused-f32acc is the measured outcome (gap-narrowing,
+#                    HONEST-NEGATIVE if the barrier/occupancy cost dominates). Runs the
+#                    resident_q4km_matmul_rb_f32acc_cached bench (AXC_Q4KM_AB_F32ACC_CACHED line)
+#                    and writes ab_results_fused_f32acc_cached.json.
 #
 # Env:
 #   LLAMACPP_DIR     (default vendor/llama.cpp)
@@ -54,12 +63,15 @@ SKIP_BUILD=0
 SKIP_LLAMA=0
 FUSED=0       # M3.5: --fused switches to the SAME-SHAPE fused-kernel A/B (AT-1774).
 FUSED_F32ACC=0 # M3.5b: --fused-f32acc switches to the f32-accumulator fused-kernel A/B (AT-1784).
+FUSED_F32ACC_CACHED=0 # M3.6: --fused-f32acc-cached -> the dequant-scale-CACHED f32acc A/B (AT-1805).
 for arg in "$@"; do
     case "$arg" in
         --skip-build) SKIP_BUILD=1 ;;
         --skip-llama) SKIP_LLAMA=1 ;;
         --fused) FUSED=1 ;;
         --fused-f32acc) FUSED=1; FUSED_F32ACC=1 ;;  # f32-accum is a fused-mode variant
+        # M3.6: cached is an f32acc-mode variant (same SAME-SHAPE A/B, same combined/raw schema).
+        --fused-f32acc-cached) FUSED=1; FUSED_F32ACC=1; FUSED_F32ACC_CACHED=1 ;;
         *) echo "unknown arg: $arg" >&2; exit 2 ;;
     esac
 done
@@ -68,7 +80,10 @@ mkdir -p "$OUTDIR"
 RAW="${OUTDIR}/llamacpp_raw.txt"
 # M3.5 (--fused) and M3.5b (--fused-f32acc) each write a DISTINCT artifact; the frozen-matvec
 # ab_results.json and the f16-accum ab_results_fused.json are kept side-by-side.
-if [ "${FUSED_F32ACC}" -eq 1 ]; then
+if [ "${FUSED_F32ACC_CACHED}" -eq 1 ]; then
+    RESULTS_JSON="${OUTDIR}/ab_results_fused_f32acc_cached.json"
+    RESULTS_MD="${OUTDIR}/ab_results_fused_f32acc_cached.md"
+elif [ "${FUSED_F32ACC}" -eq 1 ]; then
     RESULTS_JSON="${OUTDIR}/ab_results_fused_f32acc.json"
     RESULTS_MD="${OUTDIR}/ab_results_fused_f32acc.md"
 elif [ "${FUSED}" -eq 1 ]; then
@@ -224,7 +239,11 @@ if [ "${FUSED}" -eq 1 ]; then
 fi
 
 # ── 5. AXIOM side: run the AXIOM bench, parse its anchored line ───────────────────────────
-if [ "${FUSED_F32ACC}" -eq 1 ]; then
+if [ "${FUSED_F32ACC_CACHED}" -eq 1 ]; then
+    AXC_BENCH="resident_q4km_matmul_rb_f32acc_cached"
+    AXC_PREFIX="AXC_Q4KM_AB_F32ACC_CACHED"
+    AXC_KERNEL="fused_f32acc_cached"
+elif [ "${FUSED_F32ACC}" -eq 1 ]; then
     AXC_BENCH="resident_q4km_matmul_rb_f32acc"
     AXC_PREFIX="AXC_Q4KM_AB_F32ACC"
     AXC_KERNEL="fused_f32acc"

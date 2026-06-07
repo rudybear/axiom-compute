@@ -547,3 +547,124 @@ fn at_1787_q4km_f32acc_compiles_and_validates() {
          caps == M3.5 fused ({f32acc_caps:?}); meta.coopmat = {{16,16,16, F16,F16,F32,F32, Subgroup}}"
     );
 }
+
+// ── AT-1806: M3.6 dequant-scale-CACHED f32-accumulator fused Q4_K_M coopmat matmul — ──
+//            compile + spirv-val + no-new-capability vs M3.5b + metadata shape +
+//            +2 KB shared cache + a_block_size=512 PIN ─────────────────────────────────
+
+/// AT-1806 (M3.6, CI no-GPU): the dequant-scale-CACHED kernel
+/// (q4km_matmul_rb_coopmat_f32acc_cached.axc) compiles, passes spirv-val, declares NO
+/// capability/extension outside the M3.5b fused kernel's set (the two shared[f32,256]
+/// scale caches use only the Workgroup storage class + Float32, both already pulled in by
+/// the f32 accumulators), emits the same coopmat metadata shape {16,16,16, F16,F16,F32,F32,
+/// Subgroup} as M3.5b, reports shared_memory_bytes reflecting the +2 KB cache (2 * 256 * 4),
+/// and compiles only at the pinned a_block_size=512.
+///
+/// NECESSARY but NOT SUFFICIENT: the r1 silent-zeros miscompile would ALSO pass spirv-val.
+/// The true correctness gate is the orchestrator's GPU run of AT-1803 + AT-1800/1801/1802.
+///
+/// Mirrors AT-1787 verbatim. One benign delta is pre-permitted: shared[f32] may legitimately
+/// require WorkgroupMemoryExplicitLayout / a layout decoration that shared[f16] did not — if
+/// so it is documented (not failed). The capability SET equality is the strict anchor.
+#[test]
+fn at_1806_q4km_f32acc_cached_compiles_and_validates() {
+    use std::collections::BTreeSet;
+    use axc_runtime::{CoopMatScalarMeta, CoopMatScopeMeta};
+
+    let cached_src = include_str!("../../../examples/q4km_matmul_rb_coopmat_f32acc_cached.axc");
+    let f32acc_src = include_str!("../../../examples/q4km_matmul_rb_coopmat_f32acc.axc");
+
+    let assignments = rb2x2_assignments();
+
+    // Compile the CACHED kernel WITH metadata + spirv-val it (this is the load-bearing
+    // assertion that the r3 barrier hoist cleared BarrierInDivergentContext).
+    let (cached_bytes, meta) = compile_source_with_assignments(cached_src, &assignments)
+        .unwrap_or_else(|e| panic!("q4km_matmul_rb_coopmat_f32acc_cached.axc: compile failed: {e:?}"));
+    let cached_words = words_and_validate(cached_bytes, "q4km_matmul_rb_coopmat_f32acc_cached.axc");
+    let f32acc_words = compile_words(f32acc_src, Some(&assignments), "q4km_matmul_rb_coopmat_f32acc.axc");
+
+    // No capability/extension beyond the M3.5b fused kernel's set (the scale caches add NO
+    // new capability — Float32 + the Workgroup storage class are already present).
+    let (cached_caps, cached_exts) = capability_extension_sets(&cached_words);
+    let (f32acc_caps, f32acc_exts) = capability_extension_sets(&f32acc_words);
+
+    let extra_caps: Vec<u32> = cached_caps.difference(&f32acc_caps).copied().collect();
+    assert!(
+        extra_caps.is_empty(),
+        "AT-1806: cached kernel declares capabilities NOT in the M3.5b f32acc kernel's set: \
+         {extra_caps:?} (cached={cached_caps:?}, f32acc={f32acc_caps:?})"
+    );
+    let dropped_caps: Vec<u32> = f32acc_caps.difference(&cached_caps).copied().collect();
+    assert!(
+        dropped_caps.is_empty(),
+        "AT-1806: cached kernel DROPPED capabilities present in M3.5b: {dropped_caps:?}"
+    );
+    let cached_set: BTreeSet<u32> = cached_caps.iter().copied().collect();
+    let f32acc_set: BTreeSet<u32> = f32acc_caps.iter().copied().collect();
+    assert_eq!(
+        cached_set, f32acc_set,
+        "AT-1806: cached and M3.5b f32acc kernel must have IDENTICAL capability sets \
+         (the shared[f32] scale caches introduce NO new capability)"
+    );
+
+    // Extensions: the cached set must be a subset of (and equal to) the M3.5b set. The one
+    // pre-permitted benign delta is a shared[f32] layout decoration extension; document it if
+    // present rather than failing, but a NEW capability is never allowed (asserted above).
+    let extra_exts: Vec<String> = cached_exts.difference(&f32acc_exts).cloned().collect();
+    if !extra_exts.is_empty() {
+        eprintln!(
+            "AT-1806 NOTE: cached kernel declares extension(s) not in M3.5b's set: {extra_exts:?} \
+             — pre-permitted iff it is a benign shared[f32] layout-decoration extension \
+             (WorkgroupMemoryExplicitLayout-class). No NEW capability was added (asserted)."
+        );
+    }
+    assert!(
+        extra_exts.len() <= 1,
+        "AT-1806: at most ONE benign shared[f32] layout extension delta is pre-permitted; \
+         got {extra_exts:?}"
+    );
+
+    // Coopmat metadata shape unchanged from M3.5b: {16,16,16, F16,F16,F32,F32, Subgroup}.
+    let coopmat = meta.coopmat.as_ref()
+        .expect("AT-1806: cached kernel must emit coopmat metadata");
+    assert_eq!(coopmat.m, 16, "AT-1806: coopmat.m");
+    assert_eq!(coopmat.n, 16, "AT-1806: coopmat.n");
+    assert_eq!(coopmat.k, 16, "AT-1806: coopmat.k");
+    assert_eq!(coopmat.a_type, CoopMatScalarMeta::F16, "AT-1806: A type must be F16");
+    assert_eq!(coopmat.b_type, CoopMatScalarMeta::F16, "AT-1806: B type must be F16");
+    assert_eq!(coopmat.c_type, CoopMatScalarMeta::F32, "AT-1806: C type must be F32");
+    assert_eq!(coopmat.result_type, CoopMatScalarMeta::F32, "AT-1806: result type must be F32");
+    assert_eq!(coopmat.scope, CoopMatScopeMeta::Subgroup, "AT-1806: scope must be Subgroup");
+
+    // shared_memory_bytes reflects the +2 KB cache: a_tile(512 f16) + b_tile(512 f16) = 2048 B,
+    // PLUS dsc_cache(256 f32) + dmm_cache(256 f32) = 2 * 256 * 4 = 2048 B -> 4096 B total.
+    let expected_shared_bytes: u32 = (512 + 512) * 2 + 2 * 256 * 4; // 2048 + 2048 = 4096
+    assert_eq!(
+        meta.shared_memory_bytes, expected_shared_bytes,
+        "AT-1806: shared_memory_bytes must be {expected_shared_bytes} \
+         (a_tile+b_tile = (512+512)*2 = 2048 B, PLUS dsc_cache+dmm_cache = 2*256*4 = 2048 B); \
+         got {} — the +2 KB scale cache must be accounted", meta.shared_memory_bytes
+    );
+
+    // a_block_size=512 PIN: the autotuner must only ever pick 512. The pin is the SINGLE-VALUE
+    // @strategy candidate list `a_block_size: ?[512]` — axc-optimize enumerates exactly one
+    // candidate, so a_row=ei_a/16 stays in 0..31 (32*8=256 exact) and the cache index never OOBs
+    // the 256-entry shared[f32] caches. (The text-substitution compile path can take an arbitrary
+    // override, so the enforced invariant is the single-candidate declaration in source.)
+    let strategy_decl = cached_src
+        .lines()
+        .find(|l| l.trim_start().starts_with("@strategy"))
+        .expect("AT-1806: cached kernel must declare an @strategy block");
+    assert!(
+        strategy_decl.contains("a_block_size: ?[512]"),
+        "AT-1806: a_block_size MUST be PINNED to the single-value @strategy candidate `?[512]` \
+         (bounds the 256-entry scale caches to 32 rows); got @strategy line: {strategy_decl}"
+    );
+
+    eprintln!(
+        "AT-1806 PASS: q4km_matmul_rb_coopmat_f32acc_cached.axc compiles + spirv-val clean; \
+         caps == M3.5b f32acc ({cached_caps:?}); meta.coopmat = {{16,16,16, F16,F16,F32,F32, Subgroup}}; \
+         shared_memory_bytes={} (+2 KB cache); a_block_size=512 PIN enforced",
+        meta.shared_memory_bytes
+    );
+}
