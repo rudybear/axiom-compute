@@ -11,7 +11,16 @@
 #
 # Usage:
 #   VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json AXC_ENABLE_GPU_BENCHES=1 \
-#     scripts/m34_llamacpp_ab.sh [--skip-build] [--skip-llama]
+#     scripts/m34_llamacpp_ab.sh [--skip-build] [--skip-llama] [--fused | --fused-f32acc]
+#
+# Modes:
+#   (default)        M3.4 single-row matvec vs llama Q4_K n=1 GEMV (cross-shape baseline).
+#   --fused          M3.5 f16-accumulator fused GEMM vs llama Q4_K n=512 same-shape (fast-but-
+#                    WRONG at inference K — the f16 coopmat accumulator overflows precision).
+#   --fused-f32acc   M3.5b f32-accumulator fused GEMM vs llama Q4_K n=512 same-shape. Now
+#                    NUMERICALLY VALID at k=14336 (max_rel_diff <= frozen 1e-3) — a REAL
+#                    fast-AND-correct comparison (still behind on throughput; numerically_valid
+#                    is driven by the MEASURED max_rel_diff, never hardcoded).
 #
 # Env:
 #   LLAMACPP_DIR     (default vendor/llama.cpp)
@@ -39,20 +48,26 @@ ICD="${VK_DRIVER_FILES:-/usr/share/vulkan/icd.d/nvidia_icd.json}"
 
 SKIP_BUILD=0
 SKIP_LLAMA=0
-FUSED=0   # M3.5: --fused switches to the SAME-SHAPE fused-kernel A/B (AT-1774).
+FUSED=0       # M3.5: --fused switches to the SAME-SHAPE fused-kernel A/B (AT-1774).
+FUSED_F32ACC=0 # M3.5b: --fused-f32acc switches to the f32-accumulator fused-kernel A/B (AT-1784).
 for arg in "$@"; do
     case "$arg" in
         --skip-build) SKIP_BUILD=1 ;;
         --skip-llama) SKIP_LLAMA=1 ;;
         --fused) FUSED=1 ;;
+        --fused-f32acc) FUSED=1; FUSED_F32ACC=1 ;;  # f32-accum is a fused-mode variant
         *) echo "unknown arg: $arg" >&2; exit 2 ;;
     esac
 done
 
 mkdir -p "$OUTDIR"
 RAW="${OUTDIR}/llamacpp_raw.txt"
-# M3.5 (--fused) writes a DISTINCT artifact; the frozen-matvec ab_results.json is kept.
-if [ "${FUSED}" -eq 1 ]; then
+# M3.5 (--fused) and M3.5b (--fused-f32acc) each write a DISTINCT artifact; the frozen-matvec
+# ab_results.json and the f16-accum ab_results_fused.json are kept side-by-side.
+if [ "${FUSED_F32ACC}" -eq 1 ]; then
+    RESULTS_JSON="${OUTDIR}/ab_results_fused_f32acc.json"
+    RESULTS_MD="${OUTDIR}/ab_results_fused_f32acc.md"
+elif [ "${FUSED}" -eq 1 ]; then
     RESULTS_JSON="${OUTDIR}/ab_results_fused.json"
     RESULTS_MD="${OUTDIR}/ab_results_fused.md"
 else
@@ -205,7 +220,11 @@ if [ "${FUSED}" -eq 1 ]; then
 fi
 
 # ── 5. AXIOM side: run the AXIOM bench, parse its anchored line ───────────────────────────
-if [ "${FUSED}" -eq 1 ]; then
+if [ "${FUSED_F32ACC}" -eq 1 ]; then
+    AXC_BENCH="resident_q4km_matmul_rb_f32acc"
+    AXC_PREFIX="AXC_Q4KM_AB_F32ACC"
+    AXC_KERNEL="fused_f32acc"
+elif [ "${FUSED}" -eq 1 ]; then
     AXC_BENCH="resident_q4km_matmul_rb"
     AXC_PREFIX="AXC_Q4KM_AB_FUSED"
     AXC_KERNEL="fused"
