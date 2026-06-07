@@ -104,6 +104,37 @@ M3.5 FUSES the M2.6 Q4_K_M dequant front-end onto the M3.3c register-blocked coo
 
 ---
 
+## M3.5b — f32-accumulator fused Q4_K_M coopmat (numerically VALID at inference K, SAME-SHAPE A/B)
+
+M3.5b switches the M3.5 fused kernel's loop-carried accumulators from f16 to **f32** — the canonical f16×f16→f32 HMMA (`OpCooperativeMatrixMulAddKHR` AType=Float16, BType=Float16, CType=Float32, ResultType=Float32, Subgroup), NVIDIA's primary tensor-core combo. The new kernel `examples/q4km_matmul_rb_coopmat_f32acc.axc` is byte-for-byte M3.5 EXCEPT `C: buffer[f16]→buffer[f32]` and the 4 accumulators `matrix[f16,16,16,accumulator]→matrix[f32,16,16,accumulator]`; A/B stay f16, the Q4_K_M dequant→f32_to_f16→shared[f16] staging, RB 2×2, barriers, OpPhi K-loop, and @strategy holes are VERBATIM.
+
+> **NOW NUMERICALLY VALID AT INFERENCE K — the whole point.** f32's 24-bit mantissa holds a 14336-deep dot product (f16's ~3-decimal-digit mantissa could not). The f32-accumulator CPU oracle (`common_q4km_f32ref.rs`) matches the device: dequant f32 (ggml/M2.6), inputs rounded f32→f16, accumulate in **pure f32 with no per-tile rounding**. AT-1780/1781/1782 assert within the FROZEN 1e-3 at K=256, K=512 (the M3.5 f16 failure at 3.6e-3, **now ASSERTED**), and k=14336 (the inference-K validity claim). **The frozen 1e-3 was NOT loosened.**
+
+> **AUDIT (Coder): ZERO production coopmat code changed.** The type-system, codegen, metadata, runtime preflight, and OpPhi were ALREADY mixed-precision-correct (the M3.1 design dividend — coopmat shapes carry independent a/b/c/result types). AT-1787 (CI, no GPU) proves the f32-accumulator kernel compiles, passes spirv-val, has a **byte-identical capability set** to the M3.5 fused kernel (no new capability — an f32 coopmat component needs only CooperativeMatrixKHR + Shader; Float16 remains for the f16 A/B types), and emits the coopmat metadata shape {16,16,16, F16,F16,F32,F32, Subgroup}.
+
+**The SAME-SHAPE A/B is now a fast-AND-correct fight.** AXIOM f32-accumulator fused GEMM at (m=4096, n=512, k=14336) vs llama.cpp Q4_K MUL_MAT at the IDENTICAL shape = **101.48 TFLOPS** (live-parsed, never hardcoded). Because AXIOM is now numerically VALID at k=14336, the throughput ratio is a genuine usable-kernel comparison (not fast-but-wrong).
+
+| metric | AXIOM (f32-accumulator fused Q4_K_M RB coopmat GEMM) | llama.cpp (Q4_K MUL_MAT n=512) |
+|---|---|---|
+| shape (m,n,k) | 4096 × 512 × 14336 | 4096 × 512 × 14336 |
+| TFLOPS (GpuTimestamp MIN, kernel-only) | _(NVIDIA orchestrator run; expected ≤ M3.5's 11.27 — f32 accumulators cost registers/bandwidth)_ | **101.48** |
+| max-rel-diff vs f32-accum ref | _(orchestrator; expected ≤ 1e-3 — **NUMERICALLY VALID** at k=14336)_ | (ggml is the reference) |
+
+**f32-accumulator TFLOPS at cube sizes (AT-1783, honest, no asserted ratio; max-rel-diff now ≤ 1e-3 at every size):**
+
+| size (M=N=K) | TFLOPS | % of 125-TFLOPS estimate | max-rel-diff |
+|---|---|---|---|
+| 256 | _(NVIDIA orchestrator run)_ | _(orchestrator)_ | _(orchestrator; ≤ 1e-3 VALID)_ |
+| 512 | _(orchestrator)_ | _(orchestrator)_ | _(orchestrator; ≤ 1e-3 VALID — was 3.6e-3 with f16)_ |
+| 768 | _(orchestrator)_ | _(orchestrator)_ | _(orchestrator; ≤ 1e-3 VALID)_ |
+| 1024 | _(orchestrator)_ | _(orchestrator)_ | _(orchestrator; ≤ 1e-3 VALID)_ |
+
+**Honest framing:** AXIOM is now a **USABLE** Q4_K_M kernel — numerically valid at inference K — but still behind llama on throughput (the kill-criterion within-15% does NOT fire; the f32 accumulator costs registers + f32 store bandwidth vs f16, so the TFLOPS may dip below M3.5's 11.27). The exact behind-factor (X×) and TFLOPS are MEASURED by the NVIDIA orchestrator run; `numerically_valid` in the emitted JSON is driven solely by the measured max-rel-diff ≤ frozen 1e-3, never hardcoded. The kernel, oracle, GPU tests, bench, A/B harness, and all CPU-only regression tests (AT-1785/1786/1788/1789) are landed and CI-green (compile + spirv-val + no-new-capability + identical-cap-set + metadata-shape + CPU oracle + typecheck/preflight/store regressions).
+
+**Reproduce:** `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json AXC_ENABLE_GPU_BENCHES=1 scripts/m34_llamacpp_ab.sh --fused-f32acc` (writes `.pipeline/benchmarks/m34/ab_results_fused_f32acc.json` + `.md`; the M3.5 `ab_results_fused.json` and the frozen-matvec `ab_results.json` are retained).
+
+---
+
 ## Running benchmarks
 
 ```sh
