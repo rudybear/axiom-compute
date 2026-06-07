@@ -172,6 +172,25 @@ M3.6 caches the per-superblock Q4_K_M dequant scales. The M3.5b fused kernel rec
 
 ---
 
+## M3.7 — double-buffered shared staging (HONEST NEGATIVE: ~3% regression, NOT merged as leader)
+
+M3.7 tested the classic GEMM latency-hiding optimization — **software-pipelined double buffering**: parity-indexed `shared[f16,1024]` (2×512) A/B buffers, a prologue staging buffer 0, and a single flat K-loop computing `buffer[k%2]` while prefetching `buffer[(k+1)%2]` from global, so the coopmat tensor cores would not stall on the next tile's global loads. Hypothesis: the M3.6→llama residual (2.39×) was exposed global-load latency.
+
+> **RESULT: HONEST NEGATIVE — double-buffering REGRESSES this kernel ~3%.** Measured on NVIDIA RTX PRO 6000: the double-buffered kernel is **BIT-IDENTICAL** to M3.6 (AT-1903, `n_diff=0` at K=256/512/14336 + K=16 degenerate — the 2-barrier ping-pong is provably race-free, confirmed by a formal emitted-SPIR-V barrier trace AND runtime bit-identity), but **SLOWER at every size**: A/B (m=4096,n=512,k=14336) **41.64 TFLOPS vs M3.6's 42.86 → 0.97×** (exit gate ≥1.15×/≥49.3 TFLOPS MISSED); 768³ 13.0 vs 13.84 (0.94×); 256/512/1024 likewise. **The kernel is NOT global-load-latency-bound** — so there was no latency to hide, and the doubled shared footprint (6144 vs M3.6's 4096 bytes/workgroup) cut SM occupancy, a net loss (same mechanism as M3.3d's multi-subgroup negative). **M3.6 cached (42.86 TFLOPS, 2.39× behind llama) remains the production leader.**
+
+| metric | M3.6 cached (LEADER) | M3.7 double-buffered |
+|---|---|---|
+| A/B TFLOPS (GpuTimestamp MIN) | **42.86** | 41.64 (0.97×) |
+| 768³ TFLOPS | 13.84 | 13.0 (0.94×) |
+| shared bytes / workgroup | 4096 | 6144 |
+| combined max-rel-diff @ k=14336 | 2.05e-6 VALID | 2.05e-6 VALID (bit-identical) |
+
+**Why it's merged anyway (as a documented experiment, NOT the leader):** (1) it proves AXIOM can express software-pipelined double-buffering **correctly** from one annotated source — a non-trivial expressiveness result (parity-indexed shared, prologue/steady-state/epilogue, 2-barrier ping-pong, all pure-source, no new codegen); (2) the negative is scientifically informative — it **rules out latency-hiding** and points the next optimization at occupancy/compute (smaller shared footprint, larger register tiles, or async-copy that doesn't double shared), not staging latency; (3) honest-negatives are recorded, not hidden (M3.3d precedent). The kernel/tests/bench are labeled non-leader. No spin: the gate was MISSED, the kernel is slower, and that is reported as-is.
+
+**Reproduce:** `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json AXC_ENABLE_GPU_BENCHES=1 cargo bench -p axc-driver --bench resident_q4km_matmul_rb_f32acc_db` (prints the ≥1.15× gate verdict + shared_memory_bytes; AT-1903 bit-identity via `cargo test -p axc-driver --test dispatch_q4km_f32acc_db_equiv -- --ignored`).
+
+---
+
 ## Running benchmarks
 
 ```sh

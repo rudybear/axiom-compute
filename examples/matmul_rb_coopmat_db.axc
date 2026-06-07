@@ -1,0 +1,173 @@
+// examples/matmul_rb_coopmat_db.axc
+//
+// M3.7 (OPTIONAL, secondary): DOUBLE-BUFFERED (software-pipelined) variant of the M3.3c plain
+// register-blocked coopmat matmul (examples/matmul_rb_coopmat.axc). NO dequant, NO scale cache —
+// this isolates the PURE matmul-core latency-overlap effect from the Q4_K_M dequant front-end.
+//
+// MECHANISM (PURE SOURCE REWRITE — prefetch-next, single FLAT K-loop, parity-indexed shared):
+//   The A/B staging tiles become parity-indexed `shared[f16,1024]` (= 2*512); buffer p occupies
+//   [p*512, p*512+512). cur_off = (k_block%2)*512 (computed this iteration); nxt_off =
+//   ((k_block+1)%2)*512 (prefetched this iteration). The parity folds into the coopmat_load
+//   element_offset (a runtime u32 the typechecker already accepts).
+//
+//   PROLOGUE (top-level, conditional_depth==0): stage buffer 0 (k_block=0) -> ONE barrier. (Unlike
+//   the fused kernel, there is no cross-lane scale-cache fill, so the prologue needs only the
+//   post-staging barrier that makes buffer 0 visible before the loop's first coopmat-load.)
+//
+//   SINGLE FLAT K-loop (the EXACT M3.3c structure — single-level OpPhi 4-accumulator carry),
+//   body order (all blocks at conditional_depth==0, NONE inside any if):
+//     (1) B1 — workgroup_barrier(), UNCONDITIONAL top level: the BUFFER WAR. By ping-pong,
+//         iteration k+1's STAGE writes nxt=(k+2)%2=k%2 = the SAME slab buf[k] that iteration k's
+//         coopmat-load read in the IMMEDIATELY PRECEDING iteration; B1 of iteration k+1 sits
+//         between them. (B1 of iteration 0 is redundant-but-correct after the prologue barrier.)
+//     (2) STAGE / prefetch buffer nxt for k_block kn=k_block+1, with `if kn < num_k_blocks`
+//         guarding ONLY the global-read index/address expressions (NOT a barrier, NOT the acc).
+//     (3) B2 — workgroup_barrier(), UNCONDITIONAL top level: STAGE write -> next-iter
+//         coopmat-load read RAW.
+//     (4) coopmat-load buf[cur_off] (A/B) + 4 coopmat_mul_add into acc_00..acc_11, reassigned
+//         UNCONDITIONALLY at the top level (single-level OpPhi carry, VERBATIM M3.3c).
+//
+//   EPILOGUE: EMPTY — the last buffer is COMPUTED on the final iteration; the guard suppresses
+//   ONLY that iteration's prefetch. Degenerate num_k_blocks==1: prologue stages buffer 0, the
+//   single iteration computes it, the guard skips the prefetch.
+//
+// CORRECTNESS: double-buffering is PURE SCHEDULING (same coopmat tile order, same accumulation
+//   order), so the output is BIT-EXACT to M3.3c matmul_rb_coopmat.axc (AT-1907, max_diff==0 on the
+//   AT-1731 integer-exact fixture). 2 unconditional steady-state barriers + 1 prologue barrier.
+//
+// CAPABILITIES: IDENTICAL to matmul_rb_coopmat.axc — parity-indexed shared + the larger
+//   shared[f16,1024] add NO capability. shared_memory_bytes = (1024+1024)*2 = 4096 bytes.
+//
+// Anti-pattern #2: explicit `return;`.  Anti-pattern #8: no `>>`; % via x - (x/d)*d.
+
+@kernel
+@workgroup(32, 1, 1)
+@cooperative_matrix
+@strategy { rb_m: ?[2], rb_n: ?[2], tile_k: ?[16], a_block_size_db: ?[1024], b_block_size_db: ?[1024] }
+@intent("double-buffered software-pipelined register-blocked 2x2 coopmat f16 matmul (AT-1907)")
+@complexity(O(n))
+fn matmul_rb_coopmat_db(
+    A: readonly_buffer[f16],
+    B: readonly_buffer[f16],
+    C: buffer[f16],
+    M: u32,
+    N: u32,
+    K: u32
+) -> void {
+    // DOUBLE-buffered staging tiles: 2*512 = 1024 f16 each. Buffer p occupies [p*512, p*512+512).
+    shared a_tile: shared[f16, ?a_block_size_db];
+    shared b_tile: shared[f16, ?b_block_size_db];
+
+    // Block coordinates (ASYMMETRIC, identical to M3.3c).
+    let block_col: u32 = gid(0u32) / 32u32;
+    let block_row: u32 = gid(1u32);
+
+    let lane: u32 = subgroup_invocation_id();
+
+    let tile_row_0: u32 = block_row * 2u32;
+    let tile_row_1: u32 = block_row * 2u32 + 1u32;
+    let tile_col_0: u32 = block_col * 2u32;
+    let tile_col_1: u32 = block_col * 2u32 + 1u32;
+
+    // Staging iterations per thread (per 512-element slab: 512/32 = 16).
+    let a_iters: u32 = (?a_block_size_db / 2u32) / 32u32;
+    let b_iters: u32 = (?b_block_size_db / 2u32) / 32u32;
+
+    let num_k_blocks: u32 = K / ?tile_k;
+
+    // ── PROLOGUE — stage buffer 0 (k_block=0) -> ONE barrier ──────────────────────────────
+    for a_iter_p in range(0u32, a_iters) {
+        let ei_a_p: u32 = a_iter_p * 32u32 + lane;     // 0..511 (slab 0)
+        let a_row_p: u32 = ei_a_p / 16u32;
+        let a_col_p: u32 = ei_a_p - a_row_p * 16u32;
+        let a_global_row_p: u32 = block_row * 32u32 + a_row_p;
+        let a_global_col_p: u32 = 0u32 * ?tile_k + a_col_p;  // k_block 0
+        let a_global_p: u32 = a_global_row_p * K + a_global_col_p;
+        a_tile[ei_a_p] = A[a_global_p];
+    }
+    for b_iter_p in range(0u32, b_iters) {
+        let ei_b_p: u32 = b_iter_p * 32u32 + lane;     // 0..511 (slab 0)
+        let b_row_p: u32 = ei_b_p / 32u32;
+        let b_col_p: u32 = ei_b_p - b_row_p * 32u32;
+        let b_global_row_p: u32 = 0u32 * ?tile_k + b_row_p;  // k_block 0
+        let b_global_col_p: u32 = block_col * 32u32 + b_col_p;
+        let b_global_p: u32 = b_global_row_p * N + b_global_col_p;
+        b_tile[ei_b_p] = B[b_global_p];
+    }
+    // PROLOGUE barrier: buffer 0's staging complete & visible before the loop's first coopmat-load.
+    workgroup_barrier();
+
+    // 4 loop-carried coopmat accumulators — coopmat_zero BEFORE the loop (single-level OpPhi carry).
+    let mut acc_00: matrix[f16, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_01: matrix[f16, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_10: matrix[f16, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_11: matrix[f16, 16, 16, accumulator] = coopmat_zero();
+
+    // ── Single FLAT K-loop: compute buf[k%2] while PREFETCHING buf[(k+1)%2] ───────────────
+    for k_block in range(0u32, num_k_blocks) {
+        let cur_par: u32 = k_block - (k_block / 2u32) * 2u32;
+        let cur_off: u32 = cur_par * 512u32;
+        let kn: u32 = k_block + 1u32;
+        let nxt_par: u32 = kn - (kn / 2u32) * 2u32;
+        let nxt_off: u32 = nxt_par * 512u32;
+
+        // ── (1) B1 — UNCONDITIONAL, TOP LEVEL: the buffer WAR ──────────────────────────────
+        workgroup_barrier();
+
+        // ── (2) STAGE / prefetch buffer nxt for k_block kn = k_block+1 ──────────────────────
+        for a_iter in range(0u32, a_iters) {
+            let ei_a: u32 = a_iter * 32u32 + lane;     // 0..511 within the slab
+            let a_row: u32 = ei_a / 16u32;
+            let a_col: u32 = ei_a - a_row * 16u32;
+            let a_global_row: u32 = block_row * 32u32 + a_row;
+            // Default safe (in-bounds) global col for the guarded path.
+            let mut a_global_col: u32 = a_col;         // k_block 0 fallback (in-bounds)
+            if kn < num_k_blocks {
+                a_global_col = kn * ?tile_k + a_col;
+            }
+            let a_global: u32 = a_global_row * K + a_global_col;
+            a_tile[nxt_off + ei_a] = A[a_global];
+        }
+        for b_iter in range(0u32, b_iters) {
+            let ei_b: u32 = b_iter * 32u32 + lane;     // 0..511 within the slab
+            let b_row: u32 = ei_b / 32u32;
+            let b_col: u32 = ei_b - b_row * 32u32;
+            // Default safe (in-bounds) global row for the guarded path.
+            let mut b_global_row: u32 = b_row;         // k_block 0 fallback (in-bounds)
+            if kn < num_k_blocks {
+                b_global_row = kn * ?tile_k + b_row;
+            }
+            let b_global_col: u32 = block_col * 32u32 + b_col;
+            let b_global: u32 = b_global_row * N + b_global_col;
+            b_tile[nxt_off + ei_b] = B[b_global];
+        }
+
+        // ── (3) B2 — UNCONDITIONAL, TOP LEVEL: staging -> next coopmat-load RAW ─────────────
+        workgroup_barrier();
+
+        // ── (4) coopmat-load buf[cur_off] (A/B) + 4 mul_add ────────────────────────────────
+        let a_mat_0: matrix[f16, 16, 16, a] = coopmat_load(a_tile, cur_off + 0u32, 16u32);
+        let a_mat_1: matrix[f16, 16, 16, a] = coopmat_load(a_tile, cur_off + 256u32, 16u32);
+
+        let b_mat_0: matrix[f16, 16, 16, b] = coopmat_load(b_tile, cur_off + 0u32, 32u32);
+        let b_mat_1: matrix[f16, 16, 16, b] = coopmat_load(b_tile, cur_off + 16u32, 32u32);
+
+        acc_00 = coopmat_mul_add(a_mat_0, b_mat_0, acc_00);
+        acc_01 = coopmat_mul_add(a_mat_0, b_mat_1, acc_01);
+        acc_10 = coopmat_mul_add(a_mat_1, b_mat_0, acc_10);
+        acc_11 = coopmat_mul_add(a_mat_1, b_mat_1, acc_11);
+    }
+
+    // ── Store the 4 accumulated tiles to C — VERBATIM M3.3c ────────────────────────────────
+    let c_base_00: u32 = (tile_row_0 * 16u32) * N + (tile_col_0 * 16u32);
+    let c_base_01: u32 = (tile_row_0 * 16u32) * N + (tile_col_1 * 16u32);
+    let c_base_10: u32 = (tile_row_1 * 16u32) * N + (tile_col_0 * 16u32);
+    let c_base_11: u32 = (tile_row_1 * 16u32) * N + (tile_col_1 * 16u32);
+
+    coopmat_store(acc_00, C, c_base_00, N);
+    coopmat_store(acc_01, C, c_base_01, N);
+    coopmat_store(acc_10, C, c_base_10, N);
+    coopmat_store(acc_11, C, c_base_11, N);
+
+    return;
+}

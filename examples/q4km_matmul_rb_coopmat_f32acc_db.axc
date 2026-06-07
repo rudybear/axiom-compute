@@ -1,0 +1,386 @@
+// examples/q4km_matmul_rb_coopmat_f32acc_db.axc
+//
+// M3.7: DOUBLE-BUFFERED (software-pipelined) shared staging on top of the M3.6 dequant-scale-
+// CACHED f32-accumulator fused register-blocked coopmat matmul
+// (examples/q4km_matmul_rb_coopmat_f32acc_cached.axc).
+//
+// PROBLEM (measured, §3.1.23): M3.6 closed the llama.cpp gap from 9.3x to 2.39x by scale-caching
+// the dequant front-end (42.86 TFLOPS at the A/B shape vs llama 102.49). The dequant is no longer
+// the bottleneck — the residual gap is matmul-CORE efficiency. The M3.6 kernel stages
+// SYNCHRONOUSLY: each k_block (a) stages A/B from global into ONE shared tile set, (b) barrier,
+// (c) coopmat-loads from shared + 4 mul_add, (d) WAR barrier. The tensor cores STALL during the
+// next tile's global loads — global-load latency is fully EXPOSED.
+//
+// MECHANISM (PURE SOURCE REWRITE — prefetch-next, single FLAT K-loop, parity-indexed shared;
+//            NO new builtin/codegen/capability/typecheck change):
+//   The classic GEMM fix: DOUBLE-BUFFERING. Stage k_block N+1's tiles into a SECOND shared buffer
+//   while the tensor cores compute on k_block N's already-staged buffer, overlapping memory
+//   latency with compute.
+//
+//   PARITY-INDEXED DOUBLE BUFFERS: the M3.6 single `shared[f16,512]` A/B tiles become
+//   `shared[f16,1024]` (= 2*512). Buffer p (p in {0,1}) occupies the half-open slab
+//   [p*512, p*512+512). The parity `parity = k_block % 2` (anti-pattern #8: expressed as
+//   k_block - (k_block/2)*2 — EXACTLY M3.6's `% 16` idiom) folds into the coopmat_load
+//   element_offset (typecheck.rs:2777 accepts ANY runtime u32 offset; M3.6 already computes
+//   runtime shared indices). cur_off = (k_block%2)*512 = the buffer this iteration COMPUTES;
+//   nxt_off = ((k_block+1)%2)*512 = the buffer this iteration PREFETCHES. Strict ping-pong.
+//
+//   The scale caches (dsc_cache/dmm_cache, shared[f32,256]) stay SINGLE-buffered (Option-1):
+//   they rotate per-SUPERBLOCK (every 16 k_blocks), NOT per-k_block, so they are NOT the
+//   latency-hidden resource. +2 KB only (not +4 KB).
+//
+// PROLOGUE (BEFORE the K-loop, top-level statements, conditional_depth==0) — TWO barriers:
+//   (1) fill the superblock-0 scale cache (k_block=0 -> sb_idx=0): the SAME cooperative
+//       cross-lane fill body as the loop (lane L writes cache_i = fi*32 + L);
+//   (2) PROLOGUE-B1 workgroup_barrier(): orders the cross-lane fill-WRITE before the A-staging
+//       cache-READ (A-staging by lane L reads cache_idx = a_row*8 + is, entries owned by OTHER
+//       lanes — a REAL cross-lane RAW; mirrors M3.6 line 203);
+//   (3) stage buffer 0's A/B tiles (k_block pinned to 0, buf_off = 0) — the SAME A/B staging
+//       loops as M3.6, reading dsc_cache/dmm_cache for the A dequant;
+//   (4) PROLOGUE-B2 workgroup_barrier(): buffer 0's staging complete & visible before the
+//       loop's first coopmat-load (mirrors M3.6 line 256).
+//   BOTH barriers are top-level, unconditional, NOT inside any if.
+//
+// SINGLE FLAT K-LOOP (the EXACT M3.6 flat structure — single-level OpPhi N-accumulator carry):
+//   The 4 f32 coopmat accumulators are coopmat_zero-initialized BEFORE the loop (after the
+//   prologue) and reassigned UNCONDITIONALLY at the TOP LEVEL of the ONE flat loop, so the
+//   EXISTING single-level OpPhi carry (M3.3c, AT-1731/1733) is PRESERVED VERBATIM. NO nested
+//   coopmat carry. Body order (ALL blocks at conditional_depth==0, NONE inside any if):
+//     (1) CACHE FILL block — `if kn % 16 == 0` (superblock boundary for the PREFETCHED k_block
+//         kn=k_block+1): the cooperative cross-lane fill that writes ONLY dsc_cache/dmm_cache for
+//         superblock kn/16. Writes NOTHING else; the `if` wraps NO barrier.
+//     (2) B1 — workgroup_barrier(), UNCONDITIONAL at the TOP LEVEL. Covers (a) the cache
+//         fill-WRITE -> A-prefetch cache-READ RAW, AND (b) the BUFFER WAR: by ping-pong,
+//         iteration k+1's STAGE writes nxt=(k+2)%2=k%2 = the SAME slab buf[k] that iteration k's
+//         coopmat-load (block 5) read in the IMMEDIATELY PRECEDING iteration; B1 of iteration k+1
+//         sits between them, so the WAR is covered. MUST NOT be relocated after the STAGE.
+//     (3) STAGE / prefetch block — writes buf[nxt_off+ei] for A and b_tile[nxt_off+ei] for B from
+//         global (the M3.6 staging loops with k_block:=kn, buf_off:=nxt_off), READING the scale
+//         cache for the A dequant. The global-read INDEX/ADDRESS expressions are wrapped in
+//         `if kn < num_k_blocks` to avoid OOB on the final iteration (kn==num_k_blocks). This `if`
+//         guards ONLY the global-read index expressions — NOT a barrier, NOT the accumulator.
+//     (4) B2 — workgroup_barrier(), UNCONDITIONAL at the TOP LEVEL. Covers (a) the STAGE
+//         write buf[nxt] -> the NEXT iteration's coopmat-load read of buf[nxt] RAW, AND (b) is
+//         load-bearing for the cross-superblock cache WAR (superblock S's last cache-READ
+//         completes — past THIS iteration's B2 — before sb S+1's fill overwrites the cache).
+//     (5) coopmat-load buf[cur_off] (A/B) + 4 coopmat_mul_add into acc_00..acc_11. The
+//         accumulators are reassigned UNCONDITIONALLY at the TOP LEVEL (single-level OpPhi carry,
+//         VERBATIM M3.6) — NEVER inside any if (incl. the kn<num_k_blocks guard), NEVER nested.
+//
+// EPILOGUE: EMPTY. The last buffer (k_block = num_k_blocks-1) is COMPUTED (block 5) on the final
+//   iteration; the kn<num_k_blocks guard (kn == num_k_blocks, NOT < ) suppresses ONLY that
+//   iteration's prefetch global-reads, never the coopmat compute -> NO under-compute, NO over-read.
+//   DEGENERATE num_k_blocks==1 (K=16): the prologue stages buffer 0; the loop runs ONCE; iteration
+//   k=0 computes buffer 0 (cur_off=0) and the guard (kn=1 not < 1) skips the prefetch entirely.
+//
+// BARRIERS — 2 unconditional per steady-state k_block (TARGET, down from M3.6's 3) + 2 in the
+//   prologue. ALL at conditional_depth==0 (for-range does NOT raise conditional_depth — only
+//   if/else does, typecheck.rs:1338-1355), so they PASS the BarrierInDivergentContext guard
+//   (typecheck.rs:2465; barriers inside ANY if-body are blanket-rejected — the M3.6 r2 failure)
+//   and are strictly non-divergent (every lane reaches every barrier every iteration). The
+//   2-barrier scheme is a TARGET to VERIFY via the cross-kernel bit-identity test (AT-1903) on
+//   real NVIDIA, NOT an assumption: if any non-zero diff appears, the 3rd barrier is added back.
+//
+// NUMERICS — pure SCHEDULING, FROZEN 1e-3 unchanged:
+//   Double-buffering changes ONLY WHEN tiles are staged, not the arithmetic, the coopmat tile
+//   order, or the accumulation order. The per-nibble dequant is the SAME f32 multiply-then-
+//   subtract expression (M3.6 line 240) with dsc/dmm read from the SAME single-buffered cache; the
+//   coopmat_mul_add order and the single-level K-carry are UNCHANGED. So this kernel is
+//   BEHAVIORALLY identical to M3.6: the cross-kernel BIT-IDENTITY anchor (AT-1903,
+//   max|y_db - y_cached| == 0 at K=256/512/14336) is the load-bearing correctness gate AND the
+//   direct missing-barrier-race / parity-slip detector; the combined condition-aware metric stays
+//   <= the FROZEN 1e-3 (AT-1900/1901/1902). The 1e-3 NEVER loosens.
+//
+// SHARED BOUNDS — a_block_size_db / b_block_size_db PINNED at 1024:
+//   1024 = 2*512 (two 512-element parity slabs). The cache index `a_row*8 + is` must stay < 256;
+//   with a 512-element slab, a_row = ei_a/16 (ei_a 0..511) gives row_local in 0..31 (32*8=256
+//   exact). a_block_size_db is a single-value strategy hole (pinned to 1024), so the autotuner
+//   CANNOT break the parity layout. shared_memory_bytes = (1024+1024)*2 tiles + 2*256*4 caches
+//   = 4096 + 2048 = 6144 bytes << device maxComputeSharedMemorySize (>=48 KB on the target).
+//
+// CAPABILITIES: IDENTICAL to q4km_matmul_rb_coopmat_f32acc_cached.axc — parity-indexed shared, a
+//   larger shared[f16,1024] array, a prologue, and a runtime coopmat_load offset add NO capability
+//   beyond the M3.6 set. AT-1906 asserts the byte-identical capability set + the doubled
+//   shared_memory_bytes (6144) + the coopmat metadata shape + the 1024 pin.
+//
+// BENCHMARKED BY: crates/axc-driver/benches/resident_q4km_matmul_rb_f32acc_db.rs (AT-1904/1905).
+// BIT-WITHIN-TOL TESTS: crates/axc-driver/tests/dispatch_q4km_matmul_rb_f32acc_db.rs (AT-1900/1901/1902).
+// CROSS-KERNEL BIT-IDENTITY: crates/axc-driver/tests/dispatch_q4km_f32acc_db_equiv.rs (AT-1903).
+// COMPILE ANCHOR: AT-1906 in compile_shared_examples.rs (CI, no GPU).
+//
+// Anti-pattern #2: explicit `return;`.
+// Anti-pattern #8: no `>>` (use shr/lshr for shifts); % expressed as x - (x/d)*d.
+
+@kernel
+@workgroup(32, 1, 1)
+@cooperative_matrix
+@strategy { rb_m: ?[2], rb_n: ?[2], tile_k: ?[16], a_block_size_db: ?[1024], b_block_size_db: ?[1024] }
+@intent("double-buffered software-pipelined Q4_K_M scale-cached f32-acc 2x2 RB coopmat matmul (AT-1900..1905)")
+@complexity(O(n))
+fn q4km_matmul_rb_coopmat_f32acc_db(
+    q: readonly_buffer[u8],
+    x: readonly_buffer[f16],
+    C: buffer[f32],
+    M: u32,
+    N: u32,
+    K: u32,
+    n_blocks_per_row: u32
+) -> void {
+    // DOUBLE-buffered staging tiles for the 2x2 block: 2*512 = 1024 f16 each (A/B stay f16).
+    // Buffer p occupies [p*512, p*512+512).
+    shared a_tile: shared[f16, ?a_block_size_db];
+    shared b_tile: shared[f16, ?b_block_size_db];
+
+    // Per-superblock dequant-scale caches (SINGLE-buffered, Option-1; 8 sub-blocks x 32 rows = 256).
+    // Indexed row_local*8 + is (row_local 0..31, is 0..7). The 512-element slab bounds it.
+    shared dsc_cache: shared[f32, 256];
+    shared dmm_cache: shared[f32, 256];
+
+    // Block coordinates (ASYMMETRIC, identical to M3.6).
+    let block_col: u32 = gid(0u32) / 32u32;
+    let block_row: u32 = gid(1u32);
+
+    // Lane index within the subgroup for cooperative staging.
+    let lane: u32 = subgroup_invocation_id();
+
+    // Output tile coordinates within the 2x2 block.
+    let tile_row_0: u32 = block_row * 2u32;
+    let tile_row_1: u32 = block_row * 2u32 + 1u32;
+    let tile_col_0: u32 = block_col * 2u32;
+    let tile_col_1: u32 = block_col * 2u32 + 1u32;
+
+    // Staging iterations per thread (per 512-element slab: 512/32 = 16).
+    let a_iters: u32 = (?a_block_size_db / 2u32) / 32u32;
+    let b_iters: u32 = (?b_block_size_db / 2u32) / 32u32;
+
+    // Number of K-blocks.
+    let num_k_blocks: u32 = K / ?tile_k;
+
+    // ── PROLOGUE — fill sb-0 scale cache -> B1 -> stage buffer 0 -> B2 ────────────────────
+    //   All top-level (conditional_depth==0), unconditional, NOT inside any if.
+
+    // (1) Fill the superblock-0 scale cache (sb_idx=0). Cooperative cross-lane fill: cache_i =
+    //     fi*32 + lane (fi 0..7, lane 0..31) covers 0..255 EXACTLY ONCE over 32 lanes.
+    for fi_p in range(0u32, 8u32) {
+        let cache_i: u32 = fi_p * 32u32 + lane;        // 0..255
+        let row_local: u32 = cache_i / 8u32;           // 0..31
+        let is_p: u32 = cache_i - row_local * 8u32;    // 0..7
+        let g_row: u32 = block_row * 32u32 + row_local;
+
+        // Byte offset of superblock 0 in weight-row g_row.
+        let base_p: u32 = g_row * n_blocks_per_row * 144u32 + 0u32 * 144u32;
+        let d_bits_p: u32 = ptr_read_u16_zext(q, base_p);
+        let dmin_bits_p: u32 = ptr_read_u16_zext(q, base_p + 2u32);
+        let d_p: f32 = f16_bits_to_f32(d_bits_p);
+        let dmin_p: f32 = f16_bits_to_f32(dmin_bits_p);
+        let scales_base_p: u32 = base_p + 4u32;
+
+        // Inline get_scale_min_k4 for sub-block is_p (byte-identical to M3.6).
+        let mut sc_p: u32 = 0u32;
+        let mut mm_p: u32 = 0u32;
+        if is_p < 4u32 {
+            sc_p = band(ptr_read_u8_zext(q, scales_base_p + is_p), 63u32);
+            mm_p = band(ptr_read_u8_zext(q, scales_base_p + is_p + 4u32), 63u32);
+        } else {
+            let lo4_sc_p: u32 = band(ptr_read_u8_zext(q, scales_base_p + is_p + 4u32), 0x0Fu32);
+            let hi2_sc_p: u32 = band(lshr(ptr_read_u8_zext(q, scales_base_p + is_p - 4u32), 6u32), 0x03u32);
+            sc_p = bor(lo4_sc_p, shl(hi2_sc_p, 4u32));
+            let lo4_m_p: u32 = band(lshr(ptr_read_u8_zext(q, scales_base_p + is_p + 4u32), 4u32), 0x0Fu32);
+            let hi2_m_p: u32 = band(lshr(ptr_read_u8_zext(q, scales_base_p + is_p), 6u32), 0x03u32);
+            mm_p = bor(lo4_m_p, shl(hi2_m_p, 4u32));
+        }
+
+        dsc_cache[cache_i] = d_p * f32_from_u32(sc_p);
+        dmm_cache[cache_i] = dmin_p * f32_from_u32(mm_p);
+    }
+
+    // (2) PROLOGUE-B1: cross-lane fill-WRITE -> A-staging cache-READ RAW.
+    workgroup_barrier();
+
+    // (3) Stage buffer 0 (k_block=0, buf_off=0): dequant A into a_tile[0..511], copy B into
+    //     b_tile[0..511]. SAME staging math as the steady state with k_block pinned to 0.
+    for a_iter_p in range(0u32, a_iters) {
+        let ei_a_p: u32 = a_iter_p * 32u32 + lane;     // 0..511 (slab 0)
+        let a_row_p: u32 = ei_a_p / 16u32;
+        let a_col_p: u32 = ei_a_p - a_row_p * 16u32;
+        let g_k_p: u32 = 0u32 * ?tile_k + a_col_p;     // k_block 0
+
+        let sb_p2: u32 = g_k_p / 256u32;
+        let wk_p: u32 = g_k_p - sb_p2 * 256u32;
+        let chunk_p: u32 = wk_p / 64u32;
+        let wc_p: u32 = wk_p - chunk_p * 64u32;
+        let l_p: u32 = wc_p - (wc_p / 32u32) * 32u32;
+        let is_hi_p: u32 = wc_p / 32u32;
+        let is_a_p: u32 = chunk_p * 2u32 + is_hi_p;
+
+        let cache_idx_p: u32 = a_row_p * 8u32 + is_a_p;
+        let dsc_p: f32 = dsc_cache[cache_idx_p];
+        let dmm_p: f32 = dmm_cache[cache_idx_p];
+
+        let base_a_p: u32 = (block_row * 32u32 + a_row_p) * n_blocks_per_row * 144u32 + sb_p2 * 144u32;
+        let qs_base_p: u32 = base_a_p + 16u32;
+        let byte_p: u32 = ptr_read_u8_zext(q, qs_base_p + chunk_p * 32u32 + l_p);
+        let mut nib_p: u32 = band(byte_p, 0x0Fu32);
+        if is_hi_p >= 1u32 {
+            nib_p = band(lshr(byte_p, 4u32), 0x0Fu32);
+        }
+
+        let w_p: f16 = f32_to_f16(dsc_p * f32_from_u32(nib_p) - dmm_p);
+        a_tile[ei_a_p] = w_p;
+    }
+    for b_iter_p in range(0u32, b_iters) {
+        let ei_b_p: u32 = b_iter_p * 32u32 + lane;     // 0..511 (slab 0)
+        let b_row_p: u32 = ei_b_p / 32u32;
+        let b_col_p: u32 = ei_b_p - b_row_p * 32u32;
+        let b_global_row_p: u32 = 0u32 * ?tile_k + b_row_p;  // k_block 0
+        let b_global_col_p: u32 = block_col * 32u32 + b_col_p;
+        let b_global_p: u32 = b_global_row_p * N + b_global_col_p;
+        b_tile[ei_b_p] = x[b_global_p];
+    }
+
+    // (4) PROLOGUE-B2: buffer 0's staging complete & visible before the loop's first coopmat-load.
+    workgroup_barrier();
+
+    // 4 loop-carried f32 coopmat accumulators — coopmat_zero BEFORE the loop (after the prologue);
+    // single-level OpPhi K-carry, VERBATIM M3.6.
+    let mut acc_00: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_01: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_10: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_11: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+
+    // ── Single FLAT K-loop: compute buf[k%2] while PREFETCHING buf[(k+1)%2] ───────────────
+    for k_block in range(0u32, num_k_blocks) {
+        // Current buffer (computed this iteration) and next buffer (prefetched this iteration).
+        // parity = k_block % 2 (anti-pattern #8). UNIFORM (k_block is the induction var).
+        let cur_par: u32 = k_block - (k_block / 2u32) * 2u32;
+        let cur_off: u32 = cur_par * 512u32;
+        let kn: u32 = k_block + 1u32;                  // the prefetched k_block
+        let nxt_par: u32 = kn - (kn / 2u32) * 2u32;
+        let nxt_off: u32 = nxt_par * 512u32;
+        // Superblock of the PREFETCHED k_block (the cache to fill/read this iteration).
+        let sb_n: u32 = kn / 16u32;
+
+        // ── (1) CACHE FILL — fires when kn is a superblock boundary (kn % 16 == 0) ─────────
+        //   Fills dsc_cache/dmm_cache for superblock sb_n = kn/16, which the STAGE below reads.
+        //   Writes ONLY the caches; contains NO barrier.
+        if kn - sb_n * 16u32 == 0u32 {
+            for fi in range(0u32, 8u32) {
+                let cache_i: u32 = fi * 32u32 + lane;          // 0..255
+                let row_local: u32 = cache_i / 8u32;           // 0..31
+                let is: u32 = cache_i - row_local * 8u32;      // 0..7
+                let g_row: u32 = block_row * 32u32 + row_local;
+
+                let base: u32 = g_row * n_blocks_per_row * 144u32 + sb_n * 144u32;
+                let d_bits: u32 = ptr_read_u16_zext(q, base);
+                let dmin_bits: u32 = ptr_read_u16_zext(q, base + 2u32);
+                let d: f32 = f16_bits_to_f32(d_bits);
+                let dmin: f32 = f16_bits_to_f32(dmin_bits);
+                let scales_base: u32 = base + 4u32;
+
+                let mut sc: u32 = 0u32;
+                let mut mm: u32 = 0u32;
+                if is < 4u32 {
+                    sc = band(ptr_read_u8_zext(q, scales_base + is), 63u32);
+                    mm = band(ptr_read_u8_zext(q, scales_base + is + 4u32), 63u32);
+                } else {
+                    let lo4_sc: u32 = band(ptr_read_u8_zext(q, scales_base + is + 4u32), 0x0Fu32);
+                    let hi2_sc: u32 = band(lshr(ptr_read_u8_zext(q, scales_base + is - 4u32), 6u32), 0x03u32);
+                    sc = bor(lo4_sc, shl(hi2_sc, 4u32));
+                    let lo4_m: u32 = band(lshr(ptr_read_u8_zext(q, scales_base + is + 4u32), 4u32), 0x0Fu32);
+                    let hi2_m: u32 = band(lshr(ptr_read_u8_zext(q, scales_base + is), 6u32), 0x03u32);
+                    mm = bor(lo4_m, shl(hi2_m, 4u32));
+                }
+
+                dsc_cache[cache_i] = d * f32_from_u32(sc);
+                dmm_cache[cache_i] = dmin * f32_from_u32(mm);
+            }
+        }
+
+        // ── (2) B1 — UNCONDITIONAL, TOP LEVEL: cache fill->read RAW + buffer WAR ────────────
+        workgroup_barrier();
+
+        // ── (3) STAGE / prefetch buffer nxt for k_block kn = k_block+1 ──────────────────────
+        //   Writes a_tile[nxt_off+ei] / b_tile[nxt_off+ei] from global, reading the scale cache
+        //   for the A dequant. The global-read INDEX/ADDRESS expressions are guarded by
+        //   `if kn < num_k_blocks` to avoid OOB on the final iteration; the SHARED writes still
+        //   happen (writing safe in-bounds slab indices) but with clamped global reads.
+        for a_iter in range(0u32, a_iters) {
+            let ei_a: u32 = a_iter * 32u32 + lane;     // 0..511 within the slab
+            let a_row: u32 = ei_a / 16u32;
+            let a_col: u32 = ei_a - a_row * 16u32;
+
+            // Default safe (in-bounds) decode for the guarded path.
+            let mut g_k: u32 = a_col;                  // k_block 0 fallback (in-bounds)
+            if kn < num_k_blocks {
+                g_k = kn * ?tile_k + a_col;
+            }
+
+            let sb: u32 = g_k / 256u32;
+            let wk: u32 = g_k - sb * 256u32;
+            let chunk: u32 = wk / 64u32;
+            let wc: u32 = wk - chunk * 64u32;
+            let l: u32 = wc - (wc / 32u32) * 32u32;
+            let is_hi: u32 = wc / 32u32;
+            let is: u32 = chunk * 2u32 + is_hi;
+
+            // Cache read for (a_row, is) of superblock sb (== sb_n on a fill iteration).
+            let cache_idx: u32 = a_row * 8u32 + is;
+            let dsc: f32 = dsc_cache[cache_idx];
+            let dmm: f32 = dmm_cache[cache_idx];
+
+            let base: u32 = (block_row * 32u32 + a_row) * n_blocks_per_row * 144u32 + sb * 144u32;
+            let qs_base: u32 = base + 16u32;
+            let byte: u32 = ptr_read_u8_zext(q, qs_base + chunk * 32u32 + l);
+            let mut nib: u32 = band(byte, 0x0Fu32);
+            if is_hi >= 1u32 {
+                nib = band(lshr(byte, 4u32), 0x0Fu32);
+            }
+
+            let w: f16 = f32_to_f16(dsc * f32_from_u32(nib) - dmm);
+            a_tile[nxt_off + ei_a] = w;
+        }
+        for b_iter in range(0u32, b_iters) {
+            let ei_b: u32 = b_iter * 32u32 + lane;     // 0..511 within the slab
+            let b_row: u32 = ei_b / 32u32;
+            let b_col: u32 = ei_b - b_row * 32u32;
+
+            // Default safe (in-bounds) global row for the guarded path.
+            let mut b_global_row: u32 = b_row;         // k_block 0 fallback (in-bounds)
+            if kn < num_k_blocks {
+                b_global_row = kn * ?tile_k + b_row;
+            }
+            let b_global_col: u32 = block_col * 32u32 + b_col;
+            let b_global: u32 = b_global_row * N + b_global_col;
+            b_tile[nxt_off + ei_b] = x[b_global];
+        }
+
+        // ── (4) B2 — UNCONDITIONAL, TOP LEVEL: staging->next-load RAW + cross-sb cache WAR ──
+        workgroup_barrier();
+
+        // ── (5) coopmat-load buf[cur_off] (A/B) + 4 mul_add into f32 accumulators ──────────
+        let a_mat_0: matrix[f16, 16, 16, a] = coopmat_load(a_tile, cur_off + 0u32, 16u32);
+        let a_mat_1: matrix[f16, 16, 16, a] = coopmat_load(a_tile, cur_off + 256u32, 16u32);
+
+        let b_mat_0: matrix[f16, 16, 16, b] = coopmat_load(b_tile, cur_off + 0u32, 32u32);
+        let b_mat_1: matrix[f16, 16, 16, b] = coopmat_load(b_tile, cur_off + 16u32, 32u32);
+
+        // Accumulators reassigned UNCONDITIONALLY at the top level (single-level OpPhi, VERBATIM).
+        acc_00 = coopmat_mul_add(a_mat_0, b_mat_0, acc_00);
+        acc_01 = coopmat_mul_add(a_mat_0, b_mat_1, acc_01);
+        acc_10 = coopmat_mul_add(a_mat_1, b_mat_0, acc_10);
+        acc_11 = coopmat_mul_add(a_mat_1, b_mat_1, acc_11);
+    }
+
+    // ── Store the 4 accumulated f32 tiles to C (buffer[f32]) — VERBATIM M3.6 ────────────────
+    let c_base_00: u32 = (tile_row_0 * 16u32) * N + (tile_col_0 * 16u32);
+    let c_base_01: u32 = (tile_row_0 * 16u32) * N + (tile_col_1 * 16u32);
+    let c_base_10: u32 = (tile_row_1 * 16u32) * N + (tile_col_0 * 16u32);
+    let c_base_11: u32 = (tile_row_1 * 16u32) * N + (tile_col_1 * 16u32);
+
+    coopmat_store(acc_00, C, c_base_00, N);
+    coopmat_store(acc_01, C, c_base_01, N);
+    coopmat_store(acc_10, C, c_base_10, N);
+    coopmat_store(acc_11, C, c_base_11, N);
+
+    return;
+}
