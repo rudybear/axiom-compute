@@ -222,7 +222,6 @@ pub struct VulkanContext {
     in_mem_kernel_cache: Mutex<BTreeMap<KernelCacheKey, Weak<KernelHandleInner>>>,
     /// Fence timeout in milliseconds, resolved at context creation time.
     /// Stored for use in `dispatch_handle`; shadowed by env var if set after context init.
-    #[allow(dead_code)]
     fence_timeout_ms: u64,
     // ── M3.0 fields ───────────────────────────────────────────────────────────
     /// Optional dedicated transfer queue + command pool (DedicatedTransfer mode).
@@ -1162,6 +1161,90 @@ impl VulkanContext {
                 .map_err(|e| DispatchError::QueueSubmitFailed(format!("device_wait_idle drain: {e}")))?;
         }
         Ok(())
+    }
+
+    /// M4.1p3 (R2): like [`drain_external_timeline`], but with an EXPLICIT per-call
+    /// timeout override. `timeout_ms = None` falls back to the context `fence_timeout_ms`.
+    ///
+    /// The op's owned-output completion barrier + the error/teardown path use this so a
+    /// stuck cross-API handshake surfaces as a `FenceTimeout` (mapped to a Python
+    /// `AxiomError`) within a caller-chosen bound instead of an unbounded hang. The
+    /// happy-path `dispatch_zero_copy` submit is UNCHANGED (still fence-null).
+    pub fn drain_external_timeline_with_timeout(
+        &self,
+        bufs: &crate::external_memory::SharedBufferSet,
+        value: u64,
+        timeout_ms: Option<u64>,
+    ) -> Result<(), DispatchError> {
+        let device: &ash::Device = &self.device_owner.device;
+        if let Some(ts) = bufs.timeline.as_ref() {
+            let sems = [ts.semaphore];
+            let vals = [value];
+            let wait_info = vk::SemaphoreWaitInfo::default()
+                .semaphores(&sems)
+                .values(&vals);
+            let timeout_ms = timeout_ms.unwrap_or(self.fence_timeout_ms);
+            let timeout_ns: u64 = timeout_ms.saturating_mul(1_000_000);
+            // SAFETY: timeline semaphore is valid; wait_info is well-formed.
+            unsafe { device.wait_semaphores(&wait_info, timeout_ns) }
+                .map_err(|e| DispatchError::FenceTimeout {
+                    timeout_ns: { let _ = e; timeout_ns },
+                })?;
+        } else {
+            // Binary fallback: no host-waitable counter; the timeout is advisory — drain
+            // all queues (device_wait_idle is itself bounded only by the driver). The
+            // single-value host-signal release (R2) has no binary-pair analogue, so this
+            // path stays the Phase-1 behavior (flagged for M4.2 cross-vendor).
+            // SAFETY: idle-wait drains all queues on the binary-fallback path.
+            unsafe { device.device_wait_idle() }
+                .map_err(|e| DispatchError::QueueSubmitFailed(format!("device_wait_idle drain: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// M4.1p3 (R2): HOST-signal the shared external TIMELINE semaphore to `value`.
+    ///
+    /// Performs `vkSignalSemaphore(VkSemaphoreSignalInfo{ semaphore=external_timeline,
+    /// value })` on the HOST (independent of any queue submit). Because this is the SAME
+    /// timeline semaphore CUDA imported, advancing its payload to `value` SATISFIES a
+    /// dangling `cudaWaitExternalSemaphoresAsync(value)` enqueued on the CUDA stream — so
+    /// after a GPU-fault-mid-dispatch (V1 signaled, the kernel never signaled V2) the op
+    /// can RELEASE the parked CUDA wait(V2) and unblock the poisoned stream.
+    ///
+    /// MUST be at-most-once per `(set, value)` and strictly MONOTONE: a host timeline
+    /// signal to a value not greater than the current payload is illegal. The Python op
+    /// guards this (`release_cuda_wait` is fired once before poison; teardown never
+    /// re-signals). Returns a clear error on the binary-fallback path (no single-value
+    /// host-signal release exists for a binary-semaphore pair — an M4.2 cross-vendor gap).
+    pub fn host_signal_external_timeline(
+        &self,
+        bufs: &crate::external_memory::SharedBufferSet,
+        value: u64,
+    ) -> Result<(), DispatchError> {
+        let device: &ash::Device = &self.device_owner.device;
+        match bufs.timeline.as_ref() {
+            Some(ts) => {
+                let signal_info = vk::SemaphoreSignalInfo::default()
+                    .semaphore(ts.semaphore)
+                    .value(value);
+                // SAFETY: timeline semaphore is valid; signal_info is well-formed. A host
+                // signal is independent of queue/GPU state — it succeeds even when the
+                // GPU work that should have signaled `value` faulted (the recovery case).
+                unsafe { device.signal_semaphore(&signal_info) }
+                    .map_err(|e| DispatchError::QueueSubmitFailed(format!(
+                        "host_signal_external_timeline(value={value}): {e}"
+                    )))
+            }
+            None => Err(DispatchError::ExternalSemaphoreUnsupported(
+                "host_signal_external_timeline requires the external TIMELINE path \
+                 (no single-value host-signal release for a binary semaphore pair)".to_owned(),
+            )),
+        }
+    }
+
+    /// M4.1p3: the resolved fence timeout (ms) — the default bound for `wait_completion`.
+    pub fn fence_timeout_ms(&self) -> u64 {
+        self.fence_timeout_ms
     }
 
     /// FIX-2 HARD FALLBACK: block until the device is provably idle (`vkDeviceWaitIdle`).

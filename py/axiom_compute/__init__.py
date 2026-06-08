@@ -257,6 +257,9 @@ class SharedSession:
         self._bufs = bufs
         self._closed = False
         self._last_signal = 0
+        # M4.1p3 (R2): poison + at-most-once host-signal-release bookkeeping.
+        self._poisoned = False
+        self._released_value = 0  # the timeline value already host-signaled (monotone guard)
 
         sizes = bufs.sizes()
         dedicated = bufs.dedicated()
@@ -352,6 +355,67 @@ class SharedSession:
 
         self._last_signal = v2
         return v2
+
+    # ── M4.1p3 (R2): bounded completion barrier + CUDA-wait release + poison ──────────
+    def wait_completion(self, timeout_ms: Optional[int] = None) -> None:
+        """BOUNDED host wait until the timeline reaches the last signaled V2.
+
+        Used by the registered op as its owned-output completion barrier (before cloning
+        C) and by error recovery — NOT on the zero-overhead :meth:`run` data path (G-5
+        intact). It calls the Rust ``drain_with_timeout`` (already FenceTimeout-returning)
+        with an explicit per-call bound (default: the context's ``AXC_FENCE_TIMEOUT_MS``).
+
+        On the happy path the timeline is already >= V2 so this returns immediately. On a
+        one-sided GPU fault (V1 signaled, V2 never reached) it raises :class:`AxiomError`
+        within the bound (the op's error path then releases + poisons + rebuilds). On the
+        binary fallback there is no host-waitable counter; we fall back to the bounded
+        ``device_wait_idle`` (the Rust drain does so internally).
+        """
+        if self._closed:
+            raise AxiomError("session is closed")
+        try:
+            if self._timeline:
+                self._kernel._compiled.drain_with_timeout(
+                    self._bufs, self._last_signal, timeout_ms
+                )
+            else:
+                # No host-waitable counter on the binary pair; bound via device_wait_idle.
+                self._kernel._compiled.device_wait_idle()
+        except Exception as e:
+            raise AxiomError(
+                f"wait_completion: the cross-API handshake did not complete within "
+                f"{'AXC_FENCE_TIMEOUT_MS' if timeout_ms is None else f'{timeout_ms} ms'} "
+                f"(a one-sided GPU fault may have stalled the wait); raise "
+                f"AXC_FENCE_TIMEOUT_MS for a legitimately long kernel. Underlying: {e}"
+            ) from e
+
+    def release_cuda_wait(self, value: int) -> None:
+        """R2: HOST-signal the shared Vulkan timeline to ``value`` (== V2) so a dangling
+        ``cudaWaitExternalSemaphoresAsync(value)`` enqueued on stream S is SATISFIED and S
+        unblocks (the both-sides release after a GPU-fault-mid-dispatch).
+
+        AT-MOST-ONCE per (session, value) and strictly MONOTONE (WATCH-ITEM 1): a host
+        timeline signal to a value not greater than the current payload is illegal. We
+        guard with ``self._released_value`` so the poison/teardown path NEVER re-signals a
+        value already released (or any value <= one already released). A no-op on the
+        binary fallback (no single-value host-signal release exists there).
+        """
+        value = int(value)
+        if not self._timeline:
+            return  # no single-value host-signal release for the binary pair (M4.2)
+        if value <= self._released_value:
+            return  # already released at >= this value; re-signalling would be non-monotone
+        self._kernel._compiled.host_signal_timeline(self._bufs, value)
+        self._released_value = value
+
+    def poison(self) -> None:
+        """R2: mark the session UNUSABLE so the op cache evicts + rebuilds it on the next
+        call (a faulted session + its stream S are NEVER reused for a new dispatch)."""
+        self._poisoned = True
+
+    @property
+    def is_poisoned(self) -> bool:
+        return self._poisoned
 
     def staging_buffers_allocated(self) -> int:
         """AT-2109 (G-2): MUST be 0 — no staging buffer on the zero-copy path."""
@@ -449,6 +513,23 @@ from .q4km import (  # noqa: E402
     Q4KM_SUPERBLOCK_BYTES,
 )
 
+# M4.1p3: the torch.library custom-op surface. Importing ops registers helpers; calling
+# register_q4km_op() defines torch.ops.axiom.q4km_matmul. Both are guarded so the package
+# still imports WITHOUT torch present (the op only materializes when torch is available).
+from .ops import (  # noqa: E402
+    AXIOM_OP_NAMESPACE,
+    Q4KM_OP_NAME,
+    register_q4km_op,
+    q4km_register_weights,
+    q4km_release_weights,
+    q4km_activation_view,
+    last_dispatch_path,
+    last_dispatch_staging,
+)
+
+# Define torch.ops.axiom.q4km_matmul at import (no-op if torch is absent).
+register_q4km_op()
+
 __all__ = [
     "compile_kernel",
     "cuda_device_uuid",
@@ -464,4 +545,13 @@ __all__ = [
     "q4km_combined_metric",
     "q4km_raw_rel_diff",
     "Q4KM_SUPERBLOCK_BYTES",
+    # M4.1p3 torch.library custom-op surface.
+    "AXIOM_OP_NAMESPACE",
+    "Q4KM_OP_NAME",
+    "register_q4km_op",
+    "q4km_register_weights",
+    "q4km_release_weights",
+    "q4km_activation_view",
+    "last_dispatch_path",
+    "last_dispatch_staging",
 ]
