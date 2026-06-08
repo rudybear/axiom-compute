@@ -1,0 +1,51 @@
+{
+  "verdict": "IMPLEMENTED",
+  "agent": "coder",
+  "milestone_id": "M3.2c-exp",
+  "branch": "coder/M32cexp-20260608/M3.2c-exp-builtin",
+  "summary": "Implemented a real exp(x: f32) -> f32 builtin lowering to the SPIR-V GLSL.std.450 extended instruction Exp (=27) — the FIRST OpExtInstImport \"GLSL.std.450\" + OpExtInst ever emitted by the codegen. Modeled VERBATIM on the M3.5 f32_to_f16 unary builtin precedent across HIR/typecheck/codegen. The GLSL.std.450 import is emitted ONCE per module via a cached set-id (the load-bearing codegen-correctness point). NO new SPIR-V capability. Removes the M3.2b FlashAttention-2 Taylor near-uniform limitation: real-range LLM attention (post-max logit spreads -10..0) is now numerically correct.",
+  "files_created": [
+    "crates/axc-hir/src/ext_inst.rs",
+    "crates/axc-codegen/src/ext_inst.rs",
+    "examples/flash_attention_exp.axc"
+  ],
+  "files_modified": [
+    "crates/axc-hir/src/lib.rs",
+    "crates/axc-hir/src/expr.rs",
+    "crates/axc-hir/src/typecheck.rs",
+    "crates/axc-hir/src/lower.rs",
+    "crates/axc-codegen/src/lib.rs",
+    "crates/axc-codegen/src/body.rs",
+    "crates/axc-codegen/src/emit.rs",
+    "crates/axc-driver/tests/dispatch_shared_m32.rs",
+    "crates/axc-driver/tests/compile_shared_examples.rs",
+    "DESIGN.md"
+  ],
+  "implementation_notes": {
+    "hir": "New ExtInstBuiltin::Exp (source_name \"exp\", arity 1, return_ty F32, glsl450_opcode 27) + RESERVED_EXT_INST_BUILTIN_NAMES/is_reserved_ext_inst_builtin. New HirExprKind::ExtInstBuiltin { op, args } alongside Q4_0Builtin. Module wired in lib.rs + re-exported.",
+    "typecheck": "check_ext_inst_call (modeled on the F32ToF16 arm) dispatched FIRST in check_call before q4_0/coopmat/subgroup. New ExpArgMustBeF32 + ExtInstBuiltinWrongArity + ReservedExtInstBuiltinName errors. Reserved-name guard extended so `let exp` is rejected. find_mul_add_in_expr recurses into the new arm (exhaustiveness).",
+    "codegen": "emit_exp(b, tc, glsl450_set, x_id) -> OpExtInst %f32 %set 27 %x via ext_inst(f32_ty, None, set, 27, [Operand::IdRef(x_id)]). ScalarTypeCache gains glsl450_set_id: Option<Word> + get_or_emit_glsl450_set lazy accessor (the proven u32_const_cache Option pattern — emit import once, cache, reuse). emit_exp takes NO &mut CapabilitiesRequired. emit_expr ExtInstBuiltin arm emits the arg first, fetches the cached set, then emits OpExtInst. Four emit.rs expr-scan predicates (gid/local-invocation-id/subgroup/coopmat) gained recursing ExtInstBuiltin arms for exhaustiveness."
+  },
+  "measured_results_nvidia_rtx_pro_6000": {
+    "at_1820_1821_exp_vs_f32_exp_max_rel_diff": "7.089933e-7 (at x=-13.7), max_abs=1.53e-5, over x in [-30,5] step 0.1 (incl x<-5 where Taylor failed) — FROZEN 1e-3, PASS",
+    "at_1822_import_once": "PASS — exactly ONE OpExtInstImport \"GLSL.std.450\" and >=2 OpExtInst ... 27 all referencing the one set-id, on a 2-exp kernel, scanned on RAW codegen (no spirv-opt in default pipeline)",
+    "at_1823_spirv_val_no_new_capability": "PASS — spirv-val clean on flash_attention_exp + exp_micro; capability/extension signature BYTE-IDENTICAL to M3.2b Taylor flash_attention.axc; Taylor kernel emits ZERO OpExtInstImport (lazy cache stays None)",
+    "at_1824_flash_attention_exp_compiles": "PASS — compile + spirv-val clean anchor",
+    "at_1825_real_range_max_diff": "2.4e-7 (fixture max post-max arg = 11.36) vs fa2_true_exp_softmax_reference — FROZEN 1e-3, PASS — the regime M3.2b Taylor CANNOT do",
+    "at_1826_taylor_negative_control_max_diff": "0.124 (>> 1e-3) — Taylor kernel grossly wrong on the SAME wide fixture, proving the exp builtin (not the fixture) is the fix",
+    "at_1827_no_regression": "PASS — AT-1740/1740b/1741/1743/1744 all green unchanged; full dispatch_shared_m32 GPU suite 17 passed / 0 failed"
+  },
+  "checks": {
+    "cargo_check_workspace": "clean",
+    "cargo_clippy_workspace_all_targets_D_warnings": "clean",
+    "cargo_test_workspace": "931 passed, 0 failed (non-GPU)",
+    "gpu_dispatch_shared_m32_ignored_nvidia": "17 passed, 0 failed"
+  },
+  "frozen_tolerance": "combined abs/rel 1e-3 (abs floor 1e-6 for near-zero exp magnitudes) — NEVER loosened; measured gaps are far under it on NVIDIA.",
+  "deviations": [
+    "AT-1820/1821: implemented as a single GPU-gated test (at1820_exp_vs_std_exp_range) that MEASURES the max rel/abs gap and reports it before gating — AT-1821 (the GPU-run variant) is satisfied by the same #[ignore]+AXC_ENABLE_GPU_TESTS test run on NVIDIA.",
+    "AT-1827: the import-emitted-once-vs-zero structural half is asserted in at1823 (no GPU, deterministic); the full M3.2b GPU no-regression is the existing at1740/1740b/1741/1743/1744 set re-run on NVIDIA (all pass).",
+    "AT-1825 fixture: a monotone score ramp keeps ONLINE per-step post-max args small (streaming-max collapse), so the wide-spread fixture instead places the global max EARLY (row 0) with later rows fanning down to ~-11 with a saw ripple — yielding max online post-max arg = 11.36, genuinely outside the Taylor band, and confirmed wide by an explicit assertion."
+  ],
+  "escalations": []
+}

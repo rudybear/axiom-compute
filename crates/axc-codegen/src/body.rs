@@ -134,6 +134,14 @@ pub struct ScalarTypeCache {
     ///
     /// Uses `BTreeMap` (not `HashMap`) for deterministic iteration order (AT-418).
     u32_const_cache: BTreeMap<u32, Word>,
+    /// Cached `OpExtInstImport "GLSL.std.450"` set-id (M3.2c).
+    ///
+    /// `None` until the first `exp`/ext-inst builtin is emitted. The lazy accessor
+    /// `get_or_emit_glsl450_set` emits the import EXACTLY ONCE per module and
+    /// caches the id; every later ext-inst reuses it. LOAD-BEARING: rspirv's
+    /// `ext_inst_import` does NOT deduplicate, so this Option is what guarantees a
+    /// single `OpExtInstImport` regardless of exp-call count (AT-1822).
+    glsl450_set_id: Option<Word>,
 }
 
 impl ScalarTypeCache {
@@ -186,6 +194,23 @@ impl ScalarTypeCache {
         let u32_ty = self.scalar_id(b, ScalarTy::U32);
         let id = b.constant_bit32(u32_ty, value);
         self.u32_const_cache.insert(value, id);
+        id
+    }
+
+    /// Get or emit the `OpExtInstImport "GLSL.std.450"` set-id (M3.2c).
+    ///
+    /// The FIRST call emits `Builder::ext_inst_import("GLSL.std.450")` (which
+    /// appends to the module's `ext_inst_imports` header section regardless of the
+    /// currently-selected block) and caches the result-id; every later call reuses
+    /// the cached id. This is the load-bearing import-once mechanism — exactly the
+    /// `get_or_emit_u32_const` Option/lazy pattern, single-valued instead of keyed.
+    /// rspirv does NOT dedup imports, so this cache is necessary (AT-1822).
+    pub fn get_or_emit_glsl450_set(&mut self, b: &mut Builder) -> Word {
+        if let Some(id) = self.glsl450_set_id {
+            return id;
+        }
+        let id = b.ext_inst_import("GLSL.std.450");
+        self.glsl450_set_id = Some(id);
         id
     }
 }
@@ -1556,6 +1581,24 @@ fn emit_expr(em: &mut BodyEmitter<'_>, expr: &HirExpr) -> Result<Word, BodyCodeg
                     let v_id = emit_expr(em, &args[0])?;
                     // Sets caps.float16=true internally; Float16 declared by emit.rs gate.
                     q::emit_f32_to_f16(em.b, em.type_cache, em.caps, v_id)
+                }
+            }
+        }
+        // M3.2c: ext-inst (GLSL.std.450) builtin → OpExtInst (import cached once).
+        HirExprKind::ExtInstBuiltin { op, args } => {
+            use axc_hir::ext_inst::ExtInstBuiltin;
+            match op {
+                ExtInstBuiltin::Exp => {
+                    if args.len() != 1 {
+                        return Err(BodyCodegenError::UnexpectedHir(
+                            "exp: expected 1 arg"
+                        ));
+                    }
+                    // Emit the arg FIRST (loaded f32 value), then fetch the cached
+                    // GLSL.std.450 set-id (emitted once), then emit OpExtInst Exp.
+                    let x_id = emit_expr(em, &args[0])?;
+                    let set = em.type_cache.get_or_emit_glsl450_set(em.b);
+                    crate::ext_inst::emit_exp(em.b, em.type_cache, set, x_id)
                 }
             }
         }

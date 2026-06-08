@@ -193,6 +193,18 @@ pub enum HirExprKind {
         /// Buffer-parameter binding slot (0-based); `Some` for ptr_read_* builtins.
         buf_param_index: Option<u32>,
     },
+    /// GLSL.std.450 extended-instruction builtin call (M3.2c).
+    ///
+    /// Covers the transcendental ext-inst builtins lowering to a single
+    /// `OpExtInst %f32 %glsl450_set <opcode> %x`:
+    /// - `exp(x: f32) -> f32`  (GLSL.std.450 Exp = 27)
+    ///
+    /// No `buf_param_index` (scalar arg, not a buffer). The GLSL.std.450
+    /// `OpExtInstImport` is emitted ONCE per module (cached set-id in codegen).
+    ExtInstBuiltin {
+        op: crate::ext_inst::ExtInstBuiltin,
+        args: Vec<HirExpr>,
+    },
     /// Read one element from a workgroup-shared array: `tile[index]` (M3.2).
     ///
     /// `shared_id` is the 0-based index into `KernelBodyTyped.shared`.

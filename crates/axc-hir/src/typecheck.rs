@@ -540,6 +540,31 @@ pub enum TypecheckError {
         span: Span,
     },
 
+    // ── M3.2c ext-inst (GLSL.std.450) builtin typecheck errors ───────────────
+
+    #[error("`exp` requires an `f32` argument; got `{got_ty}`")]
+    ExpArgMustBeF32 {
+        got_ty: &'static str,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("`{name}` builtin expects {expected} argument(s); got {found}")]
+    ExtInstBuiltinWrongArity {
+        name: &'static str,
+        expected: usize,
+        found: usize,
+        #[label("here")]
+        span: Span,
+    },
+
+    #[error("`{name}` is a reserved GLSL.std.450 ext-inst builtin identifier and cannot be used as a variable name")]
+    ReservedExtInstBuiltinName {
+        name: String,
+        #[label("here")]
+        span: Span,
+    },
+
     #[error("f16 literal out of range for bin16 (value {value} overflows to infinity)")]
     F16LiteralOutOfRange {
         value: f64,
@@ -930,6 +955,14 @@ impl<'p> TypeChecker<'p> {
         // M2.5: Q4_0-path builtin names are reserved and cannot be used as variable names.
         if crate::q4_0::is_reserved_q4_0_builtin(name) {
             self.errors.push(TypecheckError::ReservedQ4_0BuiltinName {
+                name: name.to_owned(),
+                span,
+            });
+            return None;
+        }
+        // M3.2c: GLSL.std.450 ext-inst builtin names (e.g. `exp`) are reserved.
+        if crate::ext_inst::is_reserved_ext_inst_builtin(name) {
+            self.errors.push(TypecheckError::ReservedExtInstBuiltinName {
                 name: name.to_owned(),
                 span,
             });
@@ -3194,6 +3227,55 @@ fn check_coopmat_store_stmt(
 /// Typecheck a Q4_0-path builtin expression call.
 ///
 /// Dispatched from `check_call` when the call name is in `RESERVED_Q4_0_BUILTIN_NAMES`.
+/// Typecheck a GLSL.std.450 ext-inst builtin call (M3.2c). Modeled on the
+/// `Q4_0Builtin::F32ToF16` arm: arity-1, arg must typecheck to F32, result F32,
+/// producing `HirExprKind::ExtInstBuiltin`.
+fn check_ext_inst_call(
+    tc: &mut TypeChecker<'_>,
+    op: crate::ext_inst::ExtInstBuiltin,
+    _name_span: Span,
+    args: &[axc_lexer::Spanned<past::Expr>],
+    call_span: Span,
+    _expected: Option<ScalarTy>,
+) -> Option<HirExpr> {
+    use crate::ext_inst::ExtInstBuiltin;
+
+    // Arity check.
+    let expected_arity = op.arity();
+    if args.len() != expected_arity {
+        tc.errors.push(TypecheckError::ExtInstBuiltinWrongArity {
+            name: op.source_name(),
+            expected: expected_arity,
+            found: args.len(),
+            span: call_span,
+        });
+        return None;
+    }
+
+    match op {
+        ExtInstBuiltin::Exp => {
+            // arg0: x — must be f32. Result is f32 (GLSL.std.450 Exp).
+            let x_arg = &args[0];
+            let x_hir = check_expr(tc, &x_arg.node, x_arg.span, Some(ScalarTy::F32))?;
+            if x_hir.ty != ScalarTy::F32 {
+                tc.errors.push(TypecheckError::ExpArgMustBeF32 {
+                    got_ty: x_hir.ty.display_name(),
+                    span: x_arg.span,
+                });
+                return None;
+            }
+            Some(HirExpr {
+                kind: crate::expr::HirExprKind::ExtInstBuiltin {
+                    op,
+                    args: vec![x_hir],
+                },
+                ty: ScalarTy::F32,
+                span: call_span,
+            })
+        }
+    }
+}
+
 fn check_q4_0_call(
     tc: &mut TypeChecker<'_>,
     op: crate::q4_0::Q4_0Builtin,
@@ -3399,6 +3481,13 @@ fn check_call(
     call_span: Span,
     expected: Option<ScalarTy>,
 ) -> Option<HirExpr> {
+    // M3.2c: dispatch GLSL.std.450 ext-inst builtins FIRST (e.g. `exp`), before
+    // q4_0/coopmat/subgroup. `exp` is not a keyword and check_call has no
+    // user-function path, so this cannot be intercepted.
+    if let Some(ei_op) = crate::ext_inst::ExtInstBuiltin::from_source_name(name) {
+        return check_ext_inst_call(tc, ei_op, name_span, args, call_span, expected);
+    }
+
     // M2.5: dispatch Q4_0-path builtins FIRST (before coopmat and subgroup).
     if let Some(q4_op) = crate::q4_0::Q4_0Builtin::from_source_name(name) {
         return check_q4_0_call(tc, q4_op, name_span, args, call_span, expected);
@@ -5591,6 +5680,49 @@ mod tests {
                 e, TypecheckError::F32ToF16ArgMustBeF32 { .. }
             )),
             "AT-1775: expected F32ToF16ArgMustBeF32 for a u32 arg; got: {errors:?}"
+        );
+    }
+
+    // M3.2c: exp builtin typecheck — happy path produces an f32 binding.
+    #[test]
+    fn m32c_exp_happy_returns_f32() {
+        let (body, errors) = tc_body("let x: f32 = -2.0f32; let p: f32 = exp(x); return;");
+        assert!(errors.is_empty(), "M3.2c: exp happy path errors: {errors:?}");
+        let p_binding = body.bindings.iter().find(|b| b.name == "p")
+            .expect("M3.2c: binding `p` must exist");
+        assert_eq!(
+            p_binding.ty, BindingTy::Scalar(ScalarTy::F32),
+            "M3.2c: exp result must be f32"
+        );
+    }
+
+    // M3.2c: exp rejects a non-f32 argument with ExpArgMustBeF32.
+    #[test]
+    fn m32c_exp_rejects_non_f32_arg() {
+        let (_body, errors) = tc_body("let u: u32 = 3u32; let p: f32 = exp(u); return;");
+        assert!(
+            errors.iter().any(|e| matches!(e, TypecheckError::ExpArgMustBeF32 { .. })),
+            "M3.2c: expected ExpArgMustBeF32 for a u32 arg; got: {errors:?}"
+        );
+    }
+
+    // M3.2c: exp with the wrong arity is rejected.
+    #[test]
+    fn m32c_exp_rejects_wrong_arity() {
+        let (_body, errors) = tc_body("let p: f32 = exp(); return;");
+        assert!(
+            errors.iter().any(|e| matches!(e, TypecheckError::ExtInstBuiltinWrongArity { .. })),
+            "M3.2c: expected ExtInstBuiltinWrongArity for 0 args; got: {errors:?}"
+        );
+    }
+
+    // M3.2c: `exp` is a reserved builtin name and cannot be used as a variable.
+    #[test]
+    fn m32c_exp_reserved_name_rejected() {
+        let (_body, errors) = tc_body("let exp: f32 = 1.0f32; return;");
+        assert!(
+            errors.iter().any(|e| matches!(e, TypecheckError::ReservedExtInstBuiltinName { .. })),
+            "M3.2c: expected ReservedExtInstBuiltinName for `let exp`; got: {errors:?}"
         );
     }
 }

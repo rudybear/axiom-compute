@@ -9,6 +9,8 @@ pub mod buffers;
 pub mod subgroup;
 pub mod coopmat;
 pub mod q4_0;
+/// GLSL.std.450 extended-instruction SPIR-V emission (M3.2c — exp).
+pub mod ext_inst;
 /// Workgroup-shared array SPIR-V emission (M3.2).
 pub mod shared;
 
