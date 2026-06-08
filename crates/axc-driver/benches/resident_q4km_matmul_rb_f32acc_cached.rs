@@ -29,9 +29,8 @@
 
 #![allow(dead_code)]
 
-#[allow(clippy::duplicate_mod)]
-#[path = "../tests/common_q4km_f32ref.rs"]
-mod common_q4km_f32ref;
+// M4.1p2: the oracle is now the pub lib module axc_driver::q4km_oracle (single source of truth).
+use axc_driver::q4km_oracle as common_q4km_f32ref;
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use axc_driver::compile_source_with_assignments;

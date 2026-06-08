@@ -92,19 +92,38 @@ def _check_cuda_available():
         raise ZeroCopyUnavailable("torch.cuda is not available — no CUDA device")
 
 
-def compile_kernel(source: str, device=None) -> "Kernel":
+def compile_kernel(source: str, device=None, strategy: Optional[dict] = None) -> "Kernel":
     """Compile a `.axc` source into a zero-copy :class:`Kernel` bound to a CUDA GPU.
 
     FAIL-CLOSED (AT-2107): if torch.cuda is unavailable, the ICD lacks the external-fd
     extensions, or no Vulkan device matches the CUDA device UUID, a
     :class:`ZeroCopyUnavailable` is raised — never a silent host copy.
+
+    M4.1p2: ``strategy`` is an optional ``dict[str, int]`` of strategy-hole assignments. A
+    hole-carrying source (e.g. the M3.6 Q4_K_M kernel) MUST pass all its holes; ``strategy=None``
+    on such a source FAILS at compile (UnresolvedStrategyHole) — the kwarg is load-bearing
+    (AT-2103d). The Phase-1 saxpy path (no holes) passes ``strategy=None`` unchanged.
+
+    A compile error from an unresolved strategy hole is a COMPILE error (raised here as
+    :class:`AxiomError`), NOT a zero-copy-availability problem — so it is surfaced distinctly
+    from the UUID-mismatch / missing-extension :class:`ZeroCopyUnavailable` class.
     """
     _require_native()
     _check_cuda_available()
     uuid = cuda_device_uuid(device)
+    strat = None
+    if strategy is not None:
+        # Normalize to a plain {str: int} dict for the PyO3 boundary.
+        strat = {str(k): int(v) for k, v in strategy.items()}
     try:
-        compiled = _axiom_compute.compile_kernel(source, list(uuid))
+        compiled = _axiom_compute.compile_kernel(source, list(uuid), strat)
     except Exception as e:
+        msg = str(e)
+        # A strategy-hole / source compile failure is a COMPILE error, not an interop
+        # availability problem — surface it as AxiomError so callers (AT-2103d) can tell
+        # "the kernel did not compile" apart from "zero-copy is unavailable on this box".
+        if "compile error" in msg or "UnresolvedStrategyHole" in msg or "strategy" in msg.lower():
+            raise AxiomError(f"compile failed: {e}") from e
         # UUID-mismatch / missing extensions surface here.
         raise ZeroCopyUnavailable(f"zero-copy unavailable: {e}") from e
     return Kernel(compiled, device)
@@ -150,6 +169,56 @@ class Kernel:
 
     def workgroup_size(self):
         return self._compiled.workgroup_size()
+
+    def push_constant_bytes(self) -> int:
+        return self._compiled.push_constant_bytes()
+
+    def scalar_layout(self):
+        """M4.1p2: the scalar push-constant slots as ``[(name, offset, size_bytes), ...]``.
+
+        Python uses this to assemble push constants by OFFSET+NAME (not positionally) — the
+        analogue of the bench's ``assemble_pc`` — so a wrong scalar ORDER is impossible (each
+        value lands at its own std430 offset).
+        """
+        return self._compiled.scalar_layout()
+
+    def assemble_push_constants(self, values: dict) -> bytes:
+        """M4.1p2: pack a ``{name: int}`` dict into the std430 push-constant blob.
+
+        Each named scalar is written at its own ``offset`` from :meth:`scalar_layout` (little-
+        endian, ``size_bytes`` wide). Every scalar slot the kernel declares MUST be supplied;
+        an unknown name or a missing slot raises (no silent zero-fill of a required scalar).
+        """
+        layout = self.scalar_layout()
+        total = self._compiled.push_constant_bytes()
+        blob = bytearray(total)
+        names_in_layout = {name for (name, _off, _sz) in layout}
+        unknown = set(values) - names_in_layout
+        if unknown:
+            raise AxiomError(
+                f"assemble_push_constants: value(s) {sorted(unknown)} are not scalar push "
+                f"constants of this kernel (declared: {sorted(names_in_layout)})"
+            )
+        for (name, offset, size) in layout:
+            if name not in values:
+                raise AxiomError(
+                    f"assemble_push_constants: missing required scalar push constant '{name}' "
+                    f"(kernel declares {sorted(names_in_layout)})"
+                )
+            val = int(values[name])
+            if size == 4:
+                blob[offset:offset + 4] = val.to_bytes(4, "little", signed=False)
+            elif size == 8:
+                blob[offset:offset + 8] = val.to_bytes(8, "little", signed=False)
+            elif size == 2:
+                blob[offset:offset + 2] = val.to_bytes(2, "little", signed=False)
+            elif size == 1:
+                blob[offset:offset + 1] = val.to_bytes(1, "little", signed=False)
+            else:
+                raise AxiomError(
+                    f"assemble_push_constants: unsupported scalar size {size} for '{name}'"
+                )
+        return bytes(blob)
 
     def _next_values(self):
         with self._counter_lock:
@@ -368,6 +437,18 @@ class SharedSession:
             pass
 
 
+# M4.1p2: the Q4_K_M headline op + the (Rust-backed) reference helpers. Imported at the bottom
+# so the module-level names (compile_kernel/Kernel/AxiomError/...) the op depends on already exist.
+from .q4km import (  # noqa: E402
+    Q4KMMatmul,
+    q4km_matmul,
+    pack_q4km,
+    q4km_f32_reference,
+    q4km_combined_metric,
+    q4km_raw_rel_diff,
+    Q4KM_SUPERBLOCK_BYTES,
+)
+
 __all__ = [
     "compile_kernel",
     "cuda_device_uuid",
@@ -375,4 +456,12 @@ __all__ = [
     "SharedSession",
     "AxiomError",
     "ZeroCopyUnavailable",
+    # M4.1p2 Q4_K_M headline op + Rust-backed reference.
+    "Q4KMMatmul",
+    "q4km_matmul",
+    "pack_q4km",
+    "q4km_f32_reference",
+    "q4km_combined_metric",
+    "q4km_raw_rel_diff",
+    "Q4KM_SUPERBLOCK_BYTES",
 ]

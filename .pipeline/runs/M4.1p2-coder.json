@@ -1,0 +1,64 @@
+{
+  "verdict": "IMPLEMENTED",
+  "agent": "coder",
+  "milestone_id": "M4.1-phase2-q4km-zero-copy-headline",
+  "branch": "coder/M41p2-20260608/M4.1-q4km-zerocopy",
+  "summary": "Ran the M3.6 Q4_K_M dequant+coopmat matmul (examples/q4km_matmul_rb_coopmat_f32acc_cached.axc, the 42.86-TFLOPS leader) as the HEADLINE op through the Phase-1 CUDA<->Vulkan zero-copy PyTorch frontend. Promoted the f32-accumulator oracle to a pub lib module (single source of truth), added the optional PyO3 strategy-compile kwarg + scalar_layout() + the Rust oracle bridge, wrote the Python Q4KMMatmul op (q upload-once + x/C per-call zero-copy), and proved AT-2103/2103c/2104/2103d/2105 on the real NVIDIA RTX PRO 6000. All hard gates pass; honest latency framing (no beat-cuBLAS).",
+
+  "oracle_promotion": {
+    "action": "git mv crates/axc-driver/tests/common_q4km_f32ref.rs -> crates/axc-driver/src/q4km_oracle.rs; added `pub mod q4km_oracle;` to crates/axc-driver/src/lib.rs; promoted `half` from [dev-dependencies] to [dependencies].",
+    "including_targets_updated": "The 9 #[path]-including tests/benches now `use axc_driver::q4km_oracle as common_q4km_f32ref;` instead of re-including the file via #[path] — NO duplicate compile, NO duplicate test names, and the oracle's 5 #[cfg(test)] unit tests now run under `cargo test -p axc-driver --lib` (q4km_oracle::tests::{f32accum_ref_smoke, at1780_rootcause_cancellation_inflates_raw_rel_not_combined, f32accum_differs_from_naive_f16accum_at_larger_k, combined_metric_local_not_masked_by_global_scale, abs_dot_scale_dominates_output_magnitude}).",
+    "regression_check": "cargo test --workspace green: 915 passed / 0 failed / 72 ignored (the oracle move did not regress any of the M3.x Q4_K_M tests/benches that consume it)."
+  },
+
+  "pyo3_surface": {
+    "compile_kernel": "Added optional `strategy: Option<HashMap<String,i64>>` kwarg (pyo3 signature (source, device_uuid, strategy=None)). When Some -> BTreeMap -> axc_driver::compile_source_with_assignments (the M2.3 path the resident bench uses). When None -> compile_source_with_meta (Phase-1 saxpy path, verbatim).",
+    "scalar_layout": "CompiledKernel::scalar_layout() -> Vec<(name, offset_bytes, size_bytes)> from meta.binding_plan.scalars (ScalarTy::bit_width()/8). Python assembles M/N/K/n_blocks_per_row by OFFSET+NAME, never positionally.",
+    "oracle_bridge": "q4km_f32_reference(q, x_f16_bits: Vec<u16>, m, n, n_bpr) -> (y_ref, abs_scale); q4km_combined_metric(gpu, ref, abs_scale) -> f64 (the FROZEN gate, computed in Rust); q4km_raw_rel_diff(gpu, ref) -> f64 (report-only). All three call the IDENTICAL axc_driver::q4km_oracle functions."
+  },
+
+  "python_op": {
+    "file": "py/axiom_compute/q4km.py",
+    "Q4KMMatmul": "compile-once (full 5-hole leader strategy); upload_weights(q_bytes,m,k) registers static q; the 3-buffer SharedSession is allocated on the first matmul (N-dependent x/C sizes) and reused; q is written ONCE into the shared view (device-side copy, the static-weights carve-out). x_view()/c_view() expose the [K,N] f16 / [M,N] f32 shared views; matmul(x_f16) is genuinely zero-copy when x IS the shared view, else a DISCLOSED device-to-device copy (a [N,K] activation is rejected, never silently transposed). Push constants via assemble_push_constants (offset+name). Reuses the Phase-1 SharedSession handshake/teardown unchanged.",
+    "zero_copy_disclosure": "The docstring carries the reviewer's honest note: the gated zero-copy path requires the activation already in [K,N] f16 in the shared view; a natural [N,K] inference activation would need a per-call transpose/repack (NOT the zero-copy gated path).",
+    "init_threaded": "py/axiom_compute/__init__.py: compile_kernel(source, device, strategy) thread-through (a strategy/compile failure surfaces as AxiomError, distinct from ZeroCopyUnavailable); Kernel.scalar_layout()/push_constant_bytes()/assemble_push_constants(); re-exports Q4KMMatmul/q4km_matmul/pack_q4km/q4km_f32_reference/q4km_combined_metric/q4km_raw_rel_diff/Q4KM_SUPERBLOCK_BYTES.",
+    "kernel_bundling": "The M3.6 .axc is bundled into the wheel at py/axiom_compute/kernels/ so the installed package is self-contained; q4km.py loads from the bundled copy or the repo examples/ dir."
+  },
+
+  "tests": {
+    "file": "py/tests/test_zero_copy_q4km.py",
+    "AT-2103": "PASS at K=256/512/14336. Combined condition-aware metric (computed in Rust): K256=5.348e-7 (raw 2.546e-2), K512=6.711e-7 (raw 1.072e0), K14336=2.053e-6 (raw 2.098e0). All <= FROZEN 1e-3; raw logged report-only. GPU + oracle read the SAME RNG q-byte/x-bit fixture (seeds 0xC0FFEE^m / 0xBADF00D^n, byte-identical to the resident bench).",
+    "AT-2103c": "PASS. staging_buffers_allocated()==0 and copy_buffer_records()==0 after upload_weights AND across >=2 matmul() calls (upload is a device-side torch copy, NOT a dispatch-path vkCmdCopyBuffer).",
+    "AT-2104": "PASS. 100 matmul() calls bit-identical to a single recompute (monotone V1/V2 handshake holds for the multi-buffer coopmat op).",
+    "AT-2103d": "PASS. strategy=None on the M3.6 source FAILS at compile (UnresolvedStrategyHole); f32 x and CPU x both raise ZeroCopyUnavailable (fail-closed, no silent reinterpret).",
+    "AT-2105": "PASS (the only hard latency gate). m=4096,n=512,k=14336: (a) AXIOM zero-copy 1.532 ms / 39.25 TFLOPS < (b) AXIOM host-copy 2.951 ms (win 1.419 ms, no host transfer); (c) torch.matmul f32 cuBLAS 0.805 ms / 74.68 TFLOPS CONTEXT ONLY. AXIOM ~52.6% of this f32-cuBLAS GEMM — kernel SLOWER than native torch.matmul; NO beat-cuBLAS claim (cuBLAS reported, not gated)."
+  },
+
+  "hygiene": {
+    "cargo_check_workspace": "clean",
+    "cargo_clippy_all_targets_D_warnings": "clean (incl. forced rebuild of the moved oracle + edited tests/benches)",
+    "cargo_test_workspace": "915 passed / 0 failed / 72 ignored",
+    "maturin_wheel": "rebuilt (axiom_compute-0.0.1-cp312-abi3) + reinstalled; native bridge fns present",
+    "python_gpu_tests": "6 q4km PASS + 5 saxpy PASS together (no Phase-1 regression); the remaining 13 Phase-1 Python GPU tests PASS"
+  },
+
+  "deviations": [
+    "AT-2105's cuBLAS context number is an f32 GEMM (torch.matmul on f32-dequantized weights), measured ~0.81 ms / 74.7 TFLOPS on this box; AXIOM is ~53% of THAT f32-cuBLAS GEMM. The design's ~34% framing referenced the 125-TFLOPS datasheet ESTIMATE; the measured cuBLAS GEMM here is slower than the datasheet peak, so the measured ratio is higher. The honest conclusion is UNCHANGED and stated plainly: the Vulkan kernel is SLOWER than native torch.matmul, no beat-cuBLAS claim. Only the percentage differs because it is a measured-vs-measured ratio rather than vs the datasheet estimate.",
+    "The M3.6 .axc source is duplicated into py/axiom_compute/kernels/ for wheel self-containment (a static fixture copy, not a second source of truth like the oracle would be). q4km.py loads the bundled copy or the repo examples/ dir.",
+    "pack_q4km (the lossy Q4_K quantizer) is shipped for real-weight ergonomics but is NOT on the AT-2103 critical path (which uses the raw RNG fixture bytes so q is byte-identical on GPU + oracle), exactly as the architect scoped."
+  ],
+
+  "remaining": "QA + dual code review. Phase-1 residuals NOT touched (inherited, must-not-regress): no timeout on CUDA data-path waits; NVIDIA-only EXCLUSIVE-mode sync — Phase 2 added NO new sync.",
+
+  "self_check": {
+    "frozen_1e3_computed_in_rust_never_loosened": true,
+    "per_call_xc_path_staging_free_0_0": true,
+    "weights_upload_once_not_per_call_host_copy": true,
+    "handshake_reused_phase1_verbatim_no_weakening": true,
+    "honest_latency_no_beat_cublas": true,
+    "strategy_kwarg_load_bearing_strategy_none_fails": true,
+    "oracle_single_source_of_truth_promoted_not_reimplemented": true,
+    "real_gpu_no_mocking": true,
+    "branch_off_main_not_main": true
+  }
+}
