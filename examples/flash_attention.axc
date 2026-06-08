@@ -1,0 +1,148 @@
+// examples/flash_attention.axc — M3.2b CORE: FlashAttention-2 streaming ONLINE-SOFTMAX (C2).
+//
+// This is the C2 that examples/tiled_attention.axc (the C1 NON-streaming baseline)
+// deferred to M3.2b. It expresses the FlashAttention-2 single-pass online-softmax
+// recurrence: instead of materializing the full S=QKᵀ score block, it maintains per
+// query row a running max m_i, a running denom l_i, and a rescaled output accumulator
+// acc[d] — NO S is materialized anywhere (no shared-memory S, no global scratch buffer).
+//
+// ⚠ TAYLOR NEAR-UNIFORM LIMITATION — DISCLOSED (honest scalar-core envelope):
+//   M3.2b scalar core uses a Taylor exp (1+x+x^2/2) accurate ONLY for near-uniform
+//   attention (post-max logit gaps ≲ 0.7); real attention logit spreads (-10..-50)
+//   need a true exp builtin = M3.2c. This milestone proves the STREAMING ONLINE-SOFTMAX
+//   ALGORITHM expresses + runs correctly, NOT production-range attention.
+//   (Numerical trace: Taylor vs true exp — x=-0.7 ~3% off; x=-2 ~7x; x=-5 ~1262x;
+//   x=-20 Taylor=+181 (true≈2e-9, i.e. NEGATIVE/garbage). The fixtures HARD-WIRE
+//   post-max args to ≤ ~0.7 and a test asserts it.)
+//
+// Algorithm (FlashAttention-2, B_c=1 / one K/V row per outer iteration):
+//   m_i  <- -1e9   (running max; init ONLY to make `s > m_i` true on j==0)
+//   l_i  <- 0      (running denom)
+//   acc[d] <- 0    (rescaled output accumulator, in shared[f32,64])
+//   for j in 0..seq_len:
+//       s = dot(Q_i, K_j) * inv_sqrt_d
+//       m_new = max(m_i, s)
+//       correction = exp(m_i - m_new)   EXCEPT on j==0 where it is FORCED to 0
+//                                       (the SOLE first-iter mechanism — there is no
+//                                        prior mass to rescale; we NEVER rely on
+//                                        Taylor(-1e9 - s) being benign)
+//       p = exp(s - m_new)              (arg <= 0)
+//       l_i = l_i*correction + p
+//       acc[d] = acc[d]*correction + p*V_j[d]   for d in 0..head_dim
+//       m_i = m_new
+//   O[q_row][d] = acc[d] / l_i
+//
+// Each workgroup (single invocation, wg=(1,1,1)) handles ONE query row.
+// Dispatch geometry: (seq_len, 1, 1) workgroups — q_row = gid(0).
+// PRECONDITION (load-bearing): head_dim <= 64 (the shared[f32,64] bound). Enforced
+//   host-side by fa2_preflight(head_dim) before every dispatch. head_dim>64 is M3.2c.
+//
+// Streaming property: shared footprint = k_tile + v_tile + acc = 3*head_dim f32 =
+//   768 bytes at head_dim=64, INDEPENDENT of seq_len, AND exactly 4 global buffers
+//   {Q,K,V,O} (no O(N) or O(N·M) scratch). This is the whole point.
+//
+// m_i / l_i are loop-carried Function-storage scalars (OpVariable load/store across the
+// for-loop, exactly like tiled_attention.axc's max_score/denom — NO OpPhi, that is
+// coopmat-only). acc[d]=... is the proven k_tile[d]=... shared-array-write pattern;
+// race-free because ONE invocation owns acc under wg=(1,1,1).
+//
+// AT-1740 fixture: seq_len=64, head_dim=64, within 1e-3 vs CPU FA2 (Taylor-identical) oracle.
+// AT-1740b: head_dim=32 cross-check vs tiled_attention (C1). AT-1741: seq_len>=2048 streaming.
+// Runs on Lavapipe (pure f32, no coopmat) AND NVIDIA.
+//
+// Anti-pattern #2: explicit `return;`.
+// Anti-pattern #8: no `>>`.
+
+@kernel
+@workgroup(1, 1, 1)
+@intent("FlashAttention-2 streaming online-softmax (C2, supersedes tiled_attention — AT-1740)")
+@complexity(O(n))
+fn flash_attention(
+    Q: readonly_buffer[f32],
+    K: readonly_buffer[f32],
+    V: readonly_buffer[f32],
+    O: buffer[f32],
+    seq_len: u32,
+    head_dim: u32,
+    inv_sqrt_d: f32
+) -> void {
+    // K[j]/V[j] row staging + the rescaled output accumulator acc[d].
+    // head_dim <= 64 (the shared-array bound; host-enforced by fa2_preflight).
+    shared k_tile: shared[f32, 64];    // K-vector (one row of K)
+    shared v_tile: shared[f32, 64];    // V-vector (one row of V)
+    shared acc: shared[f32, 64];       // rescaled output accumulator acc[d]
+
+    // Which query row this workgroup handles (dispatch: (seq_len,1,1) workgroups).
+    let q_row: u32 = gid(0u32);
+    let q_base: u32 = q_row * head_dim;
+
+    // Online-softmax state, loop-carried across the K/V loop (Function-storage scalars).
+    // m_i init -1e9 ONLY to make `s > m_i` true on j==0; never fed to Taylor (the j==0
+    // guard forces correction=0 first).
+    let mut m_i: f32 = -1e9f32;        // running max
+    let mut l_i: f32 = 0.0f32;         // running denom
+
+    // Zero the accumulator.
+    for d0 in range(0u32, head_dim) {
+        acc[d0] = 0.0f32;
+    }
+    workgroup_barrier();
+
+    // ── The K/V-block loop (B_c=1: one K/V row per outer iteration) ──────────────
+    for j in range(0u32, seq_len) {
+        // Stage K[j], V[j] into shared.
+        let kb: u32 = j * head_dim;
+        for d1 in range(0u32, head_dim) {
+            k_tile[d1] = K[kb + d1];
+            v_tile[d1] = V[kb + d1];
+        }
+        workgroup_barrier();
+
+        // s = dot(Q_i, K_j) * inv_sqrt_d.
+        let mut s: f32 = 0.0f32;
+        for d2 in range(0u32, head_dim) {
+            let q_val: f32 = Q[q_base + d2];
+            let k_val: f32 = k_tile[d2];
+            s = s + q_val * k_val;
+        }
+        s = s * inv_sqrt_d;
+
+        // m_new = max(m_i, s).
+        let mut m_new: f32 = m_i;
+        let larger: bool = s > m_i;
+        if larger {
+            m_new = s;
+        }
+
+        // correction = exp(m_i - m_new) (Taylor), EXCEPT j==0 where it is FORCED to 0
+        // (the SOLE first-iter mechanism — no prior mass to rescale).
+        let cx: f32 = m_i - m_new;                          // <= 0 (unused when j==0)
+        let mut correction: f32 = 1.0f32 + cx + cx * cx * 0.5f32;   // Taylor exp(m_i - m_new)
+        let is_first: bool = j == 0u32;
+        if is_first {
+            correction = 0.0f32;
+        }
+
+        // p = exp(s - m_new) (Taylor; arg <= 0).
+        let px: f32 = s - m_new;                            // <= 0
+        let p: f32 = 1.0f32 + px + px * px * 0.5f32;        // Taylor exp(s - m_new)
+
+        // Online update of the running denom + the rescaled accumulator.
+        l_i = l_i * correction + p;
+        for d3 in range(0u32, head_dim) {
+            let v_val: f32 = v_tile[d3];
+            acc[d3] = acc[d3] * correction + p * v_val;
+        }
+
+        m_i = m_new;
+        workgroup_barrier();
+    }
+
+    // ── Finalize: O[q_row][d] = acc[d] / l_i ────────────────────────────────────
+    for d4 in range(0u32, head_dim) {
+        let out_idx: u32 = q_base + d4;
+        O[out_idx] = acc[d4] / l_i;
+    }
+
+    return;
+}

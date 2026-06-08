@@ -134,6 +134,14 @@ fn tiled_attention_compiles_and_validates() {
     compile_and_validate(src, "tiled_attention.axc");
 }
 
+/// AT-1738: flash_attention.axc (M3.2b C2 — FlashAttention-2 streaming online-softmax)
+/// compiles + spirv-val clean. CI compile anchor (no GPU). Pure source, ZERO codegen change.
+#[test]
+fn flash_attention_compiles_and_validates() {
+    let src = include_str!("../../../examples/flash_attention.axc");
+    compile_and_validate(src, "flash_attention.axc");
+}
+
 /// AT-1613: q4km_dequant_matmul_coopmat.axc SPIR-V is byte-identical before and after
 /// the CoopMatLoadSource discriminator addition (Buffer-source path unchanged).
 #[test]
