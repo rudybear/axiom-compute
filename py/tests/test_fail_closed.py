@@ -41,7 +41,6 @@ def test_bogus_uuid_fails_closed():
     """A non-matching device UUID raises ZeroCopyUnavailable, never a different GPU."""
     import axiom_compute as axc
 
-    (spirv_bytes, _) = (None, None)
     # Compile via the native API with a bogus 16-byte UUID — must FAIL CLOSED.
     with pytest.raises(Exception) as ei:
         axc._axiom_compute.compile_kernel(_SAXPY_SRC, [0xAB] * 16)

@@ -8,9 +8,11 @@ handles into CUDA and drive the cross-API timeline handshake:
     cudaSignalExternalSemaphoresAsync / cudaWaitExternalSemaphoresAsync
     cudaDestroyExternalMemory / cudaDestroyExternalSemaphore
 
-It uses cuda-python (``from cuda.bindings import runtime``) when available. The
-handle structs and a ctypes-to-libcudart fallback are isolated here so the rest of
-the package never touches the CUDA ABI directly.
+cuda-python (``from cuda.bindings import runtime``) is REQUIRED for this path. There
+is NO ctypes-to-libcudart fallback and NO host-copy degradation: if cuda-python is
+absent, every import entry point FAILS CLOSED by raising :class:`CudaInteropError`
+(see ``have_cuda_python``). The CUDA-ABI calls are isolated here so the rest of the
+package never touches the CUDA ABI directly.
 
 G-items honored:
   - G-1: ``import_memory_fd`` sets ``flags = cudaExternalMemoryDedicated`` when
@@ -124,11 +126,14 @@ class ImportedExternalMemory:
                 "strides": None,
             }
 
+        proxy = _CAIProxy()
         with torch.cuda.stream(stream):
-            t = torch.as_tensor(_CAIProxy(), device="cuda")
-        # Tie the proxy + this object to the tensor's Python lifetime so the mapping
-        # outlives the tensor (the deleter is the GC of these references).
-        t._axc_keepalive = (self, _CAIProxy)  # type: ignore[attr-defined]
+            t = torch.as_tensor(proxy, device="cuda")
+        # Tie THIS object (the owner of the cudaExternalMemory_t + mapped ptr) to the
+        # tensor's Python lifetime so the mapping outlives the tensor. `self` is the
+        # load-bearing keepalive; the proxy instance is kept only for clarity (its
+        # __cuda_array_interface__ describes the wrap).
+        t._axc_keepalive = (self, proxy)  # type: ignore[attr-defined]
         return t
 
     def close(self):
@@ -241,12 +246,20 @@ def import_memory_fd(fd: int, size: int, dedicated: bool = True) -> ImportedExte
     # G-1: MATCH the Vulkan VkMemoryDedicatedAllocateInfo (always dedicated for now).
     handle_desc.flags = int(_rt.cudaExternalMemoryDedicated) if dedicated else 0
 
-    ext_mem = _check(*_rt.cudaImportExternalMemory(handle_desc))
-    # G-3: CUDA dup'd/consumed the fd by now; we are the single owner — close it once.
+    # FIX-3: an OPAQUE_FD memory fd is NOT consumed by cudaImportExternalMemory — Python
+    # is the single owner and MUST close it exactly once, on BOTH the success and the
+    # failure path (the import RAISES on error, which previously skipped the close →
+    # fd leak per failed allocate). Close in a finally so the fd never leaks.
+    # (Distinct from the SEMAPHORE fd, which IS taken by CUDA on import — see
+    # import_timeline_semaphore_fd / import_binary_semaphore_fds, which do NOT close.)
     try:
-        os.close(int(fd))
-    except OSError:
-        pass
+        ext_mem = _check(*_rt.cudaImportExternalMemory(handle_desc))
+    finally:
+        # G-3: CUDA dup'd/consumed the fd by now (or failed); we are the single owner.
+        try:
+            os.close(int(fd))
+        except OSError:
+            pass
 
     buf_desc = _rt.cudaExternalMemoryBufferDesc()
     buf_desc.offset = 0

@@ -137,6 +137,14 @@ impl CompiledKernel {
         self.ctx.drain_external_timeline(set, value).map_err(dispatch_err)
     }
 
+    /// FIX-2 HARD FALLBACK: block until the device is provably idle (`vkDeviceWaitIdle`).
+    /// `SharedSession.close()` calls this when the timeline drain fails — nothing may be
+    /// freed while a dispatch could still be in-flight (UAF). Raises if even this fails
+    /// (unrecoverable device state — the caller logs loudly and MUST NOT free).
+    fn device_wait_idle(&self) -> PyResult<()> {
+        self.ctx.device_wait_idle().map_err(dispatch_err)
+    }
+
     /// G-4 step (5): free the Vulkan side of the shared buffers. Idempotent: a second
     /// call is a no-op (the set was already consumed). The Python side calls this
     /// LAST, after draining + destroying the CUDA imports.

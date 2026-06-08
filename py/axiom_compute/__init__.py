@@ -11,6 +11,20 @@ torch interop. Inputs are truly zero-copy when allocated DIRECTLY in the shared
 buffers (``Kernel.shared_tensor``); an arbitrary torch tensor uses a device-to-device
 copy into the shared buffer ("no host round-trip, but not input-zero-copy").
 
+Phase 1 ASSUMPTIONS (revisit for M4.2 cross-vendor):
+  - SINGLE CUDA STREAM (G-5): every shared-tensor op AND the signal/wait handshake MUST
+    run on the ONE stream captured at ``Kernel`` construction. A cross-stream op without
+    an explicit event races the cross-API handshake (silent torn read). The frontend
+    DETECTS divergence and warns (``SharedSession.run``/``tensor``), but cannot force the
+    caller's ops onto the captured stream.
+  - NVIDIA-ONLY sync: the exportable buffers are ``VK_SHARING_MODE_EXCLUSIVE`` and the
+    dispatch emits NO ``VK_QUEUE_FAMILY_EXTERNAL`` ownership-transfer barrier — it relies
+    SOLELY on the external timeline semaphore for execution AND memory ordering. This is
+    correct on the M4.1 target (discrete NVIDIA, single Vulkan queue, 580.x driver) and
+    is proven bit-exact there, but is NOT spec-portable: AMD/Intel/MoltenVK generally
+    require CONCURRENT sharing over {compute, VK_QUEUE_FAMILY_EXTERNAL} or explicit
+    ownership-transfer barriers. This MUST be revisited for cross-vendor support.
+
 Public API:
     axiom_compute.compile_kernel(source: str, device=None) -> Kernel
     Kernel(*tensors, out_shape, out_dtype, workgroups, push_constants=b'') -> torch.Tensor
@@ -199,8 +213,40 @@ class SharedSession:
     def stream(self):
         return self._kernel.stream
 
+    def _assert_captured_stream(self, where: str):
+        """FIX-4 (G-5): warn LOUDLY if the active CUDA stream != the captured stream S.
+
+        Phase 1 assumes ALL shared-tensor ops + the signal/wait handshake run on the ONE
+        stream captured at :class:`Kernel` construction. A cross-stream op without an
+        explicit event would race the cross-API handshake (a silent torn read). We cannot
+        force the caller's ops onto S, but we DETECT divergence here and warn so the
+        footgun is not silent.
+        """
+        import torch
+        import warnings
+
+        active = torch.cuda.current_stream(self._kernel._device)
+        captured = self.stream
+        # torch.cuda.Stream compares by underlying cudaStream_t handle.
+        if active.cuda_stream != captured.cuda_stream:
+            warnings.warn(
+                f"axiom_compute: {where} called while the active CUDA stream "
+                f"(cuda_stream={active.cuda_stream:#x}) differs from the stream captured "
+                f"at Kernel construction (cuda_stream={captured.cuda_stream:#x}). Phase 1 "
+                "REQUIRES all shared-tensor ops AND the signal/wait handshake to run on "
+                "the ONE captured stream (G-5); a cross-stream op without an explicit "
+                "event races the CUDA<->Vulkan handshake and can torn-read the shared "
+                "buffer. Wrap your ops in `with torch.cuda.stream(kernel.stream):` or "
+                "construct the Kernel on the stream you intend to use.",
+                stacklevel=3,
+            )
+
     def tensor(self, index: int, shape, dtype):
-        """A NON-OWNING torch CUDA tensor view of shared buffer ``index`` (G-4)."""
+        """A NON-OWNING torch CUDA tensor view of shared buffer ``index`` (G-4).
+
+        G-5: the view is created on the captured stream S; ALL ops on it MUST use S.
+        """
+        self._assert_captured_stream("SharedSession.tensor()")
         return self._imports[index].as_torch_tensor(shape, dtype, self.stream)
 
     def run(self, workgroups, push_constants: bytes = b""):
@@ -212,6 +258,9 @@ class SharedSession:
         """
         if self._closed:
             raise AxiomError("session is closed")
+        # FIX-4 (G-5): the whole handshake (signal V1 / dispatch / wait V2) runs on the
+        # captured stream S; warn if the active stream diverged.
+        self._assert_captured_stream("SharedSession.run()")
         v1, v2 = self._kernel._next_values()
 
         if self._timeline:
@@ -257,11 +306,36 @@ class SharedSession:
         self._closed = True
 
         # (1) drain in-flight GPU work BEFORE any free (no host fence on the data path).
+        # FIX-2: NEVER free buffers / the CUDA import while work may still be in-flight —
+        # that is a use-after-free. If the timeline drain fails or times out, HARD-FALL
+        # BACK to a blocking device_wait_idle (a queue-wide barrier) so the device is
+        # PROVABLY idle before any free. Only if EVEN device_wait_idle fails is the device
+        # in an unrecoverable state — we then log loudly and re-raise WITHOUT freeing
+        # (freeing into an in-flight GPU is worse than leaking handles).
         try:
             self._kernel._compiled.drain(self._bufs, self._last_signal)
-        except Exception:
-            # Best-effort: even if drain fails, proceed so we do not leak handles.
-            pass
+        except Exception as drain_exc:
+            try:
+                self._kernel._compiled.device_wait_idle()
+            except Exception as idle_exc:
+                # Unrecoverable: the device never went idle. Do NOT free (UAF risk).
+                # Re-arm _closed=False is pointless (the device is wedged); surface loudly.
+                import warnings
+
+                warnings.warn(
+                    "axiom_compute: SharedSession.close() could not drain the timeline "
+                    f"({drain_exc!r}) AND device_wait_idle failed ({idle_exc!r}); the GPU "
+                    "is in an unrecoverable state. Refusing to free shared buffers / CUDA "
+                    "imports while work may be in-flight (would be a use-after-free). "
+                    "Handles are intentionally LEAKED.",
+                    stacklevel=2,
+                )
+                raise AxiomError(
+                    "SharedSession.close(): drain and device_wait_idle both failed; "
+                    "refusing to free while GPU work may be in-flight (UAF). "
+                    f"drain={drain_exc!r} device_wait_idle={idle_exc!r}"
+                ) from idle_exc
+            # device_wait_idle succeeded → the device is provably idle; safe to free below.
 
         # (2) drop torch views: nothing torch-owned references the foreign ptr beyond
         # the user's tensors; we release our import references next which invalidates them.

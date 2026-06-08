@@ -871,6 +871,23 @@ impl VulkanContext {
             unsafe { device.update_descriptor_sets(&[write], &[]); }
         }
 
+        // FIX-1: allocate ONE PRIMARY command buffer for the whole session. Every
+        // dispatch RESETs and re-records it (the pool has RESET_COMMAND_BUFFER) instead
+        // of allocating a fresh CB per call — bounding command-buffer use to one per
+        // session and eliminating the previous per-dispatch leak.
+        let command_buffer = {
+            let alloc_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(self.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let _pool_guard = self.compute_pool_lock.lock();
+            // SAFETY: alloc_info is valid; command_pool is owned by this context.
+            let cbs = unsafe { device.allocate_command_buffers(&alloc_info) }.map_err(|e| {
+                DispatchError::CommandBufferRecordFailed(format!("alloc session cb: {e}"))
+            })?;
+            cbs[0]
+        };
+
         // Create the shared cross-API semaphore (timeline, or binary-pair fallback, G-6).
         let (timeline, binary_pair) = if use_binary_fallback {
             let pair = crate::external_memory::create_exportable_binary_semaphore_pair(device, sem_fns)?;
@@ -886,6 +903,7 @@ impl VulkanContext {
             binary_pair,
             descriptor_pool,
             descriptor_set,
+            command_buffer,
             // G-2: the zero-copy path allocates NO staging buffer and records NO copy.
             staging_buffers_allocated: 0,
             copy_buffer_records: 0,
@@ -987,24 +1005,51 @@ impl VulkanContext {
         let device: &ash::Device = &self.device_owner.device;
         let inner = &handle.inner;
 
-        // Allocate a one-shot command buffer from the compute pool.
-        let alloc_info = vk::CommandBufferAllocateInfo::default()
-            .command_pool(self.command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
+        // FIX-1: REUSE the session's single command buffer (no per-dispatch alloc, no
+        // leak). The buffer is allocated once in `allocate_shared_buffers` and lives on
+        // the `SharedBufferSet`; here we RESET and re-record it.
+        let cb = bufs.command_buffer;
         let _pool_guard = self.compute_pool_lock.lock();
-        // SAFETY: alloc_info is valid; command_pool is owned by this context.
-        let cbs = unsafe { device.allocate_command_buffers(&alloc_info) }
-            .map_err(|e| DispatchError::CommandBufferRecordFailed(format!("alloc cb: {e}")))?;
-        let cb = cbs[0];
+
+        // UAF GUARD: a command buffer must not be reset/re-recorded while a prior submit
+        // using it is still in-flight on the GPU. On the timeline path the prior dispatch
+        // completes when the timeline reaches its signal value, which is `wait_value - 1`
+        // (G-7 reserves consecutive values: prior signal = 2k-2, this wait = 2k-1). For
+        // the first dispatch `wait_value - 1 == 0`, already satisfied by the initial
+        // value, so the wait returns immediately. On the binary fallback there is no
+        // host-waitable counter, so we drain the queue with `device_wait_idle`.
+        if let Some(ts) = bufs.timeline.as_ref() {
+            let prior_signal = wait_value.saturating_sub(1);
+            if prior_signal > 0 {
+                let sems = [ts.semaphore];
+                let vals = [prior_signal];
+                let wait_info = vk::SemaphoreWaitInfo::default().semaphores(&sems).values(&vals);
+                let timeout_ns: u64 = self.fence_timeout_ms.saturating_mul(1_000_000);
+                // SAFETY: timeline semaphore is valid; wait_info is well-formed. This
+                // proves the prior submit (which signaled `prior_signal`) has retired
+                // before we reset its command buffer — no use-after-free / no in-flight
+                // reset.
+                unsafe { device.wait_semaphores(&wait_info, timeout_ns) }
+                    .map_err(|e| DispatchError::FenceTimeout { timeout_ns: { let _ = e; timeout_ns } })?;
+            }
+        } else {
+            // Binary fallback: no host-waitable timeline — drain all queues so the prior
+            // submit on this command buffer is provably retired before we reset it.
+            // SAFETY: device is valid; device_wait_idle blocks until all submits retire.
+            unsafe { device.device_wait_idle() }
+                .map_err(|e| DispatchError::QueueSubmitFailed(format!("pre-reset drain: {e}")))?;
+        }
+
+        // SAFETY: the prior submit using this CB has retired (proven above); resetting it
+        // now is sound. RELEASE_RESOURCES is not set — keep the pool-backed allocation.
+        unsafe { device.reset_command_buffer(cb, vk::CommandBufferResetFlags::empty()) }
+            .map_err(|e| DispatchError::CommandBufferRecordFailed(format!("reset session cb: {e}")))?;
 
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        // SAFETY: cb is freshly allocated; begin_info is valid.
+        // SAFETY: cb is owned by this session and freshly reset; begin_info is valid.
         unsafe { device.begin_command_buffer(cb, &begin_info) }
             .map_err(|e| {
-                // SAFETY: free the cb we just allocated on error.
-                unsafe { device.free_command_buffers(self.command_pool, &cbs); }
                 DispatchError::CommandBufferRecordFailed(format!("begin cb: {e}"))
             })?;
 
@@ -1034,8 +1079,8 @@ impl VulkanContext {
         // SAFETY: cb is recording.
         unsafe { device.end_command_buffer(cb) }
             .map_err(|e| {
-                // SAFETY: free the cb on error.
-                unsafe { device.free_command_buffers(self.command_pool, &cbs); }
+                // The session owns this CB (freed at teardown); do NOT free it here. The
+                // next dispatch will reset+re-record it from scratch.
                 DispatchError::CommandBufferRecordFailed(format!("end cb: {e}"))
             })?;
 
@@ -1081,9 +1126,11 @@ impl VulkanContext {
                 ))
             }
         };
-        // We intentionally do NOT free the command buffer immediately: the submit is
-        // async (no host fence on the data path). The command pool has
-        // RESET_COMMAND_BUFFER and is reset/freed at teardown after the timeline drain.
+        // FIX-1: the command buffer is the session's single reusable CB — it is NOT
+        // freed here. The NEXT dispatch RESETs and re-records it (after proving the prior
+        // submit retired, above); `teardown_shared_buffers` frees it exactly once after
+        // the G-4 timeline drain. This bounds command-buffer use to ONE per session
+        // (previously one VkCommandBuffer leaked per dispatch).
         let _ = wait_value;
         submit_result
     }
@@ -1117,16 +1164,39 @@ impl VulkanContext {
         Ok(())
     }
 
+    /// FIX-2 HARD FALLBACK: block until the device is provably idle (`vkDeviceWaitIdle`).
+    ///
+    /// Used by `SharedSession.close()` when the timeline drain fails/times out: freeing
+    /// the shared buffers or the CUDA import while a dispatch is still in-flight is a
+    /// use-after-free. This is the unconditional, queue-wide barrier the teardown falls
+    /// back to so nothing is freed while the GPU may still be reading/writing it. If even
+    /// this fails the device is in an unrecoverable state — the error is propagated so the
+    /// caller can log loudly and MUST NOT free.
+    pub fn device_wait_idle(&self) -> Result<(), DispatchError> {
+        // SAFETY: device is valid; device_wait_idle blocks until every submitted command
+        // on every queue retires.
+        unsafe { self.device_owner.device.device_wait_idle() }
+            .map_err(|e| DispatchError::QueueSubmitFailed(format!("device_wait_idle: {e}")))
+    }
+
     /// G-4 teardown of the Vulkan side of a [`SharedBufferSet`] — M4.1.
     ///
     /// This is step (5) of the G-4 order: it runs ONLY after the Python side has
     /// drained the timeline (step 1), dropped the torch view (step 2), and destroyed
-    /// the CUDA imports (steps 3-4). It frees the descriptor pool, the external
-    /// buffers' memory + buffers, and the semaphores. The handed-off fds are NOT
-    /// closed here (Python owns them, G-3). Idempotent-safe via null checks by the
-    /// caller (the PyO3 layer drops the set once).
+    /// the CUDA imports (steps 3-4). It frees the session command buffer (FIX-1), the
+    /// descriptor pool, the external buffers' memory + buffers, and the semaphores. The
+    /// handed-off fds are NOT closed here (Python owns them, G-3). Idempotent-safe via
+    /// null checks by the caller (the PyO3 layer drops the set once).
     pub fn teardown_shared_buffers(&self, bufs: crate::external_memory::SharedBufferSet) {
         let device: &ash::Device = &self.device_owner.device;
+        // FIX-1: free the session's single reusable command buffer under the pool lock.
+        // The G-4 drain (step 1) proved no submit using it is still in-flight.
+        {
+            let cbs = [bufs.command_buffer];
+            let _pool_guard = self.compute_pool_lock.lock();
+            // SAFETY: cb was allocated from this pool; the prior drain retired its submit.
+            unsafe { device.free_command_buffers(self.command_pool, &cbs); }
+        }
         // SAFETY: by G-4 contract the caller has drained in-flight work and destroyed
         // the CUDA imports before calling this; all handles are valid and unused.
         unsafe {

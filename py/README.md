@@ -11,6 +11,23 @@ Zero-copy ELIMINATES the host transfer, but the Vulkan kernel is ~34% of cuBLAS 
 is **not** a cuBLAS replacement. The win is **no host round-trip** + **real torch
 interop** from a single annotated `.axc` source.
 
+## Phase 1 correctness preconditions (hard requirements)
+
+- **Single CUDA stream (G-5).** ALL ops on the shared tensors **and** the internal
+  signal/wait handshake MUST run on the **one** stream captured at `compile_kernel` /
+  `Kernel` construction (`kernel.stream`). Running a shared-tensor op on a *different*
+  stream without an explicit event **races the CUDA↔Vulkan handshake** and can torn-read
+  the shared buffer. The frontend **warns loudly** when it detects a divergent active
+  stream in `run()` / `tensor()`, but it cannot move your ops onto the captured stream —
+  always wrap them in `with torch.cuda.stream(kernel.stream): ...` (see the example).
+- **NVIDIA-only sync model.** The exportable buffers are `VK_SHARING_MODE_EXCLUSIVE` and
+  the dispatch emits **no** `VK_QUEUE_FAMILY_EXTERNAL` ownership-transfer barrier; it
+  relies solely on the external **timeline semaphore** for both execution and memory
+  ordering. This is correct and bit-exact on the M4.1 target (discrete NVIDIA, single
+  Vulkan queue, 580.x driver) but is **not spec-portable** — AMD/Intel/MoltenVK generally
+  require a CONCURRENT sharing mode over `{compute, VK_QUEUE_FAMILY_EXTERNAL}` or explicit
+  ownership-transfer barriers. **Cross-vendor support (M4.2) must revisit this.**
+
 ## Prerequisites (runtime)
 
 - CUDA 12.x + a torch build for it (`torch.cuda.is_available() == True`)

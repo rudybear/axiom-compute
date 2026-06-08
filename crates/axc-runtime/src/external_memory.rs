@@ -168,6 +168,14 @@ pub struct SharedBufferSet {
     pub descriptor_pool: vk::DescriptorPool,
     /// The descriptor set binding the external buffers as SSBOs.
     pub descriptor_set: vk::DescriptorSet,
+    /// ONE PRIMARY command buffer owned by this session (M4.1 FIX-1). It is allocated
+    /// once here and RESET + re-recorded on every [`dispatch_zero_copy`] (the command
+    /// pool has `RESET_COMMAND_BUFFER`), then freed by `teardown_shared_buffers`. This
+    /// bounds command-buffer usage to ONE per session instead of leaking one per
+    /// dispatch.
+    ///
+    /// [`dispatch_zero_copy`]: crate::VulkanContext::dispatch_zero_copy
+    pub command_buffer: vk::CommandBuffer,
     /// G-2 instrumentation: number of transient staging buffers allocated on the
     /// zero-copy path. MUST stay 0 — asserted by AT-2109.
     pub staging_buffers_allocated: u32,

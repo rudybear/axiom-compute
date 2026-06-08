@@ -9,9 +9,10 @@ description = "PyTorch frontend for AXIOM-Compute: CUDA↔Vulkan zero-copy kerne
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT OR Apache-2.0" }
-# torch is a hard RUNTIME dependency; cuda-python is preferred for the CUDA import
-# but optional (a ctypes-to-libcudart fallback is built in). They are NOT installed
-# by the build — they are the user's runtime prereqs (analogous to llama.cpp tooling).
+# torch AND cuda-python are hard RUNTIME prerequisites for the zero-copy path. There is
+# NO ctypes-to-libcudart fallback: if cuda-python is absent the CUDA import fails CLOSED
+# (raises CudaInteropError), never a silent host copy. They are NOT installed by the
+# build — they are the user's runtime prereqs (analogous to llama.cpp tooling).
 dependencies = []
 
 [project.optional-dependencies]
