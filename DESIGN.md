@@ -996,7 +996,7 @@ All three are allocated in ONE `SharedSession` (`allocate_shared([q_size, x_size
 
 > **[Phase-2 inherited residuals — UPDATED by Phase 3 (§3.1.27):** the *no-timeout on the CUDA data-path waits* residual is **CLOSED on BOTH sides** by Phase 3 — the bounded `wait_completion` (`AXC_FENCE_TIMEOUT_MS`) bounds the host wait, AND on a timeout the op host-signals the Vulkan timeline to V2 (`vkSignalSemaphore`) to release the dangling CUDA wait on stream `S` + poisons/rebuilds the session, so no CUDA wait is left enqueued forever; the *NVIDIA-only EXCLUSIVE-mode sync* residual remains open for M4.2 cross-vendor.]
 
-## 3.1.27 M4.1 Phase 3 — `torch.library` custom-op registration + a ≤10-line demo + the wait-timeout residual fix [completes the M4.1 ROADMAP scope]
+## 3.1.27 M4.1 Phase 3 — `torch.library` custom-op registration + a ≤10-line demo + the wait-timeout residual fix [MERGED — completes the M4.1 ROADMAP scope]
 
 Phase 1 (§3.1.25) proved the CUDA↔Vulkan zero-copy interop on saxpy; Phase 2 (§3.1.26) ran the M3.6 Q4_K_M dequant+coopmat matmul as the headline op through it (AT-2103 combined ≤ 1e-3 at K=256/512/14336; AT-2105 honest latency). **Phase 3 completes the M4.1 ROADMAP scope**: it makes that kernel a **first-class PyTorch operator** that **composes under `torch.compile`**, ships the **≤10-line user demo** the ROADMAP requires, and **closes the Phase-1/2 wait-timeout residual** — all with **NO codegen change**, **NO new sync machinery on the data path**, and **the FROZEN 1e-3 gate untouched**. Honest framing is unchanged: **no beat-cuBLAS** (~53% of f32 cuBLAS); the value is **real torch integration** (a registered `torch.ops.axiom.q4km_matmul` that Inductor/Dynamo can trace), not speed.
 
