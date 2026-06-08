@@ -1030,7 +1030,7 @@ axiom::q4km_matmul(Tensor x, int weights_id, int M, int N, int K) -> Tensor
 
 ---
 
-## 3.1.28 M3.2b — FlashAttention-2 (streaming online softmax) — CORE scalar/register kernel [PROPOSED · r2]
+## 3.1.28 M3.2b — FlashAttention-2 (streaming online softmax) — CORE scalar/register kernel [MERGED]
 
 The M3 campaign deeply proved the **GEMM** path (M2.6→M3.8 Q4_K_M coopmat matmul, now callable from PyTorch via the M4.1 zero-copy frontend). **M3.2b broadens the thesis beyond GEMM to ATTENTION** — the OTHER flagship LLM kernel — and delivers the **online-softmax** primitive. The point: **ONE annotated `.axc` source expresses the FlashAttention-2 algorithm** (tiled, numerically-stable STREAMING softmax, **no full S=QKᵀ materialization**) → portable SPIR-V → correct on the GPU.
 
