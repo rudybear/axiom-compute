@@ -19,7 +19,7 @@ Last updated: 2026-04-28. Test count baseline: **713**.
 | Bench harness + measured baselines | ✅ done (M2.2) |
 | **FlashAttention-2** | ❌ M3.1 |
 | **KernelBench-Vulkan public submission** | ❌ M3.2 |
-| **PyTorch frontend + upstream adoption** | ❌ M4 |
+| **PyTorch frontend + upstream adoption** | 🔄 M4.1 Phase 1 MERGED — CUDA↔Vulkan ZERO-COPY proven on NVIDIA: torch CUDA tensor + AXIOM Vulkan kernel share one dedicated physical alloc (no host copy), via external-memory-fd + timeline external semaphore (spike works on 580.x). saxpy BIT-EXACT zero-copy; AT-2101 same-memory both directions; race-free 5000 dispatches; double-free/UAF-safe; fail-closed UUID. `crates/axc-py` PyO3 + `py/axiom_compute` (pip/maturin). DEFERRED: Q4_K_M headline op + latency (next phase), torch.library (M4.2), torch.compile (M4.3). Honest: ~34% cuBLAS, win is no-host-copy + interop not speed. AT-2100..2110 |
 | Bandwidth optimization (pinned memory, concurrent transfer) | ✅ M3.0 (saxpy_1m 7.5×, saxpy_1024 39×; <1ms gate re-scoped to GPU-resident metric) |
 | Multi-row tiled matmul (cooperative_matrix on real workloads) | ✅ M3.1 (first coopmat dispatch on Blackwell, bit-exact; resident-TFLOPS benchmark → M3.2) |
 | Cross-vendor real GPU CI (AMD RDNA3+, Intel Arc) | ❌ infra |
