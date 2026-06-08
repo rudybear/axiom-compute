@@ -332,6 +332,67 @@ def _dequant_q4km_to_f32(q: bytes, m: int, k: int, n_bpr: int) -> torch.Tensor:
     return torch.from_numpy(w)
 
 
+# ── W2 — bundled-.axc drift guard (no GPU needed) ────────────────────────────────────
+def test_bundled_kernel_byte_identical_to_examples():
+    """W2: the wheel-bundled kernel copy (py/axiom_compute/kernels/...) must be BYTE-IDENTICAL to
+    the canonical examples/ source. _load_kernel_src prefers the bundled copy, so a future edit to
+    examples/ that misses the bundled copy would silently run a STALE kernel — this guard fails CI
+    if they drift."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.dirname(os.path.dirname(here))  # py/tests -> py -> repo root
+    fname = "q4km_matmul_rb_coopmat_f32acc_cached.axc"
+    bundled = os.path.join(repo_root, "py", "axiom_compute", "kernels", fname)
+    canonical = os.path.join(repo_root, "examples", fname)
+    assert os.path.isfile(bundled), f"bundled kernel missing: {bundled}"
+    assert os.path.isfile(canonical), f"canonical kernel missing: {canonical}"
+    with open(bundled, "rb") as f:
+        bundled_bytes = f.read()
+    with open(canonical, "rb") as f:
+        canonical_bytes = f.read()
+    assert bundled_bytes == canonical_bytes, (
+        f"bundled {fname} has drifted from examples/ — re-sync the wheel copy "
+        f"(bundled {len(bundled_bytes)} bytes != examples {len(canonical_bytes)} bytes)"
+    )
+
+
+# ── W1 regression — no-copy path rejects a non-contiguous same-storage view ─────────
+@pytest.mark.skipif(not _gpu_enabled(), reason="GPU tests gated (AXC_ENABLE_GPU_TESTS=1)")
+def test_q4km_zero_copy_rejects_noncontiguous_shared_view():
+    """W1 guard: a same-storage NON-CONTIGUOUS view (transpose of the shared view) at a SQUARE
+    shape has a matching data_ptr and passes shape[0]==K, but its logical [K,N] layout does NOT
+    match the contiguous storage the kernel reads. The no-copy path MUST reject it (raise) rather
+    than silently reinterpret memory — it must NOT produce a (wrong) result."""
+    m, n, k = 256, 256, 256  # square: a transpose has the SAME shape and data_ptr
+    n_bpr = k // 256
+    q = make_q4km_weights(m, n_bpr, 0xC0FFEE ^ m)
+    x_bits = make_x_f16_bits(k, n, 0xBADF00D ^ n)
+    op = axc.Q4KMMatmul()
+    op.upload_weights(q, m, k)
+    try:
+        s = op.kernel.stream
+        xv = op.x_view(n)
+        x_src = _x_f16_tensor_from_bits(x_bits, k, n)
+        with torch.cuda.stream(s):
+            xv.copy_(x_src)
+        s.synchronize()
+
+        # A transposed view of the shared buffer: SAME data_ptr, SAME (square) shape, but strided.
+        xv_t = xv.t()
+        assert xv_t.data_ptr() == xv.data_ptr()
+        assert tuple(xv_t.shape) == (k, n)
+        assert not xv_t.is_contiguous()
+        with pytest.raises(axc.ZeroCopyUnavailable):
+            op.matmul(xv_t)
+
+        # And the genuine contiguous shared view STILL works (W1 must not break the happy path).
+        c = op.matmul(xv)
+        s.synchronize()
+        assert tuple(c.shape) == (m, n)
+        print("[W1] non-contiguous same-storage view REJECTED; contiguous shared view still passes")
+    finally:
+        op.close()
+
+
 # ── AT-2103d — strategy load-bearing + fail-closed (no GPU dispatch needed for the compile half) ──
 @pytest.mark.skipif(not _gpu_enabled(), reason="GPU tests gated (AXC_ENABLE_GPU_TESTS=1)")
 def test_q4km_fail_closed_and_strategy_required():

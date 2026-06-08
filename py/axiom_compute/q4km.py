@@ -33,8 +33,9 @@ CORRECTNESS ORACLE (single source of truth):
   ``q4km_combined_metric``. There is NO torch dequant re-implementation. The FROZEN 1e-3
   combined condition-aware gate is computed in RUST and cannot be loosened in Python (AT-2103).
 
-HONEST FRAMING (R-6): zero-copy ELIMINATES the host transfer, but the Vulkan kernel is ~34% of
-  cuBLAS at the A/B shape — this is NOT a cuBLAS replacement and we make NO beat-cuBLAS claim.
+HONEST FRAMING (R-6): zero-copy ELIMINATES the host transfer, but the Vulkan kernel is below
+  cuBLAS at the A/B shape (MEASURED ~53% of a same-machine f32 ``torch.matmul`` cuBLAS GEMM) —
+  this is NOT a cuBLAS replacement and we make NO beat-cuBLAS claim.
 """
 
 from __future__ import annotations
@@ -347,7 +348,23 @@ class Q4KMMatmul:
         xv = self._sess.tensor(1, (self._k, n), torch.float16)
         # If the caller handed us the shared view itself, no copy. Otherwise device-to-device
         # copy into the shared view (DISCLOSED convenience path — still no host round-trip).
-        if x_f16.data_ptr() != xv.data_ptr():
+        if x_f16.data_ptr() == xv.data_ptr():
+            # GENUINE zero-copy (no-copy) path. data_ptr equality alone is NOT enough: a
+            # same-storage NON-CONTIGUOUS view (e.g. x_view(n).t() at a square shape) shares the
+            # data_ptr and can pass shape[0]==K, yet its logical [K,N] layout does NOT match the
+            # underlying contiguous storage the kernel reads as x[k*N+col] — that would SILENTLY
+            # reinterpret memory (the silent-reinterpret class the project forbids, W1). A shared
+            # view used for zero-copy MUST be the contiguous [K, N] buffer; reject otherwise rather
+            # than fall back to a copy (the caller explicitly asked for the zero-copy gated path).
+            if not x_f16.is_contiguous() or tuple(x_f16.shape) != (self._k, n):
+                raise ZeroCopyUnavailable(
+                    "zero-copy x must be the CONTIGUOUS shared [K, N] view "
+                    f"(K={self._k}, N={n}); got shape {tuple(x_f16.shape)} "
+                    f"contiguous={x_f16.is_contiguous()}. A non-contiguous/transposed same-storage "
+                    "view would silently reinterpret the underlying buffer — write activations "
+                    "directly into x_view(n) (do not pass a transposed/strided view)."
+                )
+        else:
             with torch.cuda.stream(s):
                 xv.copy_(x_f16.contiguous())
 
