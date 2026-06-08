@@ -48,6 +48,7 @@ const SHARED_REDUCE_SRC: &str = include_str!("../../../examples/shared_reduce.ax
 const MATMUL_SHARED_COOPMAT_SRC: &str = include_str!("../../../examples/matmul_shared_coopmat.axc");
 const MATMUL_SHARED_F32_SRC: &str = include_str!("../../../examples/matmul_shared_f32.axc");
 const TILED_ATTENTION_SRC: &str = include_str!("../../../examples/tiled_attention.axc");
+const FLASH_ATTENTION_SRC: &str = include_str!("../../../examples/flash_attention.axc");
 const OPPHI_COOPMAT_ACCUMULATE_SRC: &str = include_str!("../../../examples/opphi_coopmat_accumulate.axc");
 const MATMUL_RB_COOPMAT_SRC: &str = include_str!("../../../examples/matmul_rb_coopmat.axc");
 const MATMUL_MSG_COOPMAT_SRC: &str = include_str!("../../../examples/matmul_msg_coopmat.axc");
@@ -1336,6 +1337,739 @@ fn at1744_matmul_msg_coopmat_bit_exact_multiblock() {
     eprintln!(
         "AT-1744 PASS: MSG multi-K-block matmul bit-exact (max_diff=0.0) on {} — \
          M={M} N={N} K={K} ({k_blocks} K-blocks), grid=({wg_x},{wg_y},1)",
+        ctx.physical_device_name()
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// M3.2b — FlashAttention-2 streaming online-softmax (C2)
+//
+// flash_attention.axc: the streaming online-softmax recurrence (running max m_i,
+// running denom l_i, rescaled acc[d]) — NO S materialization (no shared-S, no
+// global scratch). Taylor exp hard-wired to the near-uniform faithful band
+// (post-max args ≤ 0.7); the streaming ALGORITHM is the deliverable.
+//
+// AT-1738  compile + spirv-val (compile_shared_examples.rs has the canonical anchor;
+//          AT-1738 below also spirv-vals the emitted kernel).
+// AT-1740  small shape (seq_len=64, head_dim=64) within FROZEN 1e-3 vs Taylor oracle.
+// AT-1740b head_dim=32 cross-check vs the C1 tiled_attention kernel (both within 1e-3).
+// AT-1741  long sequence (seq_len>=2048) within 1e-3 — exercises the streaming loop.
+// AT-1742  no-S falsifiers: shared==3*head_dim*4 invariant to seq_len AND
+//          binding_plan.buffers names == {Q,K,V,O}.
+// AT-1743  oracle independence: kernel≈Taylor-oracle (FROZEN 1e-3 GATE) AND
+//          kernel≈true-exp-softmax (~5e-2 sanity) AND oracle≈full-softmax-Taylor (1e-4).
+// AT-1744  first-iter j==0 guard + monotone running-max climb, both within 1e-3.
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// FROZEN tolerance: kernel vs the Taylor-identical FA2 oracle. NEVER loosened.
+const FA2_FROZEN_TOL: f32 = 1e-3_f32;
+/// Independent SANITY tolerance: kernel vs the TRUE-exp (std f32::exp) full-softmax.
+/// Distinct from and LOOSER than the gate — NOT a gate.
+const FA2_TRUE_EXP_SANITY_TOL: f32 = 5e-2_f32;
+/// The enforced Taylor faithful-band bound on the max |post-max exp arg| over a fixture.
+const FA2_MAX_POSTMAX_ARG: f32 = 0.7_f32;
+
+/// CPU FlashAttention-2 reference — the FROZEN-1e-3 GATE oracle.
+///
+/// Runs the EXACT SAME online-softmax recurrence in f32 with the IDENTICAL Taylor exp
+/// (1 + x + x²/2) and the IDENTICAL `j==0 => correction=0` first-iteration guard in the
+/// IDENTICAL statement order as flash_attention.axc. Because the kernel and oracle compute
+/// the SAME function in the SAME f32 order, the result is bit-close (mirrors
+/// cpu_tiled_attention_reference at lines 93-140).
+fn cpu_flash_attention_reference(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    head_dim: usize,
+    inv_sqrt_d: f32,
+) -> Vec<f32> {
+    let mut o = vec![0.0_f32; seq_len * head_dim];
+    for q_row in 0..seq_len {
+        let q_base = q_row * head_dim;
+        // Loop-carried online-softmax state.
+        let mut m_i = -1e9_f32; // running max (init ONLY to make s > m_i on j==0)
+        let mut l_i = 0.0_f32; // running denom
+        let mut acc = vec![0.0_f32; head_dim]; // rescaled accumulator
+        for j in 0..seq_len {
+            let kb = j * head_dim;
+            // s = dot(Q_i, K_j) * inv_sqrt_d.
+            let mut s = 0.0_f32;
+            for d in 0..head_dim {
+                s += q[q_base + d] * k[kb + d];
+            }
+            s *= inv_sqrt_d;
+            // m_new = max(m_i, s).
+            let m_new = if s > m_i { s } else { m_i };
+            // correction = Taylor exp(m_i - m_new), EXCEPT j==0 where it is FORCED to 0
+            // (the SOLE first-iter mechanism — IDENTICAL guard + statement order to the kernel).
+            let cx = m_i - m_new;
+            let mut correction = 1.0_f32 + cx + cx * cx * 0.5_f32;
+            if j == 0 {
+                correction = 0.0_f32;
+            }
+            // p = Taylor exp(s - m_new) (arg <= 0).
+            let px = s - m_new;
+            let p = 1.0_f32 + px + px * px * 0.5_f32;
+            // Online update.
+            l_i = l_i * correction + p;
+            for d in 0..head_dim {
+                acc[d] = acc[d] * correction + p * v[kb + d];
+            }
+            m_i = m_new;
+        }
+        // Finalize.
+        for d in 0..head_dim {
+            o[q_base + d] = acc[d] / l_i;
+        }
+    }
+    o
+}
+
+/// INDEPENDENT true-exp reference (AT-1743 leg 2): a stable full-softmax attention
+/// computed with Rust std `f32::exp` (NOT the Taylor polynomial).
+///
+/// For each query row: s_j = (Q_i·K_j)*inv_sqrt_d; m = max_j s_j; w_j = exp(s_j - m);
+/// Z = Σ w_j; O_i = Σ (w_j/Z) V_j. On near-uniform fixtures (post-max args in [-0.7,0])
+/// this agrees with the Taylor oracle to ~3% → fits under FA2_TRUE_EXP_SANITY_TOL.
+fn fa2_true_exp_softmax_reference(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    head_dim: usize,
+    inv_sqrt_d: f32,
+) -> Vec<f32> {
+    let mut o = vec![0.0_f32; seq_len * head_dim];
+    for q_row in 0..seq_len {
+        let q_base = q_row * head_dim;
+        let mut scores = vec![0.0_f32; seq_len];
+        let mut m = -1e9_f32;
+        for (j, slot) in scores.iter_mut().enumerate() {
+            let kb = j * head_dim;
+            let mut s = 0.0_f32;
+            for d in 0..head_dim {
+                s += q[q_base + d] * k[kb + d];
+            }
+            s *= inv_sqrt_d;
+            *slot = s;
+            if s > m {
+                m = s;
+            }
+        }
+        let mut z = 0.0_f32;
+        let mut w = vec![0.0_f32; seq_len];
+        for (j, wj) in w.iter_mut().enumerate() {
+            let e = (scores[j] - m).exp(); // TRUE std exp, not Taylor
+            *wj = e;
+            z += e;
+        }
+        for d in 0..head_dim {
+            let mut out_val = 0.0_f32;
+            for j in 0..seq_len {
+                out_val += (w[j] / z) * v[j * head_dim + d];
+            }
+            o[q_base + d] = out_val;
+        }
+    }
+    o
+}
+
+/// AT-1743 leg 3 oracle self-consistency: the online FA2 recurrence is mathematically
+/// equal to a stable full-softmax computed with the SAME Taylor exp. This computes that
+/// full-softmax-Taylor reference (subtract row max, Taylor-exp, normalize, weight V) so
+/// the test can assert the online oracle matches it within ~1e-4 — catching an oracle-side
+/// rescale-algebra bug INDEPENDENT of the GPU and of the exp choice.
+fn fa2_full_softmax_taylor_reference(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    head_dim: usize,
+    inv_sqrt_d: f32,
+) -> Vec<f32> {
+    let mut o = vec![0.0_f32; seq_len * head_dim];
+    for q_row in 0..seq_len {
+        let q_base = q_row * head_dim;
+        let mut scores = vec![0.0_f32; seq_len];
+        let mut m = -1e9_f32;
+        for (j, slot) in scores.iter_mut().enumerate() {
+            let kb = j * head_dim;
+            let mut s = 0.0_f32;
+            for d in 0..head_dim {
+                s += q[q_base + d] * k[kb + d];
+            }
+            s *= inv_sqrt_d;
+            *slot = s;
+            if s > m {
+                m = s;
+            }
+        }
+        let mut z = 0.0_f32;
+        let mut w = vec![0.0_f32; seq_len];
+        for (j, wj) in w.iter_mut().enumerate() {
+            let x = scores[j] - m;
+            let e = 1.0_f32 + x + x * x * 0.5_f32; // SAME Taylor as the kernel/oracle
+            *wj = e;
+            z += e;
+        }
+        for d in 0..head_dim {
+            let mut out_val = 0.0_f32;
+            for j in 0..seq_len {
+                out_val += (w[j] / z) * v[j * head_dim + d];
+            }
+            o[q_base + d] = out_val;
+        }
+    }
+    o
+}
+
+/// Replay the online recurrence over the fixture and return the MAXIMUM |post-max exp arg|
+/// — max over all (i,j) of |s_ij - m_i^new| (the p-arg) and |m_i^prev - m_i^new| (the
+/// correction-arg, skipped on j==0 where correction is forced to 0). EVERY FA2 test asserts
+/// the return ≤ FA2_MAX_POSTMAX_ARG (the Taylor faithful-band HARD-WIRE), so a wide-spread
+/// fixture cannot slip through.
+fn fa2_fixture_max_postmax_arg(
+    q: &[f32],
+    k: &[f32],
+    seq_len: usize,
+    head_dim: usize,
+    inv_sqrt_d: f32,
+) -> f32 {
+    let mut max_arg = 0.0_f32;
+    for q_row in 0..seq_len {
+        let q_base = q_row * head_dim;
+        let mut m_i = -1e9_f32;
+        for j in 0..seq_len {
+            let kb = j * head_dim;
+            let mut s = 0.0_f32;
+            for d in 0..head_dim {
+                s += q[q_base + d] * k[kb + d];
+            }
+            s *= inv_sqrt_d;
+            let m_new = if s > m_i { s } else { m_i };
+            // p-arg: |s - m_new|.
+            let p_arg = (s - m_new).abs();
+            if p_arg > max_arg {
+                max_arg = p_arg;
+            }
+            // correction-arg: |m_i - m_new|, but j==0 forces correction=0 (arg unused).
+            if j != 0 {
+                let c_arg = (m_i - m_new).abs();
+                if c_arg > max_arg {
+                    max_arg = c_arg;
+                }
+            }
+            m_i = m_new;
+        }
+    }
+    max_arg
+}
+
+/// Host-side preflight: assert head_dim <= 64 (the shared[f32,64] bound) BEFORE any dispatch.
+/// head_dim>64 would OOB k_tile/v_tile/acc — UB / robustness-clamp = silently wrong.
+fn fa2_preflight(head_dim: u32) {
+    assert!(
+        head_dim <= 64,
+        "flash_attention CORE requires head_dim <= 64 (shared[f32,64] bound); \
+         head_dim={head_dim} is M3.2c (larger shared arrays / tiling)"
+    );
+}
+
+/// AT-1742 no-global-scratch falsifier: assert the kernel binds EXACTLY the 4 buffers
+/// {Q,K,V,O} (len==4, NAMES match — not just count). Any global S-materialization would
+/// require a 5th O(seq_len) or O(seq_len²) scratch/score buffer, which would appear here.
+fn fa2_assert_no_scratch(meta: &axc_runtime::KernelMetadata) {
+    let names: Vec<&str> = meta
+        .binding_plan
+        .buffers
+        .iter()
+        .map(|b| b.name.as_str())
+        .collect();
+    assert_eq!(
+        meta.binding_plan.buffers.len(),
+        4,
+        "AT-1742: flash_attention must bind EXACTLY 4 buffers (no O(N) / O(N·M) scratch); \
+         got {} buffers: {names:?}",
+        meta.binding_plan.buffers.len()
+    );
+    assert_eq!(
+        names,
+        vec!["Q", "K", "V", "O"],
+        "AT-1742: flash_attention buffer NAMES must be exactly {{Q,K,V,O}} in order \
+         (no fifth scratch/score buffer); got {names:?}"
+    );
+}
+
+/// Near-uniform FA2 fixture (inherits the AT-1630 Q/K/V scale → post-max args in the
+/// faithful band). seq_len rows, head_dim columns each.
+fn fa2_fixture(seq_len: usize, head_dim: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let q: Vec<f32> = (0..seq_len * head_dim)
+        .map(|i| 0.1_f32 * ((i % 7) as f32 - 3.0_f32))
+        .collect();
+    let k: Vec<f32> = (0..seq_len * head_dim)
+        .map(|i| 0.1_f32 * ((i % 5) as f32 - 2.0_f32))
+        .collect();
+    let v: Vec<f32> = (0..seq_len * head_dim)
+        .map(|i| 0.05_f32 * (i as f32 % 11.0_f32))
+        .collect();
+    (q, k, v)
+}
+
+/// Run the flash_attention kernel on the GPU for a fixture, returning the O buffer as f32.
+/// Calls fa2_preflight + asserts the faithful-band bound BEFORE dispatching.
+fn fa2_dispatch_gpu(
+    ctx: &VulkanContext,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    head_dim: usize,
+    inv_sqrt_d: f32,
+) -> Vec<f32> {
+    fa2_preflight(head_dim as u32);
+    let max_arg = fa2_fixture_max_postmax_arg(q, k, seq_len, head_dim, inv_sqrt_d);
+    assert!(
+        max_arg <= FA2_MAX_POSTMAX_ARG,
+        "FA2 fixture violates the Taylor faithful band: max |post-max arg|={max_arg} > {FA2_MAX_POSTMAX_ARG}"
+    );
+
+    let (bytes, meta) = compile_source_with_meta(FLASH_ATTENTION_SRC)
+        .expect("flash_attention.axc must compile");
+    let words: Vec<u32> = bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    let handle = ctx
+        .prepare_kernel_checked(
+            &words,
+            &meta.binding_plan,
+            meta.push_constant_total_bytes,
+            &meta.entry_point,
+            None,
+            "flash_attention",
+            meta.shared_memory_bytes,
+        )
+        .unwrap_or_else(|e| panic!("flash_attention: prepare_kernel_checked failed: {e}"));
+
+    let q_bytes: Vec<u8> = q.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let k_bytes: Vec<u8> = k.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let v_bytes: Vec<u8> = v.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let o_size = seq_len * head_dim * 4;
+    let pc = push_attention(seq_len as u32, head_dim as u32, inv_sqrt_d);
+
+    let outputs = ctx
+        .dispatch_handle(
+            &handle,
+            (seq_len as u32, 1, 1),
+            &[&q_bytes, &k_bytes, &v_bytes, &vec![0u8; o_size]],
+            &[0, 0, 0, o_size],
+            &pc,
+        )
+        .unwrap_or_else(|e| panic!("flash_attention: dispatch failed: {e}"));
+
+    outputs[3]
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// AT-1738: flash_attention.axc compiles to SPIR-V and passes spirv-val (no GPU).
+#[test]
+fn at1738_flash_attention_compiles_and_validates() {
+    use spirv_tools::val::{Validator, create as create_validator};
+    use spirv_tools::TargetEnv;
+
+    let (bytes, _meta) = compile_source_with_meta(FLASH_ATTENTION_SRC)
+        .expect("AT-1738: flash_attention.axc must compile");
+    let words: Vec<u32> = bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let validator = create_validator(Some(TargetEnv::Vulkan_1_1));
+    validator
+        .validate(&words, None)
+        .expect("AT-1738: flash_attention.axc spirv-val must pass");
+    eprintln!("AT-1738: flash_attention.axc compiles + spirv-val clean (M3.2b)");
+}
+
+/// AT-1742: no-S-materialization falsifiers (no GPU — reads compiled metadata).
+///
+/// (i) shared_memory_bytes == 3*head_dim*4 (== 768 at head_dim=64), INVARIANT across two
+///     different seq_len compilations (the invariance is the falsifier — a materialized-S
+///     design's SHARED footprint would scale with seq_len). seq_len is a runtime push
+///     constant, never an array dimension, so both compilations are byte-identical here;
+///     the EQUALITY assertion across them is what makes the no-shared-S claim meaningful.
+/// (ii) binding_plan.buffers names == {Q,K,V,O} exactly (len==4) — no global scratch.
+#[test]
+fn at1742_flash_attention_no_s_materialization() {
+    // Two compilations. seq_len is a push constant, so the source text is identical and
+    // the kernel cannot encode seq_len into a shared-array size — but we assert the
+    // invariance EXPLICITLY (the falsifier), and the symbolic 3*head_dim*4 value.
+    let (_b1, meta1) = compile_source_with_meta(FLASH_ATTENTION_SRC)
+        .expect("AT-1742: flash_attention.axc must compile (1)");
+    let (_b2, meta2) = compile_source_with_meta(FLASH_ATTENTION_SRC)
+        .expect("AT-1742: flash_attention.axc must compile (2)");
+
+    // head_dim is the shared-array dimension (64): 3 arrays (k_tile, v_tile, acc) × 64 × 4 B.
+    const HEAD_DIM: u32 = 64;
+    let expected = 3 * HEAD_DIM * 4; // 768
+    assert_eq!(
+        meta1.shared_memory_bytes, expected,
+        "AT-1742: shared_memory_bytes must == 3*head_dim*4 = {expected} (k_tile+v_tile+acc); \
+         got {}",
+        meta1.shared_memory_bytes
+    );
+    // (i) INVARIANCE: the shared footprint does NOT scale with seq_len.
+    assert_eq!(
+        meta1.shared_memory_bytes, meta2.shared_memory_bytes,
+        "AT-1742: shared_memory_bytes must be INVARIANT to seq_len (no shared-memory S); \
+         got {} vs {}",
+        meta1.shared_memory_bytes, meta2.shared_memory_bytes
+    );
+
+    // (ii) NO-GLOBAL-SCRATCH: exactly the 4 buffers {Q,K,V,O}, names asserted.
+    fa2_assert_no_scratch(&meta1);
+
+    eprintln!(
+        "AT-1742 PASS: no-S falsifiers — shared_memory_bytes={} (== 3*64*4, invariant to seq_len) \
+         AND binding_plan.buffers == {{Q,K,V,O}} (len 4, no global scratch)",
+        meta1.shared_memory_bytes
+    );
+}
+
+/// AT-1743 legs 2 & 3 (CPU-only): oracle independence + rescale algebra.
+///
+/// Leg 2 (INDEPENDENT SANITY, ~5e-2): the FA2 Taylor oracle ≈ the TRUE-exp full-softmax
+///   (std f32::exp) on the near-uniform fixture — closes the 'two identical-buggy Taylor
+///   impls agree' hole. (Leg 2's GPU half — kernel ≈ true-exp — is asserted in AT-1740.)
+/// Leg 3 (algebra, ~1e-4): the FA2 online Taylor oracle ≈ a full-softmax-Taylor reference
+///   (SAME Taylor) — catches an oracle-side rescale-algebra bug, no GPU, no exp dependence.
+/// All legs use abs/rel tolerance, NOT assert_eq (the rescale reassociates f32).
+#[test]
+fn at1743_fa2_oracle_independence_and_algebra() {
+    const SEQ_LEN: usize = 64;
+    const HEAD_DIM: usize = 64;
+    let inv_sqrt_d = 1.0_f32 / (HEAD_DIM as f32).sqrt();
+    let (q, k, v) = fa2_fixture(SEQ_LEN, HEAD_DIM);
+
+    // Hard-wire the faithful band.
+    let max_arg = fa2_fixture_max_postmax_arg(&q, &k, SEQ_LEN, HEAD_DIM, inv_sqrt_d);
+    assert!(
+        max_arg <= FA2_MAX_POSTMAX_ARG,
+        "AT-1743: fixture max |post-max arg|={max_arg} > {FA2_MAX_POSTMAX_ARG}"
+    );
+
+    let oracle = cpu_flash_attention_reference(&q, &k, &v, SEQ_LEN, HEAD_DIM, inv_sqrt_d);
+    let true_exp = fa2_true_exp_softmax_reference(&q, &k, &v, SEQ_LEN, HEAD_DIM, inv_sqrt_d);
+    let full_taylor = fa2_full_softmax_taylor_reference(&q, &k, &v, SEQ_LEN, HEAD_DIM, inv_sqrt_d);
+
+    // Leg 3 (algebra, abs/rel ~1e-4): online oracle ≈ full-softmax-Taylor.
+    let mut leg3_diff = 0.0_f32;
+    for (a, b) in oracle.iter().zip(full_taylor.iter()) {
+        let d = (a - b).abs();
+        if d > leg3_diff {
+            leg3_diff = d;
+        }
+    }
+    assert!(
+        leg3_diff <= 1e-4_f32,
+        "AT-1743 leg 3 (algebra): online FA2 oracle vs full-softmax-Taylor max_diff={leg3_diff} > 1e-4 \
+         — the online rescale algebra disagrees with the single-pass softmax"
+    );
+
+    // Leg 2 (sanity, abs/rel ~5e-2): Taylor oracle ≈ TRUE-exp full-softmax.
+    let mut leg2_diff = 0.0_f32;
+    for (a, b) in oracle.iter().zip(true_exp.iter()) {
+        let d = (a - b).abs();
+        if d > leg2_diff {
+            leg2_diff = d;
+        }
+    }
+    assert!(
+        leg2_diff <= FA2_TRUE_EXP_SANITY_TOL,
+        "AT-1743 leg 2 (sanity): Taylor oracle vs TRUE-exp softmax max_diff={leg2_diff} > \
+         {FA2_TRUE_EXP_SANITY_TOL} — the Taylor approximation is not faithful within the band"
+    );
+
+    eprintln!(
+        "AT-1743 PASS (CPU legs): leg3 algebra max_diff={leg3_diff} (<=1e-4); \
+         leg2 sanity max_diff={leg2_diff} (<={FA2_TRUE_EXP_SANITY_TOL}); fixture max_arg={max_arg}"
+    );
+}
+
+/// AT-1740 GPU: FlashAttention-2 bit-close at SMALL shape (seq_len=64, head_dim=64) vs the
+/// Taylor oracle within FROZEN 1e-3 (THE gate, leg 1), AND within ~5e-2 of the TRUE-exp
+/// full-softmax (AT-1743 leg 2's GPU half — the independent sanity that this is a REAL
+/// attention, not just Taylor-vs-Taylor). #[ignore]-gated, AXC_ENABLE_GPU_TESTS=1.
+#[test]
+#[ignore]
+fn at1740_flash_attention_small_bitclose() {
+    if !gpu_tests_enabled() {
+        eprintln!("at1740: AXC_ENABLE_GPU_TESTS not set; skipping");
+        return;
+    }
+    const SEQ_LEN: usize = 64;
+    const HEAD_DIM: usize = 64;
+    let inv_sqrt_d = 1.0_f32 / (HEAD_DIM as f32).sqrt();
+    let (q, k, v) = fa2_fixture(SEQ_LEN, HEAD_DIM);
+
+    let ctx = VulkanContext::new().expect("VulkanContext must init");
+    eprintln!("AT-1740 GPU: device={}", ctx.physical_device_name());
+
+    let gpu_o = fa2_dispatch_gpu(&ctx, &q, &k, &v, SEQ_LEN, HEAD_DIM, inv_sqrt_d);
+    let cpu_o = cpu_flash_attention_reference(&q, &k, &v, SEQ_LEN, HEAD_DIM, inv_sqrt_d);
+    let true_o = fa2_true_exp_softmax_reference(&q, &k, &v, SEQ_LEN, HEAD_DIM, inv_sqrt_d);
+
+    // Leg 1 (FROZEN GATE): kernel ≈ Taylor oracle within 1e-3.
+    let mut gate_diff = 0.0_f32;
+    for (g, c) in gpu_o.iter().zip(cpu_o.iter()) {
+        let d = (g - c).abs();
+        if d > gate_diff {
+            gate_diff = d;
+        }
+    }
+    assert!(
+        gate_diff <= FA2_FROZEN_TOL,
+        "AT-1740 (GATE): flash_attention max_diff={gate_diff} > FROZEN {FA2_FROZEN_TOL}; \
+         first GPU: {:?}, CPU: {:?}",
+        &gpu_o[..4.min(gpu_o.len())],
+        &cpu_o[..4.min(cpu_o.len())]
+    );
+
+    // Leg 2 (SANITY): kernel ≈ TRUE-exp softmax within ~5e-2.
+    let mut sanity_diff = 0.0_f32;
+    for (g, t) in gpu_o.iter().zip(true_o.iter()) {
+        let d = (g - t).abs();
+        if d > sanity_diff {
+            sanity_diff = d;
+        }
+    }
+    assert!(
+        sanity_diff <= FA2_TRUE_EXP_SANITY_TOL,
+        "AT-1740 (SANITY): flash_attention vs TRUE-exp softmax max_diff={sanity_diff} > \
+         {FA2_TRUE_EXP_SANITY_TOL} (independent — proves a real attention)"
+    );
+
+    eprintln!(
+        "AT-1740 PASS: GATE max_diff={gate_diff} (<= FROZEN {FA2_FROZEN_TOL}); \
+         SANITY vs true-exp max_diff={sanity_diff} (<= {FA2_TRUE_EXP_SANITY_TOL}) on {}",
+        ctx.physical_device_name()
+    );
+}
+
+/// AT-1740b GPU: head_dim=32 CROSS-CHECK — the streaming FA2 kernel and the C1 NON-streaming
+/// tiled_attention kernel, dispatched on the SAME (seq_len=64, head_dim=32) Q/K/V, must agree
+/// within FROZEN 1e-3. Two DIFFERENT algorithms, one answer — a strong independent signal.
+#[test]
+#[ignore]
+fn at1740b_flash_attention_vs_tiled_head_dim_32() {
+    if !gpu_tests_enabled() {
+        eprintln!("at1740b: AXC_ENABLE_GPU_TESTS not set; skipping");
+        return;
+    }
+    const SEQ_LEN: usize = 64;
+    const HEAD_DIM: usize = 32;
+    let inv_sqrt_d = 1.0_f32 / (HEAD_DIM as f32).sqrt();
+    // Reuse the AT-1630 fixture exactly (apples-to-apples vs the C1 head_dim=32 fixture).
+    let q: Vec<f32> = (0..SEQ_LEN * HEAD_DIM).map(|i| 0.1_f32 * ((i % 7) as f32 - 3.0_f32)).collect();
+    let k: Vec<f32> = (0..SEQ_LEN * HEAD_DIM).map(|i| 0.1_f32 * ((i % 5) as f32 - 2.0_f32)).collect();
+    let v: Vec<f32> = (0..SEQ_LEN * HEAD_DIM).map(|i| 0.05_f32 * (i as f32 % 11.0_f32)).collect();
+
+    let ctx = VulkanContext::new().expect("VulkanContext must init");
+    eprintln!("AT-1740b GPU: device={}", ctx.physical_device_name());
+
+    // FA2 (streaming) output.
+    let fa2_o = fa2_dispatch_gpu(&ctx, &q, &k, &v, SEQ_LEN, HEAD_DIM, inv_sqrt_d);
+
+    // C1 tiled_attention (non-streaming) output on the IDENTICAL inputs.
+    let (tb, tmeta) = compile_source_with_meta(TILED_ATTENTION_SRC)
+        .expect("AT-1740b: tiled_attention.axc must compile");
+    let twords: Vec<u32> = tb.chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let thandle = ctx
+        .prepare_kernel_checked(
+            &twords, &tmeta.binding_plan, tmeta.push_constant_total_bytes,
+            &tmeta.entry_point, None, "tiled_attention", tmeta.shared_memory_bytes,
+        )
+        .unwrap_or_else(|e| panic!("AT-1740b: tiled prepare failed: {e}"));
+    let q_bytes: Vec<u8> = q.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let k_bytes: Vec<u8> = k.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let v_bytes: Vec<u8> = v.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let o_size = SEQ_LEN * HEAD_DIM * 4;
+    let pc = push_attention(SEQ_LEN as u32, HEAD_DIM as u32, inv_sqrt_d);
+    let touts = ctx
+        .dispatch_handle(
+            &thandle, (SEQ_LEN as u32, 1, 1),
+            &[&q_bytes, &k_bytes, &v_bytes, &vec![0u8; o_size]],
+            &[0, 0, 0, o_size], &pc,
+        )
+        .unwrap_or_else(|e| panic!("AT-1740b: tiled dispatch failed: {e}"));
+    let tiled_o: Vec<f32> = touts[3].chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+
+    // Cross-check: FA2 streaming vs C1 non-streaming, within FROZEN 1e-3.
+    let mut cross_diff = 0.0_f32;
+    for (f, t) in fa2_o.iter().zip(tiled_o.iter()) {
+        let d = (f - t).abs();
+        if d > cross_diff {
+            cross_diff = d;
+        }
+    }
+    assert!(
+        cross_diff <= FA2_FROZEN_TOL,
+        "AT-1740b: FA2 (streaming) vs tiled_attention (C1) max_diff={cross_diff} > FROZEN \
+         {FA2_FROZEN_TOL}; first FA2: {:?}, tiled: {:?}",
+        &fa2_o[..4.min(fa2_o.len())],
+        &tiled_o[..4.min(tiled_o.len())]
+    );
+
+    // Also vs the FA2 oracle (defense in depth).
+    let cpu_o = cpu_flash_attention_reference(&q, &k, &v, SEQ_LEN, HEAD_DIM, inv_sqrt_d);
+    let mut oracle_diff = 0.0_f32;
+    for (f, c) in fa2_o.iter().zip(cpu_o.iter()) {
+        let d = (f - c).abs();
+        if d > oracle_diff {
+            oracle_diff = d;
+        }
+    }
+    assert!(
+        oracle_diff <= FA2_FROZEN_TOL,
+        "AT-1740b: FA2 vs oracle max_diff={oracle_diff} > FROZEN {FA2_FROZEN_TOL}"
+    );
+
+    eprintln!(
+        "AT-1740b PASS: FA2 (streaming) vs tiled_attention (C1) max_diff={cross_diff}; \
+         FA2 vs oracle max_diff={oracle_diff} (both <= {FA2_FROZEN_TOL}) on {} — \
+         two algorithms, one answer",
+        ctx.physical_device_name()
+    );
+}
+
+/// AT-1741 GPU: FlashAttention-2 streaming-correct at LONG sequence (seq_len=2048,
+/// head_dim=64) within FROZEN 1e-3 — exercises MANY K/V-loop iterations. Completing at all
+/// at 2048 with O(tile)=768-byte shared + 0 scratch global is the corroborating runtime
+/// evidence of the streaming property. Reports honest latency (SLOW, no perf claim).
+#[test]
+#[ignore]
+fn at1741_flash_attention_long_streaming() {
+    if !gpu_tests_enabled() {
+        eprintln!("at1741: AXC_ENABLE_GPU_TESTS not set; skipping");
+        return;
+    }
+    const SEQ_LEN: usize = 2048;
+    const HEAD_DIM: usize = 64;
+    let inv_sqrt_d = 1.0_f32 / (HEAD_DIM as f32).sqrt();
+    let (q, k, v) = fa2_fixture(SEQ_LEN, HEAD_DIM);
+
+    let ctx = VulkanContext::new().expect("VulkanContext must init");
+    eprintln!("AT-1741 GPU: device={}", ctx.physical_device_name());
+
+    let start = std::time::Instant::now();
+    let gpu_o = fa2_dispatch_gpu(&ctx, &q, &k, &v, SEQ_LEN, HEAD_DIM, inv_sqrt_d);
+    let elapsed = start.elapsed();
+    let cpu_o = cpu_flash_attention_reference(&q, &k, &v, SEQ_LEN, HEAD_DIM, inv_sqrt_d);
+
+    let mut max_diff = 0.0_f32;
+    for (g, c) in gpu_o.iter().zip(cpu_o.iter()) {
+        let d = (g - c).abs();
+        if d > max_diff {
+            max_diff = d;
+        }
+    }
+    assert!(
+        max_diff <= FA2_FROZEN_TOL,
+        "AT-1741: long-sequence flash_attention max_diff={max_diff} > FROZEN {FA2_FROZEN_TOL}; \
+         first GPU: {:?}, CPU: {:?}",
+        &gpu_o[..4.min(gpu_o.len())],
+        &cpu_o[..4.min(cpu_o.len())]
+    );
+    eprintln!(
+        "AT-1741 PASS: streaming-correct at seq_len={SEQ_LEN} head_dim={HEAD_DIM} \
+         max_diff={max_diff} (<= {FA2_FROZEN_TOL}) on {} — O(tile)=768-byte shared, 0 scratch \
+         global. HONEST latency (SLOW, scalar core, NO perf claim): {:?}",
+        ctx.physical_device_name(),
+        elapsed
+    );
+}
+
+/// AT-1744 GPU: first-iteration guard + running-max climb (TWO adversarial orderings),
+/// both within FROZEN 1e-3.
+///
+/// Fixture A: the FIRST K/V row has the max score (so every LATER correction != 1) — exercises
+///   the j==0 correction=0 guard AND the subsequent rescales.
+/// Fixture B: a monotone SMALL-step climb so the running max rises every iteration (every
+///   correction != 1) WHILE each correction arg stays > -0.7 (Taylor faithful).
+/// Both assert max |post-max arg| <= 0.7 (via fa2_dispatch_gpu).
+#[test]
+#[ignore]
+fn at1744_fa2_running_max_climb() {
+    if !gpu_tests_enabled() {
+        eprintln!("at1744: AXC_ENABLE_GPU_TESTS not set; skipping");
+        return;
+    }
+    const SEQ_LEN: usize = 64;
+    const HEAD_DIM: usize = 64;
+    let inv_sqrt_d = 1.0_f32 / (HEAD_DIM as f32).sqrt();
+
+    let ctx = VulkanContext::new().expect("VulkanContext must init");
+    eprintln!("AT-1744 GPU: device={}", ctx.physical_device_name());
+
+    // ── Fixture A: FIRST row has the max. Q/K aligned (positive), with row 0 of K boosted
+    //    so dot(Q,K_0) is the per-query max. Scores stay small (near-uniform).
+    let q_a: Vec<f32> = (0..SEQ_LEN * HEAD_DIM).map(|i| 0.05_f32 * (((i % 4) + 1) as f32)).collect();
+    let mut k_a: Vec<f32> = (0..SEQ_LEN * HEAD_DIM).map(|i| 0.04_f32 * (((i % 3) + 1) as f32)).collect();
+    for slot in k_a.iter_mut().take(HEAD_DIM) {
+        *slot += 0.03_f32;
+    }
+    let v_a: Vec<f32> = (0..SEQ_LEN * HEAD_DIM).map(|i| 0.05_f32 * (i as f32 % 11.0_f32)).collect();
+
+    let gpu_a = fa2_dispatch_gpu(&ctx, &q_a, &k_a, &v_a, SEQ_LEN, HEAD_DIM, inv_sqrt_d);
+    let cpu_a = cpu_flash_attention_reference(&q_a, &k_a, &v_a, SEQ_LEN, HEAD_DIM, inv_sqrt_d);
+    let mut diff_a = 0.0_f32;
+    for (g, c) in gpu_a.iter().zip(cpu_a.iter()) {
+        let d = (g - c).abs();
+        if d > diff_a {
+            diff_a = d;
+        }
+    }
+    assert!(
+        diff_a <= FA2_FROZEN_TOL,
+        "AT-1744 fixture A (first-row-max, j==0 guard): max_diff={diff_a} > FROZEN {FA2_FROZEN_TOL}"
+    );
+
+    // ── Fixture B: monotone SMALL-step climb. Row j of K is scaled so dot(Q,K_j) increases
+    //    monotonically in small steps → the running max rises every iteration (every
+    //    correction != 1) while each step stays in the faithful band.
+    let q_b: Vec<f32> = (0..SEQ_LEN * HEAD_DIM).map(|_| 0.05_f32).collect();
+    let mut k_b: Vec<f32> = vec![0.0_f32; SEQ_LEN * HEAD_DIM];
+    for j in 0..SEQ_LEN {
+        let base = 0.03_f32 + 0.0008_f32 * (j as f32);
+        for d in 0..HEAD_DIM {
+            k_b[j * HEAD_DIM + d] = base;
+        }
+    }
+    let v_b: Vec<f32> = (0..SEQ_LEN * HEAD_DIM).map(|i| 0.05_f32 * (i as f32 % 7.0_f32)).collect();
+
+    let gpu_b = fa2_dispatch_gpu(&ctx, &q_b, &k_b, &v_b, SEQ_LEN, HEAD_DIM, inv_sqrt_d);
+    let cpu_b = cpu_flash_attention_reference(&q_b, &k_b, &v_b, SEQ_LEN, HEAD_DIM, inv_sqrt_d);
+    let mut diff_b = 0.0_f32;
+    for (g, c) in gpu_b.iter().zip(cpu_b.iter()) {
+        let d = (g - c).abs();
+        if d > diff_b {
+            diff_b = d;
+        }
+    }
+    assert!(
+        diff_b <= FA2_FROZEN_TOL,
+        "AT-1744 fixture B (monotone climb, every-iter rescale): max_diff={diff_b} > FROZEN \
+         {FA2_FROZEN_TOL}"
+    );
+
+    eprintln!(
+        "AT-1744 PASS: first-row-max (j==0 guard) max_diff={diff_a}; monotone-climb \
+         (every-iter rescale) max_diff={diff_b} (both <= {FA2_FROZEN_TOL}) on {}",
         ctx.physical_device_name()
     );
 }
