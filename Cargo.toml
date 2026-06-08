@@ -9,6 +9,21 @@ members = [
     "crates/axc-optimize",
     "crates/axc-driver",
     "crates/axc-runtime",
+    # M4.1: PyO3 cdylib. In `members` for a shared lockfile, but EXCLUDED from
+    # default-members so `cargo build`/`cargo test --workspace` does not try to
+    # link libpython (it is built via maturin instead).
+    "crates/axc-py",
+]
+# default-members omits axc-py so the existing Lavapipe CI `cargo test --workspace`
+# stays green (the PyO3 extension-module crate is built by maturin, not cargo).
+default-members = [
+    "crates/axc-lexer",
+    "crates/axc-parser",
+    "crates/axc-hir",
+    "crates/axc-codegen",
+    "crates/axc-optimize",
+    "crates/axc-driver",
+    "crates/axc-runtime",
 ]
 
 [workspace.package]

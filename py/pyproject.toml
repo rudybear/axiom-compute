@@ -1,0 +1,26 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "axiom-compute"
+version = "0.0.1"
+description = "PyTorch frontend for AXIOM-Compute: CUDA↔Vulkan zero-copy kernels (M4.1)"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT OR Apache-2.0" }
+# torch is a hard RUNTIME dependency; cuda-python is preferred for the CUDA import
+# but optional (a ctypes-to-libcudart fallback is built in). They are NOT installed
+# by the build — they are the user's runtime prereqs (analogous to llama.cpp tooling).
+dependencies = []
+
+[project.optional-dependencies]
+cuda = ["cuda-python>=12.0"]
+
+[tool.maturin]
+# Build the axc-py cdylib as the `_axiom_compute` native module inside the
+# `axiom_compute` package; the pure-Python shim lives in python-source.
+manifest-path = "../crates/axc-py/Cargo.toml"
+module-name = "axiom_compute._axiom_compute"
+python-source = "."
+# Release build by default for the kernel dispatch path.

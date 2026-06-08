@@ -1,0 +1,21 @@
+[package]
+name = "axc-py"
+version = "0.0.1"
+edition = "2021"
+publish = false
+description = "PyO3 bindings exposing AXIOM-Compute's CUDA↔Vulkan zero-copy interop to PyTorch (M4.1)"
+
+[lib]
+# cdylib so maturin produces the `_axiom_compute` native extension module.
+# NOT a `rlib` member that `cargo build`/`cargo test --workspace` would try to
+# link against libpython — axc-py is excluded from workspace default-members.
+crate-type = ["cdylib"]
+name = "_axiom_compute"
+
+[dependencies]
+# abi3-py312: a single wheel works across CPython >= 3.12. extension-module: do not
+# link libpython at build time (the interpreter provides the symbols at runtime).
+pyo3 = { version = "0.22", features = ["abi3-py312", "extension-module"] }
+axc-runtime = { path = "../axc-runtime" }
+axc-driver = { path = "../axc-driver" }
+axc-hir = { path = "../axc-hir" }

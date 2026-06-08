@@ -80,6 +80,9 @@ pub(crate) mod transfer_queue;
 // M3.1 new modules
 pub mod coopmat;
 pub(crate) mod resident;
+// M4.1 CUDA↔Vulkan external-memory interop modules
+pub mod external_memory;
+pub mod device_uuid;
 
 pub use error::{DispatchError, DispatchResult, CopyDirection};
 pub use context::{VulkanContext, VulkanContextOptions};
@@ -94,3 +97,11 @@ pub use coopmat::{
     EnabledDeviceFeatures,
 };
 pub use resident::{ResidentBuffers, ResidentDispatchTiming, ResidentTimingSource, ResidentBenchConfig};
+pub use external_memory::{
+    ExternalBuffer, ExternalTimelineSemaphore, ExternalBinarySemaphore, ExternalInteropCaps,
+    SharedBufferSet, allocate_exportable_device_local_buffer, export_memory_fd,
+    create_exportable_timeline_semaphore, create_exportable_binary_semaphore_pair,
+    export_semaphore_fd,
+};
+pub use context::ExternalInteropOptions;
+pub use device_uuid::{select_physical_device_by_uuid, physical_device_uuid, physical_device_driver_uuid};

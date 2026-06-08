@@ -34,9 +34,14 @@ jobs:
         env:
           VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
       - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+        # M4.1: --workspace includes axc-py (cdylib, extension-module) which builds on
+        # Lavapipe CI without libpython. Clippy on the whole workspace stays useful.
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
-        run: cargo test --workspace && cargo test --workspace -- --ignored
+        # default-members EXCLUDES axc-py so the Lavapipe gate never depends on
+        # libpython / maturin (M4.1 R-5). The PyTorch-interop tests run in the separate
+        # self-hosted NVIDIA job below.
+        run: cargo test && cargo test -- --ignored
 
   # M2.2: Regression gate — runs cpu_reference benches and checks for >15% slowdown.
   # Benches are compiled in release mode to match the profile used for baselines.json.
@@ -84,3 +89,25 @@ jobs:
           -- bench_regression_detects_over_threshold_slowdown --nocapture
         env:
           AXC_BLESS_BASELINES: ""
+
+  # M4.1: PyTorch CUDA↔Vulkan zero-copy interop tests. SELF-HOSTED NVIDIA only —
+  # SKIPPED on the Lavapipe software-GPU CI (no CUDA, no NVIDIA Vulkan ICD). Mirrors
+  # the M3.x #[ignore] GPU-test gating. continue-on-error keeps the PR mergeable while
+  # the self-hosted runner fleet is provisioned; the cargo gate above stays blocking.
+  pytorch-interop:
+    runs-on: [self-hosted, nvidia, cuda]
+    continue-on-error: true
+    env:
+      AXC_ENABLE_GPU_TESTS: "1"
+      VK_DRIVER_FILES: /usr/share/vulkan/icd.d/nvidia_icd.json
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install maturin
+        run: pip install --upgrade "maturin>=1.7,<2"
+      - name: Build + install the axiom_compute wheel
+        working-directory: py
+        run: maturin develop --release
+      - name: Run zero-copy interop tests (AT-2100..2110)
+        working-directory: py
+        run: python -m pytest tests/ -v
