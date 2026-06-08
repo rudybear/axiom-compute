@@ -408,6 +408,27 @@ class SharedSession:
         self._kernel._compiled.host_signal_timeline(self._bufs, value)
         self._released_value = value
 
+    def device_wait_idle(self) -> None:
+        """PCR-1: drain the WHOLE Vulkan queue (``vkDeviceWaitIdle``). On the recovery path
+        this runs BEFORE any host-signal: it RETIRES every still-enqueued submit, so a
+        merely-SLOW (false-positive-timeout) dispatch signals its own V2 (the GPU stays the
+        SOLE signaler), and a genuine fault leaves V2 unsignaled — letting the caller decide
+        host-signal vs. skip via :meth:`external_timeline_value`. Bounded only by the driver;
+        this is the exceptional/error path, never the happy path (G-5 fast path untouched)."""
+        if self._closed:
+            raise AxiomError("session is closed")
+        self._kernel._compiled.device_wait_idle()
+
+    def external_timeline_value(self) -> int:
+        """PCR-1: current payload of the shared external timeline (``vkGetSemaphoreCounterValue``).
+        Queried AFTER :meth:`device_wait_idle` to learn whether the GPU's own submit already
+        signaled V2 (payload >= V2 → skip host-signal, avoid a double-signal UB) or the
+        dispatch genuinely faulted (payload < V2 → host-signal is the SOLE signaler).
+        Raises on the binary fallback (no host-queryable counter)."""
+        if self._closed:
+            raise AxiomError("session is closed")
+        return int(self._kernel._compiled.get_external_timeline_value(self._bufs))
+
     def poison(self) -> None:
         """R2: mark the session UNUSABLE so the op cache evicts + rebuilds it on the next
         call (a faulted session + its stream S are NEVER reused for a new dispatch)."""

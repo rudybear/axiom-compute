@@ -1242,6 +1242,34 @@ impl VulkanContext {
         }
     }
 
+    /// M4.1p3 (PCR-1): read the CURRENT payload of the shared external timeline semaphore
+    /// (`vkGetSemaphoreCounterValue`) — i.e. the highest value any signaler (GPU submit OR
+    /// a host signal) has reached. The recovery path queries this AFTER `device_wait_idle`
+    /// (which drains the queue, so any merely-SLOW still-enqueued submit has retired and
+    /// signaled V2 itself): if the payload already reached V2 the recovery MUST NOT host-
+    /// signal (that would be a non-monotone double-signal of the same value = Vulkan UB);
+    /// only a genuine fault (payload < V2 after the queue is drained, so no submit will ever
+    /// signal it) needs the host signal. Errors on the binary-fallback path (no host-
+    /// queryable single-value counter for a binary-semaphore pair).
+    pub fn get_external_timeline_value(
+        &self,
+        bufs: &crate::external_memory::SharedBufferSet,
+    ) -> Result<u64, DispatchError> {
+        let device: &ash::Device = &self.device_owner.device;
+        match bufs.timeline.as_ref() {
+            // SAFETY: timeline semaphore is valid; reading the counter is a pure host query
+            // with no queue/GPU side effects.
+            Some(ts) => unsafe { device.get_semaphore_counter_value(ts.semaphore) }
+                .map_err(|e| DispatchError::QueueSubmitFailed(format!(
+                    "get_external_timeline_value: {e}"
+                ))),
+            None => Err(DispatchError::ExternalSemaphoreUnsupported(
+                "get_external_timeline_value requires the external TIMELINE path \
+                 (no host-queryable counter for a binary semaphore pair)".to_owned(),
+            )),
+        }
+    }
+
     /// M4.1p3: the resolved fence timeout (ms) — the default bound for `wait_completion`.
     pub fn fence_timeout_ms(&self) -> u64 {
         self.fence_timeout_ms

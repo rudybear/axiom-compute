@@ -186,6 +186,21 @@ impl CompiledKernel {
             .map_err(dispatch_err)
     }
 
+    /// M4.1p3 (PCR-1): read the CURRENT payload of the shared external timeline semaphore
+    /// (`vkGetSemaphoreCounterValue`). The recovery path queries this AFTER
+    /// `device_wait_idle` to decide whether the GPU already signaled V2 (skip the host
+    /// signal — a double-signal of the same value is UB) or genuinely faulted (payload < V2,
+    /// host-signal is the SOLE signaler). Raises on the binary-fallback path.
+    fn get_external_timeline_value(&self, bufs: &SharedBuffers) -> PyResult<u64> {
+        let set = bufs
+            .set
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("shared buffers already torn down"))?;
+        self.ctx
+            .get_external_timeline_value(set)
+            .map_err(dispatch_err)
+    }
+
     /// M4.1p3: the resolved default fence timeout (ms) — the default bound `wait_completion`
     /// applies when no explicit `timeout_ms` is given.
     fn fence_timeout_ms(&self) -> u64 {

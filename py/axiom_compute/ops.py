@@ -338,16 +338,66 @@ def _q4km_matmul_impl(x, weights_id: int, M: int, N: int, K: int):
 
 
 def _recover_faulted_session(entry, n, op, session) -> None:
-    """R2: release the dangling CUDA wait(V2) (host-signal the timeline) + poison + evict.
+    """R2 + PCR-1: drain the queue, conditionally release the dangling CUDA wait(V2), then
+    poison + evict.
 
-    Best-effort + bounded: host-signalling V2 unblocks any already-enqueued CUDA op on S so
-    nothing hangs right now; poison + evict guarantees the possibly-still-mid-flight faulted
-    session is not reused for a NEW dispatch. release_cuda_wait is at-most-once / monotone
-    (guarded inside SharedSession)."""
+    PCR-1 (recovery-path double-signal / UAF fix). A ``wait_completion`` timeout cannot tell
+    a REAL GPU fault (the V2-signaling submit faulted → V2 never signals) from a merely-SLOW
+    dispatch (the submit is STILL ENQUEUED and WILL signal V2 shortly). Host-signaling V2
+    unconditionally would, on a FALSE-POSITIVE timeout, double-signal the same timeline value
+    (the GPU's still-queued submit ALSO signals it) — a non-monotone timeline double-signal =
+    Vulkan UB — and would advance the payload so the later close()/drain returns immediately,
+    BYPASSING the device_wait_idle UAF fallback while the submit still references the SSBOs.
+
+    The fix (this path is the EXCEPTIONAL/error path; the extra barrier is acceptable here —
+    the G-5 happy path is untouched):
+      1. device_wait_idle FIRST — drains the queue. A merely-SLOW submit RETIRES and signals
+         its OWN V2 (the GPU stays the SOLE signaler); a genuine fault returns with V2 still
+         unsignaled.
+      2. AFTER the drain, read the timeline payload. If it already reached V2 (false positive,
+         or a real-but-now-retired completion) → do NOT host-signal: the GPU already released
+         the CUDA wait(V2), and re-signaling the same value is the UB we must avoid. Only if
+         payload < V2 (genuine fault — no enqueued submit will ever signal it, proven by the
+         drain) do we host-signal V2 as the SOLE signaler to release the parked CUDA wait.
+      3. THEN poison + evict. Because the queue was drained, the subsequent close()/teardown
+         cannot race an unretired submit → no UAF.
+
+    All steps are best-effort/guarded (this runs while already handling a fault). The host
+    signal stays at-most-once / monotone (guarded inside SharedSession.release_cuda_wait)."""
+    target = session._last_signal
+
+    # (1) Drain the WHOLE queue FIRST so a merely-SLOW submit retires + self-signals V2, and a
+    # genuine fault is left with V2 unsignaled. This also removes the UAF window before close.
+    drained = False
     try:
-        session.release_cuda_wait(session._last_signal)
+        session.device_wait_idle()
+        drained = True
     except Exception:
+        # Could not drain (wedged device / binary fallback). Fall back to the prior R2
+        # behavior: host-signal to release the parked wait (still at-most-once/monotone).
         pass
+
+    # (2) Only host-signal V2 if the GPU did NOT already signal it (avoid the double-signal).
+    # If we could not drain, we cannot prove the GPU won't signal — but an undrained device is
+    # already the UAF-fallback's job at close(); here we still release the parked wait so the
+    # stream unblocks (the monotone guard prevents re-signaling an already-signaled value).
+    need_host_signal = True
+    if drained:
+        try:
+            payload = session.external_timeline_value()
+            # GPU already reached V2 (false positive / retired completion): SKIP host-signal.
+            need_host_signal = payload < target
+        except Exception:
+            # Could not read the counter (e.g. binary fallback): fall back to host-signal,
+            # guarded at-most-once/monotone inside release_cuda_wait.
+            need_host_signal = True
+
+    if need_host_signal:
+        try:
+            session.release_cuda_wait(target)
+        except Exception:
+            pass
+
     try:
         session.poison()
     except Exception:
