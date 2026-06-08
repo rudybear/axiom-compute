@@ -230,6 +230,8 @@ class Q4KMMatmul:
         self._n_bpr: Optional[int] = None
         self._n: Optional[int] = None
         self._sess = None  # allocated on first matmul (N-dependent sizes)
+        # M4.1p3: which path the most recent matmul() took ('zero_copy' | 'device_copy').
+        self.report_path: Optional[str] = None
 
     # ── shape / scalar helpers ──────────────────────────────────────────────────────
     @property
@@ -239,6 +241,21 @@ class Q4KMMatmul:
     @property
     def session(self):
         return self._sess
+
+    @property
+    def m(self) -> Optional[int]:
+        """The registered M (weight rows) — fixed at :meth:`upload_weights` (R1)."""
+        return self._m
+
+    @property
+    def k(self) -> Optional[int]:
+        """The registered K (contraction dim) — fixed at :meth:`upload_weights` (R1)."""
+        return self._k
+
+    @property
+    def n(self) -> Optional[int]:
+        """The session N (activation cols) — fixed on the first matmul/x_view (R1)."""
+        return self._n
 
     def scalar_layout(self):
         return self._kernel.scalar_layout()
@@ -364,9 +381,11 @@ class Q4KMMatmul:
                     "view would silently reinterpret the underlying buffer — write activations "
                     "directly into x_view(n) (do not pass a transposed/strided view)."
                 )
+            self.report_path = "zero_copy"
         else:
             with torch.cuda.stream(s):
                 xv.copy_(x_f16.contiguous())
+            self.report_path = "device_copy"
 
         n_bpr = self._k // 256
         pc = self._kernel.assemble_push_constants(

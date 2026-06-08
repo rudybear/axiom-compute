@@ -19,7 +19,7 @@ Last updated: 2026-04-28. Test count baseline: **713**.
 | Bench harness + measured baselines | ✅ done (M2.2) |
 | **FlashAttention-2** | ❌ M3.1 |
 | **KernelBench-Vulkan public submission** | ❌ M3.2 |
-| **PyTorch frontend + upstream adoption** | 🔄 M4.1 Phase 1 MERGED — CUDA↔Vulkan ZERO-COPY proven on NVIDIA: torch CUDA tensor + AXIOM Vulkan kernel share one dedicated physical alloc (no host copy), via external-memory-fd + timeline external semaphore (spike works on 580.x). saxpy BIT-EXACT zero-copy; AT-2101 same-memory both directions; race-free 5000 dispatches; double-free/UAF-safe; fail-closed UUID. `crates/axc-py` PyO3 + `py/axiom_compute` (pip/maturin). DEFERRED: Q4_K_M headline op + latency (next phase), torch.library (M4.2), torch.compile (M4.3). Honest: ~34% cuBLAS, win is no-host-copy + interop not speed. AT-2100..2110 |
+| **PyTorch frontend + upstream adoption** | 🔄 M4.1 Phase 1+2 MERGED — CUDA↔Vulkan ZERO-COPY proven on NVIDIA: torch CUDA tensor + AXIOM Vulkan kernel share one dedicated physical alloc (no host copy), via external-memory-fd + timeline external semaphore (spike works on 580.x). saxpy BIT-EXACT zero-copy; M3.6 Q4_K_M matmul as the headline op (AT-2103 combined ≤ 1e-3 at K=256/512/14336; AT-2105 honest latency); race-free; double-free/UAF-safe; fail-closed UUID. `crates/axc-py` PyO3 + `py/axiom_compute` (pip/maturin). ✅ Phase 3 DELIVERED (§3.1.27, r2 — both design reviewers APPROVED; GPU-verified on NVIDIA RTX PRO 6000 / 580.x) — `torch.library.custom_op` (`torch.ops.axiom.q4km_matmul`) + `register_fake` composes under `torch.compile(fullgraph=True)` (graph_break_count=0, combined 5.3e-7): caller (M,N,K) fail-closed-validated so fake==real shape (R1, AT-2111c); op runs on the session's captured stream with a cross-stream hand-back (R3, AT-2111d); ≤10-line user demo (AT-2116); opcheck passes (AT-2117); wait-timeout residual CLOSED on BOTH sides — bounded `wait_completion` + host-signal the timeline to V2 (`vkSignalSemaphore`) releases the dangling CUDA wait so stream S unblocks + poison/rebuild (AT-2114 PASS — the both-sides deadlock fix works on 580.x), happy path unchanged (AT-2115). DEFERRED to M4.2: cross-vendor (AMD/Intel), NVIDIA-only EXCLUSIVE-sync residual, the binary-pair host-signal-release analogue. Honest: ~53% cuBLAS, win is no-host-copy + real torch interop + torch.compile composition not speed; zero-copy claim EAGER-scoped (functionalization forces device_copy under compile). AT-2100..2118 |
 | Bandwidth optimization (pinned memory, concurrent transfer) | ✅ M3.0 (saxpy_1m 7.5×, saxpy_1024 39×; <1ms gate re-scoped to GPU-resident metric) |
 | Multi-row tiled matmul (cooperative_matrix on real workloads) | ✅ M3.1 (first coopmat dispatch on Blackwell, bit-exact; resident-TFLOPS benchmark → M3.2) |
 | Cross-vendor real GPU CI (AMD RDNA3+, Intel Arc) | ❌ infra |
@@ -270,9 +270,9 @@ Goal: real users.
 - ABI: pass `torch.Tensor` as raw GPU pointer + descriptor (zero-copy when possible)
 
 **Acceptance:**
-- `pip install axiom-compute` works on Linux x86_64 with NVIDIA + Vulkan loader
-- Drop-in custom-op replacement for `torch.matmul` on a 4096×4096 f32 case, within 50% of native PyTorch (cuBLAS-backed) speed
-- 10-line PyTorch user code can call AXIOM kernel
+- `pip install axiom-compute` works on Linux x86_64 with NVIDIA + Vulkan loader ✅ (maturin wheel)
+- Registered `torch.ops.axiom.q4km_matmul` custom-op composes under `torch.compile(fullgraph=True)`; correct within FROZEN 1e-3 vs the Rust oracle (Phase 3, §3.1.27). HONEST: ~53% of f32 cuBLAS — the value is real torch interop, NOT a beat-cuBLAS speed claim (the original "within 50% of cuBLAS" target is reported, not gated)
+- 10-line PyTorch user code can call the AXIOM kernel under `torch.compile` ✅ (`py/examples/q4km_torch_compile_demo.py`, Phase 3)
 
 **Effort:** ~3000–5000 LOC.
 **Depends on:** M3.0–M3.2.

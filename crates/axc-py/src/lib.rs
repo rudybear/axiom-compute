@@ -150,6 +150,63 @@ impl CompiledKernel {
         self.ctx.drain_external_timeline(set, value).map_err(dispatch_err)
     }
 
+    /// M4.1p3 (R2): bounded drain of the external timeline to `value` with an EXPLICIT
+    /// `timeout_ms` override (None → the context `fence_timeout_ms`). Used by the op's
+    /// owned-output completion barrier + the error path so a stuck handshake surfaces as
+    /// a Python exception (FenceTimeout) within a caller-chosen bound, not an unbounded
+    /// hang. The happy `dispatch_zero_copy` path is unchanged.
+    #[pyo3(signature = (bufs, value, timeout_ms=None))]
+    fn drain_with_timeout(
+        &self,
+        bufs: &SharedBuffers,
+        value: u64,
+        timeout_ms: Option<u64>,
+    ) -> PyResult<()> {
+        let set = bufs
+            .set
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("shared buffers already torn down"))?;
+        self.ctx
+            .drain_external_timeline_with_timeout(set, value, timeout_ms)
+            .map_err(dispatch_err)
+    }
+
+    /// M4.1p3 (R2): HOST-signal the shared external timeline semaphore to `value`
+    /// (`vkSignalSemaphore`). Releases a dangling `cudaWaitExternalSemaphoresAsync(value)`
+    /// on the CUDA stream after a one-sided GPU fault (V1 signaled, V2 never reached), so
+    /// the poisoned stream unblocks. MUST be at-most-once per (session, value) and
+    /// strictly monotone (the Python op guards this). Raises on the binary-fallback path.
+    fn host_signal_timeline(&self, bufs: &SharedBuffers, value: u64) -> PyResult<()> {
+        let set = bufs
+            .set
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("shared buffers already torn down"))?;
+        self.ctx
+            .host_signal_external_timeline(set, value)
+            .map_err(dispatch_err)
+    }
+
+    /// M4.1p3 (PCR-1): read the CURRENT payload of the shared external timeline semaphore
+    /// (`vkGetSemaphoreCounterValue`). The recovery path queries this AFTER
+    /// `device_wait_idle` to decide whether the GPU already signaled V2 (skip the host
+    /// signal — a double-signal of the same value is UB) or genuinely faulted (payload < V2,
+    /// host-signal is the SOLE signaler). Raises on the binary-fallback path.
+    fn get_external_timeline_value(&self, bufs: &SharedBuffers) -> PyResult<u64> {
+        let set = bufs
+            .set
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("shared buffers already torn down"))?;
+        self.ctx
+            .get_external_timeline_value(set)
+            .map_err(dispatch_err)
+    }
+
+    /// M4.1p3: the resolved default fence timeout (ms) — the default bound `wait_completion`
+    /// applies when no explicit `timeout_ms` is given.
+    fn fence_timeout_ms(&self) -> u64 {
+        self.ctx.fence_timeout_ms()
+    }
+
     /// FIX-2 HARD FALLBACK: block until the device is provably idle (`vkDeviceWaitIdle`).
     /// `SharedSession.close()` calls this when the timeline drain fails — nothing may be
     /// freed while a dispatch could still be in-flight (UAF). Raises if even this fails
