@@ -1,4 +1,11 @@
-//! M3.5b — f32-ACCUMULATOR Q4_K_M CPU reference (the fused-f32acc-kernel correctness oracle).
+//! M3.5b / M4.1p2 — f32-ACCUMULATOR Q4_K_M CPU reference (the fused-f32acc-kernel correctness
+//! oracle), promoted to a PUBLIC library module (`axc_driver::q4km_oracle`).
+//!
+//! SINGLE SOURCE OF TRUTH: this is the SAME code that was formerly the `#[path]`-included test
+//! module `tests/common_q4km_f32ref.rs`. It is now a pub lib module so BOTH the existing GPU
+//! tests/benches (which `use axc_driver::q4km_oracle;` — NOT a `#[path]`-include) AND the axc-py
+//! PyO3 bridge (`q4km_f32_reference`) call the IDENTICAL functions — the AT-2103 frozen-1e-3 gate
+//! computed in Rust cannot be loosened or re-implemented in Python.
 //!
 //! The GPU f32-accumulator fused kernel (q4km_matmul_rb_coopmat_f32acc.axc) accumulates in
 //! an f32 coopmat accumulator (matrix[f32,16,16,accumulator]) — the canonical f16×f16→f32

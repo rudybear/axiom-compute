@@ -153,6 +153,10 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # M2.4: SPIR-V capability name mapping.
 spirv = { workspace = true }
+# M3.5b/M4.1p2: half — f16 rounding for the pub q4km_oracle module (the f32-accumulator
+# Q4_K_M reference). Promoted from [dev-dependencies] so the oracle is callable from the
+# axc-py PyO3 bridge (single source of truth for the AT-2103 frozen-1e-3 gate).
+half = "2"
 
 [dev-dependencies]
 rspirv = { workspace = true }
@@ -160,7 +164,5 @@ spirv = { workspace = true }
 # M2.2: Criterion bench framework (cargo_bench_support only — no HTML reports dep).
 criterion = { workspace = true }
 # M2.2: Serde for baselines.json and candidate-baselines.json serialization.
-# M2.5: half crate for bit-exact f16 → f32 conversion in Q4_0 CPU reference.
-half = "2"
 # M2.4: Temp file creation for history append tests.
 tempfile = { workspace = true }

@@ -78,6 +78,19 @@ impl CompiledKernel {
         self.meta.binding_plan.push_constant_total_bytes
     }
 
+    /// M4.1p2: the kernel's scalar push-constant slots as `(name, offset_bytes, size_bytes)`,
+    /// one per scalar member (std430 layout). Python assembles M/N/K/n_blocks_per_row generically
+    /// by OFFSET+NAME (the analogue of the bench's `assemble_pc`) — NOT positionally — so a
+    /// wrong push-constant ORDER is structurally impossible (each value lands at its named offset).
+    fn scalar_layout(&self) -> Vec<(String, u32, u32)> {
+        self.meta
+            .binding_plan
+            .scalars
+            .iter()
+            .map(|s| (s.name.clone(), s.offset, s.ty.bit_width() / 8))
+            .collect()
+    }
+
     /// Allocate the exportable DEDICATED shared buffers + the shared semaphore.
     ///
     /// `sizes` is one byte-size per binding (binding order). When `use_binary_fallback`
@@ -298,8 +311,22 @@ impl SpikeBinaryPair {
 ///
 /// `device_uuid` is the CUDA device UUID (16 raw bytes) the Vulkan device MUST
 /// match (FAIL-CLOSED). Raises on no UUID match or missing external-fd extensions.
+///
+/// M4.1p2: `strategy` is an OPTIONAL `dict[str, int]` of strategy-hole assignments. When
+/// present (Some), it routes to `axc_driver::compile_source_with_assignments` (the M2.3
+/// per-variant path the resident bench uses) — source-text `?name` substitution then the
+/// `@strategy` block is stripped so codegen sees a fully-resolved kernel. The Q4_K_M headline
+/// op passes all 5 leader holes `{rb_m:2, rb_n:2, tile_k:16, a_block_size:512, b_block_size:512}`.
+/// When absent (None), the Phase-1 `compile_source_with_meta` saxpy path is used VERBATIM. A
+/// hole-carrying source with `strategy=None` FAILS at compile (UnresolvedStrategyHole) — the
+/// kwarg is load-bearing (AT-2103d).
 #[pyfunction]
-fn compile_kernel(source: &str, device_uuid: Vec<u8>) -> PyResult<CompiledKernel> {
+#[pyo3(signature = (source, device_uuid, strategy=None))]
+fn compile_kernel(
+    source: &str,
+    device_uuid: Vec<u8>,
+    strategy: Option<std::collections::HashMap<String, i64>>,
+) -> PyResult<CompiledKernel> {
     if device_uuid.len() != 16 {
         return Err(PyValueError::new_err(format!(
             "device_uuid must be 16 raw bytes, got {}",
@@ -309,8 +336,16 @@ fn compile_kernel(source: &str, device_uuid: Vec<u8>) -> PyResult<CompiledKernel
     let mut uuid = [0u8; 16];
     uuid.copy_from_slice(&device_uuid);
 
-    let (spirv_bytes, meta) = axc_driver::compile_source_with_meta(source)
-        .map_err(|e| PyRuntimeError::new_err(format!("axiom-compute compile error: {e}")))?;
+    let (spirv_bytes, meta) = match strategy {
+        Some(map) => {
+            // Convert to a BTreeMap for deterministic substitution (the contract of
+            // compile_source_with_assignments — byte-identical SPIR-V reproducibility).
+            let assignments: std::collections::BTreeMap<String, i64> = map.into_iter().collect();
+            axc_driver::compile_source_with_assignments(source, &assignments)
+        }
+        None => axc_driver::compile_source_with_meta(source),
+    }
+    .map_err(|e| PyRuntimeError::new_err(format!("axiom-compute compile error: {e}")))?;
     let words = bytes_to_words(&spirv_bytes);
 
     let ctx = VulkanContext::new_for_external_interop(uuid).map_err(dispatch_err)?;
@@ -332,6 +367,88 @@ fn compile_kernel(source: &str, device_uuid: Vec<u8>) -> PyResult<CompiledKernel
         handle,
         meta,
     })
+}
+
+/// M4.1p2: the f32-accumulator Q4_K_M CPU REFERENCE + the condition-aware combined gate,
+/// computed in RUST so the FROZEN 1e-3 (AT-2103) cannot be loosened or re-implemented in Python.
+///
+/// Calls the SHARED `axc_driver::q4km_oracle` (the SAME f32-accumulator reference + abs_dot_scale
+/// every M3.x Q4_K_M GPU test gates on — single source of truth, no torch dequant drift).
+///
+/// - `q`: Q4_K_M weight bytes (M weight-rows × n_blocks_per_row × 144-byte superblocks).
+/// - `x_f16_bits`: activation f16 BIT PATTERNS (u16), row-major `x[k * n + col]` ([K,N] layout).
+/// - returns `(y_ref, abs_scale)`: the f32 reference output and the per-element dot-product
+///   magnitude scale `Σ_k |w_k·x_k|` (the condition-aware denominator), both row-major (m × n).
+///
+/// The caller passes `y_ref`/`abs_scale` back into [`q4km_combined_metric`] together with the
+/// GPU output to obtain the FROZEN gate value (≤ 1e-3 ⇒ pass).
+#[pyfunction]
+fn q4km_f32_reference(
+    q: Vec<u8>,
+    x_f16_bits: Vec<u16>,
+    m: usize,
+    n: usize,
+    n_blocks_per_row: usize,
+) -> PyResult<(Vec<f32>, Vec<f32>)> {
+    let k = n_blocks_per_row * 256;
+    let expected_q = m * n_blocks_per_row * axc_driver::q4km_oracle::Q4KM_SUPERBLOCK_BYTES;
+    if q.len() != expected_q {
+        return Err(PyValueError::new_err(format!(
+            "q4km_f32_reference: q has {} bytes, expected m*n_bpr*144 = {expected_q}",
+            q.len()
+        )));
+    }
+    if x_f16_bits.len() != k * n {
+        return Err(PyValueError::new_err(format!(
+            "q4km_f32_reference: x_f16_bits has {} elems, expected K*N = {}",
+            x_f16_bits.len(),
+            k * n
+        )));
+    }
+    let y_ref = axc_driver::q4km_oracle::q4km_dequant_matmul_f32accum_cpu(
+        &q,
+        &x_f16_bits,
+        m,
+        n,
+        n_blocks_per_row,
+    );
+    let abs_scale =
+        axc_driver::q4km_oracle::q4km_abs_dot_scale(&q, &x_f16_bits, m, n, n_blocks_per_row);
+    Ok((y_ref, abs_scale))
+}
+
+/// M4.1p2: the FROZEN condition-aware combined metric (computed in RUST), gating AT-2103.
+///
+/// Returns `max_i |gpu_i − ref_i| / max(|ref_i|, abs_scale_i)` — the worst element's backward-
+/// stable dot-product error. `<= 1e-3` (FROZEN) ⇒ every element passes. This is the IDENTICAL
+/// `axc_driver::q4km_oracle::max_rel_diff_combined` the M3.x GPU tests use; Python NEVER computes
+/// the gate itself (so the 1e-3 cannot be silently loosened or replaced by raw/torch.allclose).
+#[pyfunction]
+fn q4km_combined_metric(gpu: Vec<f32>, reference: Vec<f32>, abs_scale: Vec<f32>) -> PyResult<f64> {
+    if gpu.len() != reference.len() || gpu.len() != abs_scale.len() {
+        return Err(PyValueError::new_err(format!(
+            "q4km_combined_metric: length mismatch (gpu={}, ref={}, abs_scale={})",
+            gpu.len(),
+            reference.len(),
+            abs_scale.len()
+        )));
+    }
+    Ok(axc_driver::q4km_oracle::max_rel_diff_combined(&gpu, &reference, &abs_scale))
+}
+
+/// M4.1p2: the RAW relative error (REPORTING ONLY — never the gate). Logged for transparency
+/// alongside the combined metric so a reviewer can see the cancellation artifact (~1e-2 raw at
+/// small K) is NOT what AT-2103 gates on.
+#[pyfunction]
+fn q4km_raw_rel_diff(gpu: Vec<f32>, reference: Vec<f32>) -> PyResult<f64> {
+    if gpu.len() != reference.len() {
+        return Err(PyValueError::new_err(format!(
+            "q4km_raw_rel_diff: length mismatch (gpu={}, ref={})",
+            gpu.len(),
+            reference.len()
+        )));
+    }
+    Ok(axc_driver::q4km_oracle::max_rel_diff(&gpu, &reference))
 }
 
 /// Build a standalone exportable timeline semaphore for the AT-2110 spike.
@@ -367,6 +484,9 @@ fn _axiom_compute(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SpikeTimelineSemaphore>()?;
     m.add_class::<SpikeBinaryPair>()?;
     m.add_function(wrap_pyfunction!(compile_kernel, m)?)?;
+    m.add_function(wrap_pyfunction!(q4km_f32_reference, m)?)?;
+    m.add_function(wrap_pyfunction!(q4km_combined_metric, m)?)?;
+    m.add_function(wrap_pyfunction!(q4km_raw_rel_diff, m)?)?;
     m.add_function(wrap_pyfunction!(make_spike_timeline_semaphore, m)?)?;
     m.add_function(wrap_pyfunction!(make_spike_binary_pair, m)?)?;
     Ok(())

@@ -25,8 +25,8 @@
 //! NVIDIA #[ignore]-gated (AXC_ENABLE_GPU_TESTS=1). Typed-skip on Lavapipe
 //! (CoopMatUnsupported / DeviceFeatureUnsupported) and on subgroup_size() != 32.
 
-#[path = "common_q4km_f32ref.rs"]
-mod common_q4km_f32ref;
+// M4.1p2: the oracle is now the pub lib module axc_driver::q4km_oracle (single source of truth).
+use axc_driver::q4km_oracle as common_q4km_f32ref;
 
 use std::collections::BTreeMap;
 use axc_driver::compile_source_with_assignments;
