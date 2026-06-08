@@ -301,6 +301,45 @@ pub enum DispatchError {
         /// Source-level kernel name (for diagnostics).
         kernel: String,
     },
+
+    // ── M4.1 CUDA↔Vulkan external-memory interop errors ───────────────────────
+    /// No enumerated Vulkan physical device's `VkPhysicalDeviceIDProperties.deviceUUID`
+    /// byte-matched the CUDA target UUID — M4.1 (FAIL-CLOSED, R-3).
+    ///
+    /// Raised by `select_physical_device_by_uuid`. NEVER falls back to a different
+    /// GPU or to a host copy: an OPAQUE_FD import across GPUs cannot succeed, so a
+    /// mismatch is a hard error surfaced to Python as `ZeroCopyUnavailable`.
+    #[error("no Vulkan physical device matched the CUDA device UUID {target:02x?}")]
+    NoUuidMatchedDevice {
+        /// The 16-byte raw CUDA device UUID that was requested.
+        target: [u8; 16],
+    },
+
+    /// The selected device / ICD does not support `VK_KHR_external_memory_fd` or a
+    /// CUDA-importable DEVICE_LOCAL OPAQUE_FD allocation — M4.1 (FAIL-CLOSED, R-4).
+    #[error("external memory (OPAQUE_FD) unsupported: {0}")]
+    ExternalMemoryUnsupported(String),
+
+    /// The selected device / ICD does not support `VK_KHR_external_semaphore_fd` — M4.1.
+    #[error("external semaphore (OPAQUE_FD) unsupported: {0}")]
+    ExternalSemaphoreUnsupported(String),
+
+    /// `vkGetMemoryFdKHR` / `vkGetSemaphoreFdKHR` (or the underlying create) failed — M4.1.
+    #[error("external {kind} export failed: {reason}")]
+    ExternalExportFailed {
+        /// `"memory"` or `"semaphore"`.
+        kind: &'static str,
+        /// Human-readable reason (Vulkan result code).
+        reason: String,
+    },
+
+    /// The chosen DEVICE_LOCAL memory type is not exportable as OPAQUE_FD — M4.1.
+    ///
+    /// On a unified-only device where the sole DEVICE_LOCAL type is also HOST_VISIBLE
+    /// and may not be importable by CUDA over OPAQUE_FD, the export path fails closed
+    /// rather than handing Python a non-importable fd.
+    #[error("the selected DEVICE_LOCAL memory type is not exportable as OPAQUE_FD (unsupported)")]
+    MemoryNotExportable,
 }
 
 /// Convenience type alias for dispatch results.
@@ -317,7 +356,7 @@ mod tests {
     /// The exhaustive match below ensures the compiler reminds us to update this test
     /// whenever a variant is added or removed.
     #[test]
-    fn at_801_dispatch_error_variants_count_is_31() {
+    fn at_801_dispatch_error_variants_count_is_36() {
         // Construct one instance of each variant and verify non-empty Display.
         let variants: Vec<DispatchError> = vec![
             DispatchError::VulkanEntryFailed("test".to_owned()),
@@ -379,10 +418,16 @@ mod tests {
                 device_max: 16384,
                 kernel: "shared_reduce".to_owned(),
             },
+            // M4.1 additions (variants 32-36):
+            DispatchError::NoUuidMatchedDevice { target: [0u8; 16] },
+            DispatchError::ExternalMemoryUnsupported("no OPAQUE_FD".to_owned()),
+            DispatchError::ExternalSemaphoreUnsupported("no OPAQUE_FD".to_owned()),
+            DispatchError::ExternalExportFailed { kind: "memory", reason: "test".to_owned() },
+            DispatchError::MemoryNotExportable,
         ];
 
-        // Verify exactly 31 variants are covered (M3.2 adds SharedMemoryExceedsDeviceLimit).
-        assert_eq!(variants.len(), 31, "expected exactly 31 DispatchError variants");
+        // Verify exactly 36 variants are covered (M4.1 adds 5 external-interop variants).
+        assert_eq!(variants.len(), 36, "expected exactly 36 DispatchError variants");
 
         for variant in &variants {
             let msg = variant.to_string();
@@ -465,6 +510,6 @@ mod tests {
     fn at_502_dispatch_error_variants_are_display_miette() {
         // This test delegates to the more complete at_801 test above.
         // Preserved for backward-compatibility with any test-name grepping.
-        at_801_dispatch_error_variants_count_is_31();
+        at_801_dispatch_error_variants_count_is_36();
     }
 }

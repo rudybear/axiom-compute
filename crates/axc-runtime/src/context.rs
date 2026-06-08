@@ -125,6 +125,23 @@ pub struct VulkanContextOptions {
     /// so the coopmat skip path is exercised even on coopmat-capable hardware (AT-1506).
     /// Reads `AXC_FORCE_NO_COOPMAT=1` from env in `from_env()`.
     pub force_no_coopmat: Option<bool>,
+    // ── M4.1 CUDA↔Vulkan external-memory interop ──────────────────────────────
+    /// When set, build the context for CUDA↔Vulkan zero-copy interop (M4.1).
+    ///
+    /// `None` preserves the M3.x behavior verbatim (no extension changes, no UUID
+    /// selection). `Some(opts)` selects the physical device whose
+    /// `VkPhysicalDeviceIDProperties.deviceUUID` byte-matches
+    /// `opts.target_device_uuid` (FAIL-CLOSED if no match), enables
+    /// `VK_KHR_external_memory_fd` + `VK_KHR_external_semaphore_fd`, and forces
+    /// `timelineSemaphore` ON for the external semaphore.
+    pub external_interop: Option<ExternalInteropOptions>,
+}
+
+/// Options for the M4.1 CUDA↔Vulkan external-memory interop context path.
+#[derive(Debug, Clone)]
+pub struct ExternalInteropOptions {
+    /// The CUDA device UUID (16 raw bytes) the Vulkan device MUST match (R-3).
+    pub target_device_uuid: [u8; 16],
 }
 
 impl VulkanContextOptions {
@@ -149,6 +166,8 @@ impl VulkanContextOptions {
             force_binary_semaphores: read_bool_flag("AXC_FORCE_BINARY_SEMAPHORES"),
             force_noncoherent_staging: read_bool_flag("AXC_FORCE_NONCOHERENT_STAGING"),
             force_no_coopmat: read_bool_flag("AXC_FORCE_NO_COOPMAT"),
+            // M4.1: external interop is opt-in via new_for_external_interop / explicit opts.
+            external_interop: None,
         }
     }
 }
@@ -247,6 +266,20 @@ pub struct VulkanContext {
     ///
     /// From VkQueueFamilyProperties.timestampValidBits. 0 means timestamps not supported.
     compute_timestamp_valid_bits: u32,
+    // ── M4.1 CUDA↔Vulkan external-memory interop fields ───────────────────────
+    /// External-interop capabilities, present only on the interop context path.
+    ///
+    /// `None` on the M3.x non-interop path. `Some` when built via
+    /// `new_for_external_interop`.
+    external_caps: Option<crate::external_memory::ExternalInteropCaps>,
+    /// `VK_KHR_external_memory_fd` device function pointers (M4.1).
+    ///
+    /// `None` on the non-interop path.
+    ext_memory_fd_fns: Option<ash::khr::external_memory_fd::Device>,
+    /// `VK_KHR_external_semaphore_fd` device function pointers (M4.1).
+    ///
+    /// `None` on the non-interop path.
+    ext_semaphore_fd_fns: Option<ash::khr::external_semaphore_fd::Device>,
 }
 
 impl VulkanContext {
@@ -336,23 +369,38 @@ impl VulkanContext {
             });
 
         // Select physical device + queue family selection (M3.0: uses transfer_queue::select).
+        //
+        // M4.1: when external_interop is requested, the physical device is selected
+        // FAIL-CLOSED by its VkPhysicalDeviceIDProperties.deviceUUID matching the
+        // CUDA device UUID — NOT by enumeration order / index (R-3). This overrides
+        // both the explicit index and the AXC_PHYSICAL_DEVICE_INDEX env override.
         let force_single_queue: bool = opts.force_single_queue.unwrap_or(false);
         let (physical_device, queue_family_sel): (vk::PhysicalDevice, QueueFamilySelection) =
-            match device_index_override {
-                Some(idx) => {
-                    let pd = physical_devices[idx];
-                    let sel = select_queue_families(instance, pd, force_single_queue)?;
-                    (pd, sel)
-                }
-                None => {
-                    let mut found: Option<(vk::PhysicalDevice, QueueFamilySelection)> = None;
-                    for &pd in &physical_devices {
-                        if let Ok(sel) = select_queue_families(instance, pd, force_single_queue) {
-                            found = Some((pd, sel));
-                            break;
-                        }
+            if let Some(interop) = opts.external_interop.as_ref() {
+                let (pd, _idx) = crate::device_uuid::select_physical_device_by_uuid(
+                    instance,
+                    interop.target_device_uuid,
+                )?;
+                // The UUID-matched device MUST also expose a compute queue family.
+                let sel = select_queue_families(instance, pd, force_single_queue)?;
+                (pd, sel)
+            } else {
+                match device_index_override {
+                    Some(idx) => {
+                        let pd = physical_devices[idx];
+                        let sel = select_queue_families(instance, pd, force_single_queue)?;
+                        (pd, sel)
                     }
-                    found.ok_or(DispatchError::NoSupportedDevice)?
+                    None => {
+                        let mut found: Option<(vk::PhysicalDevice, QueueFamilySelection)> = None;
+                        for &pd in &physical_devices {
+                            if let Ok(sel) = select_queue_families(instance, pd, force_single_queue) {
+                                found = Some((pd, sel));
+                                break;
+                            }
+                        }
+                        found.ok_or(DispatchError::NoSupportedDevice)?
+                    }
                 }
             };
 
@@ -509,6 +557,13 @@ impl VulkanContext {
         if s_mode == SyncMode::Timeline && requested_api_version >= vk::API_VERSION_1_2 {
             vk12_features.timeline_semaphore = vk::TRUE;
         }
+        // M4.1: the EXTERNAL semaphore is a TIMELINE semaphore, so timelineSemaphore
+        // MUST be enabled on the interop path regardless of the transfer-queue sync
+        // mode. (On 1.1-only devices the interop path is not reachable; this box is 1.2.)
+        let interop_requested: bool = opts.external_interop.is_some();
+        if interop_requested && requested_api_version >= vk::API_VERSION_1_2 {
+            vk12_features.timeline_semaphore = vk::TRUE;
+        }
         if enable_16bit {
             feat_16bit_storage.storage_buffer16_bit_access = vk::TRUE;
         }
@@ -537,6 +592,14 @@ impl VulkanContext {
         let coopmat_ext_cstr = std::ffi::CString::new("VK_KHR_cooperative_matrix").unwrap();
         if enable_coopmat {
             device_ext_names.push(coopmat_ext_cstr.as_ptr());
+        }
+        // M4.1: enable the external-memory/semaphore fd device extensions on the
+        // interop path. These CStrings must outlive device_create_info.
+        let ext_mem_fd_cstr = std::ffi::CString::new("VK_KHR_external_memory_fd").unwrap();
+        let ext_sem_fd_cstr = std::ffi::CString::new("VK_KHR_external_semaphore_fd").unwrap();
+        if interop_requested {
+            device_ext_names.push(ext_mem_fd_cstr.as_ptr());
+            device_ext_names.push(ext_sem_fd_cstr.as_ptr());
         }
 
         // Assemble the pNext chain UNCONDITIONALLY for every enabled feature.
@@ -655,6 +718,38 @@ impl VulkanContext {
         let transfer_pool_lock: Option<Arc<Mutex<()>>> =
             if transfer.is_some() { Some(Arc::new(Mutex::new(()))) } else { None };
 
+        // ── M4.1: build external-interop fd function pointers + caps ──────────
+        let (external_caps, ext_memory_fd_fns, ext_semaphore_fd_fns): (
+            Option<crate::external_memory::ExternalInteropCaps>,
+            Option<ash::khr::external_memory_fd::Device>,
+            Option<ash::khr::external_semaphore_fd::Device>,
+        ) = if interop_requested {
+            let mem_fns = ash::khr::external_memory_fd::Device::new(
+                &instance_owner.instance,
+                &device_owner.device,
+            );
+            let sem_fns = ash::khr::external_semaphore_fd::Device::new(
+                &instance_owner.instance,
+                &device_owner.device,
+            );
+            let device_uuid =
+                crate::device_uuid::physical_device_uuid(&instance_owner.instance, physical_device);
+            let driver_uuid = crate::device_uuid::physical_device_driver_uuid(
+                &instance_owner.instance,
+                physical_device,
+            );
+            let caps = crate::external_memory::ExternalInteropCaps {
+                external_memory_fd: true,
+                external_semaphore_fd: true,
+                timeline_semaphore: requested_api_version >= vk::API_VERSION_1_2,
+                device_uuid,
+                driver_uuid,
+            };
+            (Some(caps), Some(mem_fns), Some(sem_fns))
+        } else {
+            (None, None, None)
+        };
+
         Ok(Self {
             instance_owner,
             physical_device,
@@ -684,7 +779,460 @@ impl VulkanContext {
             subgroup_size,
             timestamp_period,
             compute_timestamp_valid_bits,
+            // M4.1 fields:
+            external_caps,
+            ext_memory_fd_fns,
+            ext_semaphore_fd_fns,
         })
+    }
+
+    /// Build a context for M4.1 CUDA↔Vulkan zero-copy interop.
+    ///
+    /// Selects the physical device whose `deviceUUID` byte-matches `target_device_uuid`
+    /// (FAIL-CLOSED, R-3), enables `VK_KHR_external_memory_fd` +
+    /// `VK_KHR_external_semaphore_fd`, and forces `timelineSemaphore` ON.
+    pub fn new_for_external_interop(target_device_uuid: [u8; 16]) -> Result<Self, DispatchError> {
+        let mut opts = VulkanContextOptions::from_env();
+        opts.external_interop = Some(ExternalInteropOptions { target_device_uuid });
+        Self::new_with_options(opts)
+    }
+
+    /// Return the external-interop capabilities, if this is an interop context (M4.1).
+    pub fn external_caps(&self) -> Option<&crate::external_memory::ExternalInteropCaps> {
+        self.external_caps.as_ref()
+    }
+
+    /// Allocate the set of exportable DEDICATED shared buffers + the shared TIMELINE
+    /// semaphore for one zero-copy kernel — M4.1 (G-1/G-2).
+    ///
+    /// `sizes` is one byte-size per descriptor binding (in `buffer_position` order).
+    /// `handle` provides the descriptor-set layout the external buffers are bound to.
+    /// When `use_binary_fallback` is true (the G-6 spike-failed path), a binary
+    /// semaphore PAIR is created instead of the timeline semaphore.
+    ///
+    /// FAIL-CLOSED if this is not an interop context.
+    pub fn allocate_shared_buffers(
+        &self,
+        handle: &KernelHandle,
+        sizes: &[u64],
+        use_binary_fallback: bool,
+    ) -> Result<crate::external_memory::SharedBufferSet, DispatchError> {
+        let mem_fns = self.ext_memory_fd_fns.as_ref().ok_or_else(|| {
+            DispatchError::ExternalMemoryUnsupported(
+                "context was not built for external interop".to_owned(),
+            )
+        })?;
+        let sem_fns = self.ext_semaphore_fd_fns.as_ref().ok_or_else(|| {
+            DispatchError::ExternalSemaphoreUnsupported(
+                "context was not built for external interop".to_owned(),
+            )
+        })?;
+        let device: &ash::Device = &self.device_owner.device;
+
+        // Allocate one exportable DEDICATED buffer per binding.
+        let mut buffers: Vec<crate::external_memory::ExternalBuffer> = Vec::with_capacity(sizes.len());
+        for (i, &sz) in sizes.iter().enumerate() {
+            let binding_idx: u32 = handle.inner.binding_plan.buffers
+                .get(i)
+                .map(|b| b.buffer_position)
+                .unwrap_or(i as u32);
+            let buf = crate::external_memory::allocate_exportable_device_local_buffer(
+                device, mem_fns, &self.memory_properties, sz, binding_idx,
+            )?;
+            buffers.push(buf);
+        }
+
+        // Allocate a descriptor pool+set and bind the external buffers DIRECTLY (G-2).
+        let dsl = handle.inner.descriptor_set_layout.ok_or_else(|| {
+            DispatchError::DescriptorSetLayoutFailed(
+                "zero-copy kernel must have buffer bindings".to_owned(),
+            )
+        })?;
+        let (descriptor_pool, descriptor_set) =
+            allocate_descriptor_pool_and_set(device, dsl, buffers.len())?;
+
+        // Write each external buffer into its descriptor slot.
+        for (i, buf) in buffers.iter().enumerate() {
+            let binding_idx: u32 = handle.inner.binding_plan.buffers
+                .get(i)
+                .map(|b| b.buffer_position)
+                .unwrap_or(i as u32);
+            let buffer_info = vk::DescriptorBufferInfo::default()
+                .buffer(buf.buffer)
+                .offset(0)
+                .range(vk::WHOLE_SIZE);
+            let write = vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(binding_idx)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(std::slice::from_ref(&buffer_info));
+            // SAFETY: descriptor_set + buffer handles are valid; write is well-formed.
+            unsafe { device.update_descriptor_sets(&[write], &[]); }
+        }
+
+        // FIX-1: allocate ONE PRIMARY command buffer for the whole session. Every
+        // dispatch RESETs and re-records it (the pool has RESET_COMMAND_BUFFER) instead
+        // of allocating a fresh CB per call — bounding command-buffer use to one per
+        // session and eliminating the previous per-dispatch leak.
+        let command_buffer = {
+            let alloc_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(self.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let _pool_guard = self.compute_pool_lock.lock();
+            // SAFETY: alloc_info is valid; command_pool is owned by this context.
+            let cbs = unsafe { device.allocate_command_buffers(&alloc_info) }.map_err(|e| {
+                DispatchError::CommandBufferRecordFailed(format!("alloc session cb: {e}"))
+            })?;
+            cbs[0]
+        };
+
+        // Create the shared cross-API semaphore (timeline, or binary-pair fallback, G-6).
+        let (timeline, binary_pair) = if use_binary_fallback {
+            let pair = crate::external_memory::create_exportable_binary_semaphore_pair(device, sem_fns)?;
+            (None, Some(pair))
+        } else {
+            let ts = crate::external_memory::create_exportable_timeline_semaphore(device, sem_fns, 0)?;
+            (Some(ts), None)
+        };
+
+        Ok(crate::external_memory::SharedBufferSet {
+            buffers,
+            timeline,
+            binary_pair,
+            descriptor_pool,
+            descriptor_set,
+            command_buffer,
+            // G-2: the zero-copy path allocates NO staging buffer and records NO copy.
+            staging_buffers_allocated: 0,
+            copy_buffer_records: 0,
+        })
+    }
+
+    /// Create a standalone exportable TIMELINE semaphore for the AT-2110 interop spike.
+    ///
+    /// Returns the semaphore wrapper; the Python side imports its fd into CUDA and
+    /// round-trips signal/wait.
+    pub fn create_spike_timeline_semaphore(
+        &self,
+        initial_value: u64,
+    ) -> Result<crate::external_memory::ExternalTimelineSemaphore, DispatchError> {
+        let sem_fns = self.ext_semaphore_fd_fns.as_ref().ok_or_else(|| {
+            DispatchError::ExternalSemaphoreUnsupported(
+                "context was not built for external interop".to_owned(),
+            )
+        })?;
+        crate::external_memory::create_exportable_timeline_semaphore(
+            &self.device_owner.device, sem_fns, initial_value,
+        )
+    }
+
+    /// Create a standalone exportable binary semaphore PAIR for the AT-2110 fallback spike.
+    pub fn create_spike_binary_semaphore_pair(
+        &self,
+    ) -> Result<
+        (crate::external_memory::ExternalBinarySemaphore, crate::external_memory::ExternalBinarySemaphore),
+        DispatchError,
+    > {
+        let sem_fns = self.ext_semaphore_fd_fns.as_ref().ok_or_else(|| {
+            DispatchError::ExternalSemaphoreUnsupported(
+                "context was not built for external interop".to_owned(),
+            )
+        })?;
+        crate::external_memory::create_exportable_binary_semaphore_pair(
+            &self.device_owner.device, sem_fns,
+        )
+    }
+
+    /// Submit the Vulkan half of the spike handshake: wait timeline >= `wait_value`
+    /// (@TOP_OF_PIPE), then signal `signal_value`. No command buffer — a pure
+    /// semaphore relay. Used by AT-2110 to prove Vulkan-waits-CUDA / Vulkan-signals-CUDA.
+    pub fn spike_timeline_relay(
+        &self,
+        sem: &crate::external_memory::ExternalTimelineSemaphore,
+        wait_value: u64,
+        signal_value: u64,
+    ) -> Result<(), DispatchError> {
+        let device: &ash::Device = &self.device_owner.device;
+        let wait_sems = [sem.semaphore];
+        let signal_sems = [sem.semaphore];
+        let wait_vals = [wait_value];
+        let signal_vals = [signal_value];
+        let wait_stages = [vk::PipelineStageFlags::TOP_OF_PIPE];
+        let mut timeline_info = vk::TimelineSemaphoreSubmitInfo::default()
+            .wait_semaphore_values(&wait_vals)
+            .signal_semaphore_values(&signal_vals);
+        let submit_info = vk::SubmitInfo::default()
+            .wait_semaphores(&wait_sems)
+            .wait_dst_stage_mask(&wait_stages)
+            .signal_semaphores(&signal_sems)
+            .push_next(&mut timeline_info);
+        let _guard = self.queue_submit_lock.lock();
+        // SAFETY: submit_info is valid; semaphore is a timeline type on this device.
+        unsafe { device.queue_submit(self.queue, &[submit_info], vk::Fence::null()) }
+            .map_err(|e| DispatchError::QueueSubmitFailed(format!("spike timeline relay: {e}")))?;
+        Ok(())
+    }
+
+    /// The staging-free zero-copy compute submit — M4.1 (G-2, the NEW path).
+    ///
+    /// Binds the [`SharedBufferSet`]'s exportable buffers DIRECTLY as the kernel's
+    /// SSBOs (NO map/memcpy, NO transient staging, NO `vkCmdCopyBuffer`) and records
+    /// ONLY the compute submit, waiting the external timeline at `wait_value`
+    /// (@COMPUTE_SHADER) and signaling `signal_value`. There is NO host fence on the
+    /// data path — the cross-API ordering is the timeline value monotonicity alone.
+    ///
+    /// On the binary-fallback path (G-6), the submit waits semaphore A (binary) and
+    /// signals semaphore B (binary) instead.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_zero_copy(
+        &self,
+        handle: &KernelHandle,
+        bufs: &crate::external_memory::SharedBufferSet,
+        workgroups: (u32, u32, u32),
+        push_constants: &[u8],
+        wait_value: u64,
+        signal_value: u64,
+    ) -> Result<(), DispatchError> {
+        // Pre-validate workgroup counts (no resource allocation needed here).
+        let max = self.max_compute_work_group_count;
+        let req = [workgroups.0, workgroups.1, workgroups.2];
+        if req[0] > max[0] || req[1] > max[1] || req[2] > max[2] {
+            return Err(DispatchError::WorkgroupCountExceedsDeviceLimit { requested: req, max });
+        }
+
+        let device: &ash::Device = &self.device_owner.device;
+        let inner = &handle.inner;
+
+        // FIX-1: REUSE the session's single command buffer (no per-dispatch alloc, no
+        // leak). The buffer is allocated once in `allocate_shared_buffers` and lives on
+        // the `SharedBufferSet`; here we RESET and re-record it.
+        let cb = bufs.command_buffer;
+        let _pool_guard = self.compute_pool_lock.lock();
+
+        // UAF GUARD: a command buffer must not be reset/re-recorded while a prior submit
+        // using it is still in-flight on the GPU. On the timeline path the prior dispatch
+        // completes when the timeline reaches its signal value, which is `wait_value - 1`
+        // (G-7 reserves consecutive values: prior signal = 2k-2, this wait = 2k-1). For
+        // the first dispatch `wait_value - 1 == 0`, already satisfied by the initial
+        // value, so the wait returns immediately. On the binary fallback there is no
+        // host-waitable counter, so we drain the queue with `device_wait_idle`.
+        if let Some(ts) = bufs.timeline.as_ref() {
+            let prior_signal = wait_value.saturating_sub(1);
+            if prior_signal > 0 {
+                let sems = [ts.semaphore];
+                let vals = [prior_signal];
+                let wait_info = vk::SemaphoreWaitInfo::default().semaphores(&sems).values(&vals);
+                let timeout_ns: u64 = self.fence_timeout_ms.saturating_mul(1_000_000);
+                // SAFETY: timeline semaphore is valid; wait_info is well-formed. This
+                // proves the prior submit (which signaled `prior_signal`) has retired
+                // before we reset its command buffer — no use-after-free / no in-flight
+                // reset.
+                unsafe { device.wait_semaphores(&wait_info, timeout_ns) }
+                    .map_err(|e| DispatchError::FenceTimeout { timeout_ns: { let _ = e; timeout_ns } })?;
+            }
+        } else {
+            // Binary fallback: no host-waitable timeline — drain all queues so the prior
+            // submit on this command buffer is provably retired before we reset it.
+            // SAFETY: device is valid; device_wait_idle blocks until all submits retire.
+            unsafe { device.device_wait_idle() }
+                .map_err(|e| DispatchError::QueueSubmitFailed(format!("pre-reset drain: {e}")))?;
+        }
+
+        // SAFETY: the prior submit using this CB has retired (proven above); resetting it
+        // now is sound. RELEASE_RESOURCES is not set — keep the pool-backed allocation.
+        unsafe { device.reset_command_buffer(cb, vk::CommandBufferResetFlags::empty()) }
+            .map_err(|e| DispatchError::CommandBufferRecordFailed(format!("reset session cb: {e}")))?;
+
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        // SAFETY: cb is owned by this session and freshly reset; begin_info is valid.
+        unsafe { device.begin_command_buffer(cb, &begin_info) }
+            .map_err(|e| {
+                DispatchError::CommandBufferRecordFailed(format!("begin cb: {e}"))
+            })?;
+
+        // Bind pipeline + the EXTERNAL-buffer descriptor set (G-2: no staging, no copy).
+        // SAFETY: cb is recording; pipeline + descriptor set + layout are valid.
+        unsafe {
+            device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, inner.pipeline);
+            device.cmd_bind_descriptor_sets(
+                cb,
+                vk::PipelineBindPoint::COMPUTE,
+                inner.pipeline_layout,
+                0,
+                &[bufs.descriptor_set],
+                &[],
+            );
+            if !push_constants.is_empty() {
+                device.cmd_push_constants(
+                    cb,
+                    inner.pipeline_layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    push_constants,
+                );
+            }
+            device.cmd_dispatch(cb, workgroups.0, workgroups.1, workgroups.2);
+        }
+        // SAFETY: cb is recording.
+        unsafe { device.end_command_buffer(cb) }
+            .map_err(|e| {
+                // The session owns this CB (freed at teardown); do NOT free it here. The
+                // next dispatch will reset+re-record it from scratch.
+                DispatchError::CommandBufferRecordFailed(format!("end cb: {e}"))
+            })?;
+
+        // Submit waiting wait_value@COMPUTE_SHADER, signaling signal_value, NO host fence.
+        let cb_slice = [cb];
+        let submit_result: Result<(), DispatchError> = {
+            let _submit_guard = self.queue_submit_lock.lock();
+            if let Some(ts) = bufs.timeline.as_ref() {
+                let wait_sems = [ts.semaphore];
+                let signal_sems = [ts.semaphore];
+                let wait_vals = [wait_value];
+                let signal_vals = [signal_value];
+                let wait_stages = [vk::PipelineStageFlags::COMPUTE_SHADER];
+                let mut timeline_info = vk::TimelineSemaphoreSubmitInfo::default()
+                    .wait_semaphore_values(&wait_vals)
+                    .signal_semaphore_values(&signal_vals);
+                let submit_info = vk::SubmitInfo::default()
+                    .command_buffers(&cb_slice)
+                    .wait_semaphores(&wait_sems)
+                    .wait_dst_stage_mask(&wait_stages)
+                    .signal_semaphores(&signal_sems)
+                    .push_next(&mut timeline_info);
+                // SAFETY: submit_info is valid; semaphore is a timeline type.
+                unsafe { device.queue_submit(self.queue, &[submit_info], vk::Fence::null()) }
+                    .map_err(|e| DispatchError::QueueSubmitFailed(format!("zero-copy timeline: {e}")))
+            } else if let Some((a, b)) = bufs.binary_pair.as_ref() {
+                // G-6 fallback: wait binary A (signaled by CUDA after its writes),
+                // signal binary B (CUDA waits on it before reading).
+                let wait_sems = [a.semaphore];
+                let signal_sems = [b.semaphore];
+                let wait_stages = [vk::PipelineStageFlags::COMPUTE_SHADER];
+                let submit_info = vk::SubmitInfo::default()
+                    .command_buffers(&cb_slice)
+                    .wait_semaphores(&wait_sems)
+                    .wait_dst_stage_mask(&wait_stages)
+                    .signal_semaphores(&signal_sems);
+                // SAFETY: submit_info is valid; both binary semaphores are external.
+                unsafe { device.queue_submit(self.queue, &[submit_info], vk::Fence::null()) }
+                    .map_err(|e| DispatchError::QueueSubmitFailed(format!("zero-copy binary: {e}")))
+            } else {
+                Err(DispatchError::ExternalSemaphoreUnsupported(
+                    "SharedBufferSet has neither a timeline nor a binary-pair semaphore".to_owned(),
+                ))
+            }
+        };
+        // FIX-1: the command buffer is the session's single reusable CB — it is NOT
+        // freed here. The NEXT dispatch RESETs and re-records it (after proving the prior
+        // submit retired, above); `teardown_shared_buffers` frees it exactly once after
+        // the G-4 timeline drain. This bounds command-buffer use to ONE per session
+        // (previously one VkCommandBuffer leaked per dispatch).
+        let _ = wait_value;
+        submit_result
+    }
+
+    /// G-4 drain: block until the external timeline reaches >= `value` (no host fence
+    /// on the data path, so we drain here before any free at teardown). On the binary
+    /// fallback there is no host-waitable counter, so we fall back to `device_wait_idle`.
+    pub fn drain_external_timeline(
+        &self,
+        bufs: &crate::external_memory::SharedBufferSet,
+        value: u64,
+    ) -> Result<(), DispatchError> {
+        let device: &ash::Device = &self.device_owner.device;
+        if let Some(ts) = bufs.timeline.as_ref() {
+            let sems = [ts.semaphore];
+            let vals = [value];
+            let wait_info = vk::SemaphoreWaitInfo::default()
+                .semaphores(&sems)
+                .values(&vals);
+            let timeout_ns: u64 = self.fence_timeout_ms.saturating_mul(1_000_000);
+            // SAFETY: timeline semaphore is valid; wait_info is well-formed.
+            unsafe { device.wait_semaphores(&wait_info, timeout_ns) }
+                .map_err(|e| DispatchError::FenceTimeout {
+                    timeout_ns: { let _ = e; timeout_ns },
+                })?;
+        } else {
+            // SAFETY: idle-wait drains all queues on the binary-fallback path.
+            unsafe { device.device_wait_idle() }
+                .map_err(|e| DispatchError::QueueSubmitFailed(format!("device_wait_idle drain: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// FIX-2 HARD FALLBACK: block until the device is provably idle (`vkDeviceWaitIdle`).
+    ///
+    /// Used by `SharedSession.close()` when the timeline drain fails/times out: freeing
+    /// the shared buffers or the CUDA import while a dispatch is still in-flight is a
+    /// use-after-free. This is the unconditional, queue-wide barrier the teardown falls
+    /// back to so nothing is freed while the GPU may still be reading/writing it. If even
+    /// this fails the device is in an unrecoverable state — the error is propagated so the
+    /// caller can log loudly and MUST NOT free.
+    pub fn device_wait_idle(&self) -> Result<(), DispatchError> {
+        // SAFETY: device is valid; device_wait_idle blocks until every submitted command
+        // on every queue retires.
+        unsafe { self.device_owner.device.device_wait_idle() }
+            .map_err(|e| DispatchError::QueueSubmitFailed(format!("device_wait_idle: {e}")))
+    }
+
+    /// G-4 teardown of the Vulkan side of a [`SharedBufferSet`] — M4.1.
+    ///
+    /// This is step (5) of the G-4 order: it runs ONLY after the Python side has
+    /// drained the timeline (step 1), dropped the torch view (step 2), and destroyed
+    /// the CUDA imports (steps 3-4). It frees the session command buffer (FIX-1), the
+    /// descriptor pool, the external buffers' memory + buffers, and the semaphores. The
+    /// handed-off fds are NOT closed here (Python owns them, G-3). Idempotent-safe via
+    /// null checks by the caller (the PyO3 layer drops the set once).
+    pub fn teardown_shared_buffers(&self, bufs: crate::external_memory::SharedBufferSet) {
+        let device: &ash::Device = &self.device_owner.device;
+        // FIX-1: free the session's single reusable command buffer under the pool lock.
+        // The G-4 drain (step 1) proved no submit using it is still in-flight.
+        {
+            let cbs = [bufs.command_buffer];
+            let _pool_guard = self.compute_pool_lock.lock();
+            // SAFETY: cb was allocated from this pool; the prior drain retired its submit.
+            unsafe { device.free_command_buffers(self.command_pool, &cbs); }
+        }
+        // SAFETY: by G-4 contract the caller has drained in-flight work and destroyed
+        // the CUDA imports before calling this; all handles are valid and unused.
+        unsafe {
+            device.destroy_descriptor_pool(bufs.descriptor_pool, None);
+            for b in &bufs.buffers {
+                device.destroy_buffer(b.buffer, None);
+                device.free_memory(b.memory, None);
+            }
+            if let Some(ts) = bufs.timeline.as_ref() {
+                device.destroy_semaphore(ts.semaphore, None);
+            }
+            if let Some((a, c)) = bufs.binary_pair.as_ref() {
+                device.destroy_semaphore(a.semaphore, None);
+                device.destroy_semaphore(c.semaphore, None);
+            }
+        }
+        // `bufs` (and any still-owned OwnedFd) drops here; if a fd was already taken
+        // by Python (into_raw_fd) it is `None` and nothing is closed (G-3).
+    }
+
+    /// Destroy a standalone spike timeline semaphore (AT-2110 cleanup).
+    pub fn teardown_spike_timeline(&self, sem: crate::external_memory::ExternalTimelineSemaphore) {
+        // SAFETY: the spike has completed (host-synchronized) before teardown.
+        unsafe { self.device_owner.device.destroy_semaphore(sem.semaphore, None); }
+    }
+
+    /// Destroy a standalone spike binary semaphore pair (AT-2110 fallback cleanup).
+    pub fn teardown_spike_binary_pair(
+        &self,
+        pair: (crate::external_memory::ExternalBinarySemaphore, crate::external_memory::ExternalBinarySemaphore),
+    ) {
+        // SAFETY: the spike has completed (host-synchronized) before teardown.
+        unsafe {
+            self.device_owner.device.destroy_semaphore(pair.0.semaphore, None);
+            self.device_owner.device.destroy_semaphore(pair.1.semaphore, None);
+        }
     }
 
     /// Return the human-readable name of the selected physical device.
