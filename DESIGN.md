@@ -967,7 +967,7 @@ M0–M3.8 built the COMPILER + RUNTIME: an annotated `.axc` source → SPIR-V �
 
 ---
 
-## 3.1.26 M4.1 Phase 2 — the M3.6 Q4_K_M matmul as the HEADLINE op through the zero-copy frontend [PROPOSED — closes AT-2103 + AT-2105 deferred by Phase 1]
+## 3.1.26 M4.1 Phase 2 — the M3.6 Q4_K_M matmul as the HEADLINE op through the zero-copy frontend [MERGED — closes AT-2103 + AT-2105]
 
 Phase 1 (§3.1.25) proved the CUDA↔Vulkan zero-copy interop on **saxpy** (bit-exact, 0/0 staging, race-free handshake) but **DEFERRED** the real headline: the M3.6 Q4_K_M dequant+coopmat matmul (`examples/q4km_matmul_rb_coopmat_f32acc_cached.axc`, 42.86 TFLOPS leader). Phase 2 runs THAT kernel through the same zero-copy path and closes **AT-2103** (Q4_K_M correctness within the FROZEN combined condition-aware 1e-3 at K=256/512/14336) + **AT-2105** (honest latency report). No new kernel, no new sync machinery — the M3.6 source and the Phase-1 handshake/teardown are reused VERBATIM.
 
