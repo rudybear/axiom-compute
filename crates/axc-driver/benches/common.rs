@@ -27,6 +27,8 @@ use rand::Rng;
 use rand::rngs::StdRng;
 use axc_hir::ParamBindingPlan;
 use axc_hir::ScalarTy;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Fixed seed for all deterministic bench inputs (AT-707).
 pub const SEED: u64 = 42;
@@ -398,4 +400,337 @@ fn cpu_model_probe_impl() -> String {
 fn cpu_model_probe_impl() -> String {
     // Windows and other platforms: empty string (AT-709b).
     String::new()
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// EB.2 — Per-machine bench-regression baselines (schema v2).
+//
+// This is the SINGLE source of truth for the machine key, the v2 schema, and
+// the bless/gate decision logic.  Both the writer (postprocess.rs) and the gate
+// (bench_regression.rs, via `#[path]`-include) call THESE functions so the key
+// derivation and struct layout can never drift between writer and gate.
+//
+// Pure-fn unit tests (AT-EB2-01..04/08/10/11) live in
+// `crates/axc-driver/tests/common_helpers.rs` (the C9 convention, common.rs:5),
+// NOT as `#[cfg(test)]` here — common.rs is `#[path]`-included by every bench
+// target + the gate and a `#[cfg(test)]` block would compile into each.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Maximum length (chars) of a sanitized machine-key token.
+pub const MACHINE_KEY_MAX_LEN: usize = 80;
+
+/// Sanitize an arbitrary device/CPU string into a JSON-key / filesystem-safe
+/// token: lowercase ASCII; every char NOT in `[a-z0-9]` → `_`; collapse runs of
+/// `_`; trim leading/trailing `_`; truncate to [`MACHINE_KEY_MAX_LEN`] chars.
+///
+/// Total and deterministic (never panics).  May return an empty string (the
+/// caller — [`machine_key`] — supplies the non-empty fallback).
+///
+/// # Examples
+/// ```ignore
+/// assert_eq!(sanitize("NVIDIA RTX PRO 6000 Blackwell Workstation Edition"),
+///            "nvidia_rtx_pro_6000_blackwell_workstation_edition");
+/// assert_eq!(sanitize("Intel(R) Core(TM) i9-14900KF"), "intel_r_core_tm_i9_14900kf");
+/// ```
+pub fn sanitize(s: &str) -> String {
+    let mut out: String = String::with_capacity(s.len());
+    let mut last_was_underscore: bool = false;
+    for ch in s.chars() {
+        // Lowercase ASCII letters and digits pass through; everything else → '_'.
+        let mapped: char = if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else {
+            '_'
+        };
+        if mapped == '_' {
+            // Collapse runs of '_'.
+            if !last_was_underscore {
+                out.push('_');
+                last_was_underscore = true;
+            }
+        } else {
+            out.push(mapped);
+            last_was_underscore = false;
+        }
+    }
+    // Trim leading/trailing '_'.
+    let trimmed: &str = out.trim_matches('_');
+    // Truncate to MACHINE_KEY_MAX_LEN chars (char-boundary safe — all bytes are
+    // ASCII here, but use char_indices for total safety), then re-trim a
+    // trailing '_' the truncation may have exposed.
+    let capped: String = trimmed.chars().take(MACHINE_KEY_MAX_LEN).collect();
+    capped.trim_matches('_').to_owned()
+}
+
+/// Derive the per-machine baseline key from the Vulkan device name and the host
+/// CPU model.
+///
+/// EB.2 decision: the key is the sanitized **device name only** (the `cpu_model`
+/// is recorded in [`MachineMeta`] for provenance and is promotable into the key
+/// later if a same-GPU/different-CPU collision ever mis-gates the `cpu_reference`
+/// benches).
+///
+/// Empty device (Lavapipe-less / no-Vulkan CI) → the documented fallback:
+/// `cpu_only__<sanitized cpu>`; if the CPU is also empty → `unknown_machine`.
+///
+/// # Examples
+/// ```ignore
+/// assert_eq!(machine_key("NVIDIA RTX PRO 6000 Blackwell Workstation Edition", "whatever"),
+///            "nvidia_rtx_pro_6000_blackwell_workstation_edition");
+/// assert_eq!(machine_key("", "Intel(R) Core(TM) i9-14900KF"), "cpu_only__intel_r_core_tm_i9_14900kf");
+/// assert_eq!(machine_key("", ""), "unknown_machine");
+/// ```
+pub fn machine_key(device_name: &str, cpu_model: &str) -> String {
+    let device_key: String = sanitize(device_name);
+    if !device_key.is_empty() {
+        return device_key;
+    }
+    // Empty device → fall back to a CPU-only key so a no-GPU host has a
+    // deterministic key that never collides with a real GPU machine.
+    let cpu_key: String = sanitize(cpu_model);
+    if cpu_key.is_empty() {
+        "unknown_machine".to_owned()
+    } else {
+        format!("cpu_only__{cpu_key}")
+    }
+}
+
+// ── Schema v2 structs (writer + gate share ONE definition) ─────────────────────
+
+/// Machine metadata sub-object (AT-709).  Unchanged from schema v1.
+///
+/// All fields are populated; empty string for unavailable probes (never null).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineMeta {
+    pub os: String,
+    pub rustc: String,
+    pub vulkan_icd: String,
+    pub vulkan_device: String,
+    pub cpu_model: String,
+    pub axc_version: String,
+}
+
+/// One bench entry in a machine block's `benchmarks` array.  Unchanged from v1.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BenchEntry {
+    pub group: String,
+    pub bench: String,
+    pub median_ns: u64,
+    pub low_ns: u64,
+    pub high_ns: u64,
+}
+
+/// A single machine's baseline block — the old schema-v1 body minus the (now
+/// top-level) `schema_version`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineBlock {
+    pub generated: String,
+    pub git_sha: String,
+    pub machine: MachineMeta,
+    pub benchmarks: Vec<BenchEntry>,
+}
+
+/// The full baselines.json document (schema v2): one nested file keyed by the
+/// per-machine [`machine_key`].  `BTreeMap` gives a deterministic, reviewable
+/// key order in the committed diff.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BaselinesV2 {
+    pub schema_version: u32,
+    pub machines: BTreeMap<String, MachineBlock>,
+}
+
+/// The legacy schema-v1 document shape — parsed ONLY by the bless-side upgrade
+/// path (`merge_blessed`) so an operator with a stale v1 file is auto-migrated
+/// rather than crashing.  The gate NEVER accepts v1 (it is a hard error there).
+#[derive(Debug, Deserialize)]
+struct BaselinesV1 {
+    schema_version: u32,
+    generated: String,
+    git_sha: String,
+    machine: MachineMeta,
+    benchmarks: Vec<BenchEntry>,
+}
+
+/// Error returned by [`merge_blessed`] when it refuses to bless.
+#[derive(Debug)]
+pub enum MergeError {
+    /// The existing baselines file is present but cannot be parsed as either
+    /// schema v2 or schema v1 — corrupt/truncated.  The bless MUST fail loudly
+    /// and MUST NOT start-from-empty (which would drop every other machine's
+    /// block on the next write — the exact clobber EB.2 prevents).
+    CorruptExistingFile { detail: String },
+}
+
+impl std::fmt::Display for MergeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MergeError::CorruptExistingFile { detail } => write!(
+                f,
+                "refusing to bless over a corrupt/unparseable baselines file \
+                 (neither schema v2 nor v1): {detail}. Fix or remove the file before blessing; \
+                 NEVER auto-restart-from-empty (that would drop every other machine's baseline)."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MergeError {}
+
+/// Pure read-modify-write merge for the bless path (BLOCKER 1).
+///
+/// - `existing_json == None` (file ABSENT): start from an empty machines map —
+///   the first bless on a fresh repo.  This is the ONLY case that starts empty.
+/// - `Some(parseable v2)`: insert-or-replace ONLY `map[current_key]`; every
+///   other machine's block is preserved byte-for-byte (modulo deterministic
+///   BTreeMap re-ordering).
+/// - `Some(parseable v1)`: auto-upgrade — re-key the single v1 block under
+///   `machine_key(its device, its cpu)`, then insert-or-replace `current_key`.
+/// - `Some(UNPARSEABLE)`: `Err(MergeError::CorruptExistingFile)` — fail loud,
+///   NEVER an empty map (BLOCKER 1).
+pub fn merge_blessed(
+    existing_json: Option<&str>,
+    current_key: &str,
+    current_block: &MachineBlock,
+) -> Result<BaselinesV2, MergeError> {
+    let mut machines: BTreeMap<String, MachineBlock> = match existing_json {
+        None => BTreeMap::new(),
+        Some(raw) => {
+            // Try v2 first (the live schema), then v1 (auto-upgrade), then fail loud.
+            if let Ok(v2) = serde_json::from_str::<BaselinesV2>(raw) {
+                v2.machines
+            } else if let Ok(v1) = serde_json::from_str::<BaselinesV1>(raw) {
+                if v1.schema_version != 1 {
+                    return Err(MergeError::CorruptExistingFile {
+                        detail: format!(
+                            "v1-shaped file with schema_version={} (expected 1)",
+                            v1.schema_version
+                        ),
+                    });
+                }
+                let mut upgraded: BTreeMap<String, MachineBlock> = BTreeMap::new();
+                let v1_key: String =
+                    machine_key(&v1.machine.vulkan_device, &v1.machine.cpu_model);
+                upgraded.insert(
+                    v1_key,
+                    MachineBlock {
+                        generated: v1.generated,
+                        git_sha: v1.git_sha,
+                        machine: v1.machine,
+                        benchmarks: v1.benchmarks,
+                    },
+                );
+                upgraded
+            } else {
+                return Err(MergeError::CorruptExistingFile {
+                    detail: "serde failed to parse the file as schema v2 or v1".to_owned(),
+                });
+            }
+        }
+    };
+
+    // Insert-or-replace ONLY the current machine's key; all others untouched.
+    machines.insert(current_key.to_owned(), current_block.clone());
+
+    Ok(BaselinesV2 {
+        schema_version: 2,
+        machines,
+    })
+}
+
+/// The gate's decision for which baseline block to compare the live run against
+/// (BLOCKER 2 two-case skip + the no-Vulkan single-machine fallback).
+#[derive(Debug)]
+pub enum SelectOutcome<'a> {
+    /// The current machine's block was found — run the 15% gate against it.
+    Gate(&'a MachineBlock),
+    /// Genuinely-empty baselines (no machine ever blessed) → QUIET skip.
+    QuietSkipEmpty,
+    /// A real device was probed AND the file is non-empty AND the current key is
+    /// absent → LOUD skip: log the current key + sorted known keys (surfaces a
+    /// driver-rename key-drift on an EXISTING machine).
+    LoudSkipKeyAbsent { current: String, known: Vec<String> },
+    /// No Vulkan device probed AND exactly one machine exists → fall back to it
+    /// (preserves today's Lavapipe-less CI gate).
+    SingleMachineFallback(&'a MachineBlock),
+    /// No Vulkan device probed AND >1 machine exists → cannot disambiguate → skip.
+    SkipAmbiguous,
+}
+
+/// Pure block-selection for the gate (BLOCKER 2).  `device_probed` is `true`
+/// when the live Vulkan device name was non-empty (a real GPU was queried).
+pub fn select_block<'a>(
+    machines: &'a BTreeMap<String, MachineBlock>,
+    current_key: &str,
+    device_probed: bool,
+) -> SelectOutcome<'a> {
+    if let Some(block) = machines.get(current_key) {
+        return SelectOutcome::Gate(block);
+    }
+
+    if !device_probed {
+        // No Vulkan device in the gate env (Lavapipe-less CI).
+        return match machines.len() {
+            0 => SelectOutcome::QuietSkipEmpty,
+            1 => {
+                // Safe: len == 1.
+                let block: &MachineBlock = machines.values().next().expect("len==1");
+                SelectOutcome::SingleMachineFallback(block)
+            }
+            _ => SelectOutcome::SkipAmbiguous,
+        };
+    }
+
+    // A real device WAS probed but its key is absent.
+    if machines.is_empty() {
+        // No machine ever blessed → quiet skip (a new repo, not a key-drift).
+        SelectOutcome::QuietSkipEmpty
+    } else {
+        // Non-empty file + probed device + key absent → LOUD: surface possible
+        // driver-rename key-drift on an EXISTING machine.
+        let known: Vec<String> = machines.keys().cloned().collect();
+        SelectOutcome::LoudSkipKeyAbsent {
+            current: current_key.to_owned(),
+            known,
+        }
+    }
+}
+
+/// Atomically write `bytes` to `dir/final_name` (BLOCKER 1).
+///
+/// Serializes to a TEMP file in the SAME directory (`<final_name>.tmp.<pid>`),
+/// `write_all` + `sync_all`, then `std::fs::rename` over the final path.  Rename
+/// is atomic on POSIX within one filesystem, so a crash mid-write leaves the OLD
+/// file fully intact — only the temp file is ever a casualty.  The same-dir
+/// requirement is load-bearing (a cross-filesystem rename is NOT atomic).
+///
+/// On any failure before the rename, the temp file is best-effort removed and
+/// the original `dir/final_name` is left untouched.
+pub fn atomic_write(dir: &std::path::Path, final_name: &str, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let final_path: std::path::PathBuf = dir.join(final_name);
+    let tmp_name: String = format!("{final_name}.tmp.{}", std::process::id());
+    let tmp_path: std::path::PathBuf = dir.join(&tmp_name);
+
+    // Scope the file handle so it is closed before the rename.
+    let write_result: std::io::Result<()> = (|| {
+        let mut f = std::fs::File::create(&tmp_path)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_result {
+        // Best-effort cleanup of the partial temp file; the original is intact.
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    // Atomic replace.  If the rename fails, the original is still intact and the
+    // temp file is cleaned up.
+    if let Err(e) = std::fs::rename(&tmp_path, &final_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    Ok(())
 }

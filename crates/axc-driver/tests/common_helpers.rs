@@ -543,3 +543,476 @@ fn cpu_model_probe_platform_contract() {
     // On all platforms: no NUL bytes (valid UTF-8 String invariant is sufficient).
     assert!(!model.contains('\0'), "cpu_model_probe must not contain NUL bytes");
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// EB.2 — Per-machine bench-regression baselines (pure-fn tests, AT-EB2-01..11).
+//
+// These exercise the SHARED helpers in common.rs (machine_key, sanitize,
+// merge_blessed, select_block, atomic_write) so the writer (postprocess.rs) and
+// the gate (bench_regression.rs) — which both call these — cannot drift.
+// ════════════════════════════════════════════════════════════════════════════
+
+// These items are used only by the `#[test]` fns below.  When this file is
+// `#[path]`-included into a BENCH target (dispatch_q4km.rs / dispatch_q4km_ab.rs
+// reuse a fixture helper from here), the `#[test]` fns are stripped and these
+// imports appear unused — allow it so the bench compile stays clippy-clean.
+#[allow(unused_imports)]
+use common::{
+    atomic_write, machine_key, merge_blessed, sanitize, select_block, BaselinesV2, BenchEntry,
+    MachineBlock, MachineMeta, SelectOutcome,
+};
+#[allow(unused_imports)]
+use std::collections::BTreeMap;
+
+/// The migrated NVIDIA machine key (must match sanitize(live deviceName)).
+const NVIDIA_KEY: &str = "nvidia_rtx_pro_6000_blackwell_workstation_edition";
+
+/// Build a trivial MachineBlock for tests, with a single named bench entry.
+fn block_with(device: &str, cpu: &str, marker_ns: u64) -> MachineBlock {
+    MachineBlock {
+        generated: "2026-06-10T00:00:00Z".to_owned(),
+        git_sha: "deadbee".to_owned(),
+        machine: MachineMeta {
+            os: "linux".to_owned(),
+            rustc: "rustc x".to_owned(),
+            vulkan_icd: String::new(),
+            vulkan_device: device.to_owned(),
+            cpu_model: cpu.to_owned(),
+            axc_version: "0.0.1".to_owned(),
+        },
+        benchmarks: vec![BenchEntry {
+            group: "cpu_reference".to_owned(),
+            bench: "cpu_saxpy_1024".to_owned(),
+            median_ns: marker_ns,
+            low_ns: marker_ns,
+            high_ns: marker_ns,
+        }],
+    }
+}
+
+// ── AT-EB2-01: sanitize / machine_key determinism + spec examples + fallback ──
+
+#[test]
+fn at_eb2_01_machine_key_sanitizes_device_name() {
+    // Spec examples (must be exact).
+    assert_eq!(
+        sanitize("NVIDIA RTX PRO 6000 Blackwell Workstation Edition"),
+        NVIDIA_KEY
+    );
+    assert_eq!(
+        sanitize("Intel(R) Core(TM) i9-14900KF"),
+        "intel_r_core_tm_i9_14900kf"
+    );
+
+    // machine_key uses device-name-only when the device is non-empty.
+    assert_eq!(
+        machine_key("NVIDIA RTX PRO 6000 Blackwell Workstation Edition", "anything"),
+        NVIDIA_KEY
+    );
+
+    // Determinism: same input → same output across calls.
+    let a = machine_key("AMD Radeon 780M", "cpu");
+    let b = machine_key("AMD Radeon 780M", "cpu");
+    assert_eq!(a, b, "machine_key must be deterministic");
+    assert_eq!(a, "amd_radeon_780m");
+
+    // Collapse runs + trim leading/trailing underscores.
+    assert_eq!(sanitize("  --Foo___Bar!!  "), "foo_bar");
+    assert_eq!(sanitize("!!!"), "", "all-non-alnum sanitizes to empty");
+
+    // Length cap (80 chars) and no trailing underscore after truncation.
+    let long: String = "a".repeat(200);
+    assert_eq!(sanitize(&long).len(), 80, "sanitize caps at 80 chars");
+
+    // Empty-device fallback.
+    assert_eq!(
+        machine_key("", "Intel(R) Core(TM) i9-14900KF"),
+        "cpu_only__intel_r_core_tm_i9_14900kf"
+    );
+    assert_eq!(machine_key("", ""), "unknown_machine");
+    // A device that sanitizes to empty also falls back (never a panic, never empty key).
+    assert_eq!(machine_key("!!!", ""), "unknown_machine");
+}
+
+// ── AT-EB2-02: bless preserves OTHER machines (read-modify-write) ─────────────
+
+#[test]
+fn at_eb2_02_merge_blessed_inserts_current_preserves_others() {
+    // Pre-seed a v2 file holding a synthetic AMD machine.
+    let amd_block: MachineBlock = block_with("AMD Synthetic GPU", "amd cpu", 12345);
+    let mut seed_machines: BTreeMap<String, MachineBlock> = BTreeMap::new();
+    seed_machines.insert("amd_synthetic".to_owned(), amd_block.clone());
+    let seed: BaselinesV2 = BaselinesV2 {
+        schema_version: 2,
+        machines: seed_machines,
+    };
+    let seed_json: String = serde_json::to_string_pretty(&seed).expect("serialize seed");
+
+    // Re-bless NVIDIA into the same file.
+    let nvidia_block: MachineBlock =
+        block_with("NVIDIA RTX PRO 6000 Blackwell Workstation Edition", "intel cpu", 210);
+    let merged: BaselinesV2 =
+        merge_blessed(Some(&seed_json), NVIDIA_KEY, &nvidia_block).expect("merge ok");
+
+    assert_eq!(merged.schema_version, 2);
+    assert_eq!(merged.machines.len(), 2, "both machines present");
+    // amd_synthetic preserved byte-identical (value-equal).
+    assert_eq!(
+        merged.machines.get("amd_synthetic"),
+        Some(&amd_block),
+        "amd_synthetic block must be preserved unchanged"
+    );
+    assert_eq!(
+        merged.machines.get(NVIDIA_KEY),
+        Some(&nvidia_block),
+        "NVIDIA block must be the freshly-blessed one"
+    );
+
+    // Re-blessing the SAME key replaces only that key (insert-or-replace).
+    let nvidia_v2: MachineBlock =
+        block_with("NVIDIA RTX PRO 6000 Blackwell Workstation Edition", "intel cpu", 999);
+    let merged_json: String = serde_json::to_string_pretty(&merged).expect("serialize merged");
+    let remerged: BaselinesV2 =
+        merge_blessed(Some(&merged_json), NVIDIA_KEY, &nvidia_v2).expect("remerge ok");
+    assert_eq!(remerged.machines.len(), 2);
+    assert_eq!(remerged.machines.get(NVIDIA_KEY), Some(&nvidia_v2));
+    assert_eq!(
+        remerged.machines.get("amd_synthetic"),
+        Some(&amd_block),
+        "amd_synthetic still preserved after a same-key re-bless"
+    );
+}
+
+#[test]
+fn at_eb2_02b_merge_blessed_absent_starts_empty() {
+    // ABSENT file (None) → fresh empty map + the single current key (first bless).
+    let block: MachineBlock = block_with("NVIDIA RTX PRO 6000 Blackwell Workstation Edition", "x", 1);
+    let merged: BaselinesV2 = merge_blessed(None, NVIDIA_KEY, &block).expect("absent → ok");
+    assert_eq!(merged.machines.len(), 1);
+    assert_eq!(merged.machines.get(NVIDIA_KEY), Some(&block));
+}
+
+#[test]
+fn at_eb2_02c_merge_blessed_upgrades_v1() {
+    // A legacy v1 file at bless time is auto-upgraded (re-keyed) — safety net.
+    let v1: &str = r#"{
+      "schema_version": 1,
+      "generated": "2026-01-01T00:00:00Z",
+      "git_sha": "abc1234",
+      "machine": {
+        "os": "linux", "rustc": "rustc x", "vulkan_icd": "",
+        "vulkan_device": "AMD Radeon 780M", "cpu_model": "amd cpu", "axc_version": "0.0.1"
+      },
+      "benchmarks": [
+        {"group":"cpu_reference","bench":"cpu_saxpy_1024","median_ns":111,"low_ns":110,"high_ns":112}
+      ]
+    }"#;
+    // Bless an NVIDIA block over the v1 AMD file → both keys present.
+    let nvidia_block: MachineBlock =
+        block_with("NVIDIA RTX PRO 6000 Blackwell Workstation Edition", "intel cpu", 210);
+    let merged: BaselinesV2 =
+        merge_blessed(Some(v1), NVIDIA_KEY, &nvidia_block).expect("v1 upgrade ok");
+    assert_eq!(merged.schema_version, 2);
+    assert_eq!(merged.machines.len(), 2, "upgraded AMD block + new NVIDIA block");
+    assert!(merged.machines.contains_key("amd_radeon_780m"), "v1 block re-keyed");
+    assert_eq!(merged.machines.get(NVIDIA_KEY), Some(&nvidia_block));
+}
+
+// ── AT-EB2-03: gate uses the current machine's block ──────────────────────────
+
+#[test]
+fn at_eb2_03_select_block_gates_present_key() {
+    let mut machines: BTreeMap<String, MachineBlock> = BTreeMap::new();
+    let nvidia: MachineBlock =
+        block_with("NVIDIA RTX PRO 6000 Blackwell Workstation Edition", "intel", 200);
+    machines.insert(NVIDIA_KEY.to_owned(), nvidia.clone());
+    // A DIFFERENT machine that must be ignored when gating NVIDIA.
+    machines.insert("amd_synthetic".to_owned(), block_with("AMD", "amd", 999999));
+
+    match select_block(&machines, NVIDIA_KEY, true) {
+        SelectOutcome::Gate(block) => {
+            assert_eq!(block, &nvidia, "must select the current machine's block");
+            // A >15% slower current median vs THIS block's baseline is a regression.
+            let baseline_ns: u64 = block.benchmarks[0].median_ns; // 200
+            assert!(
+                (baseline_ns as f64 * 1.20) / baseline_ns as f64 > 1.15,
+                "sanity: 20% over the NVIDIA baseline exceeds the 15% threshold"
+            );
+        }
+        other => panic!("expected Gate, got {other:?}"),
+    }
+}
+
+// ── AT-EB2-04: two-case skip on absent key (BLOCKER 2) ────────────────────────
+
+#[test]
+fn at_eb2_04_select_block_two_case_skip() {
+    // (a) genuinely-empty map → QuietSkipEmpty.
+    let empty: BTreeMap<String, MachineBlock> = BTreeMap::new();
+    match select_block(&empty, NVIDIA_KEY, true) {
+        SelectOutcome::QuietSkipEmpty => {}
+        other => panic!("empty map + probed → QuietSkipEmpty, got {other:?}"),
+    }
+
+    // (b) non-empty map + device probed + current key absent → LoudSkipKeyAbsent
+    //     with the SORTED list of known keys.
+    let mut machines: BTreeMap<String, MachineBlock> = BTreeMap::new();
+    machines.insert("amd_synthetic".to_owned(), block_with("AMD", "amd", 1));
+    machines.insert("intel_arc_a770".to_owned(), block_with("Intel Arc", "intel", 1));
+    match select_block(&machines, NVIDIA_KEY, true) {
+        SelectOutcome::LoudSkipKeyAbsent { current, known } => {
+            assert_eq!(current, NVIDIA_KEY);
+            assert_eq!(
+                known,
+                vec!["amd_synthetic".to_owned(), "intel_arc_a770".to_owned()],
+                "known keys must be sorted (BTreeMap order)"
+            );
+        }
+        other => panic!("non-empty + probed + absent → LoudSkipKeyAbsent, got {other:?}"),
+    }
+}
+
+// ── AT-EB2-08: no-Vulkan fallback (empty device) ──────────────────────────────
+
+#[test]
+fn at_eb2_08_select_block_no_vulkan_fallback() {
+    let only: MachineBlock = block_with("NVIDIA", "intel", 5);
+    // len == 1, device NOT probed → SingleMachineFallback.
+    let mut one: BTreeMap<String, MachineBlock> = BTreeMap::new();
+    one.insert(NVIDIA_KEY.to_owned(), only.clone());
+    match select_block(&one, "unknown_machine", false) {
+        SelectOutcome::SingleMachineFallback(block) => assert_eq!(block, &only),
+        other => panic!("len-1 + !probed → SingleMachineFallback, got {other:?}"),
+    }
+
+    // len == 2, device NOT probed → SkipAmbiguous.
+    let mut two: BTreeMap<String, MachineBlock> = BTreeMap::new();
+    two.insert(NVIDIA_KEY.to_owned(), block_with("NVIDIA", "intel", 5));
+    two.insert("amd_synthetic".to_owned(), block_with("AMD", "amd", 5));
+    match select_block(&two, "unknown_machine", false) {
+        SelectOutcome::SkipAmbiguous => {}
+        other => panic!("len-2 + !probed → SkipAmbiguous, got {other:?}"),
+    }
+
+    // len == 0, device NOT probed → QuietSkipEmpty.
+    let empty: BTreeMap<String, MachineBlock> = BTreeMap::new();
+    match select_block(&empty, "unknown_machine", false) {
+        SelectOutcome::QuietSkipEmpty => {}
+        other => panic!("len-0 + !probed → QuietSkipEmpty, got {other:?}"),
+    }
+}
+
+// ── AT-EB2-05: NVIDIA baselines migrated value-exact (full-field, BLOCKER 3) ──
+
+#[test]
+fn at_eb2_05_nvidia_baselines_preserved_full_field() {
+    // The frozen expected table: (group, bench, median_ns, low_ns, high_ns).
+    let expected: Vec<(&str, &str, u64, u64, u64)> = vec![
+        ("compile_pipeline", "compile_saxpy", 11593, 11528, 11664),
+        ("compile_pipeline", "compile_vector_add", 9670, 9632, 9694),
+        ("cpu_reference", "cpu_saxpy_1024", 210, 194, 245),
+        ("cpu_reference", "cpu_saxpy_1m", 654714, 649807, 660390),
+        ("cpu_reference", "cpu_vector_add_1024", 64, 64, 64),
+        ("cpu_reference", "cpu_vector_add_1m", 151750, 150862, 153023),
+        ("dispatch_gpu", "dispatch_saxpy_1024", 31565, 31185, 31780),
+        ("dispatch_gpu", "dispatch_saxpy_1m", 3219017, 3203119, 3231790),
+        ("dispatch_gpu", "dispatch_vector_add_1024", 1133524, 1128837, 1143283),
+        ("dispatch_gpu", "dispatch_vector_add_1m", 9941574, 9904838, 9993295),
+        ("dispatch_gpu_amortized", "dispatch_handle_saxpy_1m", 3169279, 3150457, 3181693),
+        ("dispatch_gpu_q4_0", "dispatch_gpu_q4_0_1024", 1709351, 1701715, 1720783),
+        ("dispatch_gpu_q4_0", "dispatch_gpu_q4_0_128", 1209143, 1203519, 1216455),
+        ("dispatch_gpu_q4km", "dispatch_q4km_128", 1832268, 1824685, 1844525),
+        ("dispatch_gpu_q4km", "dispatch_q4km_512", 5322206, 5255519, 5407011),
+    ];
+
+    let file: BaselinesV2 = load_committed_baselines();
+    assert_eq!(file.schema_version, 2, "committed file must be schema v2");
+    let block: &MachineBlock = file
+        .machines
+        .get(NVIDIA_KEY)
+        .expect("NVIDIA machine block must exist under the migrated key");
+
+    assert_eq!(
+        block.benchmarks.len(),
+        expected.len(),
+        "all 15 entries must be present"
+    );
+
+    // FULL per-entry tuple multiset equality (BLOCKER 3) — not median_ns only.
+    let mut got: Vec<(String, String, u64, u64, u64)> = block
+        .benchmarks
+        .iter()
+        .map(|e| {
+            (
+                e.group.clone(),
+                e.bench.clone(),
+                e.median_ns,
+                e.low_ns,
+                e.high_ns,
+            )
+        })
+        .collect();
+    let mut want: Vec<(String, String, u64, u64, u64)> = expected
+        .iter()
+        .map(|&(g, b, m, l, h)| (g.to_owned(), b.to_owned(), m, l, h))
+        .collect();
+    got.sort();
+    want.sort();
+    assert_eq!(
+        got, want,
+        "migrated NVIDIA benchmarks must be value-exact on ALL fields (group,bench,median_ns,low_ns,high_ns)"
+    );
+}
+
+// ── AT-EB2-07: committed file round-trips through the gate's v2 structs ───────
+
+#[test]
+fn at_eb2_07_committed_file_roundtrips_through_gate_structs() {
+    // Proves writer/gate schema agreement: the committed file parses cleanly via
+    // the SAME BaselinesV2/MachineBlock structs the gate uses, schema_version==2.
+    let file: BaselinesV2 = load_committed_baselines();
+    assert_eq!(file.schema_version, 2);
+    assert!(
+        file.machines.contains_key(NVIDIA_KEY),
+        "round-trip must expose the NVIDIA key"
+    );
+    // Re-serialize → re-parse: structurally stable through the gate structs.
+    let json: String = serde_json::to_string_pretty(&file).expect("serialize");
+    let reparsed: BaselinesV2 = serde_json::from_str(&json).expect("re-parse v2");
+    assert_eq!(reparsed.machines, file.machines, "v2 round-trip is stable");
+}
+
+// ── AT-EB2-10: atomic write (temp + rename) ───────────────────────────────────
+
+#[test]
+fn at_eb2_10_atomic_write_temp_rename() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("baselines.json");
+
+    // Seed an existing valid file (simulating a multi-machine baseline).
+    std::fs::write(&path, b"ORIGINAL-CONTENTS").expect("seed");
+
+    // Successful atomic write replaces the file and leaves NO *.tmp.* behind.
+    atomic_write(dir.path(), "baselines.json", b"NEW-CONTENTS").expect("atomic write ok");
+    assert_eq!(
+        std::fs::read(&path).expect("read"),
+        b"NEW-CONTENTS",
+        "atomic write must replace the file"
+    );
+    let leftover_tmp: usize = std::fs::read_dir(dir.path())
+        .expect("readdir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+        .count();
+    assert_eq!(leftover_tmp, 0, "no *.tmp.* may remain after a successful write");
+
+    // No-original case: writing where no file exists still succeeds atomically.
+    let path2 = dir.path().join("fresh.json");
+    atomic_write(dir.path(), "fresh.json", b"FRESH").expect("atomic write fresh");
+    assert_eq!(std::fs::read(&path2).expect("read fresh"), b"FRESH");
+}
+
+#[test]
+fn at_eb2_10b_atomic_write_pre_rename_failure_leaves_original_intact() {
+    // Model the BLOCKER-1 property: if the write to the temp file fails BEFORE
+    // the rename, the original target is untouched.  We force the failure by
+    // pointing the dir at a NON-EXISTENT directory so File::create(tmp) fails;
+    // the original (in a different, real dir) is provably never touched.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let original = dir.path().join("baselines.json");
+    std::fs::write(&original, b"ORIGINAL").expect("seed original");
+
+    let nonexistent = dir.path().join("does_not_exist_subdir");
+    // atomic_write into a non-existent dir: File::create(tmp) errors → Err, and
+    // it never renames over anything.
+    let res = atomic_write(&nonexistent, "baselines.json", b"WOULD-CLOBBER");
+    assert!(res.is_err(), "write into a missing dir must error (pre-rename)");
+    // The unrelated real original is byte-identical (untouched).
+    assert_eq!(
+        std::fs::read(&original).expect("read original"),
+        b"ORIGINAL",
+        "a pre-rename failure must leave the original intact"
+    );
+}
+
+// ── AT-EB2-11: fail-loud on corrupt (bless side) ──────────────────────────────
+
+#[test]
+fn at_eb2_11_merge_blessed_corrupt_returns_err() {
+    let block: MachineBlock = block_with("NVIDIA", "intel", 1);
+    // Present-but-unparseable → Err (refuse to bless over garbage); NEVER empty.
+    let res = merge_blessed(Some("{ this is not json"), NVIDIA_KEY, &block);
+    assert!(
+        res.is_err(),
+        "corrupt existing file must make merge_blessed refuse (Err), not start-from-empty"
+    );
+
+    // A structurally-wrong-but-valid-JSON file (neither v2 nor v1) also errors.
+    let res2 = merge_blessed(Some(r#"{"unexpected": true}"#), NVIDIA_KEY, &block);
+    assert!(res2.is_err(), "JSON that is neither v2 nor v1 must also be refused");
+
+    // ABSENT (None) is the ONLY empty-start case (first bless on a fresh repo).
+    let ok = merge_blessed(None, NVIDIA_KEY, &block).expect("absent → ok");
+    assert_eq!(ok.machines.len(), 1);
+}
+
+// ── Helper: load the committed baselines.json through the gate's v2 structs ────
+
+fn load_committed_baselines() -> BaselinesV2 {
+    let manifest_dir: String =
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+    let path: std::path::PathBuf = std::path::PathBuf::from(&manifest_dir)
+        .join("..")
+        .join("..")
+        .join(".pipeline")
+        .join("benchmarks")
+        .join("baselines.json");
+    let raw: String = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read committed baselines at {}: {e}", path.display()));
+    serde_json::from_str(&raw)
+        .unwrap_or_else(|e| panic!("committed baselines.json must parse as v2: {e}"))
+}
+
+// ── AT-EB2-06: live machine_key == migrated NVIDIA key (env-gated, NVIDIA box) ─
+
+/// On the NVIDIA box with a live Vulkan device, the key derived from the real
+/// deviceName must EQUAL the migrated NVIDIA key — proving the migrated gate
+/// keeps working.  Env-gated (AT-712 pattern): requires AXC_ENABLE_GPU_TESTS=1
+/// and a responsive Vulkan ICD.
+#[test]
+fn at_eb2_06_live_key_matches_migrated_nvidia_key() {
+    if std::env::var("AXC_ENABLE_GPU_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping AT-EB2-06 (AXC_ENABLE_GPU_TESTS != 1)");
+        return;
+    }
+    let device_name: String = match axc_runtime::VulkanContext::new() {
+        Ok(ctx) => ctx.physical_device_name().to_owned(),
+        Err(e) => {
+            eprintln!("skipping AT-EB2-06 (no Vulkan device: {e})");
+            return;
+        }
+    };
+    if device_name.is_empty() {
+        eprintln!("skipping AT-EB2-06 (empty device name)");
+        return;
+    }
+    let cpu: String = common::cpu_model_probe();
+    let live_key: String = machine_key(&device_name, &cpu);
+    eprintln!("AT-EB2-06: live device='{device_name}' → key='{live_key}'");
+
+    // The committed baselines must contain this key (the migrated block).
+    let file: BaselinesV2 = load_committed_baselines();
+    assert!(
+        file.machines.contains_key(&live_key),
+        "live-derived key '{live_key}' must be present in the committed baselines \
+         (known: {:?}) — the migrated gate would otherwise be silently skipped",
+        file.machines.keys().collect::<Vec<_>>()
+    );
+    // On THIS box the device is the NVIDIA RTX PRO 6000, so assert the exact key.
+    if device_name == "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" {
+        assert_eq!(
+            live_key, NVIDIA_KEY,
+            "live NVIDIA key must byte-equal the migrated NVIDIA key"
+        );
+    }
+}

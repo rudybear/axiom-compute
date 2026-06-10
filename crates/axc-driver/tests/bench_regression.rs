@@ -27,7 +27,7 @@
 #[path = "../benches/common.rs"]
 mod common;
 
-use serde::Deserialize;
+use common::{BaselinesV2, MachineBlock, SelectOutcome};
 
 /// Number of warm samples for the regression gate (AT-713).
 ///
@@ -40,20 +40,12 @@ const WARM_SAMPLES: usize = 11;
 /// the test fails.
 const REGRESSION_THRESHOLD_PCT: u32 = 15;
 
-// ── Baseline JSON schema v1 (deserialization) ─────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-struct BaselineFile {
-    schema_version: u32,
-    benchmarks: Vec<BenchEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-struct BenchEntry {
-    group: String,
-    bench: String,
-    median_ns: u64,
-}
+// ── Baseline JSON schema v2 (deserialization) ─────────────────────────────────
+//
+// The v2 schema (`BaselinesV2`, `MachineBlock`, `BenchEntry`) is defined ONCE in
+// common.rs and shared with the writer (postprocess.rs) so the gate and the
+// writer cannot drift (EB.2).  The gate accepts ONLY v2 — a v1 file is a hard
+// error at gate time (load_baselines below).
 
 // ── Regression outcome enum ────────────────────────────────────────────────────
 
@@ -144,9 +136,15 @@ fn time_cpu_reference_bench(bench: &str) -> Option<u64> {
     }
 }
 
-// ── Load baselines.json ────────────────────────────────────────────────────────
+// ── Load baselines.json (schema v2, fail-loud on corrupt/v1) ──────────────────
 
-fn load_baselines() -> BaselineFile {
+/// Load and parse the committed v2 baselines.json.
+///
+/// BLOCKER 1 (fail-loud): an unreadable/corrupt/truncated/v1 file is a HARD
+/// PANIC here — NEVER a silent skip/Ok.  The two-case skip (select_block) is
+/// reached ONLY for a successfully-parsed v2 file that lacks the current key, so
+/// a corrupt or v1 file can never silently disable the gate for ALL machines.
+fn load_baselines() -> BaselinesV2 {
     let manifest_dir: String = std::env::var("CARGO_MANIFEST_DIR")
         .expect("CARGO_MANIFEST_DIR not set");
     let baselines_path: std::path::PathBuf = std::path::PathBuf::from(&manifest_dir)
@@ -164,20 +162,38 @@ fn load_baselines() -> BaselineFile {
         )
     });
 
-    let file: BaselineFile = serde_json::from_str(&raw).unwrap_or_else(|e| {
+    parse_baselines_v2(&raw, &baselines_path.display().to_string())
+}
+
+/// Parse + validate a v2 baselines document, fail-loud on corrupt / v1
+/// (BLOCKER 1).  Factored out so the corrupt-path can be unit-tested without a
+/// dedicated on-disk fixture file (AT-EB2-11 gate side).
+fn parse_baselines_v2(raw: &str, path_for_msg: &str) -> BaselinesV2 {
+    let file: BaselinesV2 = serde_json::from_str(raw).unwrap_or_else(|e| {
         panic!(
-            "bench_regression: failed to parse '{}': {e}",
-            baselines_path.display()
+            "bench_regression: failed to parse '{path_for_msg}' as schema v2: {e}\n\
+             A schema v1 file is NOT accepted at gate time — re-bless under EB.2 \
+             (`AXC_BLESS_BASELINES=1 cargo bench -p axc-driver`)."
         )
     });
 
     assert_eq!(
-        file.schema_version, 1,
-        "bench_regression: baselines.json schema_version must be 1, got {}",
+        file.schema_version, 2,
+        "bench_regression: baselines.json schema_version must be 2 (EB.2 migration), got {}",
         file.schema_version
     );
 
     file
+}
+
+/// Probe the live Vulkan device name (empty string if no Vulkan), mirroring the
+/// writer's `probe_vulkan_device()`.  Used to derive the current machine key at
+/// gate time so the gate compares same-machine-vs-same-machine.
+fn probe_vulkan_device() -> String {
+    match axc_runtime::VulkanContext::new() {
+        Ok(ctx) => ctx.physical_device_name().to_owned(),
+        Err(_) => String::new(),
+    }
 }
 
 // ── Main regression test ───────────────────────────────────────────────────────
@@ -195,11 +211,63 @@ fn bench_regression_detects_over_threshold_slowdown() {
         return;
     }
 
-    let baselines: BaselineFile = load_baselines();
+    let baselines: BaselinesV2 = load_baselines();
+
+    // EB.2: derive the current machine key and select the same-machine block.
+    let device_name: String = probe_vulkan_device();
+    let device_probed: bool = !device_name.is_empty();
+    let cpu_model: String = common::cpu_model_probe();
+    let current_key: String = common::machine_key(&device_name, &cpu_model);
+
+    let block: &MachineBlock = match common::select_block(
+        &baselines.machines,
+        &current_key,
+        device_probed,
+    ) {
+        SelectOutcome::Gate(block) => {
+            eprintln!(
+                "bench_regression: gating against machine_key='{current_key}' (device probed)"
+            );
+            block
+        }
+        SelectOutcome::SingleMachineFallback(block) => {
+            eprintln!(
+                "bench_regression: no Vulkan device probed; exactly one machine in baselines — \
+                 falling back to it (preserves Lavapipe-less CI gate)"
+            );
+            block
+        }
+        SelectOutcome::QuietSkipEmpty => {
+            eprintln!(
+                "bench_regression: no baselines blessed yet; run \
+                 `AXC_BLESS_BASELINES=1 cargo bench -p axc-driver` — SKIPPING"
+            );
+            return;
+        }
+        SelectOutcome::LoudSkipKeyAbsent { current, known } => {
+            eprintln!(
+                "bench_regression: WARNING: probed device key '{current}' is ABSENT from a \
+                 non-empty baselines file; known machines: {known:?}. If this is an EXISTING \
+                 machine whose deviceName changed (driver rename → key drift), its regression \
+                 gate is being SKIPPED — re-bless with \
+                 `AXC_BLESS_BASELINES=1 cargo bench -p axc-driver`. If this is genuinely a new \
+                 machine, bless a first baseline. SKIPPING (not failing: a legit new machine \
+                 must not be hard-blocked)."
+            );
+            return;
+        }
+        SelectOutcome::SkipAmbiguous => {
+            eprintln!(
+                "bench_regression: no Vulkan device probed and >1 machine in baselines — \
+                 cannot disambiguate which machine this is — SKIPPING"
+            );
+            return;
+        }
+    };
 
     let mut regressions: Vec<String> = Vec::new();
 
-    for entry in &baselines.benchmarks {
+    for entry in &block.benchmarks {
         // Only gate on cpu_reference benches (AT-712 intentional scope).
         // dispatch_gpu is too variable on Lavapipe; compile_pipeline has OS-noise dominance.
         // dispatch_gpu_amortized (M2.3a): skipped here — FIXME W-7: re-arm when Lavapipe
@@ -337,5 +405,38 @@ mod unit_tests {
             REGRESSION_THRESHOLD_PCT, 15,
             "REGRESSION_THRESHOLD_PCT must be 15 per AT-713"
         );
+    }
+
+    /// AT-EB2-07: the committed baselines.json round-trips through the gate's v2
+    /// parser (writer/gate schema agreement) and is schema_version 2.
+    #[test]
+    fn at_eb2_07_committed_file_parses_through_gate() {
+        let file = load_baselines();
+        assert_eq!(file.schema_version, 2, "committed file must be v2");
+        assert!(
+            file.machines
+                .contains_key("nvidia_rtx_pro_6000_blackwell_workstation_edition"),
+            "committed file must hold the migrated NVIDIA key"
+        );
+    }
+
+    /// AT-EB2-11 (gate side): a corrupt/truncated baselines file is a HARD PANIC
+    /// in the gate parse path — NEVER a silent skip/Ok.
+    #[test]
+    #[should_panic(expected = "failed to parse")]
+    fn at_eb2_11_gate_panics_on_corrupt() {
+        let _ = parse_baselines_v2("{ this is not valid json", "<corrupt-fixture>");
+    }
+
+    /// AT-EB2-07 / AT-EB2-11: a v1-shaped file is rejected at gate time (hard
+    /// error), NOT silently gated — the schema_version assert fails loud.
+    #[test]
+    #[should_panic]
+    fn at_eb2_11_gate_rejects_v1_file() {
+        // A syntactically-valid JSON whose schema_version is 1 → assert fires.
+        // (BaselinesV2 has no `benchmarks` top-level field, so a real v1 body
+        // fails to deserialize; a minimal {schema_version:1, machines:{}} trips
+        // the schema_version==2 assert — either way it panics.)
+        let _ = parse_baselines_v2(r#"{"schema_version":1,"machines":{}}"#, "<v1-fixture>");
     }
 }
