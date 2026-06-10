@@ -1,0 +1,143 @@
+// examples/matmul_warptile_coopmat_2sg.axc
+//
+// M3.9 A/B OPPONENT (K=2): the M3.3d structure RE-EXPRESSED as the warptile baseline for
+// the K=1 (single-subgroup RB) vs K=2 vs K=4 controlled ladder.
+//
+// A workgroup of 2 subgroups (@workgroup(64,1,1) on NVIDIA wave32) cooperates on a 32x64
+// output tile. The 2 subgroups STACK ALONG N: subgroup s owns the 32x32 sub-tile at cols
+// [block_col*64 + s*32 .. +32), rows [block_row*32 .. +32). Each subgroup computes its
+// 32x32 sub-tile via the M3.6 2x2 coopmat register-blocking (4 accumulators). A (32x16)
+// and B (16x64) are staged into shared ONCE by ALL 64 threads, one workgroup_barrier, then
+// each subgroup coopmat-loads ITS sub-tile from shared.
+//
+// This is the SAME staging discipline as the K=4 leader (matmul_warptile_coopmat.axc),
+// differing ONLY in K (2 vs 4) and BM*BN (32x64 vs 64x64) -- making the bench K-ladder a
+// controlled experiment. It is EXPECTED to (re)confirm the M3.3d negative; retained so the
+// K=2 vs K=4 vs single-subgroup comparison isolates exactly the warptile width.
+//
+// HARD PRECONDITION: subgroup_size MUST be 32 (same as the K=4 leader and M3.3d). On
+// wave64 sg_id collapses (silent gap); on SIMD16 sg_id OOBs the 64-wide b_tile. ALL
+// tests/bench TYPED-SKIP when subgroup_size()!=32.
+//
+// WORKGROUP: @workgroup(64,1,1) = 2 subgroups of 32 lanes. product == 64 < 128 (the
+//   portable floor) => emits ZERO WorkgroupExceedsPortableFloor warnings.
+//
+// DISPATCH GRID: (N/64, M/32, 1). Each workgroup covers a 32x64 C tile.
+//
+// SUBGROUP PARTITION:
+//   sg_id = local_invocation_id(0) / subgroup_size()   // 0..1 (which subgroup)
+//   Subgroup s owns cols [block_col*64 + s*32 .. +32), rows [block_row*32 .. +32).
+//
+// COOPERATIVE STAGING (ALL 64 threads): A block = 32x16 = 512 f16 (a_block_size); B block =
+//   16x64 = 1024 f16 (b_block_size). a_iters = 512/64 = 8, b_iters = 1024/64 = 16
+//   (K-INDEPENDENT). ei = iter*64 + t.
+//
+// Anti-pattern #2: explicit return; Anti-pattern #8: no >>.
+
+@kernel
+@workgroup(64, 1, 1)
+@cooperative_matrix
+@strategy { wg_threads: ?[64], n_sg: ?[2], bm: ?[32], bn: ?[64], rb_m: ?[2], rb_n: ?[2], tile_k: ?[16], a_block_size: ?[512], b_block_size: ?[1024] }
+@intent("K=2 warptile opponent -- 2 subgroups stacked along N, 32x64 tile (AT-2303, A/B ladder)")
+@complexity(O(n))
+fn matmul_warptile_coopmat_2sg(
+    A: readonly_buffer[f16],
+    B: readonly_buffer[f16],
+    C: buffer[f16],
+    M: u32,
+    N: u32,
+    K: u32
+) -> void {
+    // a_tile: 32 rows x 16 cols = 512 f16 (shared by BOTH subgroups -- same A rows).
+    // b_tile: 16 rows x 64 cols = 1024 f16 (both subgroups' B columns).
+    shared a_tile: shared[f16, ?a_block_size];
+    shared b_tile: shared[f16, ?b_block_size];
+
+    // block_col = gid(0)/64 (local_size.x=64); block_row = gid(1) (local_size.y=1).
+    let block_col: u32 = gid(0u32) / 64u32;
+    let block_row: u32 = gid(1u32);
+
+    // Subgroup identity.
+    let sg_size: u32 = subgroup_size();
+    let t: u32 = local_invocation_id(0u32);        // 0..63 within the workgroup
+    let sg_id: u32 = t / sg_size;                   // 0..1 (which subgroup)
+
+    let a_iters: u32 = ?a_block_size / ?wg_threads;
+    let b_iters: u32 = ?b_block_size / ?wg_threads;
+    let num_k_blocks: u32 = K / ?tile_k;
+
+    // A row-tiles (same offsets for BOTH subgroups -- both cover the SAME 32 A rows):
+    //   a_off_0 = 0   (rows 0..16 of the 32-row A block)
+    //   a_off_1 = 256 (rows 16..32)
+    let a_off_0: u32 = 0u32;
+    let a_off_1: u32 = 256u32;
+
+    // B col-tiles: subgroup s reads cols [s*32 .. +32) of the 64-wide b_tile (stride 64).
+    let b_off_0: u32 = sg_id * 32u32;
+    let b_off_1: u32 = sg_id * 32u32 + 16u32;
+
+    // Output 16x16 tile indices. Both subgroups cover the same 2 row-tiles; subgroups
+    // stack along N => per-subgroup col base = block_col*4 + sg_id*2.
+    let tile_row_0: u32 = block_row * 2u32;
+    let tile_row_1: u32 = block_row * 2u32 + 1u32;
+    let tile_col_0: u32 = block_col * 4u32 + sg_id * 2u32;
+    let tile_col_1: u32 = block_col * 4u32 + sg_id * 2u32 + 1u32;
+
+    let mut acc_00: matrix[f16, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_01: matrix[f16, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_10: matrix[f16, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_11: matrix[f16, 16, 16, accumulator] = coopmat_zero();
+
+    for k_block in range(0u32, num_k_blocks) {
+
+        // Stage A[block_row*32..+32, k_block*16..+16] (32x16 = 512). ei = iter*64 + t.
+        for a_iter in range(0u32, a_iters) {
+            let ei_a: u32 = a_iter * ?wg_threads + t;
+            let a_row: u32 = ei_a / 16u32;
+            let a_col: u32 = ei_a - a_row * 16u32;
+            let a_global_row: u32 = block_row * 32u32 + a_row;
+            let a_global_col: u32 = k_block * ?tile_k + a_col;
+            let a_global: u32 = a_global_row * K + a_global_col;
+            a_tile[ei_a] = A[a_global];
+        }
+
+        // Stage B[k_block*16..+16, block_col*64..+64] (16x64 = 1024). ei = iter*64 + t.
+        for b_iter in range(0u32, b_iters) {
+            let ei_b: u32 = b_iter * ?wg_threads + t;
+            let b_row: u32 = ei_b / 64u32;
+            let b_col: u32 = ei_b - b_row * 64u32;
+            let b_global_row: u32 = k_block * ?tile_k + b_row;
+            let b_global_col: u32 = block_col * 64u32 + b_col;
+            let b_global: u32 = b_global_row * N + b_global_col;
+            b_tile[ei_b] = B[b_global];
+        }
+
+        // RAW barrier (workgroup-scope, depth-0).
+        workgroup_barrier();
+
+        let a_mat_0: matrix[f16, 16, 16, a] = coopmat_load(a_tile, a_off_0, 16u32);
+        let a_mat_1: matrix[f16, 16, 16, a] = coopmat_load(a_tile, a_off_1, 16u32);
+        let b_mat_0: matrix[f16, 16, 16, b] = coopmat_load(b_tile, b_off_0, 64u32);
+        let b_mat_1: matrix[f16, 16, 16, b] = coopmat_load(b_tile, b_off_1, 64u32);
+
+        acc_00 = coopmat_mul_add(a_mat_0, b_mat_0, acc_00);
+        acc_01 = coopmat_mul_add(a_mat_0, b_mat_1, acc_01);
+        acc_10 = coopmat_mul_add(a_mat_1, b_mat_0, acc_10);
+        acc_11 = coopmat_mul_add(a_mat_1, b_mat_1, acc_11);
+
+        // WAR barrier (workgroup-scope, depth-0).
+        workgroup_barrier();
+    }
+
+    let c_base_00: u32 = (tile_row_0 * 16u32) * N + (tile_col_0 * 16u32);
+    let c_base_01: u32 = (tile_row_0 * 16u32) * N + (tile_col_1 * 16u32);
+    let c_base_10: u32 = (tile_row_1 * 16u32) * N + (tile_col_0 * 16u32);
+    let c_base_11: u32 = (tile_row_1 * 16u32) * N + (tile_col_1 * 16u32);
+
+    coopmat_store(acc_00, C, c_base_00, N);
+    coopmat_store(acc_01, C, c_base_01, N);
+    coopmat_store(acc_10, C, c_base_10, N);
+    coopmat_store(acc_11, C, c_base_11, N);
+
+    return;
+}
