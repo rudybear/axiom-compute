@@ -532,6 +532,8 @@ fn expr_uses_gid(expr: &axc_hir::expr::HirExpr) -> bool {
         HirExprKind::CoopMatBuiltin { args, .. } => args.iter().any(expr_uses_gid),
         // M2.5: Q4_0 builtins may nest gid-using offset args; recurse into args.
         HirExprKind::Q4_0Builtin { args, .. } => args.iter().any(expr_uses_gid),
+        // M3.2c: ext-inst builtins (e.g. exp) may nest gid-using args; recurse.
+        HirExprKind::ExtInstBuiltin { args, .. } => args.iter().any(expr_uses_gid),
         HirExprKind::IntLit { .. }
         | HirExprKind::FloatLit { .. }
         | HirExprKind::BoolLit(_)
@@ -634,6 +636,10 @@ fn expr_uses_local_invocation_id(expr: &axc_hir::expr::HirExpr) -> bool {
         HirExprKind::Q4_0Builtin { args, .. } => {
             args.iter().any(expr_uses_local_invocation_id)
         }
+        // M3.2c: ext-inst builtins (e.g. exp) may nest local-invocation-id args.
+        HirExprKind::ExtInstBuiltin { args, .. } => {
+            args.iter().any(expr_uses_local_invocation_id)
+        }
         HirExprKind::GidBuiltin { .. }
         | HirExprKind::IntLit { .. }
         | HirExprKind::FloatLit { .. }
@@ -733,6 +739,10 @@ fn expr_uses_subgroup_op(expr: &axc_hir::expr::HirExpr, target: SubgroupOp) -> b
         HirExprKind::Q4_0Builtin { args, .. } => {
             args.iter().any(|a| expr_uses_subgroup_op(a, target))
         }
+        // M3.2c: ext-inst builtins (e.g. exp) may nest subgroup-using args; recurse.
+        HirExprKind::ExtInstBuiltin { args, .. } => {
+            args.iter().any(|a| expr_uses_subgroup_op(a, target))
+        }
         HirExprKind::GidBuiltin { .. }
         // M3.3d: LocalInvocationIdBuiltin is a leaf — no subgroup op nested in it.
         | HirExprKind::LocalInvocationIdBuiltin { .. }
@@ -815,6 +825,8 @@ fn expr_uses_coopmat(expr: &axc_hir::expr::HirExpr) -> bool {
         }
         // M2.5: Q4_0 builtins are not coopmat; no cooperative-matrix ops inside.
         HirExprKind::Q4_0Builtin { .. } => false,
+        // M3.2c: ext-inst builtin (e.g. exp) args may nest coopmat exprs; recurse.
+        HirExprKind::ExtInstBuiltin { args, .. } => args.iter().any(expr_uses_coopmat),
         HirExprKind::GidBuiltin { .. }
         // M3.3d: LocalInvocationIdBuiltin is a leaf — no coopmat nested in it.
         | HirExprKind::LocalInvocationIdBuiltin { .. }

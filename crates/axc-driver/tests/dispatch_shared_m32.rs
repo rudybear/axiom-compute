@@ -49,6 +49,21 @@ const MATMUL_SHARED_COOPMAT_SRC: &str = include_str!("../../../examples/matmul_s
 const MATMUL_SHARED_F32_SRC: &str = include_str!("../../../examples/matmul_shared_f32.axc");
 const TILED_ATTENTION_SRC: &str = include_str!("../../../examples/tiled_attention.axc");
 const FLASH_ATTENTION_SRC: &str = include_str!("../../../examples/flash_attention.axc");
+const FLASH_ATTENTION_EXP_SRC: &str = include_str!("../../../examples/flash_attention_exp.axc");
+/// M3.2c exp(x) micro-kernel (AT-1820/1821): O[i] = exp(In[i]). One invocation per element
+/// (dispatch (N,1,1) workgroups). Exercises the GLSL.std.450 Exp builtin directly.
+const EXP_MICRO_SRC: &str = r#"
+@kernel
+@workgroup(1, 1, 1)
+@intent("exp(x) micro-kernel — direct GLSL.std.450 Exp correctness (AT-1820)")
+@complexity(O(1))
+fn exp_micro(In: readonly_buffer[f32], Out: buffer[f32]) -> void {
+    let i: u32 = gid(0u32);
+    let x: f32 = In[i];
+    Out[i] = exp(x);
+    return;
+}
+"#;
 const OPPHI_COOPMAT_ACCUMULATE_SRC: &str = include_str!("../../../examples/opphi_coopmat_accumulate.axc");
 const MATMUL_RB_COOPMAT_SRC: &str = include_str!("../../../examples/matmul_rb_coopmat.axc");
 const MATMUL_MSG_COOPMAT_SRC: &str = include_str!("../../../examples/matmul_msg_coopmat.axc");
@@ -2070,6 +2085,450 @@ fn at1744_fa2_running_max_climb() {
     eprintln!(
         "AT-1744 PASS: first-row-max (j==0 guard) max_diff={diff_a}; monotone-climb \
          (every-iter rescale) max_diff={diff_b} (both <= {FA2_FROZEN_TOL}) on {}",
+        ctx.physical_device_name()
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// M3.2c-exp — real exp() via GLSL.std.450 Exp. AT-1820..1827.
+//
+// AT-1820/1821  GPU exp(x) vs Rust f32::exp(x) over x in [-30,5] within FROZEN 1e-3
+//               (combined abs/rel, abs floor 1e-6 for near-zero magnitudes). MEASURED.
+// AT-1822       import-emitted-once — in compile_shared_examples.rs (raw codegen scan).
+// AT-1823       spirv-val clean on the exp kernels + capability set BYTE-IDENTICAL to
+//               the M3.2b Taylor flash_attention.axc (no new OpCapability/OpExtension).
+// AT-1824       flash_attention_exp.axc compile anchor — in compile_shared_examples.rs.
+// AT-1825       flash_attention_exp at REAL logit spreads (post-max args -10..0) within
+//               FROZEN 1e-3 vs fa2_true_exp_softmax_reference (std f32::exp). The regime
+//               M3.2b's Taylor CANNOT do.
+// AT-1826       negative control — the M3.2b Taylor kernel on the SAME wide-spread fixture
+//               is GROSSLY wrong (>> 1e-3) vs the true-exp oracle.
+// AT-1827       M3.2b no-regression — the Taylor kernel SPIR-V emits ZERO OpExtInstImport
+//               (the lazy cache stays None for a zero-exp kernel).
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Combined abs/rel pass: |a-b| <= max(abs_floor, rel_tol*|b|).
+fn within_combined(a: f32, b: f32, rel_tol: f32, abs_floor: f32) -> bool {
+    (a - b).abs() <= abs_floor.max(rel_tol * b.abs())
+}
+
+/// Count OpExtInstImport (opcode 11) instructions in a SPIR-V word stream.
+/// Skips the 5-word module header.
+fn count_ext_inst_imports(words: &[u32]) -> usize {
+    let mut count = 0usize;
+    let mut idx = 5usize;
+    while idx < words.len() {
+        let w0 = words[idx];
+        let opcode = w0 & 0xFFFF;
+        let wc = (w0 >> 16) as usize;
+        if wc == 0 {
+            break;
+        }
+        if opcode == 11 {
+            count += 1;
+        }
+        idx += wc;
+    }
+    count
+}
+
+/// Collect the (value-id) operands of every OpCapability (opcode 17) + OpExtension
+/// (opcode 10) instruction, as a sorted multiset, for a byte-comparable capability set.
+fn capability_extension_signature(words: &[u32]) -> (Vec<u32>, Vec<String>) {
+    let mut caps: Vec<u32> = Vec::new();
+    let mut exts: Vec<String> = Vec::new();
+    let mut idx = 5usize;
+    while idx < words.len() {
+        let w0 = words[idx];
+        let opcode = w0 & 0xFFFF;
+        let wc = (w0 >> 16) as usize;
+        if wc == 0 {
+            break;
+        }
+        if opcode == 17 {
+            // OpCapability: word1 = capability enum value.
+            caps.push(words[idx + 1]);
+        } else if opcode == 10 {
+            // OpExtension: word1.. = packed null-terminated literal string.
+            let mut bytes: Vec<u8> = Vec::new();
+            for w in &words[idx + 1..idx + wc] {
+                bytes.extend_from_slice(&w.to_le_bytes());
+            }
+            let nul = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+            exts.push(String::from_utf8_lossy(&bytes[..nul]).into_owned());
+        }
+        idx += wc;
+    }
+    caps.sort_unstable();
+    exts.sort();
+    (caps, exts)
+}
+
+fn compile_words(src: &str, name: &str) -> Vec<u32> {
+    let (bytes, _meta) = compile_source_with_meta(src)
+        .unwrap_or_else(|e| panic!("{name}: compile failed: {e:?}"));
+    bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// AT-1823 (no GPU): spirv-val clean on the exp kernels AND the capability/extension set
+/// is BYTE-IDENTICAL to the M3.2b Taylor flash_attention.axc (the ext-inst adds NO new
+/// OpCapability / OpExtension). Also: flash_attention_exp emits EXACTLY ONE OpExtInstImport
+/// and the Taylor kernel emits ZERO (AT-1827's import-once-vs-none half).
+#[test]
+fn at1823_exp_spirv_val_no_new_capability() {
+    use spirv_tools::val::{Validator, create as create_validator};
+    use spirv_tools::TargetEnv;
+
+    let taylor_words = compile_words(FLASH_ATTENTION_SRC, "flash_attention.axc (Taylor)");
+    let exp_words = compile_words(FLASH_ATTENTION_EXP_SRC, "flash_attention_exp.axc");
+    let micro_words = compile_words(EXP_MICRO_SRC, "exp_micro");
+
+    let validator = create_validator(Some(TargetEnv::Vulkan_1_1));
+    validator.validate(&exp_words, None).expect("AT-1823: flash_attention_exp spirv-val must pass");
+    validator.validate(&micro_words, None).expect("AT-1823: exp_micro spirv-val must pass");
+
+    // Capability/extension signature must be byte-identical to the Taylor kernel.
+    let taylor_sig = capability_extension_signature(&taylor_words);
+    let exp_sig = capability_extension_signature(&exp_words);
+    assert_eq!(
+        exp_sig, taylor_sig,
+        "AT-1823: flash_attention_exp capability/extension set must be BYTE-IDENTICAL to the \
+         M3.2b Taylor flash_attention.axc (GLSL.std.450 ext-inst adds NO OpCapability/OpExtension). \
+         exp={exp_sig:?} taylor={taylor_sig:?}"
+    );
+
+    // Import-once vs none.
+    assert_eq!(
+        count_ext_inst_imports(&exp_words), 1,
+        "AT-1823: flash_attention_exp must emit EXACTLY ONE OpExtInstImport (GLSL.std.450)"
+    );
+    assert_eq!(
+        count_ext_inst_imports(&taylor_words), 0,
+        "AT-1827 (half): the M3.2b Taylor kernel (zero exp) must emit ZERO OpExtInstImport \
+         (the lazy GLSL.std.450 cache stays None)"
+    );
+    assert_eq!(
+        count_ext_inst_imports(&micro_words), 1,
+        "AT-1823: exp_micro (one exp) must emit EXACTLY ONE OpExtInstImport"
+    );
+
+    eprintln!(
+        "AT-1823 PASS: exp kernels spirv-val clean; capability/extension set byte-identical to \
+         M3.2b Taylor ({} caps, {} exts); imports: exp_fa=1, taylor=0, micro=1",
+        taylor_sig.0.len(), taylor_sig.1.len()
+    );
+}
+
+/// Wide-spread FA2 fixture: Q/K scaled so post-max exp args span roughly -10..0 — WELL outside
+/// the Taylor faithful band (<= 0.7). The fa2_fixture_max_postmax_arg<=0.7 hard-wire is NOT
+/// applied to this fixture (it is the whole point of the exp builtin).
+fn fa2_wide_spread_fixture(seq_len: usize, head_dim: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    // Each K row j gets a magnitude that RAMPS with the row index j, while Q is a fixed
+    // positive pattern. Then s_ij = (Q_i · K_j) * inv_sqrt_d ramps ~linearly with j, so the
+    // post-max logit gaps fan out across a WIDE band (~ -10..0), well beyond the Taylor
+    // faithful band (<= 0.7). This is the regime real LLM attention lives in and the M3.2b
+    // Taylor kernel CANNOT do.
+    let inv_sqrt_d = 1.0_f32 / (head_dim as f32).sqrt();
+    let mut q = vec![0.0_f32; seq_len * head_dim];
+    let mut k = vec![0.0_f32; seq_len * head_dim];
+    let mut v = vec![0.0_f32; seq_len * head_dim];
+    let q_const = 0.5_f32;
+    // Score for row j: s_j = head_dim * q_const * k_row(j) * inv_sqrt_d.
+    // We want a WIDE spread of post-max args in the ONLINE recurrence (s_j - m_new and
+    // m_prev - m_new). A monotone ramp keeps online per-step gaps tiny, so instead we make a
+    // SAW pattern: the max score appears EARLY (row 0 is large), then later rows are far below
+    // it (and oscillate), so for j>0 the p-arg s_j - m = (low - high) is strongly negative
+    // (spanning ~ -10..0). This is the exact regime where Taylor exp diverges.
+    let k_for_score = |target_score: f32| -> f32 {
+        target_score / (head_dim as f32 * q_const * inv_sqrt_d)
+    };
+    for i in 0..seq_len {
+        // Row 0 is the global max (score 0); later rows fan DOWN to ~ -11 with a saw ripple so
+        // the spread is genuinely wide AND non-monotone (defeats the streaming-max collapse).
+        let target = if i == 0 {
+            0.0_f32
+        } else {
+            // Base descent -2..-11 plus a small per-row ripple.
+            let base = -2.0_f32 - 9.0_f32 * (i as f32 / seq_len as f32);
+            let ripple = if i % 2 == 0 { 0.5_f32 } else { -0.5_f32 };
+            base + ripple
+        };
+        let kv = k_for_score(target);
+        for d in 0..head_dim {
+            q[i * head_dim + d] = q_const;
+            k[i * head_dim + d] = kv;
+            v[i * head_dim + d] = 0.05_f32 * ((i * head_dim + d) as f32 % 11.0_f32);
+        }
+    }
+    (q, k, v)
+}
+
+/// Dispatch flash_attention_exp.axc on the GPU (NO Taylor faithful-band assert — that is the
+/// whole point of the exp builtin). Returns the O buffer as f32.
+fn fa2_exp_dispatch_gpu(
+    ctx: &VulkanContext,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    head_dim: usize,
+    inv_sqrt_d: f32,
+) -> Vec<f32> {
+    fa2_preflight(head_dim as u32);
+    let (bytes, meta) = compile_source_with_meta(FLASH_ATTENTION_EXP_SRC)
+        .expect("flash_attention_exp.axc must compile");
+    let words: Vec<u32> = bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let handle = ctx
+        .prepare_kernel_checked(
+            &words,
+            &meta.binding_plan,
+            meta.push_constant_total_bytes,
+            &meta.entry_point,
+            None,
+            "flash_attention_exp",
+            meta.shared_memory_bytes,
+        )
+        .unwrap_or_else(|e| panic!("flash_attention_exp: prepare_kernel_checked failed: {e}"));
+
+    let q_bytes: Vec<u8> = q.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let k_bytes: Vec<u8> = k.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let v_bytes: Vec<u8> = v.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let o_size = seq_len * head_dim * 4;
+    let pc = push_attention(seq_len as u32, head_dim as u32, inv_sqrt_d);
+
+    let outputs = ctx
+        .dispatch_handle(
+            &handle,
+            (seq_len as u32, 1, 1),
+            &[&q_bytes, &k_bytes, &v_bytes, &vec![0u8; o_size]],
+            &[0, 0, 0, o_size],
+            &pc,
+        )
+        .unwrap_or_else(|e| panic!("flash_attention_exp: dispatch failed: {e}"));
+
+    outputs[3]
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// Dispatch the M3.2b Taylor flash_attention.axc on the GPU WITHOUT the faithful-band assert
+/// (the negative-control AT-1826 deliberately feeds it a wide-spread fixture to show it fails).
+fn fa2_taylor_dispatch_gpu_unguarded(
+    ctx: &VulkanContext,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    head_dim: usize,
+    inv_sqrt_d: f32,
+) -> Vec<f32> {
+    fa2_preflight(head_dim as u32);
+    let (bytes, meta) = compile_source_with_meta(FLASH_ATTENTION_SRC)
+        .expect("flash_attention.axc must compile");
+    let words: Vec<u32> = bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let handle = ctx
+        .prepare_kernel_checked(
+            &words,
+            &meta.binding_plan,
+            meta.push_constant_total_bytes,
+            &meta.entry_point,
+            None,
+            "flash_attention",
+            meta.shared_memory_bytes,
+        )
+        .unwrap_or_else(|e| panic!("flash_attention (taylor): prepare_kernel_checked failed: {e}"));
+
+    let q_bytes: Vec<u8> = q.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let k_bytes: Vec<u8> = k.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let v_bytes: Vec<u8> = v.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let o_size = seq_len * head_dim * 4;
+    let pc = push_attention(seq_len as u32, head_dim as u32, inv_sqrt_d);
+
+    let outputs = ctx
+        .dispatch_handle(
+            &handle,
+            (seq_len as u32, 1, 1),
+            &[&q_bytes, &k_bytes, &v_bytes, &vec![0u8; o_size]],
+            &[0, 0, 0, o_size],
+            &pc,
+        )
+        .unwrap_or_else(|e| panic!("flash_attention (taylor): dispatch failed: {e}"));
+
+    outputs[3]
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// AT-1820/1821 GPU: exp(x) on the GPU matches Rust f32::exp(x) over a dense sweep of
+/// x in [-30, 5] (step 0.1, INCLUDING x < -5 where the M3.2b Taylor failed) within the
+/// FROZEN 1e-3 combined abs/rel gate (abs floor 1e-6 for near-zero magnitudes). The raw
+/// max relative gap is MEASURED and reported FIRST.
+#[test]
+#[ignore]
+fn at1820_exp_vs_std_exp_range() {
+    if !gpu_tests_enabled() {
+        eprintln!("at1820: AXC_ENABLE_GPU_TESTS not set; skipping");
+        return;
+    }
+    const REL_TOL: f32 = 1e-3_f32;
+    const ABS_FLOOR: f32 = 1e-6_f32;
+
+    // Dense sweep x in [-30, 5], step 0.1 → 351 points.
+    let xs: Vec<f32> = (0..=350).map(|i| -30.0_f32 + 0.1_f32 * i as f32).collect();
+    let n = xs.len();
+
+    let (bytes, meta) = compile_source_with_meta(EXP_MICRO_SRC).expect("exp_micro must compile");
+    let words: Vec<u32> = bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    let ctx = VulkanContext::new().expect("VulkanContext must init");
+    eprintln!("AT-1820/1821 GPU: device={}", ctx.physical_device_name());
+
+    let handle = ctx
+        .prepare_kernel_checked(
+            &words, &meta.binding_plan, meta.push_constant_total_bytes,
+            &meta.entry_point, None, "exp_micro", meta.shared_memory_bytes,
+        )
+        .unwrap_or_else(|e| panic!("at1820: prepare failed: {e}"));
+
+    let in_bytes: Vec<u8> = xs.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out_size = n * 4;
+    let outputs = ctx
+        .dispatch_handle(
+            &handle, (n as u32, 1, 1),
+            &[&in_bytes, &vec![0u8; out_size]],
+            &[0, out_size],
+            &[],
+        )
+        .unwrap_or_else(|e| panic!("at1820: dispatch failed: {e}"));
+    let gpu: Vec<f32> = outputs[1]
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    // MEASURE the raw max relative gap FIRST (report before gating).
+    let mut max_rel = 0.0_f32;
+    let mut max_abs = 0.0_f32;
+    let mut worst_x = 0.0_f32;
+    for (&x, &g) in xs.iter().zip(gpu.iter()) {
+        let r = x.exp();
+        let abs = (g - r).abs();
+        let rel = if r.abs() > ABS_FLOOR { abs / r.abs() } else { 0.0_f32 };
+        if abs > max_abs { max_abs = abs; }
+        if rel > max_rel { max_rel = rel; worst_x = x; }
+    }
+    eprintln!(
+        "AT-1820 MEASURED: max_rel={max_rel:e} (at x={worst_x}), max_abs={max_abs:e} over x in [-30,5] \
+         on {}",
+        ctx.physical_device_name()
+    );
+
+    // Gate within FROZEN 1e-3 combined abs/rel.
+    for (&x, &g) in xs.iter().zip(gpu.iter()) {
+        let r = x.exp();
+        assert!(
+            within_combined(g, r, REL_TOL, ABS_FLOOR),
+            "AT-1820: exp({x}) gpu={g} vs f32::exp={r} exceeds combined tol \
+             (rel {REL_TOL}, abs floor {ABS_FLOOR})"
+        );
+    }
+    eprintln!("AT-1820/1821 PASS: GPU exp ~= f32::exp within FROZEN {REL_TOL} (max_rel={max_rel:e})");
+}
+
+/// AT-1825 GPU: flash_attention_exp.axc at REAL logit spreads (post-max args -10..0) within
+/// FROZEN 1e-3 vs fa2_true_exp_softmax_reference (std f32::exp). The regime the M3.2b Taylor
+/// kernel CANNOT do. The faithful-band hard-wire is NOT applied here; we instead ASSERT the
+/// fixture is wide (max post-max arg well beyond 0.7) so the test genuinely exercises real range.
+#[test]
+#[ignore]
+fn at1825_flash_attention_exp_real_range() {
+    if !gpu_tests_enabled() {
+        eprintln!("at1825: AXC_ENABLE_GPU_TESTS not set; skipping");
+        return;
+    }
+    const SEQ_LEN: usize = 64;
+    const HEAD_DIM: usize = 64;
+    let inv_sqrt_d = 1.0_f32 / (HEAD_DIM as f32).sqrt();
+    let (q, k, v) = fa2_wide_spread_fixture(SEQ_LEN, HEAD_DIM);
+
+    // Confirm the fixture is genuinely WIDE (well outside the Taylor faithful band).
+    let max_arg = fa2_fixture_max_postmax_arg(&q, &k, SEQ_LEN, HEAD_DIM, inv_sqrt_d);
+    assert!(
+        max_arg > 3.0_f32,
+        "AT-1825: wide-spread fixture must have max |post-max arg| > 3.0 (real range); got {max_arg}"
+    );
+
+    let ctx = VulkanContext::new().expect("VulkanContext must init");
+    eprintln!("AT-1825 GPU: device={}, fixture max post-max arg={max_arg}", ctx.physical_device_name());
+
+    let gpu_o = fa2_exp_dispatch_gpu(&ctx, &q, &k, &v, SEQ_LEN, HEAD_DIM, inv_sqrt_d);
+    let true_o = fa2_true_exp_softmax_reference(&q, &k, &v, SEQ_LEN, HEAD_DIM, inv_sqrt_d);
+
+    let mut max_diff = 0.0_f32;
+    for (g, t) in gpu_o.iter().zip(true_o.iter()) {
+        let d = (g - t).abs();
+        if d > max_diff { max_diff = d; }
+        assert!(
+            within_combined(*g, *t, FA2_FROZEN_TOL, FA2_FROZEN_TOL),
+            "AT-1825 (GATE): flash_attention_exp gpu={g} vs true-exp softmax={t} exceeds \
+             FROZEN {FA2_FROZEN_TOL} at real range (max post-max arg={max_arg})"
+        );
+    }
+    eprintln!(
+        "AT-1825 PASS: flash_attention_exp vs true-exp softmax max_diff={max_diff} \
+         (<= FROZEN {FA2_FROZEN_TOL}) at REAL range (max post-max arg={max_arg}) on {}",
+        ctx.physical_device_name()
+    );
+}
+
+/// AT-1826 GPU (negative control): the M3.2b Taylor flash_attention.axc on the SAME wide-spread
+/// fixture is GROSSLY wrong (max_diff >> 1e-3) vs the true-exp softmax oracle — proving the exp
+/// builtin (not the fixture) is what fixes AT-1825. Tolerance direction INVERTED (a lower bound).
+#[test]
+#[ignore]
+fn at1826_taylor_kernel_wrong_on_real_range() {
+    if !gpu_tests_enabled() {
+        eprintln!("at1826: AXC_ENABLE_GPU_TESTS not set; skipping");
+        return;
+    }
+    const SEQ_LEN: usize = 64;
+    const HEAD_DIM: usize = 64;
+    let inv_sqrt_d = 1.0_f32 / (HEAD_DIM as f32).sqrt();
+    let (q, k, v) = fa2_wide_spread_fixture(SEQ_LEN, HEAD_DIM);
+
+    let ctx = VulkanContext::new().expect("VulkanContext must init");
+    eprintln!("AT-1826 GPU (neg-control): device={}", ctx.physical_device_name());
+
+    let taylor_o = fa2_taylor_dispatch_gpu_unguarded(&ctx, &q, &k, &v, SEQ_LEN, HEAD_DIM, inv_sqrt_d);
+    let true_o = fa2_true_exp_softmax_reference(&q, &k, &v, SEQ_LEN, HEAD_DIM, inv_sqrt_d);
+
+    let mut max_diff = 0.0_f32;
+    for (t, r) in taylor_o.iter().zip(true_o.iter()) {
+        let d = (t - r).abs();
+        if d > max_diff { max_diff = d; }
+    }
+    // The Taylor kernel must be GROSSLY wrong at real range (large lower bound).
+    assert!(
+        max_diff > 1e-2_f32,
+        "AT-1826 (neg-control): the Taylor kernel should be GROSSLY wrong at real range \
+         (max_diff >> 1e-3); got only {max_diff} — the fixture may not be wide enough"
+    );
+    eprintln!(
+        "AT-1826 PASS (neg-control): Taylor kernel vs true-exp softmax max_diff={max_diff} \
+         (>> FROZEN {FA2_FROZEN_TOL} — Taylor cannot do real range) on {}",
         ctx.physical_device_name()
     );
 }

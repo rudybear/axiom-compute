@@ -142,6 +142,113 @@ fn flash_attention_compiles_and_validates() {
     compile_and_validate(src, "flash_attention.axc");
 }
 
+/// AT-1824: flash_attention_exp.axc (M3.2c — real exp via GLSL.std.450) compiles +
+/// spirv-val clean. Additive compile anchor (no GPU), mirroring the AT-1738 anchor.
+#[test]
+fn at1824_flash_attention_exp_compiles() {
+    let src = include_str!("../../../examples/flash_attention_exp.axc");
+    compile_and_validate(src, "flash_attention_exp.axc");
+}
+
+/// AT-1822 (codegen, no GPU): the GLSL.std.450 import is emitted EXACTLY ONCE in a
+/// kernel with MULTIPLE exp() calls, and ALL OpExtInst Exp (27) reference that one
+/// set-id. Scans the RAW codegen output (no spirv-opt in the default pipeline). A
+/// per-call-import implementation would emit 2 imports and FAIL this.
+#[test]
+fn at1822_glsl450_import_emitted_once() {
+    // Two distinct exp() call sites in expression position.
+    let src = r#"
+@kernel
+@workgroup(1, 1, 1)
+@intent("two exp calls — import-once falsifier")
+@complexity(O(1))
+fn two_exp(In: readonly_buffer[f32], Out: buffer[f32]) -> void {
+    let i: u32 = gid(0u32);
+    let a: f32 = In[i];
+    let b: f32 = exp(a);
+    let c: f32 = exp(b);
+    Out[i] = b + c;
+    return;
+}
+"#;
+    let words = compile_and_validate(src, "two_exp (AT-1822)");
+
+    // ── Scan: exactly ONE OpExtInstImport, with literal-string "GLSL.std.450". ──
+    // OpExtInstImport = opcode 11. Layout: word0 = (wc<<16)|11, word1 = result-id,
+    // word2.. = the extended-set name as a packed null-terminated UTF-8 literal.
+    let mut import_count = 0usize;
+    let mut import_set_id: u32 = 0;
+    {
+        // Skip the 5-word SPIR-V module header (magic, version, generator, bound, schema).
+        let mut idx = 5usize;
+        while idx < words.len() {
+            let word0 = words[idx];
+            let opcode = word0 & 0xFFFF;
+            let wc = (word0 >> 16) as usize;
+            if wc == 0 {
+                break; // malformed — bail (validator already passed, so unreachable)
+            }
+            if opcode == 11 {
+                import_count += 1;
+                let result_id = words[idx + 1];
+                // Decode the packed string operand (words idx+2 .. idx+wc).
+                let mut bytes: Vec<u8> = Vec::new();
+                for w in &words[idx + 2..idx + wc] {
+                    bytes.extend_from_slice(&w.to_le_bytes());
+                }
+                // Trim at first NUL.
+                let nul = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+                let name = String::from_utf8_lossy(&bytes[..nul]);
+                assert_eq!(
+                    name, "GLSL.std.450",
+                    "AT-1822: OpExtInstImport literal must be \"GLSL.std.450\", got {name:?}"
+                );
+                import_set_id = result_id;
+            }
+            idx += wc;
+        }
+    }
+    assert_eq!(
+        import_count, 1,
+        "AT-1822: a 2-exp kernel must emit EXACTLY ONE OpExtInstImport \"GLSL.std.450\" \
+         (the import-once cache is load-bearing; rspirv does NOT dedup). Found {import_count}."
+    );
+
+    // ── Scan: >= 2 OpExtInst ... 27, all referencing the one set-id. ──
+    // OpExtInst = opcode 12. Layout: word0=(wc<<16)|12, word1=result-type,
+    // word2=result-id, word3=set-id (IdRef), word4=instruction-literal (27), operands..
+    let mut exp_count = 0usize;
+    {
+        // Skip the 5-word SPIR-V module header (magic, version, generator, bound, schema).
+        let mut idx = 5usize;
+        while idx < words.len() {
+            let word0 = words[idx];
+            let opcode = word0 & 0xFFFF;
+            let wc = (word0 >> 16) as usize;
+            if wc == 0 {
+                break;
+            }
+            if opcode == 12 {
+                let set_id = words[idx + 3];
+                let instruction = words[idx + 4];
+                if instruction == 27 {
+                    exp_count += 1;
+                    assert_eq!(
+                        set_id, import_set_id,
+                        "AT-1822: every OpExtInst Exp must reference the single cached \
+                         GLSL.std.450 set-id ({import_set_id}); got {set_id}"
+                    );
+                }
+            }
+            idx += wc;
+        }
+    }
+    assert!(
+        exp_count >= 2,
+        "AT-1822: a 2-exp kernel must emit >= 2 OpExtInst ... 27 (Exp); found {exp_count}"
+    );
+}
+
 /// AT-1613: q4km_dequant_matmul_coopmat.axc SPIR-V is byte-identical before and after
 /// the CoopMatLoadSource discriminator addition (Buffer-source path unchanged).
 #[test]

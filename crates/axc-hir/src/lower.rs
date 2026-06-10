@@ -600,6 +600,10 @@ fn find_mul_add_in_expr(expr: &crate::expr::HirExpr) -> Option<&HirExprKind> {
         HirExprKind::Q4_0Builtin { args, .. } => {
             args.iter().find_map(find_mul_add_in_expr)
         }
+        // M3.2c: ext-inst builtin args (e.g. exp(x)) may nest a coopmat op — recurse.
+        HirExprKind::ExtInstBuiltin { args, .. } => {
+            args.iter().find_map(find_mul_add_in_expr)
+        }
         HirExprKind::IntLit { .. }
         | HirExprKind::FloatLit { .. }
         | HirExprKind::BoolLit(_)

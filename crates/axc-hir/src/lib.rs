@@ -25,6 +25,8 @@ pub mod control_flow;
 pub mod subgroup;
 pub mod coopmat;
 pub mod q4_0;
+/// GLSL.std.450 extended-instruction builtins (M3.2c — exp).
+pub mod ext_inst;
 /// Workgroup-shared array HIR types (M3.2).
 pub mod shared;
 
@@ -59,4 +61,5 @@ pub use loop_ctx::{HirLoopStack, ScopeStack};
 pub use subgroup::{SubgroupOp, SubgroupReduceKind, BarrierKind};
 pub use coopmat::{CoopMatUse, CoopMatBuiltin, CoopMatrixShapeKind, CoopMatKey, CoopMatrixShape};
 pub use q4_0::{Q4_0Builtin, RESERVED_Q4_0_BUILTIN_NAMES, is_reserved_q4_0_builtin};
+pub use ext_inst::{ExtInstBuiltin, RESERVED_EXT_INST_BUILTIN_NAMES, is_reserved_ext_inst_builtin};
 pub use shared::{SharedId, SharedTy, SharedDecl, MAX_SHARED_ELEMS, PORTABLE_MIN_SHARED_BYTES, is_allowed_shared_element};
