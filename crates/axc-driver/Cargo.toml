@@ -122,6 +122,13 @@ name = "resident_q4km_matmul_rb_f32acc_cached_bigrb"
 path = "benches/resident_q4km_matmul_rb_f32acc_cached_bigrb.rs"
 harness = false
 
+# M3.2c-perf: AT-2204 coopmat-vs-scalar FlashAttention wall-time A/B (seq=2048, head_dim=64).
+# Bench ID: dispatch_resident_flash_attention. STRETCH 3x gate with honest-negative clause.
+[[bench]]
+name = "resident_flash_attention"
+path = "benches/resident_flash_attention.rs"
+harness = false
+
 
 [features]
 # M2.2 AT-714: fault-injection feature for regression-gate CI validation.

@@ -1,0 +1,92 @@
+{
+  "verdict": "COMPLETE",
+  "agent": "coder",
+  "milestone_id": "M3.2c-perf",
+  "revision_implemented": "r2 (Architect PROPOSED; both design reviewers APPROVED)",
+  "branch": "coder/M32cperf-20260609/M3.2c-perf-coopmat-attention",
+  "summary": "Implemented M3.2c-perf coopmat-accelerated FlashAttention-2 as PURE SOURCE (ZERO codegen change), exactly per the r2 spec. examples/flash_attention_coopmat.axc computes S=Q·Kᵀ as a cooperative_matrix matmul into shared (s_acc DECLARED INSIDE the K/V loop body, fresh coopmat_zero() per iteration, the 4 head-dim mul_adds UNROLLED at the K/V-body top level → iteration-local, 0 coopmat OpPhi), keeps acc in shared[f32,16*64] (the crux resolution — NOT a coopmat, so the per-row correction rescale is an ordinary shared write), runs the online softmax SCALAR over the shared S tile (lane L owns row L for L<16), and the P·V + acc-rescale SCALAR over the 1024 acc cells (lane L owns {c=L+32*i}). The 4 barriers are all at conditional_depth==0 (none inside the lane<16 branch); barrier(3) is widened to cover the cross-lane corr_sh write/read. CORRECTNESS (PRIMARY) is the gate: vs the true-exp oracle max combined abs/rel diff 8.5e-5 @seq=512 and 5.1e-5 @seq=2048 (≪ FROZEN 1e-3) on a differing-rowmax fixture; cross-kernel agreement with the scalar flash_attention_exp.axc within ~8.5e-5 at seq=512 AND 2048. PERF (STRETCH ≥3×) measured ~28.8× faster than the scalar kernel at seq=2048 — but the honest attribution is that the large ratio is dominated by the PARALLELISM change (scalar @workgroup(1,1,1) one-invocation-per-row vs coopmat @workgroup(32,1,1) 16-row tile) PLUS coopmat QKᵀ, NOT a tensor-core-only figure; the remaining Amdahl ceiling (scalar P·V, 16-lane softmax, S/P shared round-trips) is what the DEFERRED coopmat-PV Option C targets. No competitive-with-llama claim.",
+  "files_created": [
+    {
+      "path": "examples/flash_attention_coopmat.axc",
+      "purpose": "M3.2c-perf CORE kernel: coopmat S=QKᵀ → shared + 32-lane 16-row query tile + scalar online-softmax + scalar P·V + acc-in-shared rescale. @workgroup(32,1,1), @cooperative_matrix, head_dim=64. ZERO compiler change.",
+      "key_decisions": [
+        "Kᵀ via STAGING-TRANSPOSE: k_tile_sh staged as [d_full][key] (k_tile_sh[d*16+key]=K[kv_base+key][d]) so a row-major coopmat_load at offsets 0/256/512/768 stride 16 yields the 4 Kᵀ sub-blocks (B operand). Q staged row-major [16][64], loaded at offsets 0/16/32/48 stride 64 (A operand). Cross-checked by AT-2205 (a wrong transpose would diverge).",
+        "Q and K narrowed to f16 via f32_to_f16 on the shared write (Q/K buffers are f32; SharedWrite into shared[f16] requires the explicit narrow — no implicit coercion). V stays f32 in shared for the scalar P·V.",
+        "s_acc: matrix[f32,16,16,accumulator] DECLARED INSIDE the K/V loop body (fresh coopmat_zero() each iteration, 4 mul_adds unrolled at top level) → no pre-loop var_ids SSA id → not a loop-carried-coopmat phi candidate → 0 coopmat OpPhi (AT-2201).",
+        "acc_sh/m_sh/l_sh loop-carry across the K/V loop through SHARED (no OpPhi — scalars/shared never get coopmat phi). corr_sh[r] written by row-owner lane r, read by cell-owner lane c%32 in P·V, ordered by barrier(3)."
+      ]
+    },
+    {
+      "path": "crates/axc-driver/benches/resident_flash_attention.rs",
+      "purpose": "AT-2204 resident wall-time A/B: times BOTH flash_attention_exp.axc (scalar) and flash_attention_coopmat.axc at seq=2048/head_dim=64 (MIN-of-20 GpuTimestamp), reports the speedup ratio + attention-TFLOPS + an honest per-phase / parallelism-attribution note. STRETCH 3× gate with the honest-negative clause. Bench ID dispatch_resident_flash_attention."
+    }
+  ],
+  "files_modified": [
+    {
+      "path": "crates/axc-driver/tests/compile_shared_examples.rs",
+      "changes": "Added AT-2200 (compiles + spirv-val + caps ⊆ matmul_shared_coopmat baseline ∪ {VulkanMemoryModel} + the 4 required caps present + GLSL.std.450 imported once), AT-2201 (EXACTLY 0 coopmat OpPhi + the coopmat op shape: 3 types / 8 loads / 1 store / 4 mul_adds / 1 OpConstantNull), AT-2206 (shared==13504 incl corr_sh + seq-invariant + buffers=={Q,K,V,O}). Added a coopmat-op + OpPhi raw word-stream scanner helper."
+    },
+    {
+      "path": "crates/axc-driver/tests/dispatch_shared_m32.rs",
+      "changes": "Added the coopmat-FA GPU dispatch helper (fa2_coopmat_dispatch_gpu, with CoopMatUnsupported/DeviceFeatureUnsupported typed-skip), fa2_coopmat_preflight (head_dim==64, seq%16==0), a differing-rowmax real-range fixture (fa2_coopmat_differing_rowmax_fixture — distinct per-row rowmax within each 16-row tile → exercises the cross-lane corr_sh path), and AT-2202 (seq=512), AT-2203 (seq=2048), AT-2205 (cross-kernel agreement vs the scalar kernel at seq=512 AND 2048 + vs the true-exp oracle). Reuses the FROZEN 1e-3 within_combined gate and fa2_true_exp_softmax_reference oracle."
+    },
+    {
+      "path": "crates/axc-driver/Cargo.toml",
+      "changes": "Registered the [[bench]] resident_flash_attention (harness=false)."
+    },
+    {
+      "path": "DESIGN.md",
+      "changes": "§3.1.30 status PROPOSED → IMPLEMENTED; added the measured-results paragraph (correctness 8.5e-5/5.1e-5 ≪ 1e-3; 0 coopmat OpPhi; shared 13504; perf ~28.8× with the honest parallelism attribution)."
+    }
+  ],
+  "public_apis_implemented": [
+    "@kernel fn flash_attention_coopmat(Q,K,V,O: buffers; seq_len,head_dim: u32, inv_sqrt_d: f32) -> void"
+  ],
+  "tests_written": [
+    "AT-2200 at_2200_flash_coopmat_compiles_validates (CI, no GPU) — PASS",
+    "AT-2201 at_2201_flash_coopmat_opphi_discipline (CI, no GPU) — PASS (0 coopmat OpPhi; op shape exact)",
+    "AT-2202 at2202_flash_coopmat_correct_seq512 (#[ignore], GPU) — PASS on NVIDIA (max_diff 8.5e-5)",
+    "AT-2203 at2203_flash_coopmat_correct_seq2048 (#[ignore], GPU) — PASS on NVIDIA (max_diff 5.1e-5)",
+    "AT-2204 resident_flash_attention bench (GPU) — STRETCH 3× MET (~28.8×), with the honest parallelism attribution",
+    "AT-2205 at2205_flash_coopmat_vs_scalar_agree (#[ignore], GPU, seq=512 AND 2048, differing-rowmax) — PASS on NVIDIA (~8.5e-5)",
+    "AT-2206 at_2206_flash_coopmat_anchor_and_streaming (CI, no GPU) — PASS (shared==13504, seq-invariant, {Q,K,V,O})",
+    "AT-2207 no-regression — the M3.2b (at1740/1741/1743/1744) and M3.2c-exp (at1820/1825/1826) GPU tests still PASS"
+  ],
+  "cargo_check_status": "clean (cargo check --workspace + --benches)",
+  "cargo_clippy_status": "clean (cargo clippy --workspace --all-targets -- -D warnings)",
+  "cargo_test_status": "cargo test --workspace: 938 passed, 0 failed, 82 ignored (the new AT-2200/2201/2206 CI anchors among the 938)",
+  "spirv_val_status": "PASS — flash_attention_coopmat.axc spirv-val clean (Vulkan_1_1 target), verified in AT-2200/2201/2206",
+  "gpu_results_nvidia_rtx_pro_6000": {
+    "correctness_seq512_max_diff": 8.5e-5,
+    "correctness_seq2048_max_diff": 5.1e-5,
+    "frozen_tol": 1e-3,
+    "cross_kernel_agreement_max_diff": 8.5e-5,
+    "coopmat_opphi_count": 0,
+    "shared_memory_bytes": 13504,
+    "perf_scalar_ms": 12.029,
+    "perf_coopmat_ms": 0.418,
+    "perf_speedup": 28.8,
+    "perf_stretch_gate": "3x",
+    "perf_attribution": "dominated by the parallelism change (scalar @workgroup(1,1,1) one-invocation-per-row vs coopmat @workgroup(32,1,1) 16-row tile) PLUS coopmat QKᵀ — faster-than-OUR-scalar, NOT a tensor-core-only or llama figure"
+  },
+  "self_assessment": {
+    "pure_source_no_codegen_change": true,
+    "spirv_val_mandatory_met": true,
+    "frozen_1e-3_not_loosened": true,
+    "barriers_depth0_only": true,
+    "s_acc_iteration_local_0_coopmat_phi": true,
+    "lane_partitions_disjoint_total": true,
+    "known_limitations": [
+      "16 of 32 lanes active in the softmax row-reduction (TILE_Q=16) — honest half-utilization, deferred (32-row tiles / 2-rows-per-lane).",
+      "head_dim pinned to 64; seq_len%16==0 required (host-preflight-enforced). Partial tiles / head_dim>64 / B_c>16 are follow-ons.",
+      "NVIDIA-32 (wave32) invariant: the lane→cell partitions assume subgroup size 32; multi-vendor (wave64/variable) is a documented follow-on. Lavapipe coopmat-typed-skips.",
+      "DEFERRED: coopmat P·V with a coopmat acc (needs a diagonal-scale feature — Option C, where the remaining Amdahl win lives)."
+    ],
+    "deviations_from_spec": [
+      "AT-2200 caps assertion: the spec's illustrative cap list was [Shader, CooperativeMatrixKHR, VulkanMemoryModel]; the kernel legitimately ALSO emits Float16 (9) and Float16Buffer (61) from the f16-shared staging — exactly the set the existing matmul_shared_coopmat.axc emits. AT-2200 therefore asserts the required four are present AND the full set ⊆ (matmul_shared_coopmat baseline ∪ {VulkanMemoryModel}), i.e. NO NEW capability vs the proven f16-coopmat kernel. This is a faithful, stronger form of the spec's intent (no new cap), not a relaxation.",
+      "AT-2204 outcome: the spec set ~1.3-2× as the EXPECTED honest-negative (Amdahl). The MEASURED result is ~28.8× — far above the 3× STRETCH bar. Reported honestly: the win is dominated by the tile-parallelism change over the deliberately-serial @workgroup(1,1,1) scalar baseline, not by coopmat QKᵀ alone. The 3× bar was NOT loosened; the correctness gate is the primary deliverable and stands; the scalar kernel's serial geometry is the baseline."
+    ]
+  },
+  "honesty_gate": "PASS — CORRECTNESS (PRIMARY) verified on NVIDIA within FROZEN 1e-3 (8.5e-5/5.1e-5, large headroom); 0 coopmat OpPhi independently scanned; cross-kernel + differing-rowmax race fixture PASS at seq=512 AND 2048; no-regression confirmed; PERF reported with honest parallelism attribution (NOT a tensor-core-only or competitive-with-llama claim); FROZEN 1e-3 and the 3× bar never loosened; pure source (no codegen change), so no escalation needed.",
+  "git_commits": []
+}
