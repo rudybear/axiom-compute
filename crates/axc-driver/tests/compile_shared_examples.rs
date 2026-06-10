@@ -1470,3 +1470,175 @@ fn at_2206_flash_coopmat_anchor_and_streaming() {
         "AT-2206 PASS: shared_memory_bytes=13504 (seq-invariant); buffers={names:?}"
     );
 }
+
+// ── M3.2c-PV: flash_attention_coopmat_pv.axc compile anchors (AT-2210/2211/2216) ──────────
+//
+// The coopmat-PV kernel ADDS a second tensor-core matmul PV = P·V (carried from M3.2c-perf's
+// coopmat QKᵀ). PURE SOURCE — the SAME shared-source coopmat load/store the QKᵀ path uses.
+
+const FLASH_ATTENTION_COOPMAT_PV_SRC: &str =
+    include_str!("../../../examples/flash_attention_coopmat_pv.axc");
+
+/// AT-2210: flash_attention_coopmat_pv.axc compiles + spirv-val clean; emitted capabilities
+/// are EXACTLY the M3.2c-perf set [Shader, CooperativeMatrixKHR, VulkanMemoryModel, Float16] —
+/// a STRICT SUBSET of matmul_shared_coopmat.axc's caps (∪ {VulkanMemoryModel}), NO new
+/// capability vs the QKᵀ-only kernel; GLSL.std.450 imported EXACTLY once (despite the two
+/// exp() call sites); SPV_KHR_cooperative_matrix + SPV_KHR_vulkan_memory_model present.
+#[test]
+fn at_2210_flash_coopmat_pv_spirv_val_and_caps() {
+    let words =
+        compile_and_validate(FLASH_ATTENTION_COOPMAT_PV_SRC, "flash_attention_coopmat_pv.axc");
+    let (caps, exts) = capability_extension_sets(&words);
+
+    for required in [
+        m32cperf_cap::SHADER,
+        m32cperf_cap::COOPERATIVE_MATRIX_KHR,
+        m32cperf_cap::VULKAN_MEMORY_MODEL,
+        m32cperf_cap::FLOAT16,
+    ] {
+        assert!(
+            caps.contains(&required),
+            "AT-2210: missing required capability {required}; got caps={caps:?}"
+        );
+    }
+    // No capability beyond (matmul_shared_coopmat ∪ {VulkanMemoryModel}) — i.e. EXACTLY the
+    // M3.2c-perf set; the f16 PV operands reuse the f16-coopmat capability surface, no NEW cap.
+    let baseline_words = compile_words(
+        MATMUL_SHARED_COOPMAT_BASELINE_SRC,
+        Some(&tile_assignments(16, 16, 16)),
+        "matmul_shared_coopmat.axc (AT-2210 baseline)",
+    );
+    let (baseline_caps, _) = capability_extension_sets(&baseline_words);
+    let mut allowed: std::collections::BTreeSet<u32> = baseline_caps.clone();
+    allowed.insert(m32cperf_cap::VULKAN_MEMORY_MODEL);
+    let extra: Vec<u32> = caps.difference(&allowed).copied().collect();
+    assert!(
+        extra.is_empty(),
+        "AT-2210: flash_attention_coopmat_pv declares capabilities NOT in \
+         (matmul_shared_coopmat ∪ {{VulkanMemoryModel}}): {extra:?} \
+         (caps={caps:?}, baseline={baseline_caps:?})"
+    );
+    // Cross-check: the PV kernel's caps equal the M3.2c-perf scalar-PV kernel's caps EXACTLY.
+    let scalar_pv_words = compile_words(
+        FLASH_ATTENTION_COOPMAT_SRC,
+        None,
+        "flash_attention_coopmat.axc (AT-2210 cap parity)",
+    );
+    let (scalar_pv_caps, _) = capability_extension_sets(&scalar_pv_words);
+    assert_eq!(
+        caps, scalar_pv_caps,
+        "AT-2210: coopmat-PV caps must EQUAL the M3.2c-perf scalar-PV caps (no new cap); \
+         pv={caps:?} scalar_pv={scalar_pv_caps:?}"
+    );
+
+    assert!(
+        exts.contains("SPV_KHR_cooperative_matrix"),
+        "AT-2210: SPV_KHR_cooperative_matrix missing; exts={exts:?}"
+    );
+    assert!(
+        exts.contains("SPV_KHR_vulkan_memory_model"),
+        "AT-2210: SPV_KHR_vulkan_memory_model missing; exts={exts:?}"
+    );
+    assert_eq!(
+        count_glsl450_imports(&words),
+        1,
+        "AT-2210: GLSL.std.450 import must be emitted EXACTLY once"
+    );
+
+    eprintln!(
+        "AT-2210 PASS: flash_attention_coopmat_pv.axc spirv-val clean; caps={caps:?}; exts={exts:?}"
+    );
+}
+
+/// AT-2211 (R3): OpPhi discipline — BOTH s_acc (QKᵀ) AND every pv_acc_ds (the 4 PV sub-block
+/// accumulators) are declared INSIDE the K/V loop body (fresh coopmat_zero() each) → the loop
+/// header has EXACTLY 0 coopmat OpPhi (the falsifier for an accidental carry of EITHER). The
+/// canonical 4-sub-block / P-loaded-once layout pins the exact op shape:
+///   3 coopmat types (A/B/accumulator — the SAME 16×16×16 f16/f16/f32 shape serves BOTH matmuls),
+///   13 coopmat loads = 4 Q + 4 K (QKᵀ) + 1 P + 4 V (PV),
+///   5 coopmat stores = 1 S + 4 PV,
+///   8 coopmat mul_adds = 4 QKᵀ + 4 PV,
+///   5 OpConstantNull = 1 s_acc + 4 pv_acc (all iteration-local).
+#[test]
+fn at_2211_flash_coopmat_pv_opphi_discipline() {
+    let words = compile_and_validate(
+        FLASH_ATTENTION_COOPMAT_PV_SRC,
+        "flash_attention_coopmat_pv.axc (AT-2211)",
+    );
+    let (n_types, n_load, n_store, n_muladd, n_null, n_phi, n_coop_phi) =
+        flash_coopmat_op_scan(&words);
+
+    // THE invariant falsifier: EXACTLY 0 coopmat OpPhi (BOTH accumulators iteration-local).
+    assert_eq!(
+        n_coop_phi, 0,
+        "AT-2211: BOTH s_acc AND every pv_acc must be iteration-local → EXACTLY 0 coopmat \
+         OpPhi; found {n_coop_phi} (an accidental pre-loop declaration of EITHER would create a \
+         coopmat phi). total_phi={n_phi}"
+    );
+    assert_eq!(
+        n_phi, 0,
+        "AT-2211: no OpPhi expected (all loop-carry is in SHARED); found {n_phi}"
+    );
+
+    // Shape-reuse proof: ONE 16×16×16 f16/f16/f32 shape serves BOTH matmuls → 3 types, NOT 6.
+    assert_eq!(
+        n_types, 3,
+        "AT-2211: expected 3 coopmat types (A,B,accumulator — shape REUSED across QKᵀ + PV); got {n_types}"
+    );
+    // Canonical 4-sub-block PV layout, P loaded once (the spec's recommended, hard-pinned form).
+    assert_eq!(
+        n_load, 13,
+        "AT-2211: expected 13 coopmat loads (4 Q + 4 K + 1 P + 4 V); got {n_load}"
+    );
+    assert_eq!(
+        n_store, 5,
+        "AT-2211: expected 5 coopmat stores (1 S + 4 PV); got {n_store}"
+    );
+    assert_eq!(
+        n_muladd, 8,
+        "AT-2211: expected 8 coopmat mul_adds (4 QKᵀ + 4 PV); got {n_muladd}"
+    );
+    assert_eq!(
+        n_null, 5,
+        "AT-2211: expected 5 OpConstantNull (1 s_acc + 4 pv_acc, all iteration-local); got {n_null}"
+    );
+
+    eprintln!(
+        "AT-2211 PASS: coopmat OpPhi=0 (s_acc + 4 pv_acc all iteration-local); shape: types={n_types} \
+         loads={n_load} stores={n_store} muladds={n_muladd} nulls={n_null}"
+    );
+}
+
+/// AT-2216: CI anchor — shared_memory_bytes == 16064 (q[f16]2048 + k[f16]2048 + v[f16]2048 +
+/// s[f32]1024 + p_sh[f16]512 + pv_sh[f32]4096 + acc[f32]4096 + m64 + l64 + corr64), seq-INVARIANT
+/// (seq is a push-constant, no O(seq) score buffer), < 16384 portable floor (320 B headroom);
+/// buffers bound exactly {Q,K,V,O}.
+#[test]
+fn at_2216_flash_coopmat_pv_anchor_and_streaming() {
+    let (bytes, meta) = compile_source_with_meta(FLASH_ATTENTION_COOPMAT_PV_SRC)
+        .expect("AT-2216: flash_attention_coopmat_pv.axc must compile");
+    let _ = words_and_validate(bytes, "flash_attention_coopmat_pv.axc (AT-2216)");
+
+    assert_eq!(
+        meta.shared_memory_bytes, 16064,
+        "AT-2216: shared_memory_bytes must be 16064 (q2048 + k2048 + v[f16]2048 + s1024 + \
+         p_sh[f16]512 + pv_sh4096 + acc4096 + m64 + l64 + corr64); got {}",
+        meta.shared_memory_bytes
+    );
+    assert!(
+        meta.shared_memory_bytes <= 16384,
+        "AT-2216: shared_memory_bytes={} exceeds the 16384 portable floor",
+        meta.shared_memory_bytes
+    );
+
+    let names: Vec<String> = meta.binding_plan.buffers.iter().map(|b| b.name.clone()).collect();
+    assert_eq!(
+        names,
+        vec!["Q".to_string(), "K".to_string(), "V".to_string(), "O".to_string()],
+        "AT-2216: buffers must be exactly {{Q,K,V,O}}; got {names:?}"
+    );
+
+    eprintln!(
+        "AT-2216 PASS: shared_memory_bytes=16064 < 16384 (320 B headroom, seq-invariant); buffers={names:?}"
+    );
+}
