@@ -1,0 +1,215 @@
+// examples/q4km_matmul_rb_coopmat_f32acc_cached_pad.axc
+//
+// M3.10a (Q4_K_M, conditional on the plain-f32 win): the M3.6 Q4_K_M dequant scale-caching
+// leader (base = examples/q4km_matmul_rb_coopmat_f32acc_cached.axc) with the SAME
+// bank-conflict-avoiding PADDED A/B shared tile stride as matmul_rb_coopmat_pad.axc.
+//
+// PURE SOURCE — NO codegen/hir/typecheck change. The ONLY change vs the M3.6 leader is the
+// shared A/B tile ADDRESS LAYOUT (the per-row PAD on the FREE dim). The dequant arithmetic, the
+// scale caches, the conditional fill, the 3 unconditional barriers, the single-level OpPhi
+// K-carry, and the multiply-then-subtract dequant order are VERBATIM M3.6.
+//
+// CORRECTNESS (BIT-IDENTICAL to the M3.6 leader). Padding changes only the shared address
+// layout; the combined condition-aware metric stays <= the FROZEN 1e-3 (NEVER loosened) and the
+// cross-kernel bit-identity (max|y_pad - y_m36| == 0) on the asymmetric fixture is the
+// load-bearing gate (AT-2402/2403/2404).
+//
+// PADDED OFFSET MATH — identical to matmul_rb_coopmat_pad.axc:
+//   A tile 32 rows × (16+PAD_A): shared ?a_pad_size; write a_row*(16+PAD_A)+a_col (?a_pad_stride
+//     factor); a_mat_0 off 0 stride 16+PAD_A; a_mat_1 off 16*(16+PAD_A) (?a_pad_mat1off, SCALES
+//     with pad — a ROW-slab offset) stride 16+PAD_A.
+//   B tile 16 rows × (32+PAD_B): shared ?b_pad_size; write b_row*(32+PAD_B)+b_col (?b_pad_stride
+//     factor); b_mat_0 off 0 stride 32+PAD_B; b_mat_1 off 16 (UNCHANGED — intra-row COLUMN-band
+//     offset, GATE-NOTE #1) stride 32+PAD_B.
+//
+// *** PESSIMISTIC GATE-NOTE #2 (CRITICAL): the dequant cache_idx = a_row*8 + is MUST use the
+//     LOGICAL row a_row = ei_a/16 (0..31), NEVER the padded stride. The 256-entry dsc/dmm caches
+//     are indexed on the LOGICAL (row_local, is) layout; mixing PAD into the cache index would
+//     OOB the 256-entry caches and race. ONLY the a_tile WRITE INDEX becomes a_row*(16+PAD_A)+
+//     a_col; the cache index and the fill's row_local stay on the unpadded logical width 16.
+//     a_block_size stays PINNED at 512 so a_row in 0..31 (32*8 = 256 exact). ***
+//
+// CAPABILITIES: BYTE-IDENTICAL to the M3.6 cached leader (AT-2405).
+//
+// BENCHMARKED BY: crates/axc-driver/benches/resident_q4km_matmul_rb_f32acc_cached_pad.rs (AT-2407).
+// BIT-IDENTITY/COMBINED-METRIC: crates/axc-driver/tests/dispatch_q4km_matmul_rb_pad.rs (AT-2402/2403/2404).
+// COMPILE ANCHOR: AT-2405 in compile_shared_examples.rs (CI, no GPU).
+//
+// Anti-pattern #2: explicit `return;`. Anti-pattern #8: no `>>`; k_block % 16 as k_block - sb_idx*16.
+
+@kernel
+@workgroup(32, 1, 1)
+@cooperative_matrix
+@strategy { rb_m: ?[2], rb_n: ?[2], tile_k: ?[16], a_block_size: ?[512], b_block_size: ?[512], a_pad_stride: ?[24], a_pad_size: ?[768], a_pad_mat1off: ?[384], b_pad_stride: ?[40], b_pad_size: ?[640] }
+@intent("M3.10a bank-padded Q4_K_M dequant scale-caching 2x2 RB coopmat matmul — bit-identical to M3.6 (AT-2402..2407)")
+@complexity(O(n))
+fn q4km_matmul_rb_coopmat_f32acc_cached_pad(
+    q: readonly_buffer[u8],
+    x: readonly_buffer[f16],
+    C: buffer[f32],
+    M: u32,
+    N: u32,
+    K: u32,
+    n_blocks_per_row: u32
+) -> void {
+    // PADDED shared staging tiles for the 2x2 block (A/B stay f16).
+    shared a_tile: shared[f16, ?a_pad_size];
+    shared b_tile: shared[f16, ?b_pad_size];
+
+    // Per-superblock dequant-scale caches (UNCHANGED from M3.6: 8 sub-blocks x 32 weight-rows
+    // = 256 each, indexed row_local*8 + is on the LOGICAL row — NEVER the padded stride).
+    shared dsc_cache: shared[f32, 256];
+    shared dmm_cache: shared[f32, 256];
+
+    // Block coordinates (ASYMMETRIC, VERBATIM M3.6).
+    let block_col: u32 = gid(0u32) / 32u32;
+    let block_row: u32 = gid(1u32);
+
+    // Lane index within the subgroup for cooperative staging.
+    let lane: u32 = subgroup_invocation_id();
+
+    // Output tile coordinates within the 2x2 block.
+    let tile_row_0: u32 = block_row * 2u32;
+    let tile_row_1: u32 = block_row * 2u32 + 1u32;
+    let tile_col_0: u32 = block_col * 2u32;
+    let tile_col_1: u32 = block_col * 2u32 + 1u32;
+
+    // 4 loop-carried f32 coopmat accumulators (single-level OpPhi K-carry, VERBATIM M3.6).
+    let mut acc_00: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_01: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_10: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_11: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+
+    // Staging iterations per thread (UNCHANGED by padding — LOGICAL element count, not the index).
+    let a_iters: u32 = ?a_block_size / 32u32;
+    let b_iters: u32 = ?b_block_size / 32u32;
+
+    // Number of K-blocks.
+    let num_k_blocks: u32 = K / ?tile_k;
+
+    // K-loop: FLAT single level (VERBATIM M3.6).
+    for k_block in range(0u32, num_k_blocks) {
+        let sb_idx: u32 = k_block / 16u32;
+
+        // ── COOPERATIVE SCALE-CACHE FILL — fires ONCE per superblock (VERBATIM M3.6) ──────────
+        // The fill writes ONLY the LOGICAL-indexed dsc/dmm caches (cache_i 0..255 on row_local
+        // 0..31, is 0..7) — UNAFFECTED by the A/B tile padding.
+        if k_block - sb_idx * 16u32 == 0u32 {
+            for fi in range(0u32, 8u32) {
+                let cache_i: u32 = fi * 32u32 + lane;          // 0..255
+                let row_local: u32 = cache_i / 8u32;           // 0..31 (LOGICAL row, NOT padded)
+                let is: u32 = cache_i - row_local * 8u32;      // 0..7
+                let g_row: u32 = block_row * 32u32 + row_local;
+
+                let base: u32 = g_row * n_blocks_per_row * 144u32 + sb_idx * 144u32;
+                let d_bits: u32 = ptr_read_u16_zext(q, base);
+                let dmin_bits: u32 = ptr_read_u16_zext(q, base + 2u32);
+                let d: f32 = f16_bits_to_f32(d_bits);
+                let dmin: f32 = f16_bits_to_f32(dmin_bits);
+                let scales_base: u32 = base + 4u32;
+
+                let mut sc: u32 = 0u32;
+                let mut mm: u32 = 0u32;
+                if is < 4u32 {
+                    sc = band(ptr_read_u8_zext(q, scales_base + is), 63u32);
+                    mm = band(ptr_read_u8_zext(q, scales_base + is + 4u32), 63u32);
+                } else {
+                    let lo4_sc: u32 = band(ptr_read_u8_zext(q, scales_base + is + 4u32), 0x0Fu32);
+                    let hi2_sc: u32 = band(lshr(ptr_read_u8_zext(q, scales_base + is - 4u32), 6u32), 0x03u32);
+                    sc = bor(lo4_sc, shl(hi2_sc, 4u32));
+                    let lo4_m: u32 = band(lshr(ptr_read_u8_zext(q, scales_base + is + 4u32), 4u32), 0x0Fu32);
+                    let hi2_m: u32 = band(lshr(ptr_read_u8_zext(q, scales_base + is), 6u32), 0x03u32);
+                    mm = bor(lo4_m, shl(hi2_m, 4u32));
+                }
+
+                dsc_cache[cache_i] = d * f32_from_u32(sc);
+                dmm_cache[cache_i] = dmin * f32_from_u32(mm);
+            }
+        }
+
+        // RAW barrier (VERBATIM M3.6 r3 OPT-B HOISTED): UNCONDITIONAL, top-level, once per k_block.
+        workgroup_barrier();
+
+        // ── Dequant A into a_tile (shared[f16]) at the PADDED index ─────────────────
+        for a_iter in range(0u32, a_iters) {
+            let ei_a: u32 = a_iter * 32u32 + lane;
+            let a_row: u32 = ei_a / 16u32;                 // LOGICAL row (0..31), NOT padded
+            let a_col: u32 = ei_a - a_row * 16u32;         // LOGICAL col (0..15)
+            let g_k: u32 = k_block * ?tile_k + a_col;
+
+            // Superblock-to-tile decode (VERBATIM M3.6).
+            let sb: u32 = g_k / 256u32;
+            let wk: u32 = g_k - sb * 256u32;
+            let chunk: u32 = wk / 64u32;
+            let wc: u32 = wk - chunk * 64u32;
+            let l: u32 = wc - (wc / 32u32) * 32u32;
+            let is_hi: u32 = wc / 32u32;
+            let is: u32 = chunk * 2u32 + is_hi;
+
+            // GATE-NOTE #2: cache_idx uses the LOGICAL row a_row (0..31), NEVER the padded stride.
+            let cache_idx: u32 = a_row * 8u32 + is;
+            let dsc: f32 = dsc_cache[cache_idx];
+            let dmm: f32 = dmm_cache[cache_idx];
+
+            let base: u32 = (block_row * 32u32 + a_row) * n_blocks_per_row * 144u32 + sb * 144u32;
+            let qs_base: u32 = base + 16u32;
+            let byte: u32 = ptr_read_u8_zext(q, qs_base + chunk * 32u32 + l);
+            let mut nib: u32 = band(byte, 0x0Fu32);
+            if is_hi >= 1u32 {
+                nib = band(lshr(byte, 4u32), 0x0Fu32);
+            }
+
+            // Dequant — SAME multiply-then-subtract order as M3.6 (bit-identical result).
+            let w: f16 = f32_to_f16(dsc * f32_from_u32(nib) - dmm);
+            // PADDED write index: a_row * (16+PAD_A) + a_col.
+            let a_sh: u32 = a_row * ?a_pad_stride + a_col;
+            a_tile[a_sh] = w;
+        }
+
+        // ── Stage B (x) tile into b_tile at the PADDED index (x is already f16) ────
+        for b_iter in range(0u32, b_iters) {
+            let ei_b: u32 = b_iter * 32u32 + lane;
+            let b_row: u32 = ei_b / 32u32;                 // LOGICAL row (0..15)
+            let b_col: u32 = ei_b - b_row * 32u32;         // LOGICAL col (0..31)
+            let b_global_row: u32 = k_block * ?tile_k + b_row;
+            let b_global_col: u32 = block_col * 32u32 + b_col;
+            let b_global: u32 = b_global_row * N + b_global_col;
+            // PADDED write index: b_row * (32+PAD_B) + b_col.
+            let b_sh: u32 = b_row * ?b_pad_stride + b_col;
+            b_tile[b_sh] = x[b_global];
+        }
+
+        // Barrier: staging complete before coopmat loads (VERBATIM M3.6).
+        workgroup_barrier();
+
+        // ── Coopmat loads from PADDED shared + 4 mul_adds into f32 accumulators ────
+        // a_mat_1 offset = 16*(16+PAD_A) (?a_pad_mat1off, SCALES with pad — a ROW-slab offset).
+        let a_mat_0: matrix[f16, 16, 16, a] = coopmat_load(a_tile, 0u32, ?a_pad_stride);
+        let a_mat_1: matrix[f16, 16, 16, a] = coopmat_load(a_tile, ?a_pad_mat1off, ?a_pad_stride);
+
+        // b_mat_1 offset = 16 (GATE-NOTE #1: intra-row COLUMN-band offset, UNCHANGED by row pad).
+        let b_mat_0: matrix[f16, 16, 16, b] = coopmat_load(b_tile, 0u32, ?b_pad_stride);
+        let b_mat_1: matrix[f16, 16, 16, b] = coopmat_load(b_tile, 16u32, ?b_pad_stride);
+
+        acc_00 = coopmat_mul_add(a_mat_0, b_mat_0, acc_00);
+        acc_01 = coopmat_mul_add(a_mat_0, b_mat_1, acc_01);
+        acc_10 = coopmat_mul_add(a_mat_1, b_mat_0, acc_10);
+        acc_11 = coopmat_mul_add(a_mat_1, b_mat_1, acc_11);
+
+        // WAR barrier (VERBATIM M3.6): doubles as the cache WAR.
+        workgroup_barrier();
+    }
+
+    // ── Store the 4 accumulated f32 tiles to C (VERBATIM M3.6) ──────────────────
+    let c_base_00: u32 = (tile_row_0 * 16u32) * N + (tile_col_0 * 16u32);
+    let c_base_01: u32 = (tile_row_0 * 16u32) * N + (tile_col_1 * 16u32);
+    let c_base_10: u32 = (tile_row_1 * 16u32) * N + (tile_col_0 * 16u32);
+    let c_base_11: u32 = (tile_row_1 * 16u32) * N + (tile_col_1 * 16u32);
+
+    coopmat_store(acc_00, C, c_base_00, N);
+    coopmat_store(acc_01, C, c_base_01, N);
+    coopmat_store(acc_10, C, c_base_10, N);
+    coopmat_store(acc_11, C, c_base_11, N);
+
+    return;
+}

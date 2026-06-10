@@ -61,6 +61,15 @@ name = "resident_matmul_rb"
 path = "benches/resident_matmul_rb.rs"
 harness = false
 
+# M3.10a: honest padded-vs-base TFLOPS bench for the BANK-PADDED plain-f32 RB coopmat matmul
+# (AT-2406) + the PAD in {1,2,4,8} sweep (AT-2410). >= 1.15x gate vs the unpadded base at 768^3,
+# printed + checked, never asserted-loose; armed honest-negative with shared-bytes/occupancy
+# diagnosis. Bench ID: dispatch_resident_matmul_rb_pad. GPU-gated.
+[[bench]]
+name = "resident_matmul_rb_pad"
+path = "benches/resident_matmul_rb_pad.rs"
+harness = false
+
 # M3.3d: honest effective-TFLOPS bench for matmul_msg_coopmat.axc (AT-1750).
 # Bench ID: dispatch_resident_matmul_msg_coopmat (distinct from AT-1711/AT-1730 ids).
 [[bench]]
@@ -106,6 +115,16 @@ harness = false
 [[bench]]
 name = "resident_q4km_matmul_rb_f32acc_cached"
 path = "benches/resident_q4km_matmul_rb_f32acc_cached.rs"
+harness = false
+
+# M3.10a (CONDITIONAL): honest A/B + cube TFLOPS bench for the BANK-PADDED Q4_K_M scale-cached
+# f32-accumulator RB coopmat matmul (AT-2407) + the PAD sweep, emitting AXC_Q4KM_AB_F32ACC_CACHED_PAD
+# (scripts/m34_llamacpp_ab.sh --pad). >= 1.15x M3.6 (>= 49.3 TFLOPS) AND combined <= 1e-3 gate,
+# printed + checked, never asserted-loose; armed honest-negative. Bench ID:
+# dispatch_resident_q4km_matmul_rb_f32acc_cached_pad. GPU-gated.
+[[bench]]
+name = "resident_q4km_matmul_rb_f32acc_cached_pad"
+path = "benches/resident_q4km_matmul_rb_f32acc_cached_pad.rs"
 harness = false
 
 # M3.7: honest effective-TFLOPS bench for the DOUBLE-BUFFERED (software-pipelined) scale-cached
