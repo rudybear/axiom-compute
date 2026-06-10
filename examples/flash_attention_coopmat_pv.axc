@@ -9,7 +9,11 @@
 //   1. S = Q·Kᵀ : coopmat (carried from M3.2c-perf) → s_tile_sh (f32).
 //   2. PV = P·V : coopmat (NEW) → pv_sh (f32), then a SCALAR per-row rescale-add folds it into
 //      acc-in-shared. acc stays in shared (NOT a coopmat) → the per-row diagonal-scale crux is
-//      NOT re-introduced (Option C stays DEFERRED). coopmat_mul_add is A·B+C only.
+//      NOT re-introduced. Option C (acc AS a coopmat) is BLOCKED, not deferred — see DESIGN
+//      §3.1.34: coopmat_mul_add is A·B+C only AND always yields an Accumulator-use result, and
+//      the KHR cooperative_matrix extension has no use-conversion, so a loop-carried
+//      Accumulator-use acc can never be the B-operand of a later mul_add without a store/load
+//      round-trip (the very traffic this acc-in-shared already does, plus an f16-narrowing).
 //
 // THE ONE GENUINE SOURCE CHANGE vs M3.2c-perf: the coopmat A-operand is f16. The M3.2c-perf
 // softmax overwrote P in place into the f32 s_tile_sh, which CANNOT be a coopmat A-load. So the
