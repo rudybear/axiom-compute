@@ -592,10 +592,24 @@ from .attention_ops import (  # noqa: E402
     release_attention_session,
 )
 
+# M4.3: the torch.compile custom backend (backend="axiom") that auto-lowers a matching SDPA to
+# torch.ops.axiom.flash_attention. Guarded like the op registrations (no-op without torch).
+from .compile_backend import (  # noqa: E402
+    AXIOM_BACKEND_NAME,
+    register_axiom_backend,
+    axiom_backend,
+    axiom_sdpa_dispatch_count,
+    axiom_sdpa_runtime_fire_count,
+    reset_axiom_sdpa_counters,
+)
+
 # Define torch.ops.axiom.q4km_matmul + torch.ops.axiom.flash_attention at import
 # (no-op if torch is absent).
 register_q4km_op()
 register_flash_attention_op()
+# Register backend="axiom" at import so torch.compile(model, backend="axiom") resolves
+# (idempotent, no-op without torch).
+register_axiom_backend()
 
 __all__ = [
     "compile_kernel",
@@ -631,4 +645,11 @@ __all__ = [
     "last_attn_dispatch_path",
     "last_attn_dispatch_staging",
     "release_attention_session",
+    # M4.3 torch.compile custom backend (backend="axiom") auto-lowering SDPA -> flash_attention.
+    "AXIOM_BACKEND_NAME",
+    "register_axiom_backend",
+    "axiom_backend",
+    "axiom_sdpa_dispatch_count",
+    "axiom_sdpa_runtime_fire_count",
+    "reset_axiom_sdpa_counters",
 ]
