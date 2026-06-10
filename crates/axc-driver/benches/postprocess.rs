@@ -27,43 +27,15 @@
 mod common;
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::io::Write;
 
-// ── Schema v1 structs (BTreeMap for stable serialization order) ────────────────
-
-/// Full baselines.json document (schema version 1).
-#[derive(Debug, Serialize, Deserialize)]
-struct BaselineFile {
-    schema_version: u32,
-    generated: String,
-    git_sha: String,
-    machine: MachineMeta,
-    benchmarks: Vec<BenchEntry>,
-}
-
-/// Machine metadata sub-object (AT-709).
-///
-/// All fields are populated; empty string for unavailable probes (never null).
-#[derive(Debug, Serialize, Deserialize)]
-struct MachineMeta {
-    os: String,
-    rustc: String,
-    vulkan_icd: String,
-    vulkan_device: String,
-    cpu_model: String,
-    axc_version: String,
-}
-
-/// One bench entry in the `benchmarks` array.
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-struct BenchEntry {
-    group: String,
-    bench: String,
-    median_ns: u64,
-    low_ns: u64,
-    high_ns: u64,
-}
+// ── Schema v2 structs (shared via common.rs — single source of truth, EB.2) ────
+//
+// MachineMeta / BenchEntry / MachineBlock / BaselinesV2 and the machine_key /
+// sanitize / merge_blessed / atomic_write helpers all live in common.rs so the
+// writer (this file) and the gate (bench_regression.rs) cannot drift.
+use common::{BaselinesV2, BenchEntry, MachineBlock, MachineMeta};
 
 // ── Criterion estimates.json shape (what Criterion writes) ─────────────────────
 
@@ -302,32 +274,50 @@ fn run_postprocess() {
         axc_version: env!("CARGO_PKG_VERSION").to_owned(),
     };
 
-    // Use BTreeMap to control JSON key order (AT-710).
-    // We serialize the struct directly — serde will emit fields in declaration order.
-    // The struct fields are already ordered per schema v1.
-    let baseline = BaselineFile {
-        schema_version: 1,
+    // EB.2: derive the current machine key from the live device + cpu, and build
+    // this run's MachineBlock.  The candidate is a single-machine v2 document;
+    // the bless is a read-modify-write that preserves all OTHER machines.
+    let current_key: String =
+        common::machine_key(&machine.vulkan_device, &machine.cpu_model);
+    let device_was_probed: bool = !machine.vulkan_device.is_empty();
+
+    let current_block: MachineBlock = MachineBlock {
         generated: chrono_now_rfc3339(),
         git_sha: git_sha.clone(),
         machine,
         benchmarks: entries,
     };
 
-    let json: String = serde_json::to_string_pretty(&baseline)
-        .expect("postprocess: failed to serialize baselines JSON");
+    // Candidate: a single-machine v2 document for inspection (gitignored).  It
+    // does NOT need atomicity — only the tracked multi-machine file does.
+    let candidate_doc: BaselinesV2 = {
+        let mut machines: std::collections::BTreeMap<String, MachineBlock> =
+            std::collections::BTreeMap::new();
+        machines.insert(current_key.clone(), current_block.clone());
+        BaselinesV2 {
+            schema_version: 2,
+            machines,
+        }
+    };
+    let candidate_json: String = serde_json::to_string_pretty(&candidate_doc)
+        .expect("postprocess: failed to serialize candidate baselines JSON");
 
-    // Write candidate (always).
     let candidate_dir: std::path::PathBuf = target_dir.join("axc-bench");
     std::fs::create_dir_all(&candidate_dir)
         .expect("postprocess: failed to create target/axc-bench/");
     let candidate_path: std::path::PathBuf = candidate_dir.join("candidate-baselines.json");
     let mut f = std::fs::File::create(&candidate_path)
         .expect("postprocess: failed to create candidate-baselines.json");
-    f.write_all(json.as_bytes())
+    f.write_all(candidate_json.as_bytes())
         .expect("postprocess: failed to write candidate-baselines.json");
-    eprintln!("postprocess: wrote candidate to {}", candidate_path.display());
+    eprintln!(
+        "postprocess: wrote candidate (machine_key='{}', device_probed={}) to {}",
+        current_key,
+        device_was_probed,
+        candidate_path.display()
+    );
 
-    // Bless if AXC_BLESS_BASELINES=1 (AT-711).
+    // Bless if AXC_BLESS_BASELINES=1 (AT-711) — EB.2 read-modify-write + atomic.
     if std::env::var("AXC_BLESS_BASELINES").as_deref() == Ok("1") {
         let repo_root: std::path::PathBuf = std::path::PathBuf::from(&manifest_dir)
             .join("..")
@@ -336,11 +326,47 @@ fn run_postprocess() {
         std::fs::create_dir_all(&blessed_dir)
             .expect("postprocess: failed to create .pipeline/benchmarks/");
         let blessed_path: std::path::PathBuf = blessed_dir.join("baselines.json");
-        let mut bf = std::fs::File::create(&blessed_path)
-            .expect("postprocess: failed to create baselines.json for blessing");
-        bf.write_all(json.as_bytes())
-            .expect("postprocess: failed to write blessed baselines.json");
-        eprintln!("postprocess: BLESSED baselines to {}", blessed_path.display());
+
+        // Read step: distinguish ABSENT (→ empty map; first bless) from
+        // PRESENT-BUT-UNPARSEABLE (→ fail loud; merge_blessed returns Err).
+        // A read error other than NotFound is itself fail-loud (corrupt FS state).
+        let existing_json: Option<String> = match std::fs::read_to_string(&blessed_path) {
+            Ok(s) => Some(s),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => panic!(
+                "postprocess: cannot read existing baselines at '{}' for blessing: {e} — \
+                 refusing to bless (will not risk clobbering other machines' baselines)",
+                blessed_path.display()
+            ),
+        };
+
+        // BLOCKER 1: never silently start-from-empty over a corrupt file.
+        let merged: BaselinesV2 =
+            common::merge_blessed(existing_json.as_deref(), &current_key, &current_block)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "postprocess: refusing to bless baselines at '{}': {e}",
+                        blessed_path.display()
+                    )
+                });
+
+        let merged_json: String = serde_json::to_string_pretty(&merged)
+            .expect("postprocess: failed to serialize merged baselines JSON");
+
+        // BLOCKER 1: atomic write (temp file in the SAME dir + rename).
+        common::atomic_write(&blessed_dir, "baselines.json", merged_json.as_bytes())
+            .unwrap_or_else(|e| {
+                panic!(
+                    "postprocess: failed to atomically write blessed baselines to '{}': {e}",
+                    blessed_path.display()
+                )
+            });
+        eprintln!(
+            "postprocess: BLESSED machine_key='{}' into {} ({} machine(s) total)",
+            current_key,
+            blessed_path.display(),
+            merged.machines.len()
+        );
     } else {
         eprintln!(
             "postprocess: set AXC_BLESS_BASELINES=1 to promote candidate to .pipeline/benchmarks/baselines.json"
