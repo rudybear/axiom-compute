@@ -10,32 +10,25 @@ LLMs iteratively optimize CUDA kernels today at the source-text level (Sakana AI
 
 AXIOM-Compute makes intent first-class. `@strategy { workgroup_x: ?[32, 64, 128, 256] }` declares holes the compiler enumerates and a grid-search (or LLM agent via MCP) fills. `@equiv_fp_tol(1e-3)` is machine-checked. The result is portable SPIR-V that downstream vendor drivers finish optimizing — without CUDA lock-in.
 
-## Current status (2026-06-01)
+## Current status (2026-06-10)
 
-- **21 milestones merged on `main`**: M0 → M3.5
-- **893 tests passing**, clippy `--all-targets` clean, zero SPIR-V validation errors
-- **Q4_K_M → coopmat fusion (M3.5)**: a `f32_to_f16` builtin + a fused Q4_K_M-dequant→shared-f16→register-blocked-coopmat matmul. On NVIDIA it reaches **~11 TFLOPS (9% of the cuBLAS f32 estimate)** — collapsing the M3.4 throughput gap vs llama.cpp from **~87,000× to ~9×** (same-shape). **Honest correctness limit:** the f16 coopmat accumulator is bit-within-tol only at **K≤256** (8.3e-4); it diverges at K=512 and is **numerically invalid at inference-scale K=14336 (max-rel-diff ≈ 29)** — i.e. *fast but wrong* at large K. A usable competitive Q4_K_M kernel needs an **f32-accumulator coopmat** (M3.5b). The throughput path is proven; correctness at scale is the next step.
-- **llama.cpp Q4_K_M Vulkan A/B (M3.4 — the pre-registered kill-criterion)**: an honest same-machine head-to-head on NVIDIA (matched timer boundary, FLOP-parity-verified, n=1 GEMV, device-match). AXIOM's *frozen M2.6 single-row Q4_K_M matvec* is **~87,000× lower throughput** than llama.cpp's optimized Vulkan kernel → **kill-criterion FAIL on NVIDIA** — the documented baseline. (This is the un-optimized matvec, not the M3.3c register-blocked matmul; an NVIDIA-only FAIL does **not** fire the project kill-criterion, which is "within 15% on *any* vendor" — AMD/Intel pending hardware. Gap-closing path: fuse Q4_K_M dequant onto the 31-TFLOPS coopmat matmul.)
-- **`local_invocation_id()` builtin + multi-subgroup matmul (M3.3d)**: a new within-workgroup-id builtin (GPU-validated). Multi-subgroup blocking was tried and is **bit-exact but slower** (768³ = 24.0 TFLOPS / 19.2%) than single-subgroup register blocking (24.96%) — the halved workgroup count + cross-subgroup barrier outweigh staging amortization. An honest negative perf result; single-subgroup RB remains the best matmul. The builtin is the durable deliverable (unblocks future multi-warp work).
-- **OpPhi loop-carried SSA (M3.3)**: `emit_for_range` now carries cooperative-matrix accumulators across loop iterations via OpPhi (the M3.2 blocker) — **GPU-proven** bit-exact on NVIDIA.
-- **Multi-tile cooperative_matrix matmul (M3.3b/M3.3c)**: a real tiled tensor-core matmul — a grid of workgroups, each K-looping with the OpPhi accumulator — is **bit-exact on NVIDIA** (full M×N) from one annotated `.axc` source → portable coopmat SPIR-V. **2×2 register blocking (M3.3c)** raises throughput with matmul size (honest occupancy tradeoff): 256³ = 3.1 TFLOPS (regresses, under-occupied), 512³ = 14.6, **768³ = 31.2 TFLOPS ≈ 24.96% of the cuBLAS f32 datasheet estimate — a 6.2× gain over the single-tile baseline** (just under the 25% "competitive" bar; still single-subgroup-per-block — multi-warp blocking is a follow-up).
-- **`shared[T,N]` workgroup memory (M3.2)**: new language feature (lexer→codegen) with a provably-sound missing-barrier analysis; a shared parallel reduction + `workgroup_barrier()` runs **bit-exact on NVIDIA**. The competitive matmul + tiled attention that use it compile + spirv-val clean but need `OpPhi` loop-carried SSA (`emit_for_range`) to compute correctly — re-scoped to M3.3.
-- **First cooperative_matrix dispatch on real Blackwell tensor cores** (M3.1): `matmul_tile` 16×16 C=A·B **bit-exact** on NVIDIA RTX PRO 6000; multi-row Q4_K_M matmul bit-exact 256×256; same `.axc` graceful-skips on Lavapipe via coopmat preflight. Resident-buffer TFLOPS benchmark + full dequant→coopmat fusion carried to M3.2.
-- **Real GPU execution** via `ash` 0.38 + Vulkan 1.1+
-- **6 GPU-gated tests pass on both NVIDIA RTX PRO 6000 Blackwell AND Lavapipe** (software Vulkan)
-- **Q4_K_M kernel dispatches bit-exact** against ggml CPU reference on real GPU — the llama.cpp beachhead
-- **M3.0 dispatch bandwidth rework**: persistent-mapped HOST_CACHED staging + dedicated transfer queue + timeline-semaphore overlap → `saxpy_1m` 23 ms → **3.08 ms (7.5×)**, `saxpy_1024` 1.22 ms → **31 µs (39×)**. The `<1 ms` gate was re-scoped to a GPU-resident metric (a host-round-trip saxpy measures PCIe transfer, not kernel quality); a ReBAR readback fix was tried and empirically reverted — see DESIGN.md §3.1.12.
+- **~34 milestones merged on `main`**: M0 → M3.2c-PV / M4.1 Phase 4
+- **941 workspace tests passing**, clippy `--all-targets` clean, zero SPIR-V validation errors. Every milestone went through the 7-agent adversarial pipeline (Architect → dual design review → Coder → QA → dual code review) with real-GPU verification before merge.
+- **Two flagship LLM kernels, from one annotated `.axc` source each → portable SPIR-V, measured on NVIDIA RTX PRO 6000 Blackwell:**
+  - **Q4_K_M matmul (the llama.cpp beachhead) — 42.86 TFLOPS, 2.39× behind hand-tuned llama.cpp Vulkan, numerically valid + bit-identical.** The campaign: M3.4 honest A/B (un-optimized matvec = 87,000× behind) → M3.5 fused dequant→coopmat (9×, but *fast-but-wrong*: f16 accumulator invalid at inference K) → **M3.5b f32 accumulator (numerically VALID, combined condition-aware metric ≤ 1e-3 at K=14336)** → **M3.6 dequant scale-caching (the leader): gap collapses 9.3× → 2.39×, bit-identical, pure source.** M3.7 (double-buffering) + M3.8 (larger register tiles) are rigorous **honest-negatives** establishing the M3.6 2×2 kernel as the occupancy/compute sweet spot — both classic GEMM levers regress because the kernel is occupancy-bound.
+  - **FlashAttention-2 — streaming online-softmax, fully coopmat-accelerated (QKᵀ *and* P·V on tensor cores), real-range correct.** M3.2b (scalar streaming softmax, no S materialization) → M3.2c-exp (a real `exp()` builtin — the **first GLSL.std.450 extended instruction** in the codegen — making real-range attention correct) → M3.2c-perf (coopmat QKᵀ + 16-row query tile) → **M3.2c-PV (coopmat P·V too)**. Correct within frozen 1e-3 vs a true-exp softmax oracle; the acc-in-shared design keeps the per-row rescale scalar (avoiding a coopmat-diagonal-scale codegen feature).
+- **PyTorch frontend with CUDA↔Vulkan zero-copy interop (M4.1, the M4 adoption phase):** a `pip`-installable PyO3 package where a torch **CUDA** tensor feeds an AXIOM **Vulkan** kernel on the **same physical GPU with zero host copies** — via `VK_KHR_external_memory_fd` export → `cudaImportExternalMemory`, a timeline external semaphore handshake, fail-closed device-UUID matching. **Both flagship kernels are registered `torch.library` custom-ops** (`torch.ops.axiom.q4km_matmul`, `torch.ops.axiom.flash_attention`) that **compose with `torch.compile(fullgraph=True)`** (0 graph breaks). Honest: the win is no-host-copy + real torch integration, not beating cuBLAS/SDPA.
+- **The thesis, demonstrated:** one annotated source → portable coopmat SPIR-V → correct, competitive-ish kernels callable from the framework the ecosystem actually uses, with every claim independently verified and every honest-negative reported as such (the frozen `@equiv_fp_tol` was never loosened across the campaign).
 
 | Kernel | Status |
 |---|---|
-| saxpy | ✅ bit-exact, 31 μs (1024 elem) / 3.08 ms (1 M, host round-trip) on NVIDIA |
-| vector_add | ✅ bit-exact |
-| reduction / workgroup barrier | ✅ compile + validate |
-| subgroup reduce | ✅ compile + validate |
-| Q4_0 dequant matvec | ✅ bit-exact on NVIDIA + Lavapipe |
-| **Q4_K_M dequant matvec** | ✅ **bit-exact on NVIDIA** — llama.cpp beachhead |
-| cooperative matrix matmul | ✅ compile + spirv-val (dispatch requires tensor-core hardware) |
-| FlashAttention-2 | 🔜 M3.1 |
+| saxpy / vector_add | ✅ bit-exact on NVIDIA (+ zero-copy from PyTorch) |
+| reduction / workgroup barrier / subgroup reduce | ✅ bit-exact / validate |
+| Q4_0 / Q4_K_M dequant | ✅ bit-exact on NVIDIA + Lavapipe — the llama.cpp beachhead |
+| **Q4_K_M matmul (fused, f32-acc, scale-cached)** | ✅ **42.86 TFLOPS, 2.39× behind llama.cpp, numerically valid (M3.6)** |
+| cooperative_matrix matmul (register-blocked) | ✅ bit-exact on NVIDIA tensor cores |
+| **FlashAttention-2 (coopmat QKᵀ + P·V, real-range exp)** | ✅ **correct within 1e-3 on NVIDIA (M3.2c-PV)** |
+| **Both kernels as `torch.library` ops** | ✅ **zero-copy, compose with `torch.compile` (M4.1)** |
 
 ## Architecture
 
