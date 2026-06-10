@@ -1218,7 +1218,7 @@ The prior coopmat-attention milestones (§3.1.30 M3.2c-perf, §3.1.32 M3.2c-PV) 
 
 ---
 
-## 3.1.35 EB.2 — Per-machine bench-regression baselines [PROPOSED r2 — harness/JSON only, no codegen]
+## 3.1.35 EB.2 — Per-machine bench-regression baselines [MERGED]
 
 **Problem.** The bench-regression harness keys baselines by `(group,bench)` only, inside one flat `BaselineFile` (schema v1: `bench_regression.rs:43-56`, `postprocess.rs:36-66`). The blessed file carries a `machine` meta object, but the GATE never reads it (`bench_regression.rs:202-248` iterates `benchmarks` with no machine matching): last-machine-to-bless-wins, and the 15% gate compares the current run against whatever machine blessed last. With one machine (NVIDIA) this is benign. The instant AMD/Intel hardware lands (**EB.1**), an AMD `AXC_BLESS_BASELINES=1` overwrites the NVIDIA numbers (`postprocess.rs:331-343` writes the single file) and the gate compares AMD-vs-NVIDIA — a meaningless regression signal. This is the same class of bug ROADMAP.md:311/EB.4 names (Lavapipe runs overwriting NVIDIA and vice-versa). **EB.2 makes the baseline per-machine so each machine keeps its own blessed numbers and the gate is same-machine-vs-same-machine.**
 
