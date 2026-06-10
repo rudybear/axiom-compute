@@ -1786,3 +1786,200 @@ fn at_2304_warptile_compiles_spirv_val() {
          (K=4 @workgroup(128)==floor, K=2 @workgroup(64)<floor)"
     );
 }
+
+// ── AT-2405 (M3.10a, CI no-GPU): the BANK-PADDED kernels compile + spirv-val clean,        ──
+//            capability set BYTE-IDENTICAL to the base (padding adds NO capability),         ──
+//            shared_memory_bytes reflects the padded stride, barrier count == base.          ──
+
+/// M3.10a plain-f32 padded RB strategy (PAD_A=PAD_B=8 canonical ship tuple).
+/// a_pad_stride=24 (16+8), a_pad_size=768 (32*24), a_pad_mat1off=384 (16*24),
+/// b_pad_stride=40 (32+8), b_pad_size=640 (16*40).
+fn rb2x2_pad_assignments() -> StrategyMap {
+    let mut m = StrategyMap::new();
+    m.insert("rb_m".to_owned(), 2_i64);
+    m.insert("rb_n".to_owned(), 2_i64);
+    m.insert("tile_k".to_owned(), 16_i64);
+    m.insert("a_block_size".to_owned(), 512_i64);
+    m.insert("b_block_size".to_owned(), 512_i64);
+    m.insert("a_pad_stride".to_owned(), 24_i64);
+    m.insert("a_pad_size".to_owned(), 768_i64);
+    m.insert("a_pad_mat1off".to_owned(), 384_i64);
+    m.insert("b_pad_stride".to_owned(), 40_i64);
+    m.insert("b_pad_size".to_owned(), 640_i64);
+    m
+}
+
+/// M3.10a Q4_K_M padded leader strategy (PAD_A=PAD_B=8; SAME pad tuple as plain-f32, PLUS the
+/// M3.6 a_block_size=512 PIN that bounds the 256-entry scale caches).
+fn rb2x2_q4km_pad_assignments() -> StrategyMap {
+    rb2x2_pad_assignments()
+}
+
+/// AT-2405 (plain-f32): matmul_rb_coopmat_pad.axc compiles + spirv-val clean; capability set
+/// BYTE-IDENTICAL to matmul_rb_coopmat.axc (the base); shared_memory_bytes == padded stride
+/// (A 32*24 + B 16*40 f16 = (768+640)*2 = 2816 B); barrier count == base (2 per k_block).
+#[test]
+fn at_2405_matmul_rb_pad_compile_capset_sharedbytes() {
+    use std::collections::BTreeSet;
+
+    let pad_src = include_str!("../../../examples/matmul_rb_coopmat_pad.axc");
+    let base_src = include_str!("../../../examples/matmul_rb_coopmat.axc");
+
+    // The padded kernel compiles WITH metadata + spirv-val (the load-bearing compile anchor).
+    let (pad_bytes, meta) = compile_source_with_assignments(pad_src, &rb2x2_pad_assignments())
+        .unwrap_or_else(|e| panic!("matmul_rb_coopmat_pad.axc: compile failed: {e:?}"));
+    let pad_words = words_and_validate(pad_bytes, "matmul_rb_coopmat_pad.axc");
+    let base_words = compile_words(base_src, Some(&rb2x2_assignments()), "matmul_rb_coopmat.axc");
+
+    // Capability set BYTE-IDENTICAL to the base (padding is plain shared[f16] index arithmetic +
+    // a runtime coopmat_load stride — NO new capability).
+    let (pad_caps, pad_exts) = capability_extension_sets(&pad_words);
+    let (base_caps, base_exts) = capability_extension_sets(&base_words);
+    let pad_set: BTreeSet<u32> = pad_caps.iter().copied().collect();
+    let base_set: BTreeSet<u32> = base_caps.iter().copied().collect();
+    assert_eq!(
+        pad_set, base_set,
+        "AT-2405 (plain): padded kernel cap set must be BYTE-IDENTICAL to matmul_rb_coopmat \
+         (padding adds NO capability); pad={pad_caps:?} base={base_caps:?}"
+    );
+    assert_eq!(
+        pad_exts, base_exts,
+        "AT-2405 (plain): padded kernel extension set must equal the base's; \
+         pad={pad_exts:?} base={base_exts:?}"
+    );
+
+    // shared_memory_bytes reflects the PADDED stride: A 32*24 + B 16*40 f16 = (768+640)*2 = 2816 B.
+    let expected_shared_bytes: u32 = (768 + 640) * 2; // 2816
+    assert_eq!(
+        meta.shared_memory_bytes, expected_shared_bytes,
+        "AT-2405 (plain): padded shared_memory_bytes must be {expected_shared_bytes} \
+         (a_tile 32*24=768 f16 + b_tile 16*40=640 f16, *2 B); got {}", meta.shared_memory_bytes
+    );
+    assert!(
+        meta.shared_memory_bytes <= 16384,
+        "AT-2405 (plain): padded shared_memory_bytes={} exceeds the 16384-byte portable floor",
+        meta.shared_memory_bytes
+    );
+
+    // Barrier count == base (2 per k_block: post-staging + WAR). Padding is pure address layout —
+    // it adds NO barrier. OpPhi count == base (single-level 4-accumulator carry intact).
+    let pad_barriers = count_op_control_barrier(&pad_words);
+    let base_barriers = count_op_control_barrier(&base_words);
+    assert_eq!(
+        pad_barriers, base_barriers,
+        "AT-2405 (plain): padded kernel must emit the SAME OpControlBarrier count as the base \
+         (padding adds no barrier); pad={pad_barriers} base={base_barriers}"
+    );
+    let pad_phis = count_op_phi(&pad_words);
+    let base_phis = count_op_phi(&base_words);
+    assert_eq!(
+        pad_phis, base_phis,
+        "AT-2405 (plain): padded kernel OpPhi count must equal the base (single-level carry \
+         intact); pad={pad_phis} base={base_phis}"
+    );
+
+    eprintln!(
+        "AT-2405 (plain) PASS: matmul_rb_coopmat_pad.axc compiles + spirv-val clean; \
+         cap set == base ({pad_caps:?}); shared_memory_bytes={} (2816 padded); \
+         OpControlBarrier={pad_barriers} == base; OpPhi={pad_phis} == base",
+        meta.shared_memory_bytes
+    );
+}
+
+/// AT-2405 (Q4_K_M): q4km_matmul_rb_coopmat_f32acc_cached_pad.axc compiles + spirv-val clean;
+/// capability set BYTE-IDENTICAL to the M3.6 cached leader; shared_memory_bytes == padded tiles
+/// (A 32*24 + B 16*40 f16 = 2816 B) PLUS the unchanged 256-entry scale caches (2*256*4 = 2048 B)
+/// = 4864 B; barrier count == base (3 per k_block); a_block_size=512 PIN preserved.
+#[test]
+fn at_2405_q4km_rb_pad_compile_capset_sharedbytes() {
+    use std::collections::BTreeSet;
+    use axc_runtime::{CoopMatScalarMeta, CoopMatScopeMeta};
+
+    let pad_src = include_str!("../../../examples/q4km_matmul_rb_coopmat_f32acc_cached_pad.axc");
+    let base_src = include_str!("../../../examples/q4km_matmul_rb_coopmat_f32acc_cached.axc");
+
+    let (pad_bytes, meta) = compile_source_with_assignments(pad_src, &rb2x2_q4km_pad_assignments())
+        .unwrap_or_else(|e| panic!("q4km_matmul_rb_coopmat_f32acc_cached_pad.axc: compile failed: {e:?}"));
+    let pad_words = words_and_validate(pad_bytes, "q4km_matmul_rb_coopmat_f32acc_cached_pad.axc");
+    let base_words = compile_words(base_src, Some(&rb2x2_assignments()),
+        "q4km_matmul_rb_coopmat_f32acc_cached.axc");
+
+    // Capability set BYTE-IDENTICAL to the M3.6 cached leader.
+    let (pad_caps, pad_exts) = capability_extension_sets(&pad_words);
+    let (base_caps, base_exts) = capability_extension_sets(&base_words);
+    let pad_set: BTreeSet<u32> = pad_caps.iter().copied().collect();
+    let base_set: BTreeSet<u32> = base_caps.iter().copied().collect();
+    assert_eq!(
+        pad_set, base_set,
+        "AT-2405 (Q4_K_M): padded kernel cap set must be BYTE-IDENTICAL to the M3.6 cached leader \
+         (padding adds NO capability); pad={pad_caps:?} base={base_caps:?}"
+    );
+    assert_eq!(
+        pad_exts, base_exts,
+        "AT-2405 (Q4_K_M): padded kernel extension set must equal the base's; \
+         pad={pad_exts:?} base={base_exts:?}"
+    );
+
+    // Coopmat metadata shape unchanged: {16,16,16, F16,F16,F32,F32, Subgroup}.
+    let coopmat = meta.coopmat.as_ref()
+        .expect("AT-2405 (Q4_K_M): padded kernel must emit coopmat metadata");
+    assert_eq!(coopmat.m, 16, "AT-2405: coopmat.m");
+    assert_eq!(coopmat.n, 16, "AT-2405: coopmat.n");
+    assert_eq!(coopmat.k, 16, "AT-2405: coopmat.k");
+    assert_eq!(coopmat.a_type, CoopMatScalarMeta::F16, "AT-2405: A type must be F16");
+    assert_eq!(coopmat.b_type, CoopMatScalarMeta::F16, "AT-2405: B type must be F16");
+    assert_eq!(coopmat.c_type, CoopMatScalarMeta::F32, "AT-2405: C type must be F32");
+    assert_eq!(coopmat.result_type, CoopMatScalarMeta::F32, "AT-2405: result type must be F32");
+    assert_eq!(coopmat.scope, CoopMatScopeMeta::Subgroup, "AT-2405: scope must be Subgroup");
+
+    // shared_memory_bytes: padded A/B tiles (768+640 f16 = 2816 B) + UNCHANGED scale caches
+    // (dsc_cache 256 f32 + dmm_cache 256 f32 = 2048 B) = 4864 B.
+    let expected_shared_bytes: u32 = (768 + 640) * 2 + 2 * 256 * 4; // 2816 + 2048 = 4864
+    assert_eq!(
+        meta.shared_memory_bytes, expected_shared_bytes,
+        "AT-2405 (Q4_K_M): padded shared_memory_bytes must be {expected_shared_bytes} \
+         (padded A/B tiles 2816 B + 256-entry scale caches 2048 B); got {}",
+        meta.shared_memory_bytes
+    );
+    assert!(
+        meta.shared_memory_bytes <= 16384,
+        "AT-2405 (Q4_K_M): padded shared_memory_bytes={} exceeds the 16384-byte portable floor",
+        meta.shared_memory_bytes
+    );
+
+    // Barrier count == base (3 per k_block: hoisted RAW + post-staging + WAR). OpPhi == base.
+    let pad_barriers = count_op_control_barrier(&pad_words);
+    let base_barriers = count_op_control_barrier(&base_words);
+    assert_eq!(
+        pad_barriers, base_barriers,
+        "AT-2405 (Q4_K_M): padded kernel must emit the SAME OpControlBarrier count as the M3.6 \
+         leader (padding adds no barrier); pad={pad_barriers} base={base_barriers}"
+    );
+    let pad_phis = count_op_phi(&pad_words);
+    let base_phis = count_op_phi(&base_words);
+    assert_eq!(
+        pad_phis, base_phis,
+        "AT-2405 (Q4_K_M): padded kernel OpPhi count must equal the M3.6 leader (single-level \
+         carry intact); pad={pad_phis} base={base_phis}"
+    );
+
+    // a_block_size=512 PIN preserved (bounds the 256-entry scale caches to 32 logical rows;
+    // GATE-NOTE #2: the cache index stays on the LOGICAL row, NEVER the padded stride).
+    let strategy_decl = pad_src
+        .lines()
+        .find(|l| l.trim_start().starts_with("@strategy"))
+        .expect("AT-2405 (Q4_K_M): padded kernel must declare an @strategy block");
+    assert!(
+        strategy_decl.contains("a_block_size: ?[512]"),
+        "AT-2405 (Q4_K_M): a_block_size MUST stay PINNED to ?[512] (bounds the 256-entry scale \
+         caches); got @strategy line: {strategy_decl}"
+    );
+
+    eprintln!(
+        "AT-2405 (Q4_K_M) PASS: q4km_matmul_rb_coopmat_f32acc_cached_pad.axc compiles + spirv-val \
+         clean; cap set == M3.6 leader ({pad_caps:?}); shared_memory_bytes={} (4864 = 2816 padded \
+         tiles + 2048 caches); OpControlBarrier={pad_barriers} == base; OpPhi={pad_phis} == base; \
+         a_block_size=512 PIN preserved",
+        meta.shared_memory_bytes
+    );
+}

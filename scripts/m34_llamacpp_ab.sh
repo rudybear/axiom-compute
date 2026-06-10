@@ -11,7 +11,15 @@
 #
 # Usage:
 #   VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json AXC_ENABLE_GPU_BENCHES=1 \
-#     scripts/m34_llamacpp_ab.sh [--skip-build] [--skip-llama] [--fused | --fused-f32acc | --fused-f32acc-cached | --fused-f32acc-db | --fused-f32acc-rb44 | --fused-f32acc-rb42]
+#     scripts/m34_llamacpp_ab.sh [--skip-build] [--skip-llama] [--fused | --fused-f32acc | --fused-f32acc-cached | --fused-f32acc-db | --fused-f32acc-rb44 | --fused-f32acc-rb42 | --warptile | --pad]
+#
+#   --pad (M3.10a): runs the BANK-PADDED resident benches — the plain-f32 padded RB
+#                    (resident_matmul_rb_pad, gate >=1.15x the unpadded base at 768^3) AND the
+#                    Q4_K_M padded leader (resident_q4km_matmul_rb_f32acc_cached_pad, gate >=1.15x
+#                    M3.6's 42.86 = >=49.3 TFLOPS AND combined<=1e-3 at the A/B shape). PAD is
+#                    swept in {1,2,4,8}; the winner is MEASURED. Short-circuits the llama Q4_K_M
+#                    path and writes ab_results_pad.json. HONEST-NEGATIVE armed: a sub-gate result
+#                    reports the shared-bytes + occupancy/bank diagnosis and NEVER loosens the gate.
 #
 #   --warptile (M3.9): runs the PLAIN-f32 multi-subgroup warptile (K=4) resident bench
 #                    (resident_matmul_warptile) at 256/512/768/1024 + the A/B shape
@@ -107,6 +115,7 @@ FUSED_F32ACC_DB=0 # M3.7: --fused-f32acc-db -> the DOUBLE-BUFFERED scale-cached 
 FUSED_F32ACC_RB44=0
 FUSED_F32ACC_RB42=0
 WARPTILE=0    # M3.9: --warptile -> PLAIN-f32 multi-subgroup warptile resident bench (no llama path).
+PAD=0         # M3.10a: --pad -> the BANK-PADDED resident benches (plain-f32 + Q4_K_M, no llama path).
 for arg in "$@"; do
     case "$arg" in
         --skip-build) SKIP_BUILD=1 ;;
@@ -122,6 +131,8 @@ for arg in "$@"; do
         --fused-f32acc-rb42) FUSED=1; FUSED_F32ACC=1; FUSED_F32ACC_RB42=1 ;;
         # M3.9: PLAIN-f32 warptile resident bench (short-circuits the Q4_K_M/llama path).
         --warptile) WARPTILE=1 ;;
+        # M3.10a: BANK-PADDED resident benches (short-circuits the Q4_K_M/llama path).
+        --pad) PAD=1 ;;
         *) echo "unknown arg: $arg" >&2; exit 2 ;;
     esac
 done
@@ -163,6 +174,56 @@ if [ "${WARPTILE}" -eq 1 ]; then
     } > "${WT_RESULTS}"
     echo "-- wrote ${WT_RESULTS}"
     echo "-- full bench log: ${WT_LOG}"
+    exit 0
+fi
+
+# ── M3.10a --pad: BANK-PADDED resident benches (NOT the Q4_K_M kill-criterion). ─────────────
+# Runs BOTH padded benches: the plain-f32 padded RB (resident_matmul_rb_pad, PRIMARY gate
+# >=1.15x the unpadded base at 768^3, PAD in {1,2,4,8} swept) and — for the real llama fight —
+# the Q4_K_M padded leader (resident_q4km_matmul_rb_f32acc_cached_pad, gate >=1.15x M3.6's 42.86
+# = >=49.3 TFLOPS AND combined <=1e-3 at the A/B shape). Both emit per-PAD per-size TFLOPS +
+# shared-bytes + the honest ratio; HONEST-NEGATIVE armed (a miss reports the occupancy/bank
+# diagnosis, NEVER loosens the gate). Writes ab_results_pad.json. No llama path (the padded
+# kernels are A/B-vs-the-AXIOM-leader experiments; the llama A/B is the M3.6 leader's, unchanged).
+if [ "${PAD}" -eq 1 ]; then
+    PAD_RESULTS="${OUTDIR}/ab_results_pad.json"
+    PAD_LOG_PLAIN="${OUTDIR}/pad_bench_plain.txt"
+    PAD_LOG_Q4KM="${OUTDIR}/pad_bench_q4km.txt"
+    echo "== M3.10a BANK-PADDED resident benches (plain-f32 + Q4_K_M; no llama Q4_K_M path) =="
+    echo "  repo_root : ${REPO_ROOT}"
+    echo "  ICD       : ${ICD}"
+    echo "  outdir    : ${OUTDIR}"
+    echo "  gate      : plain-f32 >=1.15x unpadded base @768^3; Q4_K_M >=1.15x M3.6 42.86 (>=49.3) AND combined<=1e-3"
+    echo "-- plain-f32 padded RB sweep (resident_matmul_rb_pad)"
+    VK_DRIVER_FILES="${ICD}" AXC_ENABLE_GPU_BENCHES=1 \
+        cargo bench --manifest-path "${REPO_ROOT}/Cargo.toml" -p axc-driver \
+        --bench resident_matmul_rb_pad 2>&1 | tee "${PAD_LOG_PLAIN}"
+    echo "-- Q4_K_M padded leader sweep (resident_q4km_matmul_rb_f32acc_cached_pad)"
+    VK_DRIVER_FILES="${ICD}" AXC_ENABLE_GPU_BENCHES=1 \
+        cargo bench --manifest-path "${REPO_ROOT}/Cargo.toml" -p axc-driver \
+        --bench resident_q4km_matmul_rb_f32acc_cached_pad 2>&1 | tee "${PAD_LOG_Q4KM}"
+    PLAIN_GATE_LINES="$(grep 'resident_matmul_rb_pad: AT-2406' "${PAD_LOG_PLAIN}" || true)"
+    Q4KM_GATE_LINES="$(grep 'resident_q4km_pad: AT-2407' "${PAD_LOG_Q4KM}" || true)"
+    AB_LINE="$(grep 'AXC_Q4KM_AB_F32ACC_CACHED_PAD' "${PAD_LOG_Q4KM}" | tail -1 || true)"
+    {
+        echo "{"
+        echo "  \"milestone\": \"M3.10a-bank-padding\","
+        echo "  \"mode\": \"bank-padded-vs-leader (plain-f32 vs unpadded RB; Q4_K_M vs M3.6 cached)\","
+        echo "  \"gate\": \"plain-f32 >=1.15x unpadded base @768^3; Q4_K_M >=1.15x M3.6 42.86 (>=49.3 TFLOPS) AND combined<=1e-3\","
+        echo "  \"icd\": \"${ICD}\","
+        echo "  \"vulkaninfo_device\": \"$(VK_DRIVER_FILES="${ICD}" vulkaninfo 2>/dev/null | grep -m1 'deviceName' | sed 's/.*= //' | tr -d '\r' || true)\","
+        echo "  \"note\": \"PURE-SOURCE bank padding (no codegen change). PAD swept in {1,2,4,8}; winner is MEASURED. HONEST-NEGATIVE armed: a sub-gate result reports the shared-bytes + occupancy/bank diagnosis and does NOT loosen the gate. See pad_bench_plain.txt / pad_bench_q4km.txt.\","
+        echo "  \"ab_line\": \"$(printf '%s' "${AB_LINE}" | sed 's/"/\\"/g')\","
+        echo "  \"plain_gate_lines\": ["
+        printf '%s\n' "${PLAIN_GATE_LINES}" | sed '/^$/d' | sed 's/"/\\"/g' | awk 'BEGIN{first=1} {if(!first)printf ",\n"; printf "    \"%s\"", $0; first=0} END{if(!first)printf "\n"}'
+        echo "  ],"
+        echo "  \"q4km_gate_lines\": ["
+        printf '%s\n' "${Q4KM_GATE_LINES}" | sed '/^$/d' | sed 's/"/\\"/g' | awk 'BEGIN{first=1} {if(!first)printf ",\n"; printf "    \"%s\"", $0; first=0} END{if(!first)printf "\n"}'
+        echo "  ]"
+        echo "}"
+    } > "${PAD_RESULTS}"
+    echo "-- wrote ${PAD_RESULTS}"
+    echo "-- full bench logs: ${PAD_LOG_PLAIN} ${PAD_LOG_Q4KM}"
     exit 0
 fi
 

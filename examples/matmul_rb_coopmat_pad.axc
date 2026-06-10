@@ -1,0 +1,180 @@
+// examples/matmul_rb_coopmat_pad.axc
+//
+// M3.10a (plain-f32 HEADLINE): the M3.3c register-blocked 2×2 coopmat matmul
+// (base = examples/matmul_rb_coopmat.axc) with BANK-CONFLICT-AVOIDING PADDED shared A/B tiles.
+//
+// PURE SOURCE — NO codegen/hir/typecheck change. The ONLY change vs the base is the shared
+// ADDRESS LAYOUT: each shared row gains a per-row PAD so consecutive coopmat-fragment rows
+// land in different shared-memory banks (NVIDIA = 32 banks × 4 B; an f16 16-wide row = 32 B =
+// 8 banks, which can 2-way conflict; a +PAD breaks the conflicting stride). This is the SAME
+// stride>logical-width pattern the base ALREADY uses: base:187 does
+// `coopmat_load(b_tile, 0u32, 32u32)` — a logical-16 B tile loaded at storage stride 32. The
+// KHR coopmat TYPE stays matrix[f16,16,16,*]; only the shared ALLOCATION, the scalar WRITE
+// index, and the coopmat_load STRIDE grow by PAD. The 16×16 logical tile dims are FIXED by the
+// matrix type and are NEVER padded (tile_k stays 16; padding is on the FREE dim only).
+//
+// CORRECTNESS (BIT-IDENTICAL to the base). Padding changes only the shared address layout,
+// never the arithmetic / coopmat tile order / accumulation order: the same 16×16 tiles are
+// loaded from the same logical (row,col) cells (now at padded offsets) and fed to the same
+// coopmat_mul_adds in the same order. Each output element is BIT-IDENTICAL to matmul_rb_coopmat.
+// The load-bearing gate is cross-kernel bit-identity on the ASYMMETRIC make_transpose_fixture_a/b
+// (AT-2400) — a mis-stride/mis-offset reads garbage and CANNOT pass by symmetry; spirv-val
+// cannot catch a mis-strided shared read.
+//
+// PADDED OFFSET MATH (the load-bearing detail — read carefully).
+//   A tile: RB_M*16 = 32 rows × tile_k = 16 cols (K-dim cols). Padded row stride = 16+PAD_A.
+//     - shared alloc: 32*(16+PAD_A) f16     (hole ?a_pad_size, e.g. 32*24 = 768 at PAD_A=8)
+//     - write index : a_row*(16+PAD_A)+a_col (hole ?a_pad_stride for the (16+PAD_A) factor)
+//     - a_mat_0 : offset 0,                  stride 16+PAD_A
+//     - a_mat_1 : offset 16*(16+PAD_A),      stride 16+PAD_A
+//       *** The A second-tile offset SCALES with the pad: it is the padded byte-base of LOGICAL
+//           ROW 16 (= a ROW-slab offset = rows·stride). Hole ?a_pad_mat1off = 16*(16+PAD_A).
+//           (Base value was 256 = 16*16; at PAD_A=8 it is 16*24 = 384.) ***
+//   B tile: tile_k = 16 rows (K) × RB_N*16 = 32 cols (N). Padded row stride = 32+PAD_B.
+//     - shared alloc: 16*(32+PAD_B) f16      (hole ?b_pad_size, e.g. 16*40 = 640 at PAD_B=8)
+//     - write index : b_row*(32+PAD_B)+b_col (hole ?b_pad_stride for the (32+PAD_B) factor)
+//     - b_mat_0 : offset 0,                  stride 32+PAD_B
+//     - b_mat_1 : offset 16,                 stride 32+PAD_B
+//       *** PESSIMISTIC GATE-NOTE #1 (CRITICAL): b_mat_1's offset STAYS 16 — it is an intra-row
+//           COLUMN-band offset (the start of the second 16-wide column band within row 0), NOT a
+//           row offset. Row padding extends each row's TAIL, so the intra-row column offset 16 is
+//           UNCHANGED; ONLY the row-to-row stride grows to 32+PAD_B. A naive "add PAD everywhere"
+//           that bumped this offset would silently mis-read. The A second-tile offset DOES scale
+//           (it is a row offset); the B second-tile offset does NOT (it is a column offset). ***
+//
+// PAD AS A SWEPT STRATEGY HOLE: a_pad_stride/b_pad_stride/a_pad_size/b_pad_size/a_pad_mat1off
+// are derived strategy holes; the bench/autotuner sweeps PAD in {1,2,4,8} (encoded as the
+// corresponding stride/size/offset tuples) and the measured winner is pinned. The canonical
+// ship tuple is PAD_A=PAD_B=8 (a_pad_stride=24, a_pad_size=768, a_pad_mat1off=384,
+// b_pad_stride=40, b_pad_size=640): A 32×24 = 768 f16 = 1536 B, B 16×40 = 640 f16 = 1280 B,
+// total 2816 B << the 16384-byte portable maxComputeSharedMemorySize floor.
+//
+// CAPABILITIES: BYTE-IDENTICAL to matmul_rb_coopmat.axc — padding is plain Workgroup shared[f16]
+// index arithmetic + a runtime coopmat_load stride; NO new op/decoration/capability (AT-2405).
+//
+// BENCHMARKED BY: crates/axc-driver/benches/resident_matmul_rb_pad.rs (AT-2406).
+// BIT-IDENTITY  : crates/axc-driver/tests/dispatch_matmul_rb_pad_equiv.rs (AT-2400/2401).
+// COMPILE ANCHOR: AT-2405 in compile_shared_examples.rs (CI, no GPU).
+//
+// Anti-pattern #2: explicit `return;`. Anti-pattern #8: no `>>` (use shr/lshr).
+
+@kernel
+@workgroup(32, 1, 1)
+@cooperative_matrix
+@strategy { rb_m: ?[2], rb_n: ?[2], tile_k: ?[16], a_block_size: ?[512], b_block_size: ?[512], a_pad_stride: ?[24], a_pad_size: ?[768], a_pad_mat1off: ?[384], b_pad_stride: ?[40], b_pad_size: ?[640] }
+@intent("M3.10a bank-padded register-blocked 2×2 coopmat f16 matmul — bit-identical to matmul_rb_coopmat (AT-2400/2401/2406)")
+@complexity(O(n))
+fn matmul_rb_coopmat_pad(
+    A: readonly_buffer[f16],
+    B: readonly_buffer[f16],
+    C: buffer[f16],
+    M: u32,
+    N: u32,
+    K: u32
+) -> void {
+    // PADDED shared staging tiles for the 2×2 block.
+    // a_tile: 32 rows × (16+PAD_A) padded cols = ?a_pad_size f16 (32*24 = 768 at PAD_A=8).
+    // b_tile: 16 rows × (32+PAD_B) padded cols = ?b_pad_size f16 (16*40 = 640 at PAD_B=8).
+    shared a_tile: shared[f16, ?a_pad_size];
+    shared b_tile: shared[f16, ?b_pad_size];
+
+    // Block coordinates (ASYMMETRIC, VERBATIM the base).
+    let block_col: u32 = gid(0u32) / 32u32;
+    let block_row: u32 = gid(1u32);
+
+    // Lane index within the subgroup for cooperative staging loads.
+    let lane: u32 = subgroup_invocation_id();
+
+    // Output tile coordinates within the 2×2 block.
+    let tile_row_0: u32 = block_row * 2u32;
+    let tile_row_1: u32 = block_row * 2u32 + 1u32;
+    let tile_col_0: u32 = block_col * 2u32;
+    let tile_col_1: u32 = block_col * 2u32 + 1u32;
+
+    // 4 loop-carried coopmat accumulators (N-phi OpPhi path, VERBATIM the base).
+    let mut acc_00: matrix[f16, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_01: matrix[f16, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_10: matrix[f16, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_11: matrix[f16, 16, 16, accumulator] = coopmat_zero();
+
+    // Staging iterations per thread (UNCHANGED by padding — still a_block_size/32 = 16 LOGICAL
+    // elements per lane; padding affects only the WRITE INDEX, not the element COUNT).
+    let a_iters: u32 = ?a_block_size / 32u32;
+    let b_iters: u32 = ?b_block_size / 32u32;
+
+    // Number of K-blocks.
+    let num_k_blocks: u32 = K / ?tile_k;
+
+    // K-loop: 4 coopmat accumulators are loop-carried (N-phi path), VERBATIM the base.
+    for k_block in range(0u32, num_k_blocks) {
+
+        // ── Stage A into a_tile at the PADDED index ─────────────────────────────
+        // The LOGICAL (a_row, a_col) decode is VERBATIM the base; ONLY the shared write index
+        // changes from a_row*16+a_col to a_row*(16+PAD_A)+a_col.
+        for a_iter in range(0u32, a_iters) {
+            let ei_a: u32 = a_iter * 32u32 + lane;
+            let a_row: u32 = ei_a / 16u32;                 // LOGICAL row (0..31), NOT padded
+            let a_col: u32 = ei_a - a_row * 16u32;         // LOGICAL col (0..15)
+            let a_global_row: u32 = block_row * 32u32 + a_row;
+            let a_global_col: u32 = k_block * ?tile_k + a_col;
+            let a_global: u32 = a_global_row * K + a_global_col;
+            // PADDED write index: a_row * (16+PAD_A) + a_col.
+            let a_sh: u32 = a_row * ?a_pad_stride + a_col;
+            a_tile[a_sh] = A[a_global];
+        }
+
+        // ── Stage B into b_tile at the PADDED index ─────────────────────────────
+        for b_iter in range(0u32, b_iters) {
+            let ei_b: u32 = b_iter * 32u32 + lane;
+            let b_row: u32 = ei_b / 32u32;                 // LOGICAL row (0..15)
+            let b_col: u32 = ei_b - b_row * 32u32;         // LOGICAL col (0..31)
+            let b_global_row: u32 = k_block * ?tile_k + b_row;
+            let b_global_col: u32 = block_col * 32u32 + b_col;
+            let b_global: u32 = b_global_row * N + b_global_col;
+            // PADDED write index: b_row * (32+PAD_B) + b_col.
+            let b_sh: u32 = b_row * ?b_pad_stride + b_col;
+            b_tile[b_sh] = B[b_global];
+        }
+
+        // Barrier: all invocations must finish staging before the coopmat loads.
+        workgroup_barrier();
+
+        // ── Load A row-tiles from PADDED shared (stride 16+PAD_A) ────────────────
+        // a_mat_0: row-tile 0, offset 0, stride 16+PAD_A.
+        // a_mat_1: row-tile 1, offset 16*(16+PAD_A) (the padded byte-base of LOGICAL ROW 16 —
+        //          a ROW-slab offset that SCALES with the pad), stride 16+PAD_A.
+        let a_mat_0: matrix[f16, 16, 16, a] = coopmat_load(a_tile, 0u32, ?a_pad_stride);
+        let a_mat_1: matrix[f16, 16, 16, a] = coopmat_load(a_tile, ?a_pad_mat1off, ?a_pad_stride);
+
+        // ── Load B col-tiles from PADDED shared (stride 32+PAD_B) ───────────────
+        // b_mat_0: col-tile 0, offset 0,  stride 32+PAD_B.
+        // b_mat_1: col-tile 1, offset 16, stride 32+PAD_B.
+        //   *** GATE-NOTE #1: b_mat_1 offset STAYS 16 (intra-row COLUMN-band offset, UNAFFECTED
+        //       by row padding — row padding extends the row TAIL, not the column band start);
+        //       ONLY the stride grows to 32+PAD_B. Do NOT add PAD to this offset. ***
+        let b_mat_0: matrix[f16, 16, 16, b] = coopmat_load(b_tile, 0u32, ?b_pad_stride);
+        let b_mat_1: matrix[f16, 16, 16, b] = coopmat_load(b_tile, 16u32, ?b_pad_stride);
+
+        // ── 4 coopmat MulAdds (VERBATIM the base) ───────────────────────────────
+        acc_00 = coopmat_mul_add(a_mat_0, b_mat_0, acc_00);
+        acc_01 = coopmat_mul_add(a_mat_0, b_mat_1, acc_01);
+        acc_10 = coopmat_mul_add(a_mat_1, b_mat_0, acc_10);
+        acc_11 = coopmat_mul_add(a_mat_1, b_mat_1, acc_11);
+
+        // WAR barrier: before the next k_block overwrites a_tile / b_tile.
+        workgroup_barrier();
+    }
+
+    // ── Store the 4 accumulated tiles to C (VERBATIM the base) ──────────────────
+    let c_base_00: u32 = (tile_row_0 * 16u32) * N + (tile_col_0 * 16u32);
+    let c_base_01: u32 = (tile_row_0 * 16u32) * N + (tile_col_1 * 16u32);
+    let c_base_10: u32 = (tile_row_1 * 16u32) * N + (tile_col_0 * 16u32);
+    let c_base_11: u32 = (tile_row_1 * 16u32) * N + (tile_col_1 * 16u32);
+
+    coopmat_store(acc_00, C, c_base_00, N);
+    coopmat_store(acc_01, C, c_base_01, N);
+    coopmat_store(acc_10, C, c_base_10, N);
+    coopmat_store(acc_11, C, c_base_11, N);
+
+    return;
+}
