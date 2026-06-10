@@ -32,6 +32,7 @@ use axc_runtime::{
 };
 
 const FLASH_COOPMAT_SRC: &str = include_str!("../../../examples/flash_attention_coopmat.axc");
+const FLASH_COOPMAT_PV_SRC: &str = include_str!("../../../examples/flash_attention_coopmat_pv.axc");
 const FLASH_EXP_SRC: &str = include_str!("../../../examples/flash_attention_exp.axc");
 
 /// STRETCH speedup gate (NOT loosened; a miss is a documented honest-negative).
@@ -240,6 +241,77 @@ fn bench_resident_flash_attention(c: &mut Criterion) {
         eprintln!(
             "AT-2204: ratio not computed (one kernel unavailable). scalar_ns={scalar_ns:?} \
              coopmat_ns={coopmat_ns:?}"
+        );
+    }
+
+    // ── AT-2214 A/B: coopmat-PV (flash_attention_coopmat_pv.axc) — the SECOND matmul P·V ─────
+    // now ALSO on tensor cores. SAME parallelism as flash_attention_coopmat (@workgroup(32,1,1),
+    // 16-row query tile, coopmat QKᵀ) — differs ONLY in the P·V path (coopmat PV→shared +
+    // scalar rescale, vs the scalar 16-MAC dot). So the coopmat-PV-vs-scalar-PV ratio isolates
+    // the P·V-path change, NOT the parallelism. HONEST-NEGATIVE provisioned: the scalar P·V was
+    // a cheap inner product; the coopmat round-trip (p_sh f16 write + coopmat P/V loads + PV->
+    // shared store + pv_sh read + 2 extra barriers + the f16 narrowing) may ERASE the win.
+    let coopmat_pv = prepare(&ctx, FLASH_COOPMAT_PV_SRC, "flash_attention_coopmat_pv");
+    let coopmat_pv_ns = match &coopmat_pv {
+        Some(handle) => {
+            let (ns, src) = resident_min_of_n(
+                &ctx, handle,
+                &[&q_bytes, &k_bytes, &v_bytes, &vec![0u8; o_size as usize]],
+                &[0, 0, 0, o_size],
+                ((SEQ / 16) as u32, 1, 1),
+                pc.clone(),
+            );
+            let tflops = attention_tflops(SEQ, HEAD_DIM, ns);
+            eprintln!(
+                "resident_flash_attention COOPMAT-PV (flash_attention_coopmat_pv): seq={SEQ} \
+                 head_dim={HEAD_DIM} kernel_ns={ns} ({:.3} ms) attention_tflops={tflops:.3} timing={:?}",
+                ns as f64 * 1e-6, src
+            );
+            Some(ns)
+        }
+        None => {
+            eprintln!("resident_flash_attention: coopmat-PV kernel typed-skip (no PV ratio reported)");
+            None
+        }
+    };
+
+    // ── AT-2214: the coopmat-PV vs scalar-PV ratio (the load-bearing A/B for THIS milestone) ──
+    // The A/B opponent is flash_attention_coopmat (scalar P·V), NOT the serial scalar kernel —
+    // both have identical parallelism so the ratio attributes to the P·V path ALONE.
+    if let (Some(c_ns), Some(pv_ns)) = (coopmat_ns, coopmat_pv_ns) {
+        let pv_speedup = c_ns as f64 / pv_ns as f64;
+        let pv_verdict = if pv_speedup > 1.0 {
+            "coopmat-PV FASTER than scalar-PV (a win — report the measured ratio, no overclaim)"
+        } else {
+            "HONEST-NEGATIVE (the LIKELY outcome): coopmat P·V does NOT beat the cheap scalar \
+             16-MAC dot — the p_sh-f16 write + coopmat P/V loads + PV->shared store + pv_sh read \
+             + 2 extra barriers + f16 narrowing ERASE the win. DOCUMENTED finding, NOT a failure; \
+             the M3.2c-perf scalar-PV kernel REMAINS leader; NO bar loosened"
+        };
+        eprintln!(
+            "AT-2214 RESULT (coopmat-PV vs scalar-PV — THE P·V-path A/B): seq={SEQ} head_dim={HEAD_DIM}  \
+             scalar_pv_ns={c_ns} ({:.3} ms)  coopmat_pv_ns={pv_ns} ({:.3} ms)  \
+             SPEEDUP = scalar_pv/coopmat_pv = {pv_speedup:.3}x  => {pv_verdict}",
+            c_ns as f64 * 1e-6, pv_ns as f64 * 1e-6
+        );
+        // Per-phase note: BOTH kernels share QKᵀ (coopmat) + softmax (16-lane scalar). The ONLY
+        // delta is P·V: scalar = Σ_t P[r][t]·V[t][d] (16 MACs × 1024 outputs, 32 lanes, V f32 in
+        // shared); coopmat-PV = p_sh f16 write (softmax) + 1 P-load + 4 V-loads + 4 mul_adds + 4
+        // PV-stores + a pv_sh read + 2 extra barriers (V now f16). The rescale-add is unchanged
+        // (acc-in-shared; reads pv_sh instead of computing the dot).
+        eprintln!(
+            "AT-2214 PHASE BREAKDOWN (QKᵀ coopmat / softmax 16-lane / P·V / rescale acc-in-shared): \
+             both kernels share the coopmat QKᵀ + the 16-lane scalar softmax + the scalar rescale; \
+             the ONLY measured delta is the P·V path (scalar 16-MAC dot vs coopmat PV->shared). A \
+             non-win means the P·V was already cheap relative to softmax + shared round-trips — the \
+             exact Amdahl ceiling the deferred Option C (coopmat acc + diagonal-scale) targets. The \
+             PRIMARY deliverable is the coopmat-PV MECHANISM + correctness (AT-2212/2213/2215), NOT \
+             this ratio."
+        );
+    } else {
+        eprintln!(
+            "AT-2214: coopmat-PV ratio not computed (a kernel unavailable). coopmat_ns={coopmat_ns:?} \
+             coopmat_pv_ns={coopmat_pv_ns:?}"
         );
     }
 

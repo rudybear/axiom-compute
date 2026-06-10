@@ -2814,3 +2814,246 @@ fn at2205_flash_coopmat_vs_scalar_agree() {
     }
     eprintln!("AT-2205 PASS: cross-kernel agreement at seq=512 AND seq=2048 on {}", ctx.physical_device_name());
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// M3.2c-PV: coopmat-accelerated P·V FlashAttention-2 (flash_attention_coopmat_pv.axc)
+// AT-2212/2213 (correctness vs true-exp oracle), AT-2215 (cross-kernel vs the scalar-PV kernel).
+// The SECOND matmul P·V now runs on tensor cores; the f16(P)·f16(V) coopmat is a SECOND error
+// source on top of the f16-QKᵀ — AT-2212/2213 RE-MEASURE + REPORT the actual max_diff.
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+const FLASH_ATTENTION_COOPMAT_PV_SRC: &str =
+    include_str!("../../../examples/flash_attention_coopmat_pv.axc");
+
+/// Dispatch flash_attention_coopmat_pv.axc (the coopmat-PV kernel) on the GPU for a fixture.
+/// Returns the O buffer (f32), OR None on CoopMatUnsupported (Lavapipe typed-skip). Identical
+/// dispatch shape to fa2_coopmat_dispatch_gpu — only the source + entry point differ.
+fn fa2_coopmat_pv_dispatch_gpu(
+    ctx: &VulkanContext,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    head_dim: usize,
+    inv_sqrt_d: f32,
+) -> Option<Vec<f32>> {
+    fa2_coopmat_preflight(seq_len as u32, head_dim as u32);
+    let (bytes, meta) = compile_source_with_meta(FLASH_ATTENTION_COOPMAT_PV_SRC)
+        .expect("flash_attention_coopmat_pv.axc must compile");
+    let words: Vec<u32> = bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    let handle = match ctx.prepare_kernel_checked(
+        &words,
+        &meta.binding_plan,
+        meta.push_constant_total_bytes,
+        &meta.entry_point,
+        meta.coopmat.as_ref(),
+        "flash_attention_coopmat_pv",
+        meta.shared_memory_bytes,
+    ) {
+        Ok(h) => h,
+        Err(DispatchError::CoopMatUnsupported { reason, .. }) => {
+            eprintln!("flash_attention_coopmat_pv: CoopMatUnsupported (typed-skip on Lavapipe): {reason}");
+            return None;
+        }
+        Err(DispatchError::DeviceFeatureUnsupported { feature, .. }) => {
+            eprintln!("flash_attention_coopmat_pv: DeviceFeatureUnsupported({feature}) — typed-skip");
+            return None;
+        }
+        Err(e) => panic!("flash_attention_coopmat_pv: prepare_kernel_checked failed: {e}"),
+    };
+
+    let q_bytes: Vec<u8> = q.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let k_bytes: Vec<u8> = k.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let v_bytes: Vec<u8> = v.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let o_size = seq_len * head_dim * 4;
+    let pc = push_attention(seq_len as u32, head_dim as u32, inv_sqrt_d);
+    let wg_x: u32 = (seq_len / 16) as u32;
+
+    let outputs = ctx
+        .dispatch_handle(
+            &handle,
+            (wg_x, 1, 1),
+            &[&q_bytes, &k_bytes, &v_bytes, &vec![0u8; o_size]],
+            &[0, 0, 0, o_size],
+            &pc,
+        )
+        .unwrap_or_else(|e| panic!("flash_attention_coopmat_pv: dispatch failed: {e}"));
+
+    Some(
+        outputs[3]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+    )
+}
+
+/// AT-2212: CORRECTNESS, SMALL — flash_attention_coopmat_pv at seq=512, head_dim=64 within the
+/// FROZEN combined abs/rel 1e-3 vs fa2_true_exp_softmax_reference, on the differing-rowmax
+/// fixture (sharp softmax → small f16 P values → exercises the f16-PV second error source).
+/// RE-MEASURES + REPORTS the actual max_diff (the f16(P)·f16(V) coopmat is a SECOND narrowing).
+#[test]
+#[ignore]
+fn at_2212_flash_coopmat_pv_correct_seq512() {
+    if !gpu_tests_enabled() {
+        eprintln!("at_2212: AXC_ENABLE_GPU_TESTS not set; skipping");
+        return;
+    }
+    const SEQ_LEN: usize = 512;
+    const HEAD_DIM: usize = 64;
+    let inv_sqrt_d = 1.0_f32 / (HEAD_DIM as f32).sqrt();
+    let (q, k, v) = fa2_coopmat_differing_rowmax_fixture(SEQ_LEN, HEAD_DIM);
+
+    let max_arg = fa2_fixture_max_postmax_arg(&q, &k, SEQ_LEN, HEAD_DIM, inv_sqrt_d);
+    assert!(
+        max_arg > 3.0_f32,
+        "AT-2212: fixture must be REAL range (max |post-max arg| > 3.0); got {max_arg}"
+    );
+
+    let ctx = VulkanContext::new().expect("VulkanContext must init");
+    eprintln!("AT-2212 GPU: device={}, fixture max post-max arg={max_arg}", ctx.physical_device_name());
+
+    let gpu_o = match fa2_coopmat_pv_dispatch_gpu(&ctx, &q, &k, &v, SEQ_LEN, HEAD_DIM, inv_sqrt_d) {
+        Some(o) => o,
+        None => { eprintln!("AT-2212: coopmat typed-skip"); return; }
+    };
+    let true_o = fa2_true_exp_softmax_reference(&q, &k, &v, SEQ_LEN, HEAD_DIM, inv_sqrt_d);
+
+    let mut max_diff = 0.0_f32;
+    for (g, t) in gpu_o.iter().zip(true_o.iter()) {
+        let d = (g - t).abs();
+        if d > max_diff { max_diff = d; }
+        assert!(
+            within_combined(*g, *t, FA2_FROZEN_TOL, FA2_FROZEN_TOL),
+            "AT-2212 (GATE): flash_attention_coopmat_pv gpu={g} vs true-exp softmax={t} exceeds \
+             FROZEN {FA2_FROZEN_TOL} at seq=512 (max post-max arg={max_arg}) — the f16-PV \
+             SECOND error source; do NOT loosen 1e-3, REPORT the f16-PV limitation"
+        );
+    }
+    eprintln!(
+        "AT-2212 PASS: flash_attention_coopmat_pv vs true-exp softmax max_diff={max_diff} \
+         (<= FROZEN {FA2_FROZEN_TOL}) at seq=512 head_dim=64 (MEASURED f16-PV error; max post-max \
+         arg={max_arg}) on {}",
+        ctx.physical_device_name()
+    );
+}
+
+/// AT-2213: CORRECTNESS, REAL shape — flash_attention_coopmat_pv at seq=2048, head_dim=64 within
+/// FROZEN 1e-3 vs the true-exp oracle, differing-rowmax fixture (128 K/V blocks).
+#[test]
+#[ignore]
+fn at_2213_flash_coopmat_pv_correct_seq2048() {
+    if !gpu_tests_enabled() {
+        eprintln!("at_2213: AXC_ENABLE_GPU_TESTS not set; skipping");
+        return;
+    }
+    const SEQ_LEN: usize = 2048;
+    const HEAD_DIM: usize = 64;
+    let inv_sqrt_d = 1.0_f32 / (HEAD_DIM as f32).sqrt();
+    let (q, k, v) = fa2_coopmat_differing_rowmax_fixture(SEQ_LEN, HEAD_DIM);
+
+    let max_arg = fa2_fixture_max_postmax_arg(&q, &k, SEQ_LEN, HEAD_DIM, inv_sqrt_d);
+    assert!(
+        max_arg > 3.0_f32,
+        "AT-2213: fixture must be REAL range (max |post-max arg| > 3.0); got {max_arg}"
+    );
+
+    let ctx = VulkanContext::new().expect("VulkanContext must init");
+    eprintln!("AT-2213 GPU: device={}, fixture max post-max arg={max_arg}", ctx.physical_device_name());
+
+    let gpu_o = match fa2_coopmat_pv_dispatch_gpu(&ctx, &q, &k, &v, SEQ_LEN, HEAD_DIM, inv_sqrt_d) {
+        Some(o) => o,
+        None => { eprintln!("AT-2213: coopmat typed-skip"); return; }
+    };
+    let true_o = fa2_true_exp_softmax_reference(&q, &k, &v, SEQ_LEN, HEAD_DIM, inv_sqrt_d);
+
+    let mut max_diff = 0.0_f32;
+    for (g, t) in gpu_o.iter().zip(true_o.iter()) {
+        let d = (g - t).abs();
+        if d > max_diff { max_diff = d; }
+        assert!(
+            within_combined(*g, *t, FA2_FROZEN_TOL, FA2_FROZEN_TOL),
+            "AT-2213 (GATE): flash_attention_coopmat_pv gpu={g} vs true-exp softmax={t} exceeds \
+             FROZEN {FA2_FROZEN_TOL} at seq=2048 (max post-max arg={max_arg})"
+        );
+    }
+    eprintln!(
+        "AT-2213 PASS: flash_attention_coopmat_pv vs true-exp softmax max_diff={max_diff} \
+         (<= FROZEN {FA2_FROZEN_TOL}) at seq=2048 head_dim=64 (128 K/V blocks; MEASURED f16-PV \
+         error; max post-max arg={max_arg}) on {}",
+        ctx.physical_device_name()
+    );
+}
+
+/// AT-2215: CROSS-KERNEL AGREEMENT (the load-bearing structural-RACE / wrong-stride / f16-PV
+/// detector). The coopmat-PV kernel vs the M3.2c-perf scalar-PV kernel (flash_attention_coopmat
+/// .axc) — two coopmat-QKᵀ impls that differ ONLY in the P·V path — within 1e-3 at seq=512 AND
+/// 2048, on an ASYMMETRIC (per-d-varying V) differing-rowmax fixture: a wrong pv_sh store/read
+/// stride, a wrong V column-slice offset, a missing BARRIER(P)/BARRIER(PV), or the corr_sh
+/// cross-lane race cannot pass by luck. Both ALSO checked vs the true-exp oracle.
+#[test]
+#[ignore]
+fn at_2215_flash_coopmat_pv_vs_scalar_pv_agree() {
+    if !gpu_tests_enabled() {
+        eprintln!("at_2215: AXC_ENABLE_GPU_TESTS not set; skipping");
+        return;
+    }
+    const HEAD_DIM: usize = 64;
+    let inv_sqrt_d = 1.0_f32 / (HEAD_DIM as f32).sqrt();
+
+    let ctx = VulkanContext::new().expect("VulkanContext must init");
+    eprintln!("AT-2215 GPU: device={}", ctx.physical_device_name());
+
+    for &seq_len in &[512usize, 2048usize] {
+        // The differing-rowmax fixture's V[j][d] = 0.05*((j*64+d)%13)-0.3 is NON-constant in
+        // BOTH the contraction index j AND the head-dim column d → a wrong PV stride/offset
+        // mis-slices V and CANNOT pass by luck.
+        let (q, k, v) = fa2_coopmat_differing_rowmax_fixture(seq_len, HEAD_DIM);
+        let max_arg = fa2_fixture_max_postmax_arg(&q, &k, seq_len, HEAD_DIM, inv_sqrt_d);
+
+        let coopmat_pv_o = match fa2_coopmat_pv_dispatch_gpu(&ctx, &q, &k, &v, seq_len, HEAD_DIM, inv_sqrt_d) {
+            Some(o) => o,
+            None => { eprintln!("AT-2215: coopmat typed-skip"); return; }
+        };
+        // The M3.2c-perf scalar-PV coopmat-QKᵀ kernel on the IDENTICAL inputs (the A/B opponent).
+        let scalar_pv_o = match fa2_coopmat_dispatch_gpu(&ctx, &q, &k, &v, seq_len, HEAD_DIM, inv_sqrt_d) {
+            Some(o) => o,
+            None => { eprintln!("AT-2215: scalar-PV coopmat typed-skip"); return; }
+        };
+
+        let mut cross_diff = 0.0_f32;
+        for (cm, sc) in coopmat_pv_o.iter().zip(scalar_pv_o.iter()) {
+            let d = (cm - sc).abs();
+            if d > cross_diff { cross_diff = d; }
+            assert!(
+                within_combined(*cm, *sc, FA2_FROZEN_TOL, FA2_FROZEN_TOL),
+                "AT-2215 (seq={seq_len}): coopmat-PV={cm} vs scalar-PV flash_attention_coopmat={sc} \
+                 exceeds FROZEN {FA2_FROZEN_TOL} (asymmetric differing-rowmax fixture, max post-max \
+                 arg={max_arg}) — a wrong V stride/offset, a missing BARRIER(P)/BARRIER(PV), the \
+                 corr_sh cross-lane race, OR an f16-PV rounding surprise"
+            );
+        }
+
+        // Defense in depth: coopmat-PV vs the true-exp oracle too.
+        let true_o = fa2_true_exp_softmax_reference(&q, &k, &v, seq_len, HEAD_DIM, inv_sqrt_d);
+        let mut oracle_diff = 0.0_f32;
+        for (cm, t) in coopmat_pv_o.iter().zip(true_o.iter()) {
+            let d = (cm - t).abs();
+            if d > oracle_diff { oracle_diff = d; }
+        }
+        assert!(
+            oracle_diff <= FA2_FROZEN_TOL,
+            "AT-2215 (seq={seq_len}): coopmat-PV vs true-exp oracle max_diff={oracle_diff} > FROZEN {FA2_FROZEN_TOL}"
+        );
+
+        eprintln!(
+            "AT-2215 PASS (seq={seq_len}): coopmat-PV vs scalar-PV max_diff={cross_diff}; \
+             coopmat-PV vs oracle max_diff={oracle_diff} (both <= {FA2_FROZEN_TOL}); \
+             asymmetric differing-rowmax fixture, max post-max arg={max_arg}"
+        );
+    }
+    eprintln!("AT-2215 PASS: coopmat-PV vs scalar-PV agreement at seq=512 AND seq=2048 on {}", ctx.physical_device_name());
+}
