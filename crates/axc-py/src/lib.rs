@@ -78,16 +78,31 @@ impl CompiledKernel {
         self.meta.binding_plan.push_constant_total_bytes
     }
 
-    /// M4.1p2: the kernel's scalar push-constant slots as `(name, offset_bytes, size_bytes)`,
-    /// one per scalar member (std430 layout). Python assembles M/N/K/n_blocks_per_row generically
-    /// by OFFSET+NAME (the analogue of the bench's `assemble_pc`) — NOT positionally — so a
-    /// wrong push-constant ORDER is structurally impossible (each value lands at its named offset).
-    fn scalar_layout(&self) -> Vec<(String, u32, u32)> {
+    /// M4.1p2: the kernel's scalar push-constant slots as
+    /// `(name, offset_bytes, size_bytes, ty_str)`, one per scalar member (std430 layout).
+    /// Python assembles M/N/K/n_blocks_per_row/inv_sqrt_d generically by OFFSET+NAME (the
+    /// analogue of the bench's `assemble_pc`) — NOT positionally — so a wrong push-constant
+    /// ORDER is structurally impossible (each value lands at its named offset).
+    ///
+    /// M4.1p4 (the f32 push-constant blocker fix): the per-slot tuple now EXPOSES the scalar
+    /// type keyword (`s.ty.display_name()` — e.g. "f32"/"u32"), which is already carried by
+    /// the HIR `ScalarPushConstantSlot.ty`. f32 and u32 both report `size_bytes == 4`, so
+    /// without the ty string the Python packer cannot tell `inv_sqrt_d` (f32) from `seq_len`
+    /// (u32) and would `int(0.125) == 0` it to four zero bytes (uniform softmax — silently
+    /// wrong). This surfaces the EXISTING HIR field — NO codegen / binding_plan change.
+    fn scalar_layout(&self) -> Vec<(String, u32, u32, String)> {
         self.meta
             .binding_plan
             .scalars
             .iter()
-            .map(|s| (s.name.clone(), s.offset, s.ty.bit_width() / 8))
+            .map(|s| {
+                (
+                    s.name.clone(),
+                    s.offset,
+                    s.ty.bit_width() / 8,
+                    s.ty.display_name().to_string(),
+                )
+            })
             .collect()
     }
 
