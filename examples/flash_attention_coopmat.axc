@@ -1,0 +1,246 @@
+// examples/flash_attention_coopmat.axc — M3.2c-perf: coopmat-accelerated FlashAttention-2.
+//
+// Computes S = Q·Kᵀ (the score block) as a cooperative_matrix (tensor-core) matmul into
+// shared, then runs the online softmax + P·V + acc-rescale SCALAR over the shared tile.
+// One workgroup (32 lanes / one subgroup) computes a 16-row QUERY TILE (vs the scalar
+// flash_attention_exp.axc's one row). head_dim=64. PURE SOURCE — ZERO codegen change.
+//
+// THE CRUX (acc-rescale), resolved by Option A: the output accumulator acc[16][64] is held
+// in shared[f32] (NOT a coopmat), so the per-row `correction` rescale (acc = acc*corr + P·V)
+// is an ordinary shared elementwise write — the M3.2b acc-in-shared pattern
+// (flash_attention_exp.axc:120) lifted from ONE row to a 16-row tile. coopmat_mul_add is
+// A·B+C only (no per-row diagonal scale), so a coopmat acc could NOT carry the rescale; the
+// coopmat P·V variant (Option C) is DEFERRED to a follow-on (needs a diagonal-scale feature).
+//
+// What coopmat accelerates HERE: only the QKᵀ matmul (step 1). The scalar P·V + 16-lane
+// softmax + the S/P shared round-trips dominate (Amdahl) → a ~1.3-2× speedup vs the scalar
+// kernel is the EXPECTED, documented outcome; the scalar kernel stays leader. The PRIMARY
+// deliverable is CORRECTNESS + the coopmat-QKᵀ + acc-in-shared MECHANISM (de-risks Option C).
+//
+// ── Tiling + dispatch ────────────────────────────────────────────────────────────────────
+//   TILE_Q = TILE_K = 16, head_dim = 64 (= 4 coopmat K-blocks of 16). @workgroup(32,1,1) = one
+//   subgroup. Dispatch (seq_len/16, 1, 1) workgroups: q_tile = gid(0)/32 (ASYMMETRIC divide-x);
+//   lane = subgroup_invocation_id(). Each workgroup streams ALL seq_len keys in 16-key blocks,
+//   maintaining per-query-row online-softmax state for its 16 rows. seq_len%16==0 and
+//   head_dim==64 are host-preflight-enforced (fa2_coopmat_preflight).
+//
+// ── Shared layout (head_dim=64, TILE_Q=TILE_K=16) — 13504 B total < 16384 portable floor ──
+//   q_tile_sh: shared[f16, 16*64] = 1024 f16 = 2048 B   (Q tile, staged ONCE — the FA2 win)
+//   k_tile_sh: shared[f16, 64*16] = 1024 f16 = 2048 B   (K block TRANSPOSED [d_full][key], for Kᵀ)
+//   v_tile_sh: shared[f32, 16*64] = 1024 f32 = 4096 B   (V block, for the scalar P·V)
+//   s_tile_sh: shared[f32, 16*16] =  256 f32 = 1024 B   (coopmat S=QKᵀ result; overwritten as P)
+//   acc_sh:    shared[f32, 16*64] = 1024 f32 = 4096 B   (rescaled output accumulator — the crux)
+//   m_sh:      shared[f32, 16]    =   16 f32 =   64 B   (per-row running max)
+//   l_sh:      shared[f32, 16]    =   16 f32 =   64 B   (per-row running denom)
+//   corr_sh:   shared[f32, 16]    =   16 f32 =   64 B   (per-row block correction; cross-lane)
+//
+// ── Lane partitions (R1, DISJOINT + TOTAL) ─────────────────────────────────────────────────
+//   softmax phase (under `if lane < 16`): lane L owns row L; lanes 16..31 idle. Lane L is the
+//     SOLE writer of m_sh[L]/l_sh[L]/corr_sh[L] and its row band s_tile_sh[L*16 .. L*16+15].
+//   P·V / zero-init / finalize phase (ALL 32 lanes): lane L owns cells {c = L + 32*i, i in
+//     0..32} over [0,1024); r = c/64, d = c%64.
+//
+// ── The 4 barriers (R2, ALL at conditional_depth==0 — NONE inside the lane<16 branch) ──────
+//   (1) post K/V/(first-block Q) staging → before coopmat loads          (RAW)
+//   (2) after the warp-collective coopmat S-store → before scalar S-read (RAW)
+//   (3) after BOTH P AND corr_sh written → before the P·V phase reads them
+//         — THE cross-lane visibility: corr_sh[r] written by lane r, read by cell-owner lane c%32
+//   (4) WAR end-of-body → before the next block overwrites k/v/s/corr shared
+//
+// ── s_acc iteration-local (R3) ─────────────────────────────────────────────────────────────
+//   s_acc is DECLARED INSIDE the K/V-block loop body (fresh coopmat_zero() per iteration, the 4
+//   head-dim mul_adds UNROLLED at the K/V-body top level — NOT a nested loop, NOT pre-loop
+//   declared) → no pre-loop SSA id → NOT loop-carried → EXACTLY 0 coopmat OpPhi (AT-2201). Only
+//   acc_sh/m_sh/l_sh (SHARED) loop-carry across the K/V loop (shared needs no phi).
+//
+// Anti-pattern #2: explicit `return;`.   Anti-pattern #8: no `>>` (none used here).
+
+@kernel
+@workgroup(32, 1, 1)
+@cooperative_matrix
+@intent("coopmat S=QKᵀ FlashAttention-2: 16-row query tile, scalar online-softmax + acc-in-shared (AT-2200..2207)")
+@complexity(O(n))
+fn flash_attention_coopmat(
+    Q: readonly_buffer[f32],
+    K: readonly_buffer[f32],
+    V: readonly_buffer[f32],
+    O: buffer[f32],
+    seq_len: u32,
+    head_dim: u32,
+    inv_sqrt_d: f32
+) -> void {
+    // Shared layout (see header). head_dim=64, TILE_Q=TILE_K=16 (host-preflight-enforced).
+    shared q_tile_sh: shared[f16, 1024];   // Q tile [16][64], row-major (f16 for coopmat A)
+    shared k_tile_sh: shared[f16, 1024];   // K block TRANSPOSED [64][16] (d_full,key) → Kᵀ via row-major load
+    shared v_tile_sh: shared[f32, 1024];   // V block [16][64], row-major (f32 for scalar P·V)
+    shared s_tile_sh: shared[f32, 256];    // S=QKᵀ [16][16] (coopmat store dest; then overwritten as P)
+    shared acc_sh: shared[f32, 1024];      // output accumulator [16][64] (the crux — in shared)
+    shared m_sh: shared[f32, 16];          // per-row running max
+    shared l_sh: shared[f32, 16];          // per-row running denom
+    shared corr_sh: shared[f32, 16];       // per-row block correction (cross-lane: written by row r, read by cell c%32)
+
+    // Which 16-row query tile this workgroup handles (ASYMMETRIC gid(0)/32 divide).
+    let q_tile: u32 = gid(0u32) / 32u32;
+    let lane: u32 = subgroup_invocation_id();
+
+    // Global row base of this query tile.
+    let q_tile_row0: u32 = q_tile * 16u32;
+
+    // ── Stage Q tile ONCE (reused across all K/V blocks — the FA2 win) ───────────────────
+    // q_tile_sh[16*64=1024] = Q[(q_tile_row0 + r)*head_dim + d], r=ei/64, d=ei%64.
+    // 1024 elements / 32 lanes = 32 iters per lane (ei = it*32 + lane covers 0..1023).
+    for q_it in range(0u32, 32u32) {
+        let ei: u32 = q_it * 32u32 + lane;
+        let r: u32 = ei / 64u32;
+        let d: u32 = ei - r * 64u32;
+        let g_row: u32 = q_tile_row0 + r;
+        q_tile_sh[ei] = f32_to_f16(Q[g_row * head_dim + d]);
+    }
+
+    // ── Zero-init acc_sh + per-row state (R1 cell partition; m/l set by lane<16) ──────────
+    // acc_sh[1024]: lane L owns {c = L + 32*i, i in 0..32}.
+    for z_it in range(0u32, 32u32) {
+        let c: u32 = z_it * 32u32 + lane;
+        acc_sh[c] = 0.0f32;
+    }
+    if lane < 16u32 {
+        m_sh[lane] = -1e9f32;   // running max init (j==0 guard forces correction=0 first)
+        l_sh[lane] = 0.0f32;    // running denom
+    }
+    workgroup_barrier();
+
+    // Number of K/V blocks streamed (seq_len / TILE_K). seq_len%16==0 host-enforced.
+    let num_kv_blocks: u32 = seq_len / 16u32;
+
+    // ── The K/V-block loop (TILE_K=16 keys per block) ─────────────────────────────────────
+    for j in range(0u32, num_kv_blocks) {
+        let kv_row0: u32 = j * 16u32;     // global key-row base of this block
+
+        // ── Stage K block TRANSPOSED into k_tile_sh [d_full][key] ────────────────────────
+        // k_tile_sh[d*16 + key] = K[(kv_row0 + key)*head_dim + d], d in 0..64, key in 0..16.
+        // 1024 elements / 32 lanes = 32 iters. ei = it*32 + lane → d = ei/16, key = ei%16.
+        for k_it in range(0u32, 32u32) {
+            let ei_k: u32 = k_it * 32u32 + lane;
+            let d_full: u32 = ei_k / 16u32;
+            let key: u32 = ei_k - d_full * 16u32;
+            let g_krow: u32 = kv_row0 + key;
+            k_tile_sh[ei_k] = f32_to_f16(K[g_krow * head_dim + d_full]);
+        }
+
+        // ── Stage V block [key][d] into v_tile_sh (f32, for scalar P·V) ──────────────────
+        // v_tile_sh[key*64 + d] = V[(kv_row0 + key)*head_dim + d]. ei = it*32 + lane.
+        for v_it in range(0u32, 32u32) {
+            let ei_v: u32 = v_it * 32u32 + lane;
+            let vkey: u32 = ei_v / 64u32;
+            let vd: u32 = ei_v - vkey * 64u32;
+            let g_vrow: u32 = kv_row0 + vkey;
+            v_tile_sh[ei_v] = V[g_vrow * head_dim + vd];
+        }
+
+        // BARRIER (1): staging writes → coopmat loads + scalar V reads (RAW). Depth 0.
+        workgroup_barrier();
+
+        // ── coopmat S = Q·Kᵀ (4 head-dim sub-blocks, UNROLLED at top level; s_acc fresh) ─
+        // A sub-block dk: q_tile_sh[16][64], the dk-th 16-wide column slice (offset dk*16,
+        //   stride 64). B sub-block dk: k_tile_sh[64][16], the dk-th 16-row slice (offset
+        //   dk*256, stride 16) = Kᵀ. s_acc += A_dk · B_dk for dk = 0..3.
+        let mut s_acc: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+
+        let qa0: matrix[f16, 16, 16, a] = coopmat_load(q_tile_sh, 0u32, 64u32);
+        let qa1: matrix[f16, 16, 16, a] = coopmat_load(q_tile_sh, 16u32, 64u32);
+        let qa2: matrix[f16, 16, 16, a] = coopmat_load(q_tile_sh, 32u32, 64u32);
+        let qa3: matrix[f16, 16, 16, a] = coopmat_load(q_tile_sh, 48u32, 64u32);
+
+        let kb0: matrix[f16, 16, 16, b] = coopmat_load(k_tile_sh, 0u32, 16u32);
+        let kb1: matrix[f16, 16, 16, b] = coopmat_load(k_tile_sh, 256u32, 16u32);
+        let kb2: matrix[f16, 16, 16, b] = coopmat_load(k_tile_sh, 512u32, 16u32);
+        let kb3: matrix[f16, 16, 16, b] = coopmat_load(k_tile_sh, 768u32, 16u32);
+
+        s_acc = coopmat_mul_add(qa0, kb0, s_acc);
+        s_acc = coopmat_mul_add(qa1, kb1, s_acc);
+        s_acc = coopmat_mul_add(qa2, kb2, s_acc);
+        s_acc = coopmat_mul_add(qa3, kb3, s_acc);
+
+        // Store S → shared (warp-collective, all 32 lanes). Row width = TILE_K = 16.
+        coopmat_store(s_acc, s_tile_sh, 0u32, 16u32);
+
+        // BARRIER (2): collective S-store → scalar S-read (RAW). Depth 0, BEFORE the branch.
+        workgroup_barrier();
+
+        // ── Scalar online-softmax over the shared S tile (R1: lane L owns row L, L<16) ────
+        if lane < 16u32 {
+            let r: u32 = lane;
+            let r_base: u32 = r * 16u32;
+            let m_i: f32 = m_sh[r];
+            let l_i: f32 = l_sh[r];
+
+            // rowmax: m_new = max(m_i, max_t S[r][t]*inv_sqrt_d).
+            let mut m_new: f32 = m_i;
+            for t0 in range(0u32, 16u32) {
+                let s_t: f32 = s_tile_sh[r_base + t0] * inv_sqrt_d;
+                let bigger: bool = s_t > m_new;
+                if bigger {
+                    m_new = s_t;
+                }
+            }
+
+            // correction = exp(m_i - m_new), EXCEPT j==0 where FORCED to 0 (no prior mass).
+            let cx: f32 = m_i - m_new;
+            let mut correction: f32 = exp(cx);
+            let is_first: bool = j == 0u32;
+            if is_first {
+                correction = 0.0f32;
+            }
+            corr_sh[r] = correction;    // CROSS-LANE: read by cell-owner lane c%32 in P·V (barrier 3)
+
+            // P overwrites S in this row band (in place); rowsum psum.
+            let mut psum: f32 = 0.0f32;
+            for t1 in range(0u32, 16u32) {
+                let px: f32 = s_tile_sh[r_base + t1] * inv_sqrt_d - m_new;
+                let p: f32 = exp(px);
+                s_tile_sh[r_base + t1] = p;
+                psum = psum + p;
+            }
+
+            l_sh[r] = l_i * correction + psum;
+            m_sh[r] = m_new;
+        }
+
+        // BARRIER (3): P (s_tile_sh) AND corr_sh fully written → P·V reads them. Depth 0,
+        // AFTER the lane<16 branch closes (the KEY cross-lane corr_sh visibility).
+        workgroup_barrier();
+
+        // ── Scalar P·V + acc-rescale (R1: all 32 lanes, lane L owns {c=L+32*i}) ───────────
+        // acc_sh[c] = acc_sh[c]*corr_sh[r] + Σ_t P[r][t] * V[t][d], r=c/64, d=c%64.
+        for pv_it in range(0u32, 32u32) {
+            let c: u32 = pv_it * 32u32 + lane;
+            let rr: u32 = c / 64u32;
+            let dd: u32 = c - rr * 64u32;
+            let rr_base: u32 = rr * 16u32;
+            let corr: f32 = corr_sh[rr];   // cross-lane read (written by lane rr; ordered by barrier 3)
+
+            let mut pv: f32 = 0.0f32;
+            for t2 in range(0u32, 16u32) {
+                let p_rt: f32 = s_tile_sh[rr_base + t2];
+                let v_td: f32 = v_tile_sh[t2 * 64u32 + dd];
+                pv = pv + p_rt * v_td;
+            }
+            acc_sh[c] = acc_sh[c] * corr + pv;
+        }
+
+        // BARRIER (4): WAR — P·V reads of s/v/corr → next block overwrites k/v/s/corr. Depth 0.
+        workgroup_barrier();
+    }
+
+    // ── Finalize: O[r][d] = acc_sh[c] / l_sh[r] (R1 cell partition; same as P·V) ──────────
+    for f_it in range(0u32, 32u32) {
+        let c: u32 = f_it * 32u32 + lane;
+        let rr: u32 = c / 64u32;
+        let dd: u32 = c - rr * 64u32;
+        let g_orow: u32 = q_tile_row0 + rr;
+        let out_idx: u32 = g_orow * head_dim + dd;
+        O[out_idx] = acc_sh[c] / l_sh[rr];
+    }
+
+    return;
+}

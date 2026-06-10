@@ -1254,3 +1254,219 @@ fn at_2006_bigrb_4x4_compile_validates() {
     let expected_shared: u32 = (1024 + 1024) * 2 + 2 * 512 * 4; // 4096 + 4096 = 8192
     at_2006_variant(src, "4x4", &rb4x4_assignments(), 16, expected_shared);
 }
+
+
+// ── M3.2c-perf: flash_attention_coopmat.axc compile anchors (AT-2200/2201/2206) ──────────
+
+const FLASH_ATTENTION_COOPMAT_SRC: &str =
+    include_str!("../../../examples/flash_attention_coopmat.axc");
+
+const MATMUL_SHARED_COOPMAT_BASELINE_SRC: &str =
+    include_str!("../../../examples/matmul_shared_coopmat.axc");
+
+/// SPIR-V capability values (subset).
+mod m32cperf_cap {
+    pub const SHADER: u32 = 1;
+    pub const FLOAT16: u32 = 9;
+    pub const VULKAN_MEMORY_MODEL: u32 = 5345;
+    pub const COOPERATIVE_MATRIX_KHR: u32 = 6022;
+}
+
+/// Scan coopmat-relevant ops + OpPhi, returning
+/// (n_coop_types, n_loads, n_stores, n_muladds, n_constant_null, n_total_phi, n_coop_phi).
+fn flash_coopmat_op_scan(words: &[u32]) -> (usize, usize, usize, usize, usize, usize, usize) {
+    use std::collections::BTreeSet;
+    const OP_TYPE_COOP: u16 = 4456;
+    const OP_COOP_LOAD: u16 = 4457;
+    const OP_COOP_STORE: u16 = 4458;
+    const OP_COOP_MULADD: u16 = 4459;
+    const OP_CONSTANT_NULL: u16 = 46;
+    const OP_PHI: u16 = 245;
+
+    let mut coop_type_ids: BTreeSet<u32> = BTreeSet::new();
+    let (mut n_load, mut n_store, mut n_muladd, mut n_null, mut n_phi, mut n_coop_phi) =
+        (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+    let mut idx = 5usize;
+    while idx < words.len() {
+        let w0 = words[idx];
+        let op = (w0 & 0xFFFF) as u16;
+        let wc = (w0 >> 16) as usize;
+        if wc == 0 || idx + wc > words.len() {
+            break;
+        }
+        match op {
+            // OpTypeCooperativeMatrixKHR: result id is the first operand word.
+            OP_TYPE_COOP => {
+                coop_type_ids.insert(words[idx + 1]);
+            }
+            OP_COOP_LOAD => n_load += 1,
+            OP_COOP_STORE => n_store += 1,
+            OP_COOP_MULADD => n_muladd += 1,
+            OP_CONSTANT_NULL => n_null += 1,
+            // OpPhi: word[idx+1] = result-type id, word[idx+2] = result id.
+            OP_PHI => {
+                n_phi += 1;
+                if coop_type_ids.contains(&words[idx + 1]) {
+                    n_coop_phi += 1;
+                }
+            }
+            _ => {}
+        }
+        idx += wc;
+    }
+    (coop_type_ids.len(), n_load, n_store, n_muladd, n_null, n_phi, n_coop_phi)
+}
+
+/// AT-2200: flash_attention_coopmat.axc compiles + spirv-val clean; caps are exactly
+/// [Shader, CooperativeMatrixKHR, VulkanMemoryModel] (+ Float16 for the f16 coopmat/shared
+/// types); SPV_KHR_cooperative_matrix + SPV_KHR_vulkan_memory_model present; the GLSL.std.450
+/// import is emitted EXACTLY once despite multiple exp() call sites.
+#[test]
+fn at_2200_flash_coopmat_compiles_validates() {
+    let words = compile_and_validate(FLASH_ATTENTION_COOPMAT_SRC, "flash_attention_coopmat.axc");
+    let (caps, exts) = capability_extension_sets(&words);
+
+    for required in [
+        m32cperf_cap::SHADER,
+        m32cperf_cap::COOPERATIVE_MATRIX_KHR,
+        m32cperf_cap::VULKAN_MEMORY_MODEL,
+        m32cperf_cap::FLOAT16,
+    ] {
+        assert!(
+            caps.contains(&required),
+            "AT-2200: missing required capability {required}; got caps={caps:?}"
+        );
+    }
+    // No capability beyond the PROVEN f16-coopmat baseline (matmul_shared_coopmat.axc) ∪
+    // {VulkanMemoryModel}. The required four are the load-bearing set; the f16-shared
+    // staging legitimately pulls in Float16Buffer (61) etc., exactly as the existing
+    // shared-staged coopmat kernel does (no NEW capability vs that proven kernel).
+    let baseline_words =
+        compile_words(MATMUL_SHARED_COOPMAT_BASELINE_SRC, Some(&tile_assignments(16, 16, 16)),
+            "matmul_shared_coopmat.axc (AT-2200 baseline)");
+    let (baseline_caps, _) = capability_extension_sets(&baseline_words);
+    let mut allowed: std::collections::BTreeSet<u32> = baseline_caps.clone();
+    allowed.insert(m32cperf_cap::VULKAN_MEMORY_MODEL);
+    let extra: Vec<u32> = caps.difference(&allowed).copied().collect();
+    assert!(
+        extra.is_empty(),
+        "AT-2200: flash_attention_coopmat declares capabilities NOT in \
+         (matmul_shared_coopmat ∪ {{VulkanMemoryModel}}): {extra:?} \
+         (caps={caps:?}, baseline={baseline_caps:?})"
+    );
+
+    assert!(
+        exts.contains("SPV_KHR_cooperative_matrix"),
+        "AT-2200: SPV_KHR_cooperative_matrix missing; exts={exts:?}"
+    );
+    assert!(
+        exts.contains("SPV_KHR_vulkan_memory_model"),
+        "AT-2200: SPV_KHR_vulkan_memory_model missing; exts={exts:?}"
+    );
+
+    // GLSL.std.450 import emitted exactly once (two exp() call sites — correction + p).
+    assert_eq!(
+        count_glsl450_imports(&words),
+        1,
+        "AT-2200: GLSL.std.450 import must be emitted EXACTLY once"
+    );
+
+    eprintln!("AT-2200 PASS: flash_attention_coopmat.axc spirv-val clean; caps={caps:?}; exts={exts:?}");
+}
+
+/// Count OpExtInstImport "GLSL.std.450" occurrences.
+fn count_glsl450_imports(words: &[u32]) -> usize {
+    let mut count = 0usize;
+    let mut idx = 5usize;
+    while idx < words.len() {
+        let w0 = words[idx];
+        let opcode = w0 & 0xFFFF;
+        let wc = (w0 >> 16) as usize;
+        if wc == 0 || idx + wc > words.len() {
+            break;
+        }
+        if opcode == 11 {
+            let mut bytes: Vec<u8> = Vec::new();
+            for &w in &words[idx + 2..idx + wc] {
+                bytes.extend_from_slice(&w.to_le_bytes());
+            }
+            let nul = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+            if String::from_utf8_lossy(&bytes[..nul]) == "GLSL.std.450" {
+                count += 1;
+            }
+        }
+        idx += wc;
+    }
+    count
+}
+
+/// AT-2201 (R3): OpPhi discipline — s_acc is declared INSIDE the K/V loop body (fresh
+/// coopmat_zero() per iteration, the 4 head-dim mul_adds UNROLLED at top level) so it is
+/// iteration-local and gets NO OpPhi. Assert the emitted SPIR-V has EXACTLY 0 coopmat OpPhi
+/// (the falsifier for an accidental pre-loop declaration/carry) AND exactly the expected
+/// coopmat op shape: 3 coopmat types (A/B/accumulator), 8 loads (4 Q + 4 K), 1 store (S),
+/// 4 mul_adds (the 4 head-dim sub-blocks), 1 OpConstantNull (the fresh s_acc per iteration).
+#[test]
+fn at_2201_flash_coopmat_opphi_discipline() {
+    let words = compile_and_validate(FLASH_ATTENTION_COOPMAT_SRC, "flash_attention_coopmat.axc (AT-2201)");
+    let (n_types, n_load, n_store, n_muladd, n_null, n_phi, n_coop_phi) =
+        flash_coopmat_op_scan(&words);
+
+    // THE falsifier: EXACTLY 0 coopmat OpPhi (s_acc iteration-local, not loop-carried).
+    assert_eq!(
+        n_coop_phi, 0,
+        "AT-2201: s_acc must be iteration-local → EXACTLY 0 coopmat OpPhi; found {n_coop_phi} \
+         (an accidental pre-loop s_acc declaration would create a coopmat phi). \
+         total_phi={n_phi}"
+    );
+    // No OpPhi at all is expected (acc/m/l loop-carry lives in SHARED, scalars never get phi).
+    assert_eq!(
+        n_phi, 0,
+        "AT-2201: no OpPhi expected (all loop-carry is in SHARED); found {n_phi}"
+    );
+
+    assert_eq!(n_types, 3, "AT-2201: expected 3 coopmat types (A,B,accumulator); got {n_types}");
+    assert_eq!(n_load, 8, "AT-2201: expected 8 coopmat loads (4 Q + 4 K); got {n_load}");
+    assert_eq!(n_store, 1, "AT-2201: expected 1 coopmat store (S); got {n_store}");
+    assert_eq!(n_muladd, 4, "AT-2201: expected 4 coopmat mul_adds (4 head-dim sub-blocks); got {n_muladd}");
+    assert_eq!(n_null, 1, "AT-2201: expected 1 OpConstantNull (the fresh s_acc); got {n_null}");
+
+    eprintln!(
+        "AT-2201 PASS: coopmat OpPhi=0 (s_acc iteration-local); shape: types={n_types} loads={n_load} \
+         stores={n_store} muladds={n_muladd} nulls={n_null}"
+    );
+}
+
+/// AT-2206: CI anchor — shared_memory_bytes == 13504 (INCL corr_sh[16]=64), seq-INVARIANT
+/// (seq is a push-constant, not an array dim → streaming, no O(seq) score buffer);
+/// exactly {Q,K,V,O} buffers bound (no S scratch buffer); < 16384 portable floor.
+#[test]
+fn at_2206_flash_coopmat_anchor_and_streaming() {
+    let (bytes, meta) = compile_source_with_meta(FLASH_ATTENTION_COOPMAT_SRC)
+        .expect("AT-2206: flash_attention_coopmat.axc must compile");
+    let _ = words_and_validate(bytes, "flash_attention_coopmat.axc (AT-2206)");
+
+    // Exact shared tally: q 2048 + k 2048 + v 4096 + s 1024 + acc 4096 + m 64 + l 64 + corr 64.
+    assert_eq!(
+        meta.shared_memory_bytes, 13504,
+        "AT-2206: shared_memory_bytes must be 13504 (incl corr_sh[16]); got {}",
+        meta.shared_memory_bytes
+    );
+    assert!(
+        meta.shared_memory_bytes <= 16384,
+        "AT-2206: shared_memory_bytes={} exceeds the 16384 portable floor",
+        meta.shared_memory_bytes
+    );
+
+    // Exactly {Q,K,V,O} — no O(seq) score scratch buffer (the streaming property).
+    let names: Vec<String> = meta.binding_plan.buffers.iter().map(|b| b.name.clone()).collect();
+    assert_eq!(
+        names,
+        vec!["Q".to_string(), "K".to_string(), "V".to_string(), "O".to_string()],
+        "AT-2206: buffers must be exactly {{Q,K,V,O}}; got {names:?}"
+    );
+
+    eprintln!(
+        "AT-2206 PASS: shared_memory_bytes=13504 (seq-invariant); buffers={names:?}"
+    );
+}
