@@ -34,6 +34,7 @@ Public API:
 from __future__ import annotations
 
 import itertools
+import struct
 import threading
 from typing import Optional, Sequence
 
@@ -174,50 +175,76 @@ class Kernel:
         return self._compiled.push_constant_bytes()
 
     def scalar_layout(self):
-        """M4.1p2: the scalar push-constant slots as ``[(name, offset, size_bytes), ...]``.
+        """The scalar push-constant slots as ``[(name, offset, size_bytes, ty_str), ...]``.
 
         Python uses this to assemble push constants by OFFSET+NAME (not positionally) — the
         analogue of the bench's ``assemble_pc`` — so a wrong scalar ORDER is impossible (each
         value lands at its own std430 offset).
+
+        M4.1p4: the 4th element ``ty_str`` is the scalar's source type keyword
+        (``'f32'``/``'u32'``/...), surfaced from the HIR slot's ``ScalarTy`` so the packer can
+        tell an f32 push constant (e.g. ``inv_sqrt_d``) from a u32 (both report ``size_bytes==4``)
+        and IEEE-754-pack it instead of ``int(0.125)==0``-ing it to zero bytes.
         """
         return self._compiled.scalar_layout()
 
     def assemble_push_constants(self, values: dict) -> bytes:
-        """M4.1p2: pack a ``{name: int}`` dict into the std430 push-constant blob.
+        """Pack a ``{name: scalar}`` dict into the std430 push-constant blob.
 
         Each named scalar is written at its own ``offset`` from :meth:`scalar_layout` (little-
         endian, ``size_bytes`` wide). Every scalar slot the kernel declares MUST be supplied;
         an unknown name or a missing slot raises (no silent zero-fill of a required scalar).
+
+        M4.1p4 — the f32 push-constant fix: the packer BRANCHES on the slot ``ty_str``. A FLOAT
+        slot (``ty_str == 'f32'``) is IEEE-754-packed via ``struct.pack('<f', float(value))`` so
+        e.g. ``inv_sqrt_d=0.125`` packs to ``b'\\x00\\x00\\x00\\x3e'`` (0x3E000000), NOT
+        ``int(0.125)==0`` (four zero bytes → uniform softmax, silently wrong). An INTEGER slot
+        keeps the existing ``int(value).to_bytes(...)`` path (the q4km M/N/K/n_blocks_per_row
+        path is UNCHANGED). f16/f64 floats are rejected (not needed by any current kernel — the
+        only float push constant is the f32 ``inv_sqrt_d``; fail-loud rather than silently
+        narrow).
         """
         layout = self.scalar_layout()
         total = self._compiled.push_constant_bytes()
         blob = bytearray(total)
-        names_in_layout = {name for (name, _off, _sz) in layout}
+        names_in_layout = {name for (name, _off, _sz, _ty) in layout}
         unknown = set(values) - names_in_layout
         if unknown:
             raise AxiomError(
                 f"assemble_push_constants: value(s) {sorted(unknown)} are not scalar push "
                 f"constants of this kernel (declared: {sorted(names_in_layout)})"
             )
-        for (name, offset, size) in layout:
+        for (name, offset, size, ty_str) in layout:
             if name not in values:
                 raise AxiomError(
                     f"assemble_push_constants: missing required scalar push constant '{name}' "
                     f"(kernel declares {sorted(names_in_layout)})"
                 )
-            val = int(values[name])
-            if size == 4:
-                blob[offset:offset + 4] = val.to_bytes(4, "little", signed=False)
-            elif size == 8:
-                blob[offset:offset + 8] = val.to_bytes(8, "little", signed=False)
-            elif size == 2:
-                blob[offset:offset + 2] = val.to_bytes(2, "little", signed=False)
-            elif size == 1:
-                blob[offset:offset + 1] = val.to_bytes(1, "little", signed=False)
-            else:
+            value = values[name]
+            if ty_str == "f32":
+                # IEEE-754 f32 (e.g. inv_sqrt_d) — NOT int(0.125)==0.
+                blob[offset:offset + 4] = struct.pack("<f", float(value))
+            elif ty_str in ("f16", "f64"):
                 raise AxiomError(
-                    f"assemble_push_constants: unsupported scalar size {size} for '{name}'"
+                    f"assemble_push_constants: float scalar '{name}' has type {ty_str!r}, "
+                    "which this packer does not support yet (only f32 floats and integer "
+                    "scalars are packable); add a packing branch if a kernel needs it."
                 )
+            else:
+                # Integer slot (u8/u16/u32/u64/i*): the existing int path, UNCHANGED.
+                val = int(value)
+                if size == 4:
+                    blob[offset:offset + 4] = val.to_bytes(4, "little", signed=False)
+                elif size == 8:
+                    blob[offset:offset + 8] = val.to_bytes(8, "little", signed=False)
+                elif size == 2:
+                    blob[offset:offset + 2] = val.to_bytes(2, "little", signed=False)
+                elif size == 1:
+                    blob[offset:offset + 1] = val.to_bytes(1, "little", signed=False)
+                else:
+                    raise AxiomError(
+                        f"assemble_push_constants: unsupported scalar size {size} for '{name}'"
+                    )
         return bytes(blob)
 
     def _next_values(self):
@@ -548,8 +575,27 @@ from .ops import (  # noqa: E402
     last_dispatch_staging,
 )
 
-# Define torch.ops.axiom.q4km_matmul at import (no-op if torch is absent).
+# M4.1p4: the merged FlashAttention zero-copy wrapper (mirrors the q4km import block).
+from .flash_attention import (  # noqa: E402
+    FlashAttention,
+    flash_attention,
+)
+
+# M4.1p4: the FlashAttention torch.library custom-op surface (mirrors the q4km ops block).
+from .attention_ops import (  # noqa: E402
+    FLASH_ATTENTION_OP_NAME,
+    register_flash_attention_op,
+    flash_attention_session,
+    flash_attention_views,
+    last_attn_dispatch_path,
+    last_attn_dispatch_staging,
+    release_attention_session,
+)
+
+# Define torch.ops.axiom.q4km_matmul + torch.ops.axiom.flash_attention at import
+# (no-op if torch is absent).
 register_q4km_op()
+register_flash_attention_op()
 
 __all__ = [
     "compile_kernel",
@@ -575,4 +621,14 @@ __all__ = [
     "q4km_activation_view",
     "last_dispatch_path",
     "last_dispatch_staging",
+    # M4.1p4 FlashAttention zero-copy wrapper + torch.library custom-op surface.
+    "FlashAttention",
+    "flash_attention",
+    "FLASH_ATTENTION_OP_NAME",
+    "register_flash_attention_op",
+    "flash_attention_session",
+    "flash_attention_views",
+    "last_attn_dispatch_path",
+    "last_attn_dispatch_staging",
+    "release_attention_session",
 ]
