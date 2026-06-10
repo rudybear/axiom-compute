@@ -1,0 +1,238 @@
+// examples/matmul_warptile_coopmat.axc
+//
+// M3.9 (THE PIVOT): Multi-subgroup WARPTILE register-blocked coopmat f16 matmul.
+//
+// A workgroup of 4 subgroups (@workgroup(128,1,1) on NVIDIA wave32) cooperates on a
+// 64x64 output tile. The 4 subgroups form a 2x2 grid; each subgroup owns a DISJOINT
+// 32x32 sub-tile computed via the M3.6 2x2 coopmat register-blocking (4 accumulators).
+// A (64x16) and B (16x64) are staged into shared ONCE by ALL 128 threads cooperatively,
+// then a single workgroup_barrier, then each subgroup coopmat-loads ITS sub-tile from
+// shared. The staged A/B is AMORTIZED across all 4 subgroups (4x fewer global loads/MAC).
+//
+// THIS IS THE MISSING ALGORITHM vs llama.cpp mul_mm.comp (the multi-subgroup warptile,
+// :174 warp_i=gl_SubgroupID, :193-194 warp_r/warp_c, :276-285 cooperative staging, :287
+// one barrier, :252-304 per-warp sums[] coopmat loop). AXIOM's M3.6 leader is ONE subgroup
+// = ONE warp = a 32x32 tile; M3.9 generalizes to K=4 subgroups cooperating on a 64x64 tile.
+//
+// M3.3d-TRAP AVOIDANCE (the load-bearing design decision): the bigger 64x64 tile with
+// 4 subgroups keeps warps-in-flight == single-subgroup at the A/B shape (4096x512x14336:
+// single-subgroup grid (16,128)=2048 WGs x 1 warp == warptile grid (8,64)=512 WGs x 4
+// warps = 2048 warps). It amortizes staging 4x WITHOUT cutting total warps below SM
+// saturation (M3.3d's mistake was halving the workgroup count). At 768^3 the grid is
+// (12,12)=144 WGs x 4 = 576 warps and MAY under-occupy (reported honestly per-size).
+//
+// HARD PRECONDITION: subgroup_size MUST be 32. The kernel MISCOMPUTES on any other wave
+// width:
+//   - wave64 (sg_size=64): sg_id = local_x/64 collapses to {0,1} for the 128 threads =>
+//     only 2 distinct sg_id => half the 64x64 tile (sg_id 2,3) NEVER written (silent gap).
+//   - SIMD16 (sg_size=16): sg_id in {0..7} => the 2x2 grid math (sg_r=sg_id%2, sg_c=sg_id/2)
+//     puts sg_c in {0,1,2,3} => sg_c*32 in {64,96} OOBs the 64-wide b_tile (OOB shared read)
+//     AND writes into the NEXT workgroup's C region (cross-workgroup overwrite race).
+//   ALL dispatch/tests/bench (AT-2300..2308) TYPED-SKIP when subgroup_size()!=32 (mirror
+//   the M3.3d / AT-1510 guard). On NVIDIA RTX PRO 6000 (wave32) the guard passes.
+//
+// WORKGROUP: @workgroup(128,1,1) = 4 subgroups of 32 lanes (NVIDIA wave32).
+//   product == 128 == PORTABLE_MIN_WORKGROUP_INVOCATIONS (the portable floor) => emits
+//   ZERO WorkgroupExceedsPortableFloor warnings (the warn fires only at product > 128).
+//
+// DISPATCH GRID: (N/64, M/64, 1). Each workgroup covers a 64x64 C tile.
+//
+// SUBGROUP PARTITION (pure source, all builtins exist):
+//   sg_size = subgroup_size()                      // 32 on NVIDIA -- NOT hardcoded
+//   t       = local_invocation_id(0)               // 0..127 within the workgroup
+//   sg_id   = t / sg_size                           // 0..3 (which subgroup)
+//   sg_r    = sg_id % 2  (no %: sg_id - (sg_id/2)*2)  // row band 0..1
+//   sg_c    = sg_id / 2                              // col band 0..1
+//   Subgroup s owns the 32x32 sub-tile at rows [block_row*64 + sg_r*32 .. +32),
+//   cols [block_col*64 + sg_c*32 .. +32).
+//
+// COOPERATIVE STAGING (ALL 128 threads -- the amortization, mirrors llama :276-285):
+//   A block = BM x BK = 64 x 16 = 1024 f16 (a_block_size). B block = BK x BN = 16 x 64 =
+//   1024 f16 (b_block_size). Total shared = 2048 f16 = 4096 bytes.
+//   Each of the 128 threads stages a_block_size/wg_threads = 1024/128 = 8 A and 8 B
+//   elements. The staging iter count is K-INDEPENDENT (a_iters=b_iters=8 for EVERY k_block,
+//   regardless of how many k_blocks K decomposes into; K only sets the OUTER k_block count).
+//   ei = iter*128 + t covers {0..1023} EXACTLY once for both A and B (1024 % 128 == 0).
+//
+// WORKGROUP BARRIER (depth-0, unconditional): ALL 128 threads (ALL 4 subgroups) sync;
+//   cross-subgroup visibility guaranteed by construction (Workgroup-scope OpControlBarrier,
+//   execution scope Workgroup=2, memory semantics AcquireRelease|WorkgroupMemory). This is
+//   the SAME path M3.3d relied on -- no subgroup-scope weakening path exists. RAW barrier:
+//   after staging, BEFORE the first coopmat_load (kept in this order for the static RAW
+//   analyzer). WAR barrier: at K-loop bottom, before the next k_block overwrites shared.
+//
+// PER-SUBGROUP COOPMAT (scope Subgroup -- each 32-lane subgroup runs its sub-tile):
+//   a_tile layout: 64 rows x 16 cols, stride 16. Subgroup's 32 rows start at sg_r*32:
+//     a_off_0 = (sg_r*32 + 0 )*16 = sg_r*512        (rows [sg_r*32 .. +16))
+//     a_off_1 = (sg_r*32 + 16)*16 = sg_r*512 + 256  (rows [sg_r*32+16 .. +32))
+//   b_tile layout: 16 rows x 64 cols, stride 64. Subgroup's 32 cols start at sg_c*32:
+//     b_off_0 = sg_c*32 + 0   (cols [sg_c*32 .. +16))
+//     b_off_1 = sg_c*32 + 16  (cols [sg_c*32+16 .. +32))
+//   The element offsets are RUNTIME expressions (depend on sg_r/sg_c) -- supported
+//   (coopmat_load takes a u32 element_offset that need not be const; M3.3d/M3.7 precedent).
+//   4 loop-carried accumulators per subgroup (N-coopmat-phi, per-INVOCATION SSA -- 4
+//   subgroups are 4 independent instances of the proven single-subgroup carry):
+//     acc_00 += a_mat_0 * b_mat_0
+//     acc_01 += a_mat_0 * b_mat_1
+//     acc_10 += a_mat_1 * b_mat_0
+//     acc_11 += a_mat_1 * b_mat_1
+//
+// OUTPUT STORE (per-subgroup DISJOINT 32x32 C offsets -- no cross-subgroup write race):
+//   tile_row_i = block_row*4 + sg_r*2 + i   (16-row tile index)
+//   tile_col_j = block_col*4 + sg_c*2 + j   (16-col tile index)
+//   c_base_ij  = (tile_row_i*16)*N + (tile_col_j*16); coopmat_store stride N.
+//
+// BIT-EXACT vs CPU oracle (AT-2300/2301/2302/2303) AND BIT-IDENTICAL vs single-subgroup
+// RB on an asymmetric fixture (AT-2305 -- the load-bearing cross-subgroup-race detector).
+// The warptile is a pure RE-PARTITION of the SAME coopmat MACs in the SAME per-element
+// accumulation order, so it MUST be bit-identical to single-subgroup RB at the same shape.
+//
+// BENCHMARKED BY: crates/axc-driver/benches/resident_matmul_warptile.rs (AT-2306/2307).
+// BIT-EXACT TESTS: crates/axc-driver/tests/dispatch_matmul_warptile.rs (AT-2300..2305).
+// COMPILE ANCHOR: AT-2304 in compile_shared_examples.rs (CI, no GPU).
+//
+// Anti-pattern #2: explicit return;
+// Anti-pattern #8: no >> (use shr/lshr).
+
+@kernel
+@workgroup(128, 1, 1)
+@cooperative_matrix
+@strategy { wg_threads: ?[128], n_sg: ?[4], bm: ?[64], bn: ?[64], rb_m: ?[2], rb_n: ?[2], tile_k: ?[16], a_block_size: ?[1024], b_block_size: ?[1024] }
+@intent("multi-subgroup warptile register-blocked 2x2 coopmat f16 matmul -- 4 subgroups, 64x64 tile (AT-2300..2308)")
+@complexity(O(n))
+fn matmul_warptile_coopmat(
+    A: readonly_buffer[f16],
+    B: readonly_buffer[f16],
+    C: buffer[f16],
+    M: u32,
+    N: u32,
+    K: u32
+) -> void {
+    // Shared staging tiles, written cooperatively by ALL 128 threads.
+    // a_tile: 64 rows x 16 cols = 1024 f16 (the workgroup's A row-band, all 4 subgroups).
+    // b_tile: 16 rows x 64 cols = 1024 f16 (the workgroup's B col-band, all 4 subgroups).
+    shared a_tile: shared[f16, ?a_block_size];
+    shared b_tile: shared[f16, ?b_block_size];
+
+    // Block coordinates (via gid).
+    // gid(0) = workgroup_id.x * 128 + local_id.x => block_col = gid(0) / 128.
+    //   (local_size.x = 128, so the 128 threads of a workgroup span gid(0) range 128.)
+    // gid(1) = workgroup_id.y * 1 + local_id.y => block_row = gid(1) (no division; local_size.y=1).
+    let block_col: u32 = gid(0u32) / 128u32;
+    let block_row: u32 = gid(1u32);
+
+    // Subgroup identity derived from the local thread index.
+    let sg_size: u32 = subgroup_size();
+    let t: u32 = local_invocation_id(0u32);        // 0..127 within the workgroup
+    let sg_id: u32 = t / sg_size;                   // 0..3 (which subgroup)
+    let sg_c: u32 = sg_id / 2u32;                    // col band: 0 or 1
+    let sg_r: u32 = sg_id - sg_c * 2u32;             // sg_id % 2 (anti-pattern #8: no %)
+
+    // Staging iteration counts (K-INDEPENDENT: 1024/128 = 8 for every k_block).
+    let a_iters: u32 = ?a_block_size / ?wg_threads;
+    let b_iters: u32 = ?b_block_size / ?wg_threads;
+
+    // Number of K-blocks (the OUTER loop count; K/tile_k).
+    let num_k_blocks: u32 = K / ?tile_k;
+
+    // Per-subgroup A row-band base offset into the 64x16 a_tile (stride 16).
+    //   a_off_0 = (sg_r*32 + 0 )*16 = sg_r*512
+    //   a_off_1 = (sg_r*32 + 16)*16 = sg_r*512 + 256
+    let a_off_0: u32 = sg_r * 512u32;
+    let a_off_1: u32 = sg_r * 512u32 + 256u32;
+
+    // Per-subgroup B col-band base offset into the 16x64 b_tile (stride 64).
+    //   b_off_0 = sg_c*32 + 0
+    //   b_off_1 = sg_c*32 + 16
+    let b_off_0: u32 = sg_c * 32u32;
+    let b_off_1: u32 = sg_c * 32u32 + 16u32;
+
+    // Output 16x16 tile indices within the global C grid (each subgroup owns a 2x2 block).
+    //   tile_row_i = block_row*4 + sg_r*2 + i
+    //   tile_col_j = block_col*4 + sg_c*2 + j
+    let tile_row_0: u32 = block_row * 4u32 + sg_r * 2u32;
+    let tile_row_1: u32 = block_row * 4u32 + sg_r * 2u32 + 1u32;
+    let tile_col_0: u32 = block_col * 4u32 + sg_c * 2u32;
+    let tile_col_1: u32 = block_col * 4u32 + sg_c * 2u32 + 1u32;
+
+    // 4 loop-carried coopmat accumulators (defined BEFORE the K-loop for the N-phi OpPhi path).
+    let mut acc_00: matrix[f16, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_01: matrix[f16, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_10: matrix[f16, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_11: matrix[f16, 16, 16, accumulator] = coopmat_zero();
+
+    // K-loop: all 128 threads execute the SAME loop (uniform control flow -- required).
+    for k_block in range(0u32, num_k_blocks) {
+
+        // ── Stage A[block_row*64..+64, k_block*16..+16] into a_tile (all 128 threads) ──
+        // A block: BM = 64 rows x BK = 16 cols = 1024 elements. ei = iter*128 + t.
+        //   a_row = ei / 16   (row in the 64-row A block, 0..63)
+        //   a_col = ei - a_row*16  (col in the tile, 0..15)
+        //   A global row = block_row*64 + a_row
+        //   A global col = k_block*tile_k + a_col
+        for a_iter in range(0u32, a_iters) {
+            let ei_a: u32 = a_iter * ?wg_threads + t;
+            let a_row: u32 = ei_a / 16u32;
+            let a_col: u32 = ei_a - a_row * 16u32;
+            let a_global_row: u32 = block_row * 64u32 + a_row;
+            let a_global_col: u32 = k_block * ?tile_k + a_col;
+            let a_global: u32 = a_global_row * K + a_global_col;
+            a_tile[ei_a] = A[a_global];
+        }
+
+        // ── Stage B[k_block*16..+16, block_col*64..+64] into b_tile (all 128 threads) ──
+        // B block: BK = 16 rows x BN = 64 cols = 1024 elements. ei = iter*128 + t.
+        //   b_row = ei / 64   (row in the 16-row K-block, 0..15)
+        //   b_col = ei - b_row*64  (col in the 64-col B block, 0..63)
+        //   B global row = k_block*tile_k + b_row
+        //   B global col = block_col*64 + b_col
+        for b_iter in range(0u32, b_iters) {
+            let ei_b: u32 = b_iter * ?wg_threads + t;
+            let b_row: u32 = ei_b / 64u32;
+            let b_col: u32 = ei_b - b_row * 64u32;
+            let b_global_row: u32 = k_block * ?tile_k + b_row;
+            let b_global_col: u32 = block_col * 64u32 + b_col;
+            let b_global: u32 = b_global_row * N + b_global_col;
+            b_tile[ei_b] = B[b_global];
+        }
+
+        // RAW barrier: ALL 128 threads (ALL 4 subgroups) must finish staging before ANY
+        // coopmat_load reads shared cells written by OTHER subgroups' threads.
+        // Workgroup-scope (=2), AcquireRelease|WorkgroupMemory. Depth-0, unconditional.
+        workgroup_barrier();
+
+        // ── Load THIS subgroup's A row-tiles from shared (stride 16) ──────────────
+        let a_mat_0: matrix[f16, 16, 16, a] = coopmat_load(a_tile, a_off_0, 16u32);
+        let a_mat_1: matrix[f16, 16, 16, a] = coopmat_load(a_tile, a_off_1, 16u32);
+
+        // ── Load THIS subgroup's B col-tiles from shared (stride 64) ─────────────
+        let b_mat_0: matrix[f16, 16, 16, b] = coopmat_load(b_tile, b_off_0, 64u32);
+        let b_mat_1: matrix[f16, 16, 16, b] = coopmat_load(b_tile, b_off_1, 64u32);
+
+        // ── 4 coopmat MulAdds (subgroup-scope, per-subgroup independent) ──────────
+        // Each acc_ij is reassigned UNCONDITIONALLY at the top level (the N-phi path).
+        acc_00 = coopmat_mul_add(a_mat_0, b_mat_0, acc_00);
+        acc_01 = coopmat_mul_add(a_mat_0, b_mat_1, acc_01);
+        acc_10 = coopmat_mul_add(a_mat_1, b_mat_0, acc_10);
+        acc_11 = coopmat_mul_add(a_mat_1, b_mat_1, acc_11);
+
+        // WAR barrier: before the next k_block iteration overwrites a_tile / b_tile that
+        // the coopmat_loads above still read. Workgroup-scope, depth-0, unconditional.
+        workgroup_barrier();
+    }
+
+    // ── Store the 4 accumulated tiles to C (this subgroup's DISJOINT 32x32 sub-tile) ──
+    // c_base_ij = (tile_row_i*16)*N + (tile_col_j*16), store stride N.
+    // Post-loop reads resolve to the header phi (zero-trip safe).
+    let c_base_00: u32 = (tile_row_0 * 16u32) * N + (tile_col_0 * 16u32);
+    let c_base_01: u32 = (tile_row_0 * 16u32) * N + (tile_col_1 * 16u32);
+    let c_base_10: u32 = (tile_row_1 * 16u32) * N + (tile_col_0 * 16u32);
+    let c_base_11: u32 = (tile_row_1 * 16u32) * N + (tile_col_1 * 16u32);
+
+    coopmat_store(acc_00, C, c_base_00, N);
+    coopmat_store(acc_01, C, c_base_01, N);
+    coopmat_store(acc_10, C, c_base_10, N);
+    coopmat_store(acc_11, C, c_base_11, N);
+
+    return;
+}

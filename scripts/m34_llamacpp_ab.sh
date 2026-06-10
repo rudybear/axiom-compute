@@ -13,6 +13,17 @@
 #   VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json AXC_ENABLE_GPU_BENCHES=1 \
 #     scripts/m34_llamacpp_ab.sh [--skip-build] [--skip-llama] [--fused | --fused-f32acc | --fused-f32acc-cached | --fused-f32acc-db | --fused-f32acc-rb44 | --fused-f32acc-rb42]
 #
+#   --warptile (M3.9): runs the PLAIN-f32 multi-subgroup warptile (K=4) resident bench
+#                    (resident_matmul_warptile) at 256/512/768/1024 + the A/B shape
+#                    (4096x512x14336), measuring K=4 warptile vs the K=2 opponent vs
+#                    single-subgroup RB. The PRIMARY M3.9 gate is PLAIN warptile vs PLAIN
+#                    single-subgroup RB (>=1.3x at 768^3 OR the A/B shape) — measured by the
+#                    bench itself, NOT against the Q4_K_M llama line (that fusion is the
+#                    explicit M3.10 follow-on, out of M3.9 scope). This flag short-circuits
+#                    the llama Q4_K_M path and writes ab_results_warptile.json. HONEST-NEGATIVE
+#                    armed: if K=4 misses 1.3x the per-size TFLOPS + occupancy artifact are
+#                    reported for the bottleneck diagnosis (-> M3.10 vectorized loads + bank pad).
+#
 # Modes:
 #   (default)        M3.4 single-row matvec vs llama Q4_K n=1 GEMV (cross-shape baseline).
 #   --fused          M3.5 f16-accumulator fused GEMM vs llama Q4_K n=512 same-shape (fast-but-
@@ -95,6 +106,7 @@ FUSED_F32ACC_DB=0 # M3.7: --fused-f32acc-db -> the DOUBLE-BUFFERED scale-cached 
 # 102.49 and applies the >=1.15x / >=49.3 TFLOPS gate (HONEST-NEGATIVE if register pressure regresses).
 FUSED_F32ACC_RB44=0
 FUSED_F32ACC_RB42=0
+WARPTILE=0    # M3.9: --warptile -> PLAIN-f32 multi-subgroup warptile resident bench (no llama path).
 for arg in "$@"; do
     case "$arg" in
         --skip-build) SKIP_BUILD=1 ;;
@@ -108,9 +120,51 @@ for arg in "$@"; do
         # M3.8: larger-register-tile variants (same SAME-SHAPE A/B, same combined/raw schema).
         --fused-f32acc-rb44) FUSED=1; FUSED_F32ACC=1; FUSED_F32ACC_RB44=1 ;;
         --fused-f32acc-rb42) FUSED=1; FUSED_F32ACC=1; FUSED_F32ACC_RB42=1 ;;
+        # M3.9: PLAIN-f32 warptile resident bench (short-circuits the Q4_K_M/llama path).
+        --warptile) WARPTILE=1 ;;
         *) echo "unknown arg: $arg" >&2; exit 2 ;;
     esac
 done
+
+mkdir -p "$OUTDIR"
+
+# ── M3.9 --warptile: PLAIN-f32 warptile gate (NOT the Q4_K_M kill-criterion). ───────────────
+# The M3.9 primary gate is PLAIN multi-subgroup warptile (K=4) vs PLAIN single-subgroup RB
+# (>=1.3x at 768^3 OR the A/B shape 4096x512x14336), measured by the resident_matmul_warptile
+# bench itself (it prints per-size TFLOPS + the occupancy artifact + the honest ratio line).
+# The Q4_K_M warptile fusion + a llama A/B is the EXPLICIT M3.10 follow-on (out of M3.9 scope),
+# so this branch does NOT touch the llama Q4_K_M path. HONEST-NEGATIVE armed: a miss reports the
+# numbers for the bottleneck diagnosis, never loosens the gate.
+if [ "${WARPTILE}" -eq 1 ]; then
+    WT_RESULTS="${OUTDIR}/ab_results_warptile.json"
+    WT_LOG="${OUTDIR}/warptile_bench.txt"
+    echo "== M3.9 PLAIN-f32 multi-subgroup warptile resident bench (no llama Q4_K_M path) =="
+    echo "  repo_root : ${REPO_ROOT}"
+    echo "  ICD       : ${ICD}"
+    echo "  outdir    : ${OUTDIR}"
+    echo "  gate      : K=4 warptile >= 1.3x single-subgroup RB at 768^3 OR A/B (4096x512x14336)"
+    VK_DRIVER_FILES="${ICD}" AXC_ENABLE_GPU_BENCHES=1 \
+        cargo bench --manifest-path "${REPO_ROOT}/Cargo.toml" -p axc-driver \
+        --bench resident_matmul_warptile 2>&1 | tee "${WT_LOG}"
+    # Extract the per-size RATIO lines emitted by the bench for the artifact.
+    RATIO_LINES="$(grep 'resident_matmul_warptile RATIO' "${WT_LOG}" || true)"
+    {
+        echo "{"
+        echo "  \"milestone\": \"M3.9-multi-subgroup-warptile\","
+        echo "  \"mode\": \"plain-f32-warptile-vs-plain-single-subgroup-RB\","
+        echo "  \"gate\": \"K=4 warptile >= 1.3x single-subgroup RB at 768^3 OR A/B (4096x512x14336)\","
+        echo "  \"icd\": \"${ICD}\","
+        echo "  \"vulkaninfo_device\": \"$(VK_DRIVER_FILES="${ICD}" vulkaninfo 2>/dev/null | grep -m1 'deviceName' | sed 's/.*= //' | tr -d '\r' || true)\","
+        echo "  \"note\": \"Q4_K_M warptile fusion + llama A/B is the M3.10 follow-on (out of M3.9 scope). See warptile_bench.txt for per-size TFLOPS + the occupancy artifact + the honest ratio.\","
+        echo "  \"ratio_lines\": ["
+        printf '%s\n' "${RATIO_LINES}" | sed '/^$/d' | sed 's/"/\\"/g' | awk 'BEGIN{first=1} {if(!first)printf ",\n"; printf "    \"%s\"", $0; first=0} END{if(!first)printf "\n"}'
+        echo "  ]"
+        echo "}"
+    } > "${WT_RESULTS}"
+    echo "-- wrote ${WT_RESULTS}"
+    echo "-- full bench log: ${WT_LOG}"
+    exit 0
+fi
 
 mkdir -p "$OUTDIR"
 RAW="${OUTDIR}/llamacpp_raw.txt"

@@ -68,6 +68,13 @@ name = "resident_matmul_msg"
 path = "benches/resident_matmul_msg.rs"
 harness = false
 
+# M3.9: honest effective-TFLOPS bench for the multi-subgroup warptile (K=4) vs the K=2
+# opponent vs single-subgroup RB (AT-2306/2307). Bench ID: dispatch_resident_matmul_warptile.
+[[bench]]
+name = "resident_matmul_warptile"
+path = "benches/resident_matmul_warptile.rs"
+harness = false
+
 # M3.4: AXIOM-side A/B measurement bench for the llama.cpp Vulkan Q4_K_M head-to-head
 # (the DESIGN §5 kill-criterion run). Bench ID: dispatch_q4km_ab. GPU-gated.
 [[bench]]

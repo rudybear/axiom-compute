@@ -1642,3 +1642,147 @@ fn at_2216_flash_coopmat_pv_anchor_and_streaming() {
         "AT-2216 PASS: shared_memory_bytes=16064 < 16384 (320 B headroom, seq-invariant); buffers={names:?}"
     );
 }
+
+// ── AT-2304: M3.9 multi-subgroup warptile kernels — compile + spirv-val + cap-set ──────
+//            == matmul_rb_coopmat.axc (no new capability) + ZERO portable-floor warns ────
+
+/// Shipped K=4 warptile assignments (wg_threads=128, 4 subgroups, 64x64 tile).
+fn warptile_k4_assignments() -> StrategyMap {
+    let mut m = StrategyMap::new();
+    m.insert("wg_threads".to_owned(), 128_i64);
+    m.insert("n_sg".to_owned(), 4_i64);
+    m.insert("bm".to_owned(), 64_i64);
+    m.insert("bn".to_owned(), 64_i64);
+    m.insert("rb_m".to_owned(), 2_i64);
+    m.insert("rb_n".to_owned(), 2_i64);
+    m.insert("tile_k".to_owned(), 16_i64);
+    m.insert("a_block_size".to_owned(), 1024_i64);
+    m.insert("b_block_size".to_owned(), 1024_i64);
+    m
+}
+
+/// Shipped K=2 opponent assignments (wg_threads=64, 2 subgroups, 32x64 tile).
+fn warptile_k2_assignments() -> StrategyMap {
+    let mut m = StrategyMap::new();
+    m.insert("wg_threads".to_owned(), 64_i64);
+    m.insert("n_sg".to_owned(), 2_i64);
+    m.insert("bm".to_owned(), 32_i64);
+    m.insert("bn".to_owned(), 64_i64);
+    m.insert("rb_m".to_owned(), 2_i64);
+    m.insert("rb_n".to_owned(), 2_i64);
+    m.insert("tile_k".to_owned(), 16_i64);
+    m.insert("a_block_size".to_owned(), 512_i64);
+    m.insert("b_block_size".to_owned(), 1024_i64);
+    m
+}
+
+/// Lower a kernel source and return its HIR warnings (raw source — the `@workgroup` dims
+/// are literals, not holes, so the workgroup-product validation runs as written; the
+/// `@strategy` holes lower to `UnusedStrategyHole` warns which AT-2304 filters out).
+fn lower_warnings(src: &str) -> Vec<axc_hir::HirWarning> {
+    let (tokens, _lex) = axc_lexer::tokenize(src);
+    let mut parser = axc_parser::Parser::new(&tokens);
+    let (ast, _parse) = parser.parse_module();
+    let (_hir, _errors, warnings) = axc_hir::lower_module(&ast);
+    warnings
+}
+
+/// AT-2304 (CI, no GPU): both M3.9 warptile kernels compile + spirv-val clean; the emitted
+/// capability set EQUALS matmul_rb_coopmat.axc's caps (no NEW capability beyond the M3.6
+/// set); and NEITHER kernel emits a `WorkgroupExceedsPortableFloor` warning.
+///
+/// PORTABLE-FLOOR (r2): `@workgroup(128,1,1)` product==128 IS the portable floor
+/// (`PORTABLE_MIN_WORKGROUP_INVOCATIONS`, hir.rs:19) so it does NOT warn (the warn fires
+/// only when product > 128, validate.rs:413); `@workgroup(64,1,1)` (64<128) likewise. The
+/// test asserts SPECIFICALLY the ABSENCE of the `WorkgroupExceedsPortableFloor` variant for
+/// EITHER kernel — it does NOT assert warning-free overall, because the base matmul kernel
+/// emits pre-existing `UnusedStrategyHole` warns for its @strategy holes (those are filtered
+/// out before the assertion).
+#[test]
+fn at_2304_warptile_compiles_spirv_val() {
+    use std::collections::BTreeSet;
+
+    let k4_src = include_str!("../../../examples/matmul_warptile_coopmat.axc");
+    let k2_src = include_str!("../../../examples/matmul_warptile_coopmat_2sg.axc");
+    let rb_src = include_str!("../../../examples/matmul_rb_coopmat.axc");
+
+    let k4_assignments = warptile_k4_assignments();
+    let k2_assignments = warptile_k2_assignments();
+    let rb_assignments = rb2x2_assignments();
+
+    // Compile + spirv-val both warptile kernels and the single-subgroup RB baseline.
+    let k4_words = compile_words(k4_src, Some(&k4_assignments), "matmul_warptile_coopmat.axc");
+    let k2_words = compile_words(k2_src, Some(&k2_assignments), "matmul_warptile_coopmat_2sg.axc");
+    let rb_words = compile_words(rb_src, Some(&rb_assignments), "matmul_rb_coopmat.axc");
+
+    // ── Cap set == matmul_rb_coopmat.axc (no NEW capability beyond the M3.6 set). ──
+    let (k4_caps, k4_exts) = capability_extension_sets(&k4_words);
+    let (k2_caps, k2_exts) = capability_extension_sets(&k2_words);
+    let (rb_caps, rb_exts) = capability_extension_sets(&rb_words);
+
+    let k4_extra: Vec<u32> = k4_caps.difference(&rb_caps).copied().collect();
+    assert!(
+        k4_extra.is_empty(),
+        "AT-2304: K=4 warptile declares capabilities NOT in matmul_rb_coopmat: {k4_extra:?} \
+         (k4={k4_caps:?}, rb={rb_caps:?})"
+    );
+    let k2_extra: Vec<u32> = k2_caps.difference(&rb_caps).copied().collect();
+    assert!(
+        k2_extra.is_empty(),
+        "AT-2304: K=2 warptile declares capabilities NOT in matmul_rb_coopmat: {k2_extra:?} \
+         (k2={k2_caps:?}, rb={rb_caps:?})"
+    );
+    // Both directions: the cap set must EQUAL the RB set (a pure re-partition adds/drops
+    // nothing — same coopmat + Float16 + Shader + memory-model caps).
+    let k4_set: BTreeSet<u32> = k4_caps.iter().copied().collect();
+    let k2_set: BTreeSet<u32> = k2_caps.iter().copied().collect();
+    let rb_set: BTreeSet<u32> = rb_caps.iter().copied().collect();
+    assert_eq!(
+        k4_set, rb_set,
+        "AT-2304: K=4 warptile cap set must EQUAL matmul_rb_coopmat's (pure source, no new cap)"
+    );
+    assert_eq!(
+        k2_set, rb_set,
+        "AT-2304: K=2 warptile cap set must EQUAL matmul_rb_coopmat's (pure source, no new cap)"
+    );
+    // Extensions likewise — no new extension beyond the RB baseline.
+    let k4_extra_exts: Vec<String> = k4_exts.difference(&rb_exts).cloned().collect();
+    assert!(
+        k4_extra_exts.is_empty(),
+        "AT-2304: K=4 warptile declares extensions NOT in matmul_rb_coopmat: {k4_extra_exts:?}"
+    );
+    let k2_extra_exts: Vec<String> = k2_exts.difference(&rb_exts).cloned().collect();
+    assert!(
+        k2_extra_exts.is_empty(),
+        "AT-2304: K=2 warptile declares extensions NOT in matmul_rb_coopmat: {k2_extra_exts:?}"
+    );
+
+    // ── ZERO WorkgroupExceedsPortableFloor warnings (the r2 BLOCKER fix). ──
+    // Lower the RAW source (the @workgroup dims are literals 128/64, so the portable-floor
+    // validation runs as written); tolerate the pre-existing UnusedStrategyHole warns.
+    let is_portable_floor = |w: &axc_hir::HirWarning| {
+        matches!(w, axc_hir::HirWarning::WorkgroupExceedsPortableFloor { .. })
+    };
+
+    let k4_warns = lower_warnings(k4_src);
+    let k4_floor: Vec<_> = k4_warns.iter().filter(|w| is_portable_floor(w)).collect();
+    assert!(
+        k4_floor.is_empty(),
+        "AT-2304: @workgroup(128,1,1) product==128 IS the portable floor and must emit ZERO \
+         WorkgroupExceedsPortableFloor warns (warn fires only at product > 128); got {k4_floor:?}"
+    );
+
+    let k2_warns = lower_warnings(k2_src);
+    let k2_floor: Vec<_> = k2_warns.iter().filter(|w| is_portable_floor(w)).collect();
+    assert!(
+        k2_floor.is_empty(),
+        "AT-2304: @workgroup(64,1,1) (64 < 128) must emit ZERO WorkgroupExceedsPortableFloor \
+         warns; got {k2_floor:?}"
+    );
+
+    eprintln!(
+        "AT-2304 PASS: both warptile kernels compile + spirv-val clean; cap set == \
+         matmul_rb_coopmat ({k4_caps:?}); ZERO WorkgroupExceedsPortableFloor warns \
+         (K=4 @workgroup(128)==floor, K=2 @workgroup(64)<floor)"
+    );
+}
