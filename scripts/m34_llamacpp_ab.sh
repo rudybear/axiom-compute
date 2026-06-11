@@ -11,7 +11,7 @@
 #
 # Usage:
 #   VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json AXC_ENABLE_GPU_BENCHES=1 \
-#     scripts/m34_llamacpp_ab.sh [--skip-build] [--skip-llama] [--fused | --fused-f32acc | --fused-f32acc-cached | --fused-f32acc-db | --fused-f32acc-rb44 | --fused-f32acc-rb42 | --warptile | --pad]
+#     scripts/m34_llamacpp_ab.sh [--skip-build] [--skip-llama] [--fused | --fused-f32acc | --fused-f32acc-cached | --fused-f32acc-db | --fused-f32acc-rb44 | --fused-f32acc-rb42 | --warptile | --pad | --sr]
 #
 #   --pad (M3.10a): runs the BANK-PADDED resident benches — the plain-f32 padded RB
 #                    (resident_matmul_rb_pad, gate >=1.15x the unpadded base at 768^3) AND the
@@ -116,6 +116,7 @@ FUSED_F32ACC_RB44=0
 FUSED_F32ACC_RB42=0
 WARPTILE=0    # M3.9: --warptile -> PLAIN-f32 multi-subgroup warptile resident bench (no llama path).
 PAD=0         # M3.10a: --pad -> the BANK-PADDED resident benches (plain-f32 + Q4_K_M, no llama path).
+SR=0          # M3.11a: --sr -> the dequant-index STRENGTH-REDUCED resident bench vs M3.6 (no llama path).
 for arg in "$@"; do
     case "$arg" in
         --skip-build) SKIP_BUILD=1 ;;
@@ -133,11 +134,52 @@ for arg in "$@"; do
         --warptile) WARPTILE=1 ;;
         # M3.10a: BANK-PADDED resident benches (short-circuits the Q4_K_M/llama path).
         --pad) PAD=1 ;;
+        # M3.11a: dequant-index STRENGTH-REDUCED resident bench vs M3.6 (short-circuits the llama path).
+        --sr) SR=1 ;;
         *) echo "unknown arg: $arg" >&2; exit 2 ;;
     esac
 done
 
 mkdir -p "$OUTDIR"
+
+# ── M3.11a --sr: dequant-index STRENGTH-REDUCED resident bench vs the M3.6 leader. ──────────
+# Runs resident_q4km_matmul_rb_f32acc_cached_sr (the SR kernel A/B + 768^3 + per-size table, timed
+# AGAINST the M3.6 leader at the same shapes). PRIMARY gate >=1.15x M3.6's 42.86 (>=49.3 TFLOPS) at
+# the A/B shape; ARMED honest-negative: ALU-count-down (AT-2600, CPU) but TFLOPS-flat => latency-
+# hidden under HMMA (the LIKELY base case) => M3.11b NO-GO, M3.6 stays leader, gate NOT loosened.
+# Emits AXC_Q4KM_AB_F32ACC_CACHED_SR + the per-size SR-vs-M3.6 ratio. Writes ab_results_sr.json.
+# No llama path (the SR kernel is an A/B-vs-the-AXIOM-leader experiment; the llama A/B is M3.6's).
+if [ "${SR}" -eq 1 ]; then
+    SR_RESULTS="${OUTDIR}/ab_results_sr.json"
+    SR_LOG="${OUTDIR}/sr_bench_q4km.txt"
+    echo "== M3.11a dequant-index STRENGTH-REDUCED resident bench (SR vs M3.6 leader; no llama path) =="
+    echo "  repo_root : ${REPO_ROOT}"
+    echo "  ICD       : ${ICD}"
+    echo "  outdir    : ${OUTDIR}"
+    echo "  gate      : SR >=1.15x M3.6 42.86 (>=49.3 TFLOPS) @ A/B; ARMED honest-negative (latency-hidden flat = the LIKELY base case)"
+    VK_DRIVER_FILES="${ICD}" AXC_ENABLE_GPU_BENCHES=1 \
+        cargo bench --manifest-path "${REPO_ROOT}/Cargo.toml" -p axc-driver \
+        --bench resident_q4km_matmul_rb_f32acc_cached_sr 2>&1 | tee "${SR_LOG}"
+    SR_GATE_LINES="$(grep 'resident_sr: AT-2602\|resident_sr: .*\^3 SR=' "${SR_LOG}" || true)"
+    AB_LINE="$(grep 'AXC_Q4KM_AB_F32ACC_CACHED_SR' "${SR_LOG}" | tail -1 || true)"
+    {
+        echo "{"
+        echo "  \"milestone\": \"M3.11a-dequant-index-strength-reduction\","
+        echo "  \"mode\": \"strength-reduced-vs-leader (SR kernel vs M3.6 cached, same A/B shapes)\","
+        echo "  \"gate\": \"SR >=1.15x M3.6 42.86 (>=49.3 TFLOPS) AND combined<=1e-3 @ A/B; ARMED honest-negative\","
+        echo "  \"icd\": \"${ICD}\","
+        echo "  \"vulkaninfo_device\": \"$(VK_DRIVER_FILES="${ICD}" vulkaninfo 2>/dev/null | grep -m1 'deviceName' | sed 's/.*= //' | tr -d '\r' || true)\","
+        echo "  \"note\": \"PURE-SOURCE induction-variable strength-reduction (no codegen change). The per-element integer-index ALU drop is pinned by AT-2600 (CPU). ARMED honest-negative: ALU-down-but-TFLOPS-flat => the dequant integer ALU is latency-hidden under the HMMA pipeline (the LIKELY base case) => M3.11b NO-GO; the 1.77x tax is NOT the integer index-decode. See sr_bench_q4km.txt.\","
+        echo "  \"ab_line\": \"$(printf '%s' "${AB_LINE}" | sed 's/"/\\"/g')\","
+        echo "  \"sr_gate_lines\": ["
+        printf '%s\n' "${SR_GATE_LINES}" | sed '/^$/d' | sed 's/"/\\"/g' | awk 'BEGIN{first=1} {if(!first)printf ",\n"; printf "    \"%s\"", $0; first=0} END{if(!first)printf "\n"}'
+        echo "  ]"
+        echo "}"
+    } > "${SR_RESULTS}"
+    echo "-- wrote ${SR_RESULTS}"
+    echo "-- full bench log: ${SR_LOG}"
+    exit 0
+fi
 
 # ── M3.9 --warptile: PLAIN-f32 warptile gate (NOT the Q4_K_M kill-criterion). ───────────────
 # The M3.9 primary gate is PLAIN multi-subgroup warptile (K=4) vs PLAIN single-subgroup RB
