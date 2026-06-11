@@ -11,7 +11,7 @@
 #
 # Usage:
 #   VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json AXC_ENABLE_GPU_BENCHES=1 \
-#     scripts/m34_llamacpp_ab.sh [--skip-build] [--skip-llama] [--fused | --fused-f32acc | --fused-f32acc-cached | --fused-f32acc-db | --fused-f32acc-rb44 | --fused-f32acc-rb42 | --warptile | --pad | --sr | --ablate]
+#     scripts/m34_llamacpp_ab.sh [--skip-build] [--skip-llama] [--fused | --fused-f32acc | --fused-f32acc-cached | --fused-f32acc-db | --fused-f32acc-rb44 | --fused-f32acc-rb42 | --warptile | --pad | --sr | --ablate | --tightlive]
 #
 #   --pad (M3.10a): runs the BANK-PADDED resident benches — the plain-f32 padded RB
 #                    (resident_matmul_rb_pad, gate >=1.15x the unpadded base at 768^3) AND the
@@ -118,6 +118,7 @@ WARPTILE=0    # M3.9: --warptile -> PLAIN-f32 multi-subgroup warptile resident b
 PAD=0         # M3.10a: --pad -> the BANK-PADDED resident benches (plain-f32 + Q4_K_M, no llama path).
 SR=0          # M3.11a: --sr -> the dequant-index STRENGTH-REDUCED resident bench vs M3.6 (no llama path).
 ABLATE=0      # M3.12: --ablate -> the dequant front-end ABLATION DIAGNOSTIC profiling instruments (no llama path).
+TIGHTLIVE=0   # M3.13 PRONG A: --tightlive -> the LIVE-RANGE-TIGHTENED resident bench vs M3.6 (no llama path).
 for arg in "$@"; do
     case "$arg" in
         --skip-build) SKIP_BUILD=1 ;;
@@ -139,6 +140,8 @@ for arg in "$@"; do
         --sr) SR=1 ;;
         # M3.12: dequant front-end ABLATION DIAGNOSTIC profiling instruments (short-circuits the llama path).
         --ablate) ABLATE=1 ;;
+        # M3.13 PRONG A: LIVE-RANGE-TIGHTENED resident bench vs M3.6 (short-circuits the llama path).
+        --tightlive) TIGHTLIVE=1 ;;
         *) echo "unknown arg: $arg" >&2; exit 2 ;;
     esac
 done
@@ -221,6 +224,46 @@ if [ "${ABLATE}" -eq 1 ]; then
     } > "${ABLATE_RESULTS}"
     echo "-- wrote ${ABLATE_RESULTS}"
     echo "-- full bench log: ${ABLATE_LOG}"
+    exit 0
+fi
+
+# ── M3.13 PRONG A --tightlive: LIVE-RANGE-TIGHTENED resident bench vs the M3.6 leader (no llama path). ──
+# Runs resident_q4km_matmul_rb_f32acc_cached_tightlive: BOTH the tightlive kernel AND the M3.6 leader at
+# A/B + 768^3, MIN-of-10/GpuTimestamp, with the >=1.15x gate verdict + the per-variant A-staging
+# temp-count proxy (the M3.12 r3 instrument). The tightlive kernel is BIT-IDENTICAL to the M3.6 leader
+# (a pure-source reorder/inline of the A-staging body); the deliverable is the MEASURED tightlive-vs-M3.6
+# ratio + the ARMED DOUBLE honest-negative (proxy-no-drop OR proxy-drop-but-TFLOPS-flat — the LIKELY
+# base case: AXIOM has no scheduler/register-allocator; the driver re-allocates from the dataflow graph).
+# Emits AXC_Q4KM_TIGHTLIVE. Writes ab_results_tightlive.json. No llama path (the llama A/B is M3.6's).
+if [ "${TIGHTLIVE}" -eq 1 ]; then
+    TIGHTLIVE_RESULTS="${OUTDIR}/ab_results_tightlive.json"
+    TIGHTLIVE_LOG="${OUTDIR}/tightlive_bench_q4km.txt"
+    echo "== M3.13 PRONG A LIVE-RANGE-TIGHTENED resident bench (tightlive vs M3.6 leader; no llama path) =="
+    echo "  repo_root : ${REPO_ROOT}"
+    echo "  ICD       : ${ICD}"
+    echo "  outdir    : ${OUTDIR}"
+    echo "  gate       : tightlive/leader >= 1.15x (NEVER loosened); ARMED DOUBLE honest-negative (proxy-no-drop OR proxy-drop-but-TFLOPS-flat)"
+    VK_DRIVER_FILES="${ICD}" AXC_ENABLE_GPU_BENCHES=1 \
+        cargo bench --manifest-path "${REPO_ROOT}/Cargo.toml" -p axc-driver \
+        --bench resident_q4km_matmul_rb_f32acc_cached_tightlive 2>&1 | tee "${TIGHTLIVE_LOG}"
+    TIGHTLIVE_GATE_LINES="$(grep 'AT-2802\|AT-2804 proxy\|GATE-MET\|HONEST-NEGATIVE\|ratio=' "${TIGHTLIVE_LOG}" || true)"
+    TIGHTLIVE_LINE="$(grep 'AXC_Q4KM_TIGHTLIVE' "${TIGHTLIVE_LOG}" | tail -1 || true)"
+    {
+        echo "{"
+        echo "  \"milestone\": \"M3.13-prong-a-live-range-tightening\","
+        echo "  \"mode\": \"pure-source live-range-tightening (BIT-IDENTICAL to the M3.6 leader; >=1.15x gate, never loosened)\","
+        echo "  \"deliverable\": \"the MEASURED tightlive-vs-M3.6 TFLOPS ratio + the A-staging temp-count proxy delta (did the chain drop below 86?) + the ARMED DOUBLE honest-negative verdict\","
+        echo "  \"icd\": \"${ICD}\","
+        echo "  \"vulkaninfo_device\": \"$(VK_DRIVER_FILES="${ICD}" vulkaninfo 2>/dev/null | grep -m1 'deviceName' | sed 's/.*= //' | tr -d '\r' || true)\","
+        echo "  \"note\": \"PURE-SOURCE reorder/inline of the A-staging body (just-in-time dsc/dmm reads + single-use-let inlining). NO codegen change. HONEST EXPECTATION: flat TFLOPS (no AXIOM scheduler/register-allocator; the driver re-allocates from the dataflow graph). A flat result NARROWLY closes register-pressure as a SOURCE-ADDRESSABLE lever; it does NOT falsify the register-pressure pinpoint. See tightlive_bench_q4km.txt.\","
+        echo "  \"ab_line\": \"$(printf '%s' "${TIGHTLIVE_LINE}" | sed 's/"/\\"/g')\","
+        echo "  \"gate_lines\": ["
+        printf '%s\n' "${TIGHTLIVE_GATE_LINES}" | sed '/^$/d' | sed 's/"/\\"/g' | awk 'BEGIN{first=1} {if(!first)printf ",\n"; printf "    \"%s\"", $0; first=0} END{if(!first)printf "\n"}'
+        echo "  ]"
+        echo "}"
+    } > "${TIGHTLIVE_RESULTS}"
+    echo "-- wrote ${TIGHTLIVE_RESULTS}"
+    echo "-- full bench log: ${TIGHTLIVE_LOG}"
     exit 0
 fi
 

@@ -1,0 +1,246 @@
+// examples/q4km_matmul_rb_coopmat_f32acc_cached_tightlive.axc
+//
+// M3.13 PRONG A — LIVE-RANGE-TIGHTENED variant of the M3.6 leader
+// (examples/q4km_matmul_rb_coopmat_f32acc_cached.axc, the 42.86-TFLOPS dequant-scale-caching
+// LEADER). This kernel is the M3.6 leader VERBATIM EXCEPT the A-staging inner-loop body
+// (M3.6 leader lines 207-242) is RESTRUCTURED by SOURCE-LEVEL REORDER + INLINE ONLY to tighten
+// the dequant chain's live ranges. NO new builtin / codegen / capability / typecheck change.
+//
+// HYPOTHESIS UNDER TEST (M3.12's HEDGED register-pressure attribution, §3.1.40): IF the dominant
+// 1.77x dequant front-end tax is partly register/occupancy (live dequant-chain temporaries cut
+// resident warps on this register-limited kernel) AND that is influenceable in SOURCE, THEN a
+// pure-source restructure that tightens the dequant chain's live ranges should DROP the emitted
+// A-staging temp-count proxy (M3.12's 86) AND RAISE TFLOPS. A win would be a PORTABLE + pure-source
+// partial gain on the dominant gap (the tightlive kernel could become the new leader).
+//
+// HONEST EXPECTATION (the LIKELY base case): FLAT TFLOPS. AXIOM emits naive codegen with NO
+// scheduler / register-allocator pass; the NVIDIA driver re-schedules and re-allocates SASS
+// registers from the dataflow GRAPH, which a SOURCE let-reorder does NOT change. Two distinct
+// armed honest-negatives, both reported, the >=1.15x gate NEVER loosened:
+//   (a) the temp-count proxy does NOT drop (AXIOM's SSA construction is source-order-insensitive
+//       for this pattern) -> no codegen leverage; OR
+//   (b) the proxy DROPS but TFLOPS is FLAT -> the driver re-allocates from the dataflow graph, NOT
+//       source order -> register pressure is NOT a SOURCE-ADDRESSABLE lever (NARROWLY closes that;
+//       does NOT falsify the register-pressure pinpoint itself — it stays a hedged static proxy).
+//
+// THE RESTRUCTURE (M3.6 leader A-staging :207-242 -> here :NNN; the ONLY delta):
+//   (1) JUST-IN-TIME scale-cache reads: the M3.6 leader reads dsc/dmm (its :226-227) EARLY — hoisted
+//       BEFORE the whole base/byte/nib computation, so dsc/dmm live across ~14 ops. Here the two
+//       reads move DOWN to IMMEDIATELY before their sole consumer (the dequant at the bottom of the
+//       body), shrinking each live range from ~14 ops to ~1.
+//   (2) INLINE single-use intermediate lets: the M3.6 leader's `cache_idx` (its :225, sole use the
+//       two cache reads) and `qs_base` (its :231, sole use the byte read) are INLINED into their
+//       sole consumers and DROPPED as named bindings.
+//   (3) Each a_iter's dequant fully COMPLETES (the a_tile[ei_a] store) before the next a_iter begins:
+//       no value is hoisted across the a_iter loop boundary (no cross-iteration live range introduced).
+//
+// BIT-IDENTICAL TO THE M3.6 LEADER (AT-2803 authoritative). This is a REORDER/INLINE of the SAME
+// arithmetic on the SAME values:
+//   * the byte read `ptr_read_u8_zext(q, base + 16 + chunk*32 + l)` is the SAME byte (qs_base = base+16
+//     inlined; base unchanged) — same superblock-to-tile decode (sb/wk/chunk/wc/l/is_hi/is) verbatim;
+//   * the nibble select (lo `band(byte,0x0F)` / hi `band(lshr(byte,4),0x0F)`) is verbatim;
+//   * the scale-cache index `a_row*8 + is` (was `cache_idx`) is the SAME integer (inlined into the two
+//     reads) — integer arithmetic is exact, inlining cannot change the value;
+//   * dsc/dmm are read from the SAME dsc_cache/dmm_cache slots (the cache is FILLED before the post-fill
+//     RAW barrier; reading later returns the byte-IDENTICAL value — the reads stay AFTER the RAW barrier
+//     and BEFORE the post-staging barrier, WITHIN the A-staging region, so no race and no value change);
+//   * the dequant expression `f32_to_f16(dsc * f32_from_u32(nib) - dmm)` is verbatim — SAME multiply-
+//     then-subtract ORDER, SAME f32_to_f16 sole f16 sink, SAME a_tile[ei_a] store.
+//   The FP ops are NOT reassociated (a different FP order = different IEEE rounding = NOT bit-identical);
+//   only the EMISSION order of reads + the naming of single-use lets changes. AT-2803 (cross-kernel
+//   max|y_tightlive - y_cached|.to_bits() == 0 on the ASYMMETRIC make_q4km_weights fixture at
+//   K=256/512/14336, real NVIDIA) is STRICTLY STRONGER than the FROZEN 1e-3 and forbids ANY FP-order
+//   change; AT-2805 (combined condition-aware metric <= FROZEN 1e-3 vs axc_driver::q4km_oracle) is the
+//   secondary. FROZEN 1e-3 NEVER loosens.
+//
+// CAPABILITIES: BYTE-IDENTICAL to the M3.6 leader (AT-2806). Reordering reads + inlining single-use
+//   lets adds NO op-class and NO capability; shared_memory_bytes == 4096 (a_tile+b_tile 2048 +
+//   dsc_cache+dmm_cache 2048), barrier count == 3 per k_block, OpPhi count == leader. Everything OUTSIDE
+//   the A-staging body (the cache FILL, the 3 barriers, B staging, the coopmat loads + 4 mul_adds, the
+//   single-level OpPhi K-carry, the coopmat_store) is VERBATIM M3.6.
+//
+// BENCHMARKED BY: crates/axc-driver/benches/resident_q4km_matmul_rb_f32acc_cached_tightlive.rs (AT-2802/2804).
+// BIT-IDENTITY + COMBINED: crates/axc-driver/tests/dispatch_q4km_f32acc_cached_tightlive_equiv.rs (AT-2803/2805).
+// STATIC PROXY + STRUCTURE + PRONG B VERDICT: crates/axc-driver/tests/m313_tightlive_proxy_and_feasibility.rs
+//   (AT-2800/2801/2810). COMPILE/CAP-SET ANCHOR: AT-2806 in compile_shared_examples.rs (CI, no GPU).
+//
+// Anti-pattern #2: explicit `return;`.
+// Anti-pattern #8: no `>>` (use shr/lshr for shifts); k_block % 16 expressed as k_block - (k_block/16)*16.
+
+@kernel
+@workgroup(32, 1, 1)
+@cooperative_matrix
+@strategy { rb_m: ?[2], rb_n: ?[2], tile_k: ?[16], a_block_size: ?[512], b_block_size: ?[512] }
+@intent("M3.13 PRONG A live-range-tightened Q4_K_M scale-cached 2x2 RB coopmat matmul (AT-2800..2807)")
+@complexity(O(n))
+fn q4km_matmul_rb_coopmat_f32acc_cached_tightlive(
+    q: readonly_buffer[u8],
+    x: readonly_buffer[f16],
+    C: buffer[f32],
+    M: u32,
+    N: u32,
+    K: u32,
+    n_blocks_per_row: u32
+) -> void {
+    // Shared staging tiles for the 2x2 block (identical sizing to M3.6; A/B stay f16).
+    shared a_tile: shared[f16, ?a_block_size];
+    shared b_tile: shared[f16, ?b_block_size];
+
+    // Per-superblock dequant-scale caches (8 sub-blocks x 32 weight-rows = 256 each). VERBATIM M3.6.
+    shared dsc_cache: shared[f32, 256];
+    shared dmm_cache: shared[f32, 256];
+
+    // Block coordinates (ASYMMETRIC, identical to M3.6).
+    let block_col: u32 = gid(0u32) / 32u32;
+    let block_row: u32 = gid(1u32);
+
+    // Lane index within the subgroup for cooperative staging.
+    let lane: u32 = subgroup_invocation_id();
+
+    // Output tile coordinates within the 2x2 block.
+    let tile_row_0: u32 = block_row * 2u32;
+    let tile_row_1: u32 = block_row * 2u32 + 1u32;
+    let tile_col_0: u32 = block_col * 2u32;
+    let tile_col_1: u32 = block_col * 2u32 + 1u32;
+
+    // 4 loop-carried f32 coopmat accumulators (single-level OpPhi K-carry, VERBATIM M3.6).
+    let mut acc_00: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_01: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_10: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_11: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+
+    // Staging iterations per thread.
+    let a_iters: u32 = ?a_block_size / 32u32;
+    let b_iters: u32 = ?b_block_size / 32u32;
+
+    // Number of K-blocks.
+    let num_k_blocks: u32 = K / ?tile_k;
+
+    // K-loop: FLAT single level (single-level OpPhi N-accumulator carry, VERBATIM M3.6).
+    for k_block in range(0u32, num_k_blocks) {
+        // Superblock currently in flight (UNIFORM: k_block is the loop induction variable).
+        let sb_idx: u32 = k_block / 16u32;
+
+        // ── COOPERATIVE SCALE-CACHE FILL — fires ONCE per superblock (VERBATIM M3.6) ──────────
+        if k_block - sb_idx * 16u32 == 0u32 {
+            for fi in range(0u32, 8u32) {
+                let cache_i: u32 = fi * 32u32 + lane;          // 0..255
+                let row_local: u32 = cache_i / 8u32;           // 0..31
+                let is: u32 = cache_i - row_local * 8u32;      // 0..7
+                let g_row: u32 = block_row * 32u32 + row_local;
+
+                let base: u32 = g_row * n_blocks_per_row * 144u32 + sb_idx * 144u32;
+                let d_bits: u32 = ptr_read_u16_zext(q, base);
+                let dmin_bits: u32 = ptr_read_u16_zext(q, base + 2u32);
+                let d: f32 = f16_bits_to_f32(d_bits);
+                let dmin: f32 = f16_bits_to_f32(dmin_bits);
+                let scales_base: u32 = base + 4u32;
+
+                let mut sc: u32 = 0u32;
+                let mut mm: u32 = 0u32;
+                if is < 4u32 {
+                    sc = band(ptr_read_u8_zext(q, scales_base + is), 63u32);
+                    mm = band(ptr_read_u8_zext(q, scales_base + is + 4u32), 63u32);
+                } else {
+                    let lo4_sc: u32 = band(ptr_read_u8_zext(q, scales_base + is + 4u32), 0x0Fu32);
+                    let hi2_sc: u32 = band(lshr(ptr_read_u8_zext(q, scales_base + is - 4u32), 6u32), 0x03u32);
+                    sc = bor(lo4_sc, shl(hi2_sc, 4u32));
+                    let lo4_m: u32 = band(lshr(ptr_read_u8_zext(q, scales_base + is + 4u32), 4u32), 0x0Fu32);
+                    let hi2_m: u32 = band(lshr(ptr_read_u8_zext(q, scales_base + is), 6u32), 0x03u32);
+                    mm = bor(lo4_m, shl(hi2_m, 4u32));
+                }
+
+                dsc_cache[cache_i] = d * f32_from_u32(sc);
+                dmm_cache[cache_i] = dmin * f32_from_u32(mm);
+            }
+        }
+
+        // RAW barrier (HOISTED, VERBATIM M3.6): UNCONDITIONAL, AFTER the fill, BEFORE A staging.
+        workgroup_barrier();
+
+        // ── Dequant A[block_row*32..+32, k_block*16..+16] into a_tile — LIVE-RANGE-TIGHTENED ──
+        // M3.13 PRONG A: the ONLY delta vs M3.6. The dsc/dmm cache reads are moved JUST-IN-TIME
+        // (down to immediately before the consuming dequant); `cache_idx` and `qs_base` are inlined
+        // into their sole consumers. SAME byte read, SAME nibble select, SAME dequant FP expression
+        // + ORDER, SAME f32_to_f16 sink, SAME a_tile store — BIT-IDENTICAL (AT-2803).
+        for a_iter in range(0u32, a_iters) {
+            let ei_a: u32 = a_iter * 32u32 + lane;
+            let a_row: u32 = ei_a / 16u32;
+            let a_col: u32 = ei_a - a_row * 16u32;
+            let g_k: u32 = k_block * ?tile_k + a_col;
+
+            // Superblock-to-tile decode for this element's nibble (byte-identical M3.6).
+            let sb: u32 = g_k / 256u32;
+            let wk: u32 = g_k - sb * 256u32;
+            let chunk: u32 = wk / 64u32;
+            let wc: u32 = wk - chunk * 64u32;
+            let l: u32 = wc - (wc / 32u32) * 32u32;
+            let is_hi: u32 = wc / 32u32;            // 0 = lo nibble, 1 = hi nibble
+            let is: u32 = chunk * 2u32 + is_hi;     // sub-block index 0..7
+
+            // Byte holding this element's nibble: (base + 16) + chunk*32 + l. `qs_base = base + 16`
+            // is INLINED here (its sole use). SAME byte as M3.6 (base unchanged).
+            let base: u32 = (block_row * 32u32 + a_row) * n_blocks_per_row * 144u32 + sb * 144u32;
+            let byte: u32 = ptr_read_u8_zext(q, base + 16u32 + chunk * 32u32 + l);
+            let mut nib: u32 = band(byte, 0x0Fu32);
+            if is_hi >= 1u32 {
+                nib = band(lshr(byte, 4u32), 0x0Fu32);
+            }
+
+            // JUST-IN-TIME scale-cache reads: read dsc/dmm IMMEDIATELY before the dequant consumer
+            // (live range ~14 ops -> ~1). `cache_idx = a_row*8 + is` is INLINED here (its sole use).
+            // The reads stay AFTER the post-fill RAW barrier and BEFORE the post-staging barrier —
+            // they consume the FILL output; same shared slots, byte-identical values (integer index
+            // is exact; the cache is filled). NO FP reassociation (multiply-then-subtract verbatim).
+            let dsc: f32 = dsc_cache[a_row * 8u32 + is];
+            let dmm: f32 = dmm_cache[a_row * 8u32 + is];
+
+            // Dequant in f32, narrow to f16 — VERBATIM M3.6 line 240 (SAME multiply-then-subtract
+            // ORDER, SAME f32_to_f16 sole f16 sink). a_tile store completes this a_iter (no hoist).
+            let w: f16 = f32_to_f16(dsc * f32_from_u32(nib) - dmm);
+            a_tile[ei_a] = w;
+        }
+
+        // ── Stage B (x) tile into b_tile — VERBATIM M3.6 (x is already f16) ──────
+        for b_iter in range(0u32, b_iters) {
+            let ei_b: u32 = b_iter * 32u32 + lane;
+            let b_row: u32 = ei_b / 32u32;
+            let b_col: u32 = ei_b - b_row * 32u32;
+            let b_global_row: u32 = k_block * ?tile_k + b_row;
+            let b_global_col: u32 = block_col * 32u32 + b_col;
+            let b_global: u32 = b_global_row * N + b_global_col;
+            b_tile[ei_b] = x[b_global];
+        }
+
+        // Barrier: staging complete before coopmat loads (VERBATIM M3.6).
+        workgroup_barrier();
+
+        // ── Coopmat loads (f16 A/B) + 4 mul_adds into f32 accumulators (HMMA) — VERBATIM M3.6 ──
+        let a_mat_0: matrix[f16, 16, 16, a] = coopmat_load(a_tile, 0u32, 16u32);
+        let a_mat_1: matrix[f16, 16, 16, a] = coopmat_load(a_tile, 256u32, 16u32);
+
+        let b_mat_0: matrix[f16, 16, 16, b] = coopmat_load(b_tile, 0u32, 32u32);
+        let b_mat_1: matrix[f16, 16, 16, b] = coopmat_load(b_tile, 16u32, 32u32);
+
+        acc_00 = coopmat_mul_add(a_mat_0, b_mat_0, acc_00);
+        acc_01 = coopmat_mul_add(a_mat_0, b_mat_1, acc_01);
+        acc_10 = coopmat_mul_add(a_mat_1, b_mat_0, acc_10);
+        acc_11 = coopmat_mul_add(a_mat_1, b_mat_1, acc_11);
+
+        // WAR barrier (VERBATIM M3.6 end-of-body — doubles as the cache WAR).
+        workgroup_barrier();
+    }
+
+    // ── Store the 4 accumulated f32 tiles to C (buffer[f32]) — VERBATIM M3.6 ──
+    let c_base_00: u32 = (tile_row_0 * 16u32) * N + (tile_col_0 * 16u32);
+    let c_base_01: u32 = (tile_row_0 * 16u32) * N + (tile_col_1 * 16u32);
+    let c_base_10: u32 = (tile_row_1 * 16u32) * N + (tile_col_0 * 16u32);
+    let c_base_11: u32 = (tile_row_1 * 16u32) * N + (tile_col_1 * 16u32);
+
+    coopmat_store(acc_00, C, c_base_00, N);
+    coopmat_store(acc_01, C, c_base_01, N);
+    coopmat_store(acc_10, C, c_base_10, N);
+    coopmat_store(acc_11, C, c_base_11, N);
+
+    return;
+}
