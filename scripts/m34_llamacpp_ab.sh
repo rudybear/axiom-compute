@@ -11,7 +11,7 @@
 #
 # Usage:
 #   VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json AXC_ENABLE_GPU_BENCHES=1 \
-#     scripts/m34_llamacpp_ab.sh [--skip-build] [--skip-llama] [--fused | --fused-f32acc | --fused-f32acc-cached | --fused-f32acc-db | --fused-f32acc-rb44 | --fused-f32acc-rb42 | --warptile | --pad | --sr]
+#     scripts/m34_llamacpp_ab.sh [--skip-build] [--skip-llama] [--fused | --fused-f32acc | --fused-f32acc-cached | --fused-f32acc-db | --fused-f32acc-rb44 | --fused-f32acc-rb42 | --warptile | --pad | --sr | --ablate]
 #
 #   --pad (M3.10a): runs the BANK-PADDED resident benches — the plain-f32 padded RB
 #                    (resident_matmul_rb_pad, gate >=1.15x the unpadded base at 768^3) AND the
@@ -117,6 +117,7 @@ FUSED_F32ACC_RB42=0
 WARPTILE=0    # M3.9: --warptile -> PLAIN-f32 multi-subgroup warptile resident bench (no llama path).
 PAD=0         # M3.10a: --pad -> the BANK-PADDED resident benches (plain-f32 + Q4_K_M, no llama path).
 SR=0          # M3.11a: --sr -> the dequant-index STRENGTH-REDUCED resident bench vs M3.6 (no llama path).
+ABLATE=0      # M3.12: --ablate -> the dequant front-end ABLATION DIAGNOSTIC profiling instruments (no llama path).
 for arg in "$@"; do
     case "$arg" in
         --skip-build) SKIP_BUILD=1 ;;
@@ -136,6 +137,8 @@ for arg in "$@"; do
         --pad) PAD=1 ;;
         # M3.11a: dequant-index STRENGTH-REDUCED resident bench vs M3.6 (short-circuits the llama path).
         --sr) SR=1 ;;
+        # M3.12: dequant front-end ABLATION DIAGNOSTIC profiling instruments (short-circuits the llama path).
+        --ablate) ABLATE=1 ;;
         *) echo "unknown arg: $arg" >&2; exit 2 ;;
     esac
 done
@@ -178,6 +181,46 @@ if [ "${SR}" -eq 1 ]; then
     } > "${SR_RESULTS}"
     echo "-- wrote ${SR_RESULTS}"
     echo "-- full bench log: ${SR_LOG}"
+    exit 0
+fi
+
+# ── M3.12 --ablate: dequant front-end ABLATION DIAGNOSTIC (PROFILING INSTRUMENTS, no llama path). ──
+# Runs resident_q4km_matmul_rb_f32acc_cached_ablate: per-variant resident TFLOPS (V-structure-probe
+# FIRST = the PRIMARY denominator, then V-passthrough, the M3.6 leader, and the plain-f32 core) at
+# A/B + 768^3, plus the per-variant register/temp-count proxy + the RE-ANCHORED triangulation
+# (arithmetic bucket on [42.86 <-> V-structure-probe]; structural = 75.8 - V-structure-probe). The
+# variants are PROFILING INSTRUMENTS with WRONG OUTPUT BY DESIGN (NO correctness gate, NO perf gate);
+# the deliverable is the PINPOINT of the dominant 1.77x dequant front-end tax + the next-milestone
+# target. Emits AXC_Q4KM_AB_ABLATE. Writes ab_results_ablate.json. No llama path (the llama A/B is M3.6's).
+if [ "${ABLATE}" -eq 1 ]; then
+    ABLATE_RESULTS="${OUTDIR}/ab_results_ablate.json"
+    ABLATE_LOG="${OUTDIR}/ablate_bench_q4km.txt"
+    echo "== M3.12 dequant front-end ABLATION DIAGNOSTIC (profiling instruments; no llama path) =="
+    echo "  repo_root : ${REPO_ROOT}"
+    echo "  ICD       : ${ICD}"
+    echo "  outdir    : ${OUTDIR}"
+    echo "  deliverable: the PINPOINT (arithmetic vs structural bucket) + the next-milestone target; NO perf/correctness gate (wrong output by design)"
+    VK_DRIVER_FILES="${ICD}" AXC_ENABLE_GPU_BENCHES=1 \
+        cargo bench --manifest-path "${REPO_ROOT}/Cargo.toml" -p axc-driver \
+        --bench resident_q4km_matmul_rb_f32acc_cached_ablate 2>&1 | tee "${ABLATE_LOG}"
+    ABLATE_PINPOINT_LINES="$(grep 'ablate AT-2702\|ablate .* TFLOPS\|bucket (\|PINPOINT\|CROSS-CHECK\|temp-count proxy\|MEASURED FINDING\|CONSISTENCY' "${ABLATE_LOG}" || true)"
+    ABLATE_LINE="$(grep 'AXC_Q4KM_AB_ABLATE' "${ABLATE_LOG}" | tail -1 || true)"
+    {
+        echo "{"
+        echo "  \"milestone\": \"M3.12-dequant-frontend-ablation-diagnostic\","
+        echo "  \"mode\": \"ablation-diagnostic (profiling instruments, wrong output by design, no correctness/perf gate)\","
+        echo "  \"deliverable\": \"PINPOINT the dominant 1.77x dequant front-end tax (arithmetic vs structural bucket, RE-ANCHORED on V-structure-probe as the PRIMARY denominator) + name the next-milestone target\","
+        echo "  \"icd\": \"${ICD}\","
+        echo "  \"vulkaninfo_device\": \"$(VK_DRIVER_FILES="${ICD}" vulkaninfo 2>/dev/null | grep -m1 'deviceName' | sed 's/.*= //' | tr -d '\r' || true)\","
+        echo "  \"note\": \"PURE-SOURCE profiling instruments (no codegen change). V-structure-probe (near-free A-value, full M3.6 structure) is the PRIMARY denominator measured FIRST; V-passthrough (f32_to_f16-retaining nibble pass-through) forks structure-vs-arithmetic; V-no-scale-read SUBSUMED, V-no-convert DROPPED (no integer-route-to-f16). Per-variant register/temp-count proxy makes the in-bucket register-occupancy residual visible (the r3 cross-check). See ablate_bench_q4km.txt.\","
+        echo "  \"ab_line\": \"$(printf '%s' "${ABLATE_LINE}" | sed 's/"/\\"/g')\","
+        echo "  \"pinpoint_lines\": ["
+        printf '%s\n' "${ABLATE_PINPOINT_LINES}" | sed '/^$/d' | sed 's/"/\\"/g' | awk 'BEGIN{first=1} {if(!first)printf ",\n"; printf "    \"%s\"", $0; first=0} END{if(!first)printf "\n"}'
+        echo "  ]"
+        echo "}"
+    } > "${ABLATE_RESULTS}"
+    echo "-- wrote ${ABLATE_RESULTS}"
+    echo "-- full bench log: ${ABLATE_LOG}"
     exit 0
 fi
 

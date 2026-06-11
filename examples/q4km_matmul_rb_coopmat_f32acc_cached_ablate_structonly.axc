@@ -1,0 +1,179 @@
+// examples/q4km_matmul_rb_coopmat_f32acc_cached_ablate_structonly.axc
+//
+// PROFILING INSTRUMENT — WRONG OUTPUT BY DESIGN — NOT A CORRECT/SHIPPABLE KERNEL — measures TFLOPS only
+//
+// M3.12 ABLATION DIAGNOSTIC — V-structure-probe (the PRIMARY DENOMINATOR).
+//
+// This is the M3.6 leader (q4km_matmul_rb_coopmat_f32acc_cached.axc) with ONLY the per-element
+// A-dequant VALUE (cached.axc:240) replaced by a NEAR-FREE per-element-index value. EVERYTHING
+// ELSE is VERBATIM M3.6: the scale-cache FILL (held constant), the dsc_cache/dmm_cache shared
+// arrays, ALL 3 barriers, B staging, the coopmat loads + 4 mul_adds, the single-level OpPhi
+// K-carry, the 4096 B shared footprint.
+//
+// WHAT IT ISOLATES: the pure M3.6 STRUCTURE ceiling — the shared-A store + 3 barriers + coopmat
+// issue + B-path + the 4 KB scale-cache occupancy + the kept fill — with ZERO per-element A-side
+// dequant work (no packed-q u8 load, no per-element dsc/dmm scale-read, no FMul/FSub). Its TFLOPS
+// is the CEILING the M3.6 structure can reach if the entire per-element dequant front-end were free.
+//
+// TRIANGULATION ROLE (re-anchored, r2): this is the PRIMARY DENOMINATOR, MEASURED FIRST. The 1.77x
+// splits into TWO non-confounded buckets:
+//   (A) ARITHMETIC = the [42.86 <-> V-structure-probe] interval (BOTH endpoints carry the IDENTICAL
+//       4 KB caches + 3 barriers + kept fill — isolates the per-element dequant-ARITHMETIC delta with
+//       NO SHARED-MEMORY/BARRIER structural confound; r3: per-thread REGISTER footprint is NOT held
+//       constant along this line — this probe collapses the dequant value to a near-free index-derived
+//       expression, removing the live dequant-chain temporaries; the AT-2701 temp-count proxy makes
+//       that delta visible).
+//   (B) STRUCTURAL = (75.8 - V-structure-probe) (the cost of HAVING the dequant front-end's 4 KB
+//       scale-cache occupancy + the extra barrier vs the leaner plain-f32 core).
+//
+// THE NEAR-FREE A-VALUE (store-hoist guard, r2 Fix 5): the a_tile value is derived from the
+// per-element index ei_a (`f32_to_f16(f32_from_u32(ei_a))`) — NOT a workgroup-uniform loop-invariant
+// constant. Because ei_a depends on a_iter (the inner-loop induction var), the value VARIES per
+// iteration, so the per-element a_tile OpStore CANNOT be hoisted out of the k_block loop body (it
+// genuinely depends on the loop index). This keeps the store INSIDE the loop (AT-2700 asserts it)
+// while dropping the entire dequant front-end (no u8 load, no scale-read, no FMul/FSub). f32_to_f16
+// is the ONLY f16 sink in the language (q4_0.rs), so an f16 store MUST route through it; the chain is
+// the minimal ConvertUToF + FConvert (no global load, no per-element shared read).
+//
+// CAPABILITIES: byte-identical to the M3.6 leader (no new op-class; the index-derived value uses only
+// f32_from_u32 / f32_to_f16 already present). shared_memory_bytes == 4096 (the fill is kept).
+//
+// HONESTY: this variant computes WRONG output BY DESIGN (a_tile holds a bogus index-derived f16). It
+// is a DIAGNOSTIC-ONLY profiling instrument — NOT a correct kernel, NOT shippable, NO correctness
+// gate. AT-2705 asserts the wrong-output marker above + that NO correctness-gated test references it.
+//
+// Anti-pattern #2: explicit `return;`.
+// Anti-pattern #8: no `>>` (k_block % 16 expressed as k_block - (k_block/16)*16).
+
+@kernel
+@workgroup(32, 1, 1)
+@cooperative_matrix
+@strategy { rb_m: ?[2], rb_n: ?[2], tile_k: ?[16], a_block_size: ?[512], b_block_size: ?[512] }
+@intent("PROFILING INSTRUMENT (wrong output): M3.12 V-structure-probe — M3.6 structure ceiling, near-free A-value")
+@complexity(O(n))
+fn q4km_matmul_rb_coopmat_f32acc_cached_ablate_structonly(
+    q: readonly_buffer[u8],
+    x: readonly_buffer[f16],
+    C: buffer[f32],
+    M: u32,
+    N: u32,
+    K: u32,
+    n_blocks_per_row: u32
+) -> void {
+    shared a_tile: shared[f16, ?a_block_size];
+    shared b_tile: shared[f16, ?b_block_size];
+
+    // M3.6 scale caches — KEPT (the fill is held constant; only per-element reads/arith vary).
+    shared dsc_cache: shared[f32, 256];
+    shared dmm_cache: shared[f32, 256];
+
+    let block_col: u32 = gid(0u32) / 32u32;
+    let block_row: u32 = gid(1u32);
+
+    let lane: u32 = subgroup_invocation_id();
+
+    let tile_row_0: u32 = block_row * 2u32;
+    let tile_row_1: u32 = block_row * 2u32 + 1u32;
+    let tile_col_0: u32 = block_col * 2u32;
+    let tile_col_1: u32 = block_col * 2u32 + 1u32;
+
+    let mut acc_00: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_01: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_10: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_11: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+
+    let a_iters: u32 = ?a_block_size / 32u32;
+    let b_iters: u32 = ?b_block_size / 32u32;
+
+    let num_k_blocks: u32 = K / ?tile_k;
+
+    for k_block in range(0u32, num_k_blocks) {
+        let sb_idx: u32 = k_block / 16u32;
+
+        // ── SCALE-CACHE FILL — VERBATIM M3.6 (HELD CONSTANT; structural, fires once per superblock) ──
+        if k_block - sb_idx * 16u32 == 0u32 {
+            for fi in range(0u32, 8u32) {
+                let cache_i: u32 = fi * 32u32 + lane;
+                let row_local: u32 = cache_i / 8u32;
+                let is: u32 = cache_i - row_local * 8u32;
+                let g_row: u32 = block_row * 32u32 + row_local;
+
+                let base: u32 = g_row * n_blocks_per_row * 144u32 + sb_idx * 144u32;
+                let d_bits: u32 = ptr_read_u16_zext(q, base);
+                let dmin_bits: u32 = ptr_read_u16_zext(q, base + 2u32);
+                let d: f32 = f16_bits_to_f32(d_bits);
+                let dmin: f32 = f16_bits_to_f32(dmin_bits);
+                let scales_base: u32 = base + 4u32;
+
+                let mut sc: u32 = 0u32;
+                let mut mm: u32 = 0u32;
+                if is < 4u32 {
+                    sc = band(ptr_read_u8_zext(q, scales_base + is), 63u32);
+                    mm = band(ptr_read_u8_zext(q, scales_base + is + 4u32), 63u32);
+                } else {
+                    let lo4_sc: u32 = band(ptr_read_u8_zext(q, scales_base + is + 4u32), 0x0Fu32);
+                    let hi2_sc: u32 = band(lshr(ptr_read_u8_zext(q, scales_base + is - 4u32), 6u32), 0x03u32);
+                    sc = bor(lo4_sc, shl(hi2_sc, 4u32));
+                    let lo4_m: u32 = band(lshr(ptr_read_u8_zext(q, scales_base + is + 4u32), 4u32), 0x0Fu32);
+                    let hi2_m: u32 = band(lshr(ptr_read_u8_zext(q, scales_base + is), 6u32), 0x03u32);
+                    mm = bor(lo4_m, shl(hi2_m, 4u32));
+                }
+
+                dsc_cache[cache_i] = d * f32_from_u32(sc);
+                dmm_cache[cache_i] = dmin * f32_from_u32(mm);
+            }
+        }
+
+        // RAW barrier (VERBATIM M3.6) — held constant.
+        workgroup_barrier();
+
+        // ── A staging: NEAR-FREE per-element-index value (PROFILING INSTRUMENT — wrong output) ──
+        //   The packed-q u8 load + the per-element dsc/dmm scale-reads + the FMul/FSub are DROPPED.
+        //   The stored f16 is derived from the per-element index ei_a (VARIES per iteration -> the
+        //   store CANNOT hoist out of the loop). f32_to_f16 is the only f16 sink, so the chain is the
+        //   minimal ConvertUToF + FConvert with NO global load and NO per-element shared read.
+        for a_iter in range(0u32, a_iters) {
+            let ei_a: u32 = a_iter * 32u32 + lane;
+            let w: f16 = f32_to_f16(f32_from_u32(ei_a));
+            a_tile[ei_a] = w;
+        }
+
+        // ── Stage B (x) tile into b_tile — VERBATIM M3.6 ──────────────────────────
+        for b_iter in range(0u32, b_iters) {
+            let ei_b: u32 = b_iter * 32u32 + lane;
+            let b_row: u32 = ei_b / 32u32;
+            let b_col: u32 = ei_b - b_row * 32u32;
+            let b_global_row: u32 = k_block * ?tile_k + b_row;
+            let b_global_col: u32 = block_col * 32u32 + b_col;
+            let b_global: u32 = b_global_row * N + b_global_col;
+            b_tile[ei_b] = x[b_global];
+        }
+
+        workgroup_barrier();
+
+        let a_mat_0: matrix[f16, 16, 16, a] = coopmat_load(a_tile, 0u32, 16u32);
+        let a_mat_1: matrix[f16, 16, 16, a] = coopmat_load(a_tile, 256u32, 16u32);
+
+        let b_mat_0: matrix[f16, 16, 16, b] = coopmat_load(b_tile, 0u32, 32u32);
+        let b_mat_1: matrix[f16, 16, 16, b] = coopmat_load(b_tile, 16u32, 32u32);
+
+        acc_00 = coopmat_mul_add(a_mat_0, b_mat_0, acc_00);
+        acc_01 = coopmat_mul_add(a_mat_0, b_mat_1, acc_01);
+        acc_10 = coopmat_mul_add(a_mat_1, b_mat_0, acc_10);
+        acc_11 = coopmat_mul_add(a_mat_1, b_mat_1, acc_11);
+
+        workgroup_barrier();
+    }
+
+    let c_base_00: u32 = (tile_row_0 * 16u32) * N + (tile_col_0 * 16u32);
+    let c_base_01: u32 = (tile_row_0 * 16u32) * N + (tile_col_1 * 16u32);
+    let c_base_10: u32 = (tile_row_1 * 16u32) * N + (tile_col_0 * 16u32);
+    let c_base_11: u32 = (tile_row_1 * 16u32) * N + (tile_col_1 * 16u32);
+
+    coopmat_store(acc_00, C, c_base_00, N);
+    coopmat_store(acc_01, C, c_base_01, N);
+    coopmat_store(acc_10, C, c_base_10, N);
+    coopmat_store(acc_11, C, c_base_11, N);
+
+    return;
+}
