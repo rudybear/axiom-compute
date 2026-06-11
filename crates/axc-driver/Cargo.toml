@@ -117,6 +117,16 @@ name = "resident_q4km_matmul_rb_f32acc_cached"
 path = "benches/resident_q4km_matmul_rb_f32acc_cached.rs"
 harness = false
 
+# M3.13 PRONG A: resident TFLOPS for the LIVE-RANGE-TIGHTENED kernel vs the M3.6 leader (AT-2802/2804),
+# emitting AXC_Q4KM_TIGHTLIVE (scripts/m34_llamacpp_ab.sh --tightlive). Prints the tightlive/leader
+# ratio at 768^3 + A/B, the >=1.15x gate verdict (NEVER loosened), and the per-variant A-staging
+# temp-count proxy; ARMED DOUBLE honest-negative (proxy-no-drop OR proxy-drop-but-TFLOPS-flat, the
+# LIKELY base case). Bench ID: dispatch_resident_q4km_matmul_rb_f32acc_cached_tightlive. GPU-gated.
+[[bench]]
+name = "resident_q4km_matmul_rb_f32acc_cached_tightlive"
+path = "benches/resident_q4km_matmul_rb_f32acc_cached_tightlive.rs"
+harness = false
+
 # M3.11a: honest A/B + cube TFLOPS bench for the dequant-index STRENGTH-REDUCED Q4_K_M scale-cached
 # f32-accumulator RB coopmat matmul (AT-2602/2604) vs the M3.6 leader, emitting
 # AXC_Q4KM_AB_F32ACC_CACHED_SR (scripts/m34_llamacpp_ab.sh --sr). >= 1.15x M3.6 (>= 49.3 TFLOPS) gate,

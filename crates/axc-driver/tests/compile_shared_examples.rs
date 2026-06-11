@@ -2094,6 +2094,79 @@ fn at_2405_q4km_rb_pad_compile_capset_sharedbytes() {
     );
 }
 
+// ── AT-2806: M3.13 PRONG A — the LIVE-RANGE-TIGHTENED kernel compiles + spirv-val clean + ──────
+//            cap-set BYTE-IDENTICAL to the M3.6 leader + shared_memory_bytes==4096 + barrier/OpPhi
+//            counts == leader (the reorder/inline adds NO op-class, NO capability, NO barrier).
+//
+// PRONG A is a PURE-SOURCE reorder/inline of the A-staging body (just-in-time dsc/dmm reads +
+// single-use-let inlining of cache_idx/qs_base). It must emit a SPIR-V module with the SAME caps,
+// the SAME 4096 shared bytes, the SAME 3 per-k_block barriers, and the SAME OpPhi count as the M3.6
+// leader. (Optimistic reviewer's note: confirm inlining qs_base/cache_idx does not drop a now-unused
+// type/constant that alters the byte-level cap encoding or shared_memory_bytes.) BIT-IDENTITY is the
+// GPU gate (AT-2803); this is the CI compile/cap-set anchor (no GPU).
+#[test]
+fn at_2806_tightlive_compile_capset_sharedbytes() {
+    use std::collections::BTreeSet;
+
+    let tl_src = include_str!("../../../examples/q4km_matmul_rb_coopmat_f32acc_cached_tightlive.axc");
+    let base_src = include_str!("../../../examples/q4km_matmul_rb_coopmat_f32acc_cached.axc");
+
+    let (tl_bytes, meta) = compile_source_with_assignments(tl_src, &rb2x2_assignments())
+        .unwrap_or_else(|e| panic!("q4km_matmul_rb_coopmat_f32acc_cached_tightlive.axc: compile failed: {e:?}"));
+    let tl_words = words_and_validate(tl_bytes, "q4km_matmul_rb_coopmat_f32acc_cached_tightlive.axc");
+    let base_words = compile_words(base_src, Some(&rb2x2_assignments()),
+        "q4km_matmul_rb_coopmat_f32acc_cached.axc");
+
+    // Cap set + extension set BYTE-IDENTICAL to the M3.6 leader.
+    let (tl_caps, tl_exts) = capability_extension_sets(&tl_words);
+    let (base_caps, base_exts) = capability_extension_sets(&base_words);
+    let tl_set: BTreeSet<u32> = tl_caps.iter().copied().collect();
+    let base_set: BTreeSet<u32> = base_caps.iter().copied().collect();
+    assert_eq!(
+        tl_set, base_set,
+        "AT-2806: tightlive cap set must be BYTE-IDENTICAL to the M3.6 leader (reorder/inline adds \
+         NO capability); tightlive={tl_caps:?} base={base_caps:?}"
+    );
+    assert_eq!(
+        tl_exts, base_exts,
+        "AT-2806: tightlive extension set must equal the M3.6 leader's; \
+         tightlive={tl_exts:?} base={base_exts:?}"
+    );
+
+    // shared_memory_bytes == 4096 (a_tile+b_tile 2048 + dsc/dmm caches 2048) — VERBATIM M3.6.
+    let expected_shared_bytes: u32 = (512 + 512) * 2 + 2 * 256 * 4; // 4096
+    assert_eq!(
+        meta.shared_memory_bytes, expected_shared_bytes,
+        "AT-2806: tightlive shared_memory_bytes must be {expected_shared_bytes} (==M3.6 leader); \
+         got {} (the inlined single-use lets must NOT alter the shared footprint)",
+        meta.shared_memory_bytes
+    );
+
+    // Barrier count == base (3 per k_block) and OpPhi count == base (single-level carry intact).
+    let tl_barriers = count_op_control_barrier(&tl_words);
+    let base_barriers = count_op_control_barrier(&base_words);
+    assert_eq!(
+        tl_barriers, base_barriers,
+        "AT-2806: tightlive OpControlBarrier count must equal the M3.6 leader (the reorder is WITHIN \
+         the A-staging region between barriers — no barrier added/removed); \
+         tightlive={tl_barriers} base={base_barriers}"
+    );
+    let tl_phis = count_op_phi(&tl_words);
+    let base_phis = count_op_phi(&base_words);
+    assert_eq!(
+        tl_phis, base_phis,
+        "AT-2806: tightlive OpPhi count must equal the M3.6 leader (single-level K-carry intact); \
+         tightlive={tl_phis} base={base_phis}"
+    );
+
+    eprintln!(
+        "AT-2806 PASS: q4km_matmul_rb_coopmat_f32acc_cached_tightlive.axc compiles + spirv-val clean; \
+         cap set BYTE-IDENTICAL to the M3.6 leader ({tl_caps:?}); shared_memory_bytes={} (4096); \
+         OpControlBarrier={tl_barriers} == base; OpPhi={tl_phis} == base.",
+        meta.shared_memory_bytes
+    );
+}
+
 // ── AT-2703: M3.12 dequant front-end ABLATION DIAGNOSTIC profiling-instrument variants — ──
 //            compile + spirv-val + cap-set BYTE-IDENTICAL to the M3.6 leader (no new capability)
 //
