@@ -1,0 +1,287 @@
+// examples/q4km_matmul_rb_coopmat_f32acc_cached_sr.axc
+//
+// M3.11a: DEQUANT-INDEX AFFINE STRENGTH-REDUCTION on top of the M3.6 leader
+// (examples/q4km_matmul_rb_coopmat_f32acc_cached.axc).
+//
+// PROBLEM (DESIGN §3.1.39, the first lever on the DOMINANT 1.77x dequant front-end gap):
+// the M3.6 leader's A-staging inner loop (cached.axc:207-242) decodes, PER A-element, a packed-q
+// nibble address from the affine seed g_k = k_block*16 + a_col, RECOMPUTING the whole superblock
+// index chain (sb, wk, chunk, wc, l, is_hi, is) every k_block — INCLUDING the non-power-of-2
+// x144 superblock-byte-stride OpIMul on sb (cached.axc:230), the compound nibble byte address
+// (cached.axc:232), and the sb/chunk/is decode. The dsc/dmm SCALES are already amortized (the
+// M3.6 once-per-16-k_blocks cache fill), so the per-element residual is exactly this AFFINE integer
+// index-decode + the ~7-op IRREDUCIBLE dequant floor (nibble band/lshr/band + ConvertUToF/FMul/
+// FSub/FConvert). The index-decode is AFFINE over the k_block induction variable with a constant
+// per-iteration delta (g_k(k_block+1) = g_k(k_block) + 16), so it is strength-reducible to running
+// scalar counters — the classic IndVarSimplify / Allen-Cocke-Kennedy operator-strength-reduction.
+//
+// MECHANISM (PURE SOURCE — loop-carried scalar counters; ZERO codegen/HIR/typecheck/parser change):
+//   Three carried integer counters replace the recomputed-each-k_block affine chain, using the
+//   PROVEN scalar Function-storage OpVariable carry (body.rs:493-498/540-564 — the SAME mechanism
+//   the induction variable k_block itself uses, body.rs:1102 — NOT the coopmat OpPhi path, which is
+//   gated on coopmat_binding_ids and never touches scalars, so this does NOT trip
+//   LoopCarriedCoopMatConditionalReassignUnsupported):
+//
+//     sb_idx_c       : superblock index = k_block/16. init 0; += 1 on the 16-wrap.
+//     sb_byte_base_c : the superblock byte-base sb*144 (the x144 OpIMul PRIZE). init 0; += 144 on
+//                      the 16-wrap. A carried OpIAdd REPLACES the per-element non-pow2 multiply.
+//     wc0_c          : within-superblock offset at a_col=0 = (k_block mod 16)*16. init 0; += 16
+//                      each k_block; wraps to 0 on the 16-boundary (wc0_c == 256). Since wk for
+//                      any a_col is wc0_c + a_col (a_col 0..15, wk in [0,256)), the whole wk/chunk/
+//                      wc/l/is_hi/is decode is recomputed from the SMALL carried wc0_c + a_col
+//                      instead of from g_k - sb*256.
+//
+//   ── THE DECLARE-BEFORE-LOOP CARRY INVARIANT (load-bearing) ──
+//   The three counters are `let mut` declared in the scope ENCLOSING the `for k_block` loop and are
+//   ONLY Assign-reassigned (`counter = ...`) inside the loop body — NEVER re-`let` inside. A loop-body
+//   re-`let` would allocate a FRESH BindingId -> a FRESH Function-storage OpVariable whose init OpStore
+//   re-runs each iteration -> the carry would be SILENTLY DESTROYED (revert to per-iteration recompute
+//   = no ALU saving). AT-2600 (the emitted per-element integer-ALU count MUST drop) is the STATIC guard;
+//   AT-2603 (GPU bit-identity on the asymmetric fixture) is the runtime backstop.
+//
+//   ── THE 16-WRAP / SOUNDNESS PRECONDITION (256 mod tile_k == 0) ──
+//   The carry is valid ONLY because 256/tile_k = 256/16 = 16 is an INTEGER: each k_block lies
+//   ENTIRELY within ONE superblock (sb = (k_block*16)/256 = k_block/16, constant across the 16
+//   a_iters), so a_col NEVER crosses a 256 superblock boundary within a k_block and the once-per-
+//   k_block carry is correct. tile_k is PINNED ?[16] (the autotuner cannot widen it). AT-2601
+//   ASSERTS tile_k==16 and replays the carried recurrence vs the div/mod decode over the full
+//   K=14336 range incl. every superblock wrap (FAILS LOUDLY if tile_k is ever widened to a
+//   non-256-divisor, which would silently mis-stride the carry). The wrap test wc0_c == 256 is
+//   workgroup-uniform (k_block-derived, identical across all 32 lanes) — a scalar conditional
+//   reassign that stores through its OpVariable (no phi, no coopmat involvement).
+//
+// WHAT CHANGES vs the M3.6 leader: ONLY the A-staging inner-loop integer index math (the sb/wk/
+//   chunk/wc/l/is_hi/is recompute + the x144 base IMul + the compound qs/byte address). EVERYTHING
+//   ELSE is VERBATIM M3.6: the dequant arithmetic (line 240, the ~7-op floor), the scale-cache fill,
+//   B staging, all 3 barriers, the coopmat loads/4 mul_adds, the single-level OpPhi K-carry,
+//   coopmat_store. The dequant FORMULA and accumulation ORDER are UNCHANGED — a correct strength-
+//   reduction reads the IDENTICAL nibble => BIT-IDENTICAL output (AT-2603 n_diff==0), combined
+//   metric <= FROZEN 1e-3 (AT-2605, NEVER loosened).
+//
+// CAPABILITIES: BYTE-IDENTICAL to the M3.6 leader (AT-2606). Strength-reducing integer index math
+//   removes OpIMul/OpUDiv and adds carried OpIAdd on Function-storage u32 OpVariables; no new
+//   capability, no new extension.
+//
+// ARMED HONEST-NEGATIVE (the LIKELY base case): if the emitted ALU count drops (AT-2600) but TFLOPS
+//   is FLAT (< 1.15x, AT-2604), the dequant integer ALU is LATENCY-HIDDEN under the HMMA tensor-core
+//   pipeline (issued concurrently on the int/SFU pipes) — NOT on the critical path. Flat is the
+//   expected, still-profound result; a >= 1.15x win (AT-2602) is the surprising upside.
+//
+// BENCHMARKED BY: crates/axc-driver/benches/resident_q4km_matmul_rb_f32acc_cached_sr.rs (AT-2602/2604).
+// BIT-IDENTITY + COMBINED: crates/axc-driver/tests/dispatch_q4km_f32acc_cached_sr_equiv.rs (AT-2603/2605).
+// STATIC FALSIFIERS: crates/axc-driver/tests/m311_strength_reduction_diagnostic.rs (AT-2600/2601).
+// COMPILE + CAP-SET ANCHOR: AT-2606 in compile_shared_examples.rs (CI, no GPU).
+//
+// Anti-pattern #2: explicit `return;`.
+// Anti-pattern #8: no `>>` (use shr/lshr for shifts); k_block % 16 expressed as k_block - sb_idx_c*16.
+
+@kernel
+@workgroup(32, 1, 1)
+@cooperative_matrix
+@strategy { rb_m: ?[2], rb_n: ?[2], tile_k: ?[16], a_block_size: ?[512], b_block_size: ?[512] }
+@intent("Q4_K_M dequant-index affine strength-reduction on the M3.6 scale-cached f32-acc 2x2 RB coopmat matmul (AT-2600..2606)")
+@complexity(O(n))
+fn q4km_matmul_rb_coopmat_f32acc_cached_sr(
+    q: readonly_buffer[u8],
+    x: readonly_buffer[f16],
+    C: buffer[f32],
+    M: u32,
+    N: u32,
+    K: u32,
+    n_blocks_per_row: u32
+) -> void {
+    // Shared staging tiles for the 2x2 block (identical sizing to M3.6; A/B stay f16).
+    shared a_tile: shared[f16, ?a_block_size];
+    shared b_tile: shared[f16, ?b_block_size];
+
+    // Per-superblock dequant-scale caches (8 sub-blocks x 32 weight-rows = 256 each), VERBATIM M3.6.
+    shared dsc_cache: shared[f32, 256];
+    shared dmm_cache: shared[f32, 256];
+
+    // Block coordinates (ASYMMETRIC, identical to M3.6).
+    let block_col: u32 = gid(0u32) / 32u32;
+    let block_row: u32 = gid(1u32);
+
+    // Lane index within the subgroup for cooperative staging.
+    let lane: u32 = subgroup_invocation_id();
+
+    // Output tile coordinates within the 2x2 block.
+    let tile_row_0: u32 = block_row * 2u32;
+    let tile_row_1: u32 = block_row * 2u32 + 1u32;
+    let tile_col_0: u32 = block_col * 2u32;
+    let tile_col_1: u32 = block_col * 2u32 + 1u32;
+
+    // 4 loop-carried f32 coopmat accumulators (single-level OpPhi K-carry, VERBATIM M3.6).
+    let mut acc_00: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_01: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_10: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_11: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+
+    // Staging iterations per thread.
+    let a_iters: u32 = ?a_block_size / 32u32;
+    let b_iters: u32 = ?b_block_size / 32u32;
+
+    // Number of K-blocks.
+    let num_k_blocks: u32 = K / ?tile_k;
+
+    // ── M3.11a STRENGTH-REDUCTION CARRIED COUNTERS — DECLARED BEFORE the `for k_block` loop ──
+    //   These replace the per-A-element recomputed affine index chain. They are `let mut` here, in
+    //   the scope ENCLOSING the K-loop, and ONLY Assign-reassigned inside the loop body (NEVER re-`let`
+    //   — a loop-body re-`let` would allocate a fresh OpVariable whose init re-runs each iteration,
+    //   SILENTLY DESTROYING the carry; AT-2600 catches that statically). Init to the EXACT div/mod
+    //   value at k_block=0 (a_col 0..15): sb=0, sb*144=0, (k_block mod 16)*16=0 — all zero.
+    let mut sb_idx_c: u32 = 0u32;        // = k_block / 16
+    let mut sb_byte_base_c: u32 = 0u32;  // = sb_idx_c * 144  (REPLACES the per-element x144 OpIMul)
+    let mut wc0_c: u32 = 0u32;           // = (k_block mod 16) * 16  (within-superblock offset at a_col=0)
+
+    // K-loop: FLAT single level. The 4 coopmat accumulators are loop-carried (N-phi path),
+    // reassigned UNCONDITIONALLY at the top level -> single-level OpPhi (M3.3c), no nested carry.
+    for k_block in range(0u32, num_k_blocks) {
+        // ── COOPERATIVE SCALE-CACHE FILL — fires ONCE per superblock (VERBATIM M3.6) ────────
+        //   Predicate k_block % 16 == 0, expressed via the CARRIED sb_idx_c (== k_block/16):
+        //   k_block - sb_idx_c*16 == 0. WORKGROUP-UNIFORM -> all 32 lanes take the branch together.
+        if k_block - sb_idx_c * 16u32 == 0u32 {
+            // 256 (row,is) entries over 32 lanes -> 8 fills/lane.
+            for fi in range(0u32, 8u32) {
+                let cache_i: u32 = fi * 32u32 + lane;          // 0..255
+                let row_local: u32 = cache_i / 8u32;           // 0..31
+                let is: u32 = cache_i - row_local * 8u32;      // 0..7
+                let g_row: u32 = block_row * 32u32 + row_local;
+
+                // Byte offset of superblock sb_idx_c in weight-row g_row (uses the CARRIED sb_idx_c).
+                let base: u32 = g_row * n_blocks_per_row * 144u32 + sb_idx_c * 144u32;
+                let d_bits: u32 = ptr_read_u16_zext(q, base);
+                let dmin_bits: u32 = ptr_read_u16_zext(q, base + 2u32);
+                let d: f32 = f16_bits_to_f32(d_bits);
+                let dmin: f32 = f16_bits_to_f32(dmin_bits);
+                let scales_base: u32 = base + 4u32;
+
+                // Inline get_scale_min_k4 for sub-block `is` (byte-identical to M3.6).
+                let mut sc: u32 = 0u32;
+                let mut mm: u32 = 0u32;
+                if is < 4u32 {
+                    sc = band(ptr_read_u8_zext(q, scales_base + is), 63u32);
+                    mm = band(ptr_read_u8_zext(q, scales_base + is + 4u32), 63u32);
+                } else {
+                    let lo4_sc: u32 = band(ptr_read_u8_zext(q, scales_base + is + 4u32), 0x0Fu32);
+                    let hi2_sc: u32 = band(lshr(ptr_read_u8_zext(q, scales_base + is - 4u32), 6u32), 0x03u32);
+                    sc = bor(lo4_sc, shl(hi2_sc, 4u32));
+                    let lo4_m: u32 = band(lshr(ptr_read_u8_zext(q, scales_base + is + 4u32), 4u32), 0x0Fu32);
+                    let hi2_m: u32 = band(lshr(ptr_read_u8_zext(q, scales_base + is), 6u32), 0x03u32);
+                    mm = bor(lo4_m, shl(hi2_m, 4u32));
+                }
+
+                // Cache the per-sub-block PRODUCTS (SAME d*sc / dmin*m as M3.6).
+                dsc_cache[cache_i] = d * f32_from_u32(sc);
+                dmm_cache[cache_i] = dmin * f32_from_u32(mm);
+            }
+        }
+
+        // RAW barrier (VERBATIM M3.6 OPT-B HOISTED): UNCONDITIONAL, top level, after the fill,
+        // before A staging. Orders cache WRITE -> cache READ on a fill k_block.
+        workgroup_barrier();
+
+        // ── Dequant A[block_row*32..+32, k_block*16..+16] into a_tile (shared[f16]) ─
+        //   M3.11a: the per-element nibble byte address + sub-block decode use the CARRIED counters
+        //   (sb_byte_base_c, wc0_c) instead of recomputing the affine chain from g_k. The
+        //   (block_row*32 + a_row)*n_blocks_per_row*144 term is k_block-INVARIANT (it depends on
+        //   a_row, which depends on lane/a_iter only), so it is hoisted into the inner loop body
+        //   exactly as in M3.6 — the strength-reduction removes the sb*144 term, the sb/chunk/is
+        //   recompute, and the g_k seed.
+        for a_iter in range(0u32, a_iters) {
+            let ei_a: u32 = a_iter * 32u32 + lane;
+            let a_row: u32 = ei_a / 16u32;
+            let a_col: u32 = ei_a - a_row * 16u32;
+
+            // Within-superblock offset for this element = wc0_c + a_col (in [0,256) since a_col 0..15
+            // and wc0_c in {0,16,...,240}). Replaces wk = g_k - sb*256. chunk/wc/l/is_hi/is decode
+            // is now on this SMALL carried quantity (the sb/x144 recompute is gone).
+            let wk: u32 = wc0_c + a_col;
+            let chunk: u32 = wk / 64u32;
+            let wc: u32 = wk - chunk * 64u32;
+            let l: u32 = wc - (wc / 32u32) * 32u32;
+            let is_hi: u32 = wc / 32u32;            // 0 = lo nibble, 1 = hi nibble
+            let is: u32 = chunk * 2u32 + is_hi;     // sub-block index 0..7
+
+            // READ the cached (dsc, dmm) for (a_row, is) — VERBATIM M3.6.
+            let cache_idx: u32 = a_row * 8u32 + is;
+            let dsc: f32 = dsc_cache[cache_idx];
+            let dmm: f32 = dmm_cache[cache_idx];
+
+            // Byte holding this element's nibble: (hoisted invariant) + carried superblock byte-base
+            // + qs(16) + chunk*32 + l. The carried sb_byte_base_c REPLACES the per-element sb*144
+            // OpIMul; the row-invariant term is hoisted (k_block-independent).
+            let row_base: u32 = (block_row * 32u32 + a_row) * n_blocks_per_row * 144u32;
+            let qs_base: u32 = row_base + sb_byte_base_c + 16u32;
+            let byte: u32 = ptr_read_u8_zext(q, qs_base + chunk * 32u32 + l);
+            let mut nib: u32 = band(byte, 0x0Fu32);
+            if is_hi >= 1u32 {
+                nib = band(lshr(byte, 4u32), 0x0Fu32);
+            }
+
+            // Dequant in f32, narrow to f16 — SAME multiply-then-subtract ORDER as M3.6 line 240,
+            // with dsc/dmm read from the cache (bit-identical result).
+            let w: f16 = f32_to_f16(dsc * f32_from_u32(nib) - dmm);
+            a_tile[ei_a] = w;
+        }
+
+        // ── Stage B (x) tile into b_tile — VERBATIM M3.6 (x is already f16) ──────
+        for b_iter in range(0u32, b_iters) {
+            let ei_b: u32 = b_iter * 32u32 + lane;
+            let b_row: u32 = ei_b / 32u32;
+            let b_col: u32 = ei_b - b_row * 32u32;
+            let b_global_row: u32 = k_block * ?tile_k + b_row;
+            let b_global_col: u32 = block_col * 32u32 + b_col;
+            let b_global: u32 = b_global_row * N + b_global_col;
+            b_tile[ei_b] = x[b_global];
+        }
+
+        // Barrier: staging complete before coopmat loads.
+        workgroup_barrier();
+
+        // ── Coopmat loads (f16 A/B) + 4 mul_adds into f32 accumulators (HMMA) ─────
+        let a_mat_0: matrix[f16, 16, 16, a] = coopmat_load(a_tile, 0u32, 16u32);
+        let a_mat_1: matrix[f16, 16, 16, a] = coopmat_load(a_tile, 256u32, 16u32);
+
+        let b_mat_0: matrix[f16, 16, 16, b] = coopmat_load(b_tile, 0u32, 32u32);
+        let b_mat_1: matrix[f16, 16, 16, b] = coopmat_load(b_tile, 16u32, 32u32);
+
+        // f16 A × f16 B → f32 accumulator (mixed-precision HMMA).
+        acc_00 = coopmat_mul_add(a_mat_0, b_mat_0, acc_00);
+        acc_01 = coopmat_mul_add(a_mat_0, b_mat_1, acc_01);
+        acc_10 = coopmat_mul_add(a_mat_1, b_mat_0, acc_10);
+        acc_11 = coopmat_mul_add(a_mat_1, b_mat_1, acc_11);
+
+        // WAR barrier: before the next k_block overwrites a_tile / b_tile AND (next superblock)
+        // the scale caches. VERBATIM M3.6 — doubles as the cache WAR.
+        workgroup_barrier();
+
+        // ── M3.11a CARRY ADVANCE (bottom of loop body, top level, UNCONDITIONAL + uniform 16-wrap) ──
+        //   Counter-driven affine advance for the NEXT k_block. wc0_c advances +16 each k_block; on
+        //   the 16-wrap (wc0_c reaches 256 = one full superblock of 16 k_blocks x 16) it resets to 0
+        //   and bumps the superblock counters: sb_idx_c += 1, sb_byte_base_c += 144 (the carried
+        //   OpIAdd that REPLACES the per-element x144 OpIMul). The wrap test wc0_c == 256u32 is
+        //   workgroup-uniform (k_block-derived) -> a scalar conditional reassign through its
+        //   Function-storage OpVariable (no phi, no coopmat binding). Init (all 0) = k_block=0 value,
+        //   and this bottom-advance keeps the carried-in value valid for every subsequent k_block.
+        wc0_c = wc0_c + 16u32;
+        if wc0_c == 256u32 {
+            wc0_c = 0u32;
+            sb_idx_c = sb_idx_c + 1u32;
+            sb_byte_base_c = sb_byte_base_c + 144u32;
+        }
+    }
+
+    // ── Store the 4 accumulated f32 tiles to C (buffer[f32]) — element-type matched ──
+    let c_base_00: u32 = (tile_row_0 * 16u32) * N + (tile_col_0 * 16u32);
+    let c_base_01: u32 = (tile_row_0 * 16u32) * N + (tile_col_1 * 16u32);
+    let c_base_10: u32 = (tile_row_1 * 16u32) * N + (tile_col_0 * 16u32);
+    let c_base_11: u32 = (tile_row_1 * 16u32) * N + (tile_col_1 * 16u32);
+
+    coopmat_store(acc_00, C, c_base_00, N);
+    coopmat_store(acc_01, C, c_base_01, N);
+    coopmat_store(acc_10, C, c_base_10, N);
+    coopmat_store(acc_11, C, c_base_11, N);
+
+    return;
+}

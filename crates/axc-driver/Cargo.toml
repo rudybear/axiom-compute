@@ -117,6 +117,17 @@ name = "resident_q4km_matmul_rb_f32acc_cached"
 path = "benches/resident_q4km_matmul_rb_f32acc_cached.rs"
 harness = false
 
+# M3.11a: honest A/B + cube TFLOPS bench for the dequant-index STRENGTH-REDUCED Q4_K_M scale-cached
+# f32-accumulator RB coopmat matmul (AT-2602/2604) vs the M3.6 leader, emitting
+# AXC_Q4KM_AB_F32ACC_CACHED_SR (scripts/m34_llamacpp_ab.sh --sr). >= 1.15x M3.6 (>= 49.3 TFLOPS) gate,
+# printed + checked, never asserted-loose; ARMED honest-negative (ALU-down-but-TFLOPS-flat =>
+# latency-hidden under HMMA, the LIKELY base case). Bench ID:
+# dispatch_resident_q4km_matmul_rb_f32acc_cached_sr. GPU-gated.
+[[bench]]
+name = "resident_q4km_matmul_rb_f32acc_cached_sr"
+path = "benches/resident_q4km_matmul_rb_f32acc_cached_sr.rs"
+harness = false
+
 # M3.10a (CONDITIONAL): honest A/B + cube TFLOPS bench for the BANK-PADDED Q4_K_M scale-cached
 # f32-accumulator RB coopmat matmul (AT-2407) + the PAD sweep, emitting AXC_Q4KM_AB_F32ACC_CACHED_PAD
 # (scripts/m34_llamacpp_ab.sh --pad). >= 1.15x M3.6 (>= 49.3 TFLOPS) AND combined <= 1e-3 gate,

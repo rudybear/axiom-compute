@@ -784,6 +784,116 @@ fn at_1806_q4km_f32acc_cached_compiles_and_validates() {
     );
 }
 
+// ── AT-2606: M3.11a dequant-index STRENGTH-REDUCED scale-cached f32-accumulator fused ──
+//            Q4_K_M coopmat matmul — compile + spirv-val + cap-set BYTE-IDENTICAL to the M3.6
+//            leader (no new capability — scalar integer carried counters add none) ──────────
+
+/// AT-2606 (M3.11a, CI no-GPU): the dequant-index STRENGTH-REDUCED kernel
+/// (q4km_matmul_rb_coopmat_f32acc_cached_sr.axc) compiles, passes spirv-val (Vulkan 1.1), and
+/// emits a capability set BYTE-IDENTICAL to the M3.6 leader (cached.axc). The strength-reduction
+/// removes OpIMul/OpUDiv and adds carried OpIAdd on Function-storage u32 OpVariables — all
+/// already-emitted op classes, NO new capability/extension. It also keeps the M3.6 coopmat
+/// metadata shape {16,16,16, F16,F16,F32,F32, Subgroup}, the same +2 KB scale cache
+/// (shared_memory_bytes == 4096), and the a_block_size=512 pin.
+///
+/// NECESSARY but NOT SUFFICIENT: a wrong-nibble carry would ALSO pass spirv-val. The true
+/// correctness gate is the orchestrator's GPU run of AT-2603 (bit-identity) + AT-2605 (combined).
+#[test]
+fn at_2606_sr_compiles_capset_identical() {
+    use std::collections::BTreeSet;
+    use axc_runtime::{CoopMatScalarMeta, CoopMatScopeMeta};
+
+    let sr_src = include_str!("../../../examples/q4km_matmul_rb_coopmat_f32acc_cached_sr.axc");
+    let cached_src = include_str!("../../../examples/q4km_matmul_rb_coopmat_f32acc_cached.axc");
+
+    let assignments = rb2x2_assignments();
+
+    // Compile the SR kernel WITH metadata + spirv-val it.
+    let (sr_bytes, meta) = compile_source_with_assignments(sr_src, &assignments)
+        .unwrap_or_else(|e| panic!("q4km_matmul_rb_coopmat_f32acc_cached_sr.axc: compile failed: {e:?}"));
+    let sr_words = words_and_validate(sr_bytes, "q4km_matmul_rb_coopmat_f32acc_cached_sr.axc");
+    let cached_words = compile_words(cached_src, Some(&assignments), "q4km_matmul_rb_coopmat_f32acc_cached.axc");
+
+    // Capability set BYTE-IDENTICAL to the M3.6 leader (no new capability from carried scalar counters).
+    let (sr_caps, sr_exts) = capability_extension_sets(&sr_words);
+    let (cached_caps, cached_exts) = capability_extension_sets(&cached_words);
+
+    let extra_caps: Vec<u32> = sr_caps.difference(&cached_caps).copied().collect();
+    assert!(
+        extra_caps.is_empty(),
+        "AT-2606: SR kernel declares capabilities NOT in the M3.6 leader's set: \
+         {extra_caps:?} (sr={sr_caps:?}, cached={cached_caps:?})"
+    );
+    let dropped_caps: Vec<u32> = cached_caps.difference(&sr_caps).copied().collect();
+    assert!(
+        dropped_caps.is_empty(),
+        "AT-2606: SR kernel DROPPED capabilities present in the M3.6 leader: {dropped_caps:?}"
+    );
+    let sr_set: BTreeSet<u32> = sr_caps.iter().copied().collect();
+    let cached_set: BTreeSet<u32> = cached_caps.iter().copied().collect();
+    assert_eq!(
+        sr_set, cached_set,
+        "AT-2606: SR and M3.6 leader must have BYTE-IDENTICAL capability sets \
+         (carried scalar integer counters introduce NO new capability)"
+    );
+
+    // Extensions identical (or at most the same one benign shared[f32] layout delta the M3.6
+    // leader already carries — but NO new capability ever, asserted above).
+    let extra_exts: Vec<String> = sr_exts.difference(&cached_exts).cloned().collect();
+    assert!(
+        extra_exts.is_empty(),
+        "AT-2606: SR kernel must not declare extensions beyond the M3.6 leader's set \
+         (the strength-reduction adds only carried OpIAdd on Function-storage OpVariables); \
+         got {extra_exts:?}"
+    );
+
+    // Coopmat metadata shape unchanged from M3.6: {16,16,16, F16,F16,F32,F32, Subgroup}.
+    let coopmat = meta.coopmat.as_ref()
+        .expect("AT-2606: SR kernel must emit coopmat metadata");
+    assert_eq!(coopmat.m, 16, "AT-2606: coopmat.m");
+    assert_eq!(coopmat.n, 16, "AT-2606: coopmat.n");
+    assert_eq!(coopmat.k, 16, "AT-2606: coopmat.k");
+    assert_eq!(coopmat.a_type, CoopMatScalarMeta::F16, "AT-2606: A type must be F16");
+    assert_eq!(coopmat.b_type, CoopMatScalarMeta::F16, "AT-2606: B type must be F16");
+    assert_eq!(coopmat.c_type, CoopMatScalarMeta::F32, "AT-2606: C type must be F32");
+    assert_eq!(coopmat.result_type, CoopMatScalarMeta::F32, "AT-2606: result type must be F32");
+    assert_eq!(coopmat.scope, CoopMatScopeMeta::Subgroup, "AT-2606: scope must be Subgroup");
+
+    // shared_memory_bytes UNCHANGED from M3.6: a_tile+b_tile (2048) + dsc+dmm cache (2048) = 4096.
+    let expected_shared_bytes: u32 = (512 + 512) * 2 + 2 * 256 * 4;
+    assert_eq!(
+        meta.shared_memory_bytes, expected_shared_bytes,
+        "AT-2606: shared_memory_bytes must be {expected_shared_bytes} (UNCHANGED vs M3.6 — the SR \
+         rewrite touches only integer index math, not the shared layout); got {}",
+        meta.shared_memory_bytes
+    );
+
+    // a_block_size=512 PIN (bounds the 256-entry scale caches to 32 rows — the carry magnitudes
+    // and the cache index both depend on it).
+    let strategy_decl = sr_src
+        .lines()
+        .find(|l| l.trim_start().starts_with("@strategy"))
+        .expect("AT-2606: SR kernel must declare an @strategy block");
+    assert!(
+        strategy_decl.contains("a_block_size: ?[512]"),
+        "AT-2606: a_block_size MUST be PINNED to `?[512]`; got @strategy line: {strategy_decl}"
+    );
+    // tile_k=16 PIN (the 256/tile_k=16-integer carry soundness precondition; AT-2601 also asserts it).
+    assert!(
+        strategy_decl.contains("tile_k: ?[16]"),
+        "AT-2606: tile_k MUST be PINNED to `?[16]` (the carry soundness precondition 256 mod \
+         tile_k == 0); got @strategy line: {strategy_decl}"
+    );
+
+    eprintln!(
+        "AT-2606 PASS: q4km_matmul_rb_coopmat_f32acc_cached_sr.axc compiles + spirv-val clean; \
+         caps BYTE-IDENTICAL to M3.6 leader ({sr_caps:?}); meta.coopmat = \
+         {{16,16,16, F16,F16,F32,F32, Subgroup}}; shared_memory_bytes={} (unchanged); \
+         a_block_size=512 + tile_k=16 PIN enforced",
+        meta.shared_memory_bytes
+    );
+}
+
 // ── AT-1906: M3.7 DOUBLE-BUFFERED (software-pipelined) scale-cached f32-accumulator fused ──
 //            Q4_K_M coopmat matmul — compile + spirv-val + no-new-capability vs M3.6 cached +
 //            metadata shape + DOUBLED shared (6144 bytes) + emitted-barrier-count +
