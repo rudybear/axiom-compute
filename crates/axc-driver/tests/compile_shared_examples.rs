@@ -2093,3 +2093,94 @@ fn at_2405_q4km_rb_pad_compile_capset_sharedbytes() {
         meta.shared_memory_bytes
     );
 }
+
+// ── AT-2703: M3.12 dequant front-end ABLATION DIAGNOSTIC profiling-instrument variants — ──
+//            compile + spirv-val + cap-set BYTE-IDENTICAL to the M3.6 leader (no new capability)
+//
+// The M3.12 variants are PROFILING INSTRUMENTS with WRONG OUTPUT BY DESIGN (they hold the M3.6
+// structure constant and vary only the per-element A-dequant value). The cheaper substitute
+// expressions (a near-free index-derived value / an f32_to_f16-retaining nibble pass-through) remove
+// the per-element Workgroup scale-reads + FMul/FSub (and, V-structure-probe, the u8 load) and add NO
+// op-class requiring a new capability. AT-2703 asserts each variant compiles, passes spirv-val
+// (Vulkan 1.1), and emits a cap set BYTE-IDENTICAL to the M3.6 leader. NECESSARY but NOT SUFFICIENT:
+// these variants are WRONG by construction — they carry NO correctness gate (AT-2705 enforces that
+// negatively); the deliverable is the per-variant resident TFLOPS (the bench).
+#[test]
+fn at_2703_ablation_variants_compile_capset_identical() {
+    use std::collections::BTreeSet;
+
+    let leader_src =
+        include_str!("../../../examples/q4km_matmul_rb_coopmat_f32acc_cached.axc");
+    let structonly_src =
+        include_str!("../../../examples/q4km_matmul_rb_coopmat_f32acc_cached_ablate_structonly.axc");
+    let passthrough_src =
+        include_str!("../../../examples/q4km_matmul_rb_coopmat_f32acc_cached_ablate_passthrough.axc");
+
+    let assignments = rb2x2_assignments();
+
+    let leader_words = compile_words(
+        leader_src, Some(&assignments), "q4km_matmul_rb_coopmat_f32acc_cached.axc");
+    let (leader_caps, leader_exts) = capability_extension_sets(&leader_words);
+    let leader_cap_set: BTreeSet<u32> = leader_caps.iter().copied().collect();
+
+    for (src, name) in [
+        (structonly_src, "q4km_matmul_rb_coopmat_f32acc_cached_ablate_structonly.axc"),
+        (passthrough_src, "q4km_matmul_rb_coopmat_f32acc_cached_ablate_passthrough.axc"),
+    ] {
+        // Compile WITH metadata + spirv-val (the f32_to_f16-retaining / index-derived substitutes
+        // are still valid SPIR-V).
+        let (bytes, meta) = compile_source_with_assignments(src, &assignments)
+            .unwrap_or_else(|e| panic!("AT-2703: {name} compile failed: {e:?}"));
+        let words = words_and_validate(bytes, name);
+
+        let (caps, exts) = capability_extension_sets(&words);
+        let cap_set: BTreeSet<u32> = caps.iter().copied().collect();
+
+        let extra_caps: Vec<u32> = caps.difference(&leader_caps).copied().collect();
+        assert!(
+            extra_caps.is_empty(),
+            "AT-2703: ablation variant {name} declares capabilities NOT in the M3.6 leader's set: \
+             {extra_caps:?} (variant={caps:?}, leader={leader_caps:?}). The cheaper substitute \
+             expressions must add NO new capability."
+        );
+        let dropped_caps: Vec<u32> = leader_caps.difference(&caps).copied().collect();
+        assert!(
+            dropped_caps.is_empty(),
+            "AT-2703: ablation variant {name} DROPPED capabilities present in the M3.6 leader: \
+             {dropped_caps:?}"
+        );
+        assert_eq!(
+            cap_set, leader_cap_set,
+            "AT-2703: ablation variant {name} cap set must be BYTE-IDENTICAL to the M3.6 leader's"
+        );
+
+        // Extensions: identical, or at most the SAME one benign shared[f32] layout-decoration delta
+        // the M3.6 leader already carries (the dsc/dmm caches remain WRITTEN by the kept fill). NO
+        // new capability ever (asserted above).
+        let extra_exts: Vec<String> = exts.difference(&leader_exts).cloned().collect();
+        assert!(
+            extra_exts.is_empty(),
+            "AT-2703: ablation variant {name} must not declare extensions beyond the M3.6 leader's \
+             set; got {extra_exts:?}"
+        );
+
+        // shared_memory_bytes == the M3.6 leader's 4096 B (the FILL is kept; the dsc/dmm arrays are
+        // still allocated + written, so the 4 KB footprint is CONSTANT — SHARED-MEMORY occupancy
+        // held constant across variants, the AT-2701 cross-check premise).
+        let expected_shared_bytes: u32 = (512 + 512) * 2 + 2 * 256 * 4;
+        assert_eq!(
+            meta.shared_memory_bytes, expected_shared_bytes,
+            "AT-2703: ablation variant {name} shared_memory_bytes must be {expected_shared_bytes} \
+             (==M3.6 leader — the fill is kept; the dsc/dmm caches remain written; the 4 KB footprint \
+             is constant); got {}",
+            meta.shared_memory_bytes
+        );
+    }
+
+    eprintln!(
+        "AT-2703 PASS: M3.12 ablation variants (structonly, passthrough) compile + spirv-val clean; \
+         cap set BYTE-IDENTICAL to the M3.6 leader ({leader_caps:?}); shared_memory_bytes==4096 \
+         (fill kept, footprint constant). PROFILING INSTRUMENTS — wrong output by design, no \
+         correctness gate (AT-2705)."
+    );
+}

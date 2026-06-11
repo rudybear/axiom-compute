@@ -128,6 +128,17 @@ name = "resident_q4km_matmul_rb_f32acc_cached_sr"
 path = "benches/resident_q4km_matmul_rb_f32acc_cached_sr.rs"
 harness = false
 
+# M3.12: dequant front-end ABLATION DIAGNOSTIC — per-variant resident TFLOPS + the RE-ANCHORED
+# triangulation (V-structure-probe is the PRIMARY denominator) + the register/temp-count proxy,
+# emitting AXC_Q4KM_AB_ABLATE (scripts/m34_llamacpp_ab.sh --ablate). The variants are PROFILING
+# INSTRUMENTS with WRONG OUTPUT BY DESIGN (no correctness gate); the deliverable is the PINPOINT of
+# the dominant 1.77x dequant front-end tax (arithmetic vs structural). Bench ID:
+# dispatch_resident_q4km_matmul_rb_f32acc_cached_ablate. GPU-gated.
+[[bench]]
+name = "resident_q4km_matmul_rb_f32acc_cached_ablate"
+path = "benches/resident_q4km_matmul_rb_f32acc_cached_ablate.rs"
+harness = false
+
 # M3.10a (CONDITIONAL): honest A/B + cube TFLOPS bench for the BANK-PADDED Q4_K_M scale-cached
 # f32-accumulator RB coopmat matmul (AT-2407) + the PAD sweep, emitting AXC_Q4KM_AB_F32ACC_CACHED_PAD
 # (scripts/m34_llamacpp_ab.sh --pad). >= 1.15x M3.6 (>= 49.3 TFLOPS) AND combined <= 1e-3 gate,
