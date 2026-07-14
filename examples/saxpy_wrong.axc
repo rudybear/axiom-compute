@@ -1,0 +1,26 @@
+// saxpy_wrong.axc — M3.16 (FG.1) REJECT fixture: interface-identical to saxpy.axc but
+// computes alpha*x - y instead of alpha*x + y (numerically divergent, AT-2853).
+//
+// Purpose: `axc rewrite-verify saxpy.axc saxpy_wrong.axc` must REJECT-by-output
+// (Verdict::Fail, stage="output", reason.kind="numeric_mismatch") — the anti-cheat
+// differential harness's core negative control. Interface (buffer/scalar/workgroup
+// shape) is BYTE-IDENTICAL to saxpy.axc so the REJECT fires at the OUTPUT stage, not
+// the interface stage (that is AT-2854's job, via a buffer-count-changed fixture).
+//
+// Non-vacuity (r2/CRIT-1): with a pinned nonzero alpha (n=elem_count, alpha=2.0),
+// alpha*x - y diverges from alpha*x + y for any y != 0 — never vacuously equal.
+
+@kernel
+@workgroup(64, 1, 1)
+@intent("REJECT fixture: computes Y[i] = alpha*X[i] - Y[i] (wrong sign) — AT-2853")
+@complexity(O(n))
+fn saxpy(n: u32, alpha: f32, x: readonly_buffer[f32], y: buffer[f32]) -> void {
+    let i: u32 = gid(0);
+    let limit: u32 = n;
+    let in_range: bool = i < limit;
+    let xi: f32 = x[i];
+    let yi: f32 = y[i];
+    let result: f32 = alpha * xi - yi;
+    y[i] = result;
+    return;
+}

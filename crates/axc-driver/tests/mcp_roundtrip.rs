@@ -182,6 +182,7 @@ fn at_1101_initialize_returns_server_info() {
             "bench_variant",
             "grid_search",
             "optimization_history",
+            "verify_rewrite",
         ],
         "tool list mismatch"
     );
@@ -327,9 +328,9 @@ fn at_1106_unknown_method_returns_method_not_found_error() {
         .iter()
         .map(|v: &serde_json::Value| v.as_str().expect("method name is string"))
         .collect();
-    // Must include "initialize" plus the 6 tool methods.
+    // Must include "initialize" plus the 7 tool methods (M3.16 adds verify_rewrite).
     assert!(methods.contains(&"initialize"), "available must include 'initialize'");
-    assert_eq!(methods.len(), 7, "must list all 7 methods; got {methods:?}");
+    assert_eq!(methods.len(), 8, "must list all 8 methods; got {methods:?}");
 }
 
 // ── AT-1107: malformed JSON returns -32700 ────────────────────────────────────
@@ -1322,7 +1323,7 @@ fn at_1132_mcp_rejects_malformed_jsonrpc_field() {
     );
     assert_eq!(
         available_c.as_array().unwrap().len(),
-        7,
-        "(c) must list 7 methods"
+        8,
+        "(c) must list 8 methods (M3.16 adds verify_rewrite)"
     );
 }

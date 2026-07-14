@@ -16,6 +16,10 @@
 //! M3.15 (EB.3) adds:
 //! - `axc bench [--filter NAME] [--bless]`: discoverable wrapper over
 //!   `cargo bench -p axc-driver`.
+//!
+//! M3.16 (FG.1) adds:
+//! - `axc rewrite-verify <original.axc> <rewritten.axc> [--tol ...] ...`: the
+//!   LLM structural-rewrite verifier CLI primitive (verify, don't generate).
 
 use std::path::PathBuf;
 
@@ -160,6 +164,46 @@ pub enum Command {
         #[arg(long)]
         bless: bool,
     },
+    /// Verify that a rewritten kernel is observationally equivalent to the
+    /// original (M3.16 / FG.1 — the LLM structural-rewrite verifier).
+    ///
+    /// This is the LLM-free, CI-runnable verification primitive: it never
+    /// generates a rewrite, it only checks one. Writes the `VerifyReport` JSON
+    /// to stdout (always, regardless of exit code) and exits `0` for
+    /// PASS/SKIPPED/NONDETERMINISTIC_ORACLE, `1` for FAIL/REJECT, `2` for a
+    /// usage/under-specified-request/I-O ERROR.
+    RewriteVerify {
+        /// Original kernel source file (`.axc`).
+        original: PathBuf,
+        /// Rewritten kernel source file (`.axc`) to verify against `original`.
+        rewritten: PathBuf,
+        /// Differential-comparison tolerance policy: `bit-exact` (default),
+        /// `ulp:N`, or `rel:EPS`.
+        #[arg(long, default_value = "bit-exact")]
+        tol: String,
+        /// One size (bytes) per buffer binding. Required unless `--size` is used.
+        #[arg(long, value_delimiter = ',')]
+        buffer_sizes: Vec<usize>,
+        /// Uniform-element-count shortcut for same-`ScalarTy`, non-coopmat,
+        /// non-shared element-wise kernels (e.g. saxpy/vector_add class).
+        #[arg(long)]
+        size: Option<usize>,
+        /// Output-buffer sizes (bytes). Defaults to `buffer_sizes`.
+        #[arg(long, value_delimiter = ',')]
+        output_sizes: Option<Vec<usize>>,
+        /// Explicit dispatch grid `x,y,z`. Mandatory for coopmat/shared kernels.
+        #[arg(long, value_delimiter = ',')]
+        workgroups: Option<Vec<u32>>,
+        /// Base64-encoded (RFC 4648 §4 standard alphabet) push-constant bytes.
+        #[arg(long)]
+        push_constants_base64: Option<String>,
+        /// Seed for deterministic input generation.
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+        /// Shared `@strategy` hole assignment applied to BOTH sources: `name=value`.
+        #[arg(long = "strategy-value", value_name = "name=value")]
+        strategy_values: Vec<StrategyValue>,
+    },
 }
 
 #[cfg(test)]
@@ -194,6 +238,48 @@ mod tests {
             }
             other => panic!("expected Command::Bench, got a different variant: {:?}",
                 std::mem::discriminant(&other)),
+        }
+    }
+
+    // ── AT-2841: `axc rewrite-verify` CLI parsing (M3.16) ──────────────────────
+
+    /// AT-2841: `axc rewrite-verify a.axc b.axc --tol rel:1e-3 --buffer-sizes 256,256`
+    /// parses to `Command::RewriteVerify` with the correct fields.
+    #[test]
+    fn at_2841_rewrite_verify_parse_buffer_sizes() {
+        let cli = Cli::parse_from([
+            "axc", "rewrite-verify", "a.axc", "b.axc",
+            "--tol", "rel:1e-3",
+            "--buffer-sizes", "256,256",
+            "--seed", "7",
+        ]);
+        match cli.command {
+            Command::RewriteVerify { original, rewritten, tol, buffer_sizes, size, seed, .. } => {
+                assert_eq!(original, PathBuf::from("a.axc"));
+                assert_eq!(rewritten, PathBuf::from("b.axc"));
+                assert_eq!(tol, "rel:1e-3");
+                assert_eq!(buffer_sizes, vec![256, 256]);
+                assert_eq!(size, None);
+                assert_eq!(seed, 7);
+            }
+            other => panic!("expected Command::RewriteVerify, got: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    /// AT-2841: `--size` shortcut parses; default `--tol` is `bit-exact`; default `--seed` is 0.
+    #[test]
+    fn at_2841b_rewrite_verify_parse_size_shortcut_and_defaults() {
+        let cli = Cli::parse_from(["axc", "rewrite-verify", "a.axc", "b.axc", "--size", "1024"]);
+        match cli.command {
+            Command::RewriteVerify { tol, buffer_sizes, size, seed, workgroups, push_constants_base64, .. } => {
+                assert_eq!(tol, "bit-exact", "default --tol must be bit-exact");
+                assert!(buffer_sizes.is_empty());
+                assert_eq!(size, Some(1024));
+                assert_eq!(seed, 0, "default --seed must be 0");
+                assert_eq!(workgroups, None);
+                assert_eq!(push_constants_base64, None);
+            }
+            other => panic!("expected Command::RewriteVerify, got: {:?}", std::mem::discriminant(&other)),
         }
     }
 

@@ -7,6 +7,7 @@
 //! - `bench_variant`      — GPU dispatch + timing + correctness oracle
 //! - `grid_search`        — full grid search + history append
 //! - `optimization_history` — read JSONL history for a source file
+//! - `verify_rewrite`     — M3.16 (FG.1): differential structural-rewrite verification
 
 pub mod load_source;
 pub mod enumerate_variants;
@@ -14,3 +15,4 @@ pub mod compile_variant;
 pub mod bench_variant;
 pub mod grid_search;
 pub mod optimization_history;
+pub mod verify_rewrite;

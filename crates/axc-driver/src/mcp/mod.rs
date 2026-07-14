@@ -20,7 +20,7 @@
 //! # Tools
 //!
 //! `initialize`, `load_source`, `enumerate_variants`, `compile_variant`,
-//! `bench_variant`, `grid_search`, `optimization_history`.
+//! `bench_variant`, `grid_search`, `optimization_history`, `verify_rewrite`.
 
 pub mod protocol;
 pub mod dispatch;
@@ -46,6 +46,7 @@ pub use tools::grid_search::{
     format_rfc3339_utc, history_path_for_source, append_history_entry,
 };
 pub use tools::optimization_history::{OptHistoryRequest, OptHistoryResponse, HistoryEntry};
+pub use tools::verify_rewrite::VerifyRewriteRequest;
 pub use dispatch::{McpToolError, OnceVulkan, resolve_source};
 
 /// Maximum inbound line size: 8 MiB.

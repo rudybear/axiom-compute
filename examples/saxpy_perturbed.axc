@@ -1,0 +1,32 @@
+// saxpy_perturbed.axc — M3.16 (FG.1) TOLERANCE fixture: saxpy.axc with alpha scaled by
+// (1 + 1e-7) before use — a ~1-ULP-class divergence (AT-2855).
+//
+// Purpose: demonstrates the verifier OWNS the tolerance policy (§4.2), not the kernel:
+//   - `axc rewrite-verify saxpy.axc saxpy_perturbed.axc --tol bit-exact` (default) → FAIL
+//     (stage="output", n_diff>0 — the non-vacuity proof required of every reject fixture).
+//   - the SAME pair under `--tol rel:1e-3` → PASS (the perturbation is within the looser
+//     policy).
+//   - the SAME pair with `alpha=0.0` (a negative control, r2/CRIT-1) → PASS even under
+//     bit-exact, because alpha=0 ANNIHILATES the perturbation (0 * anything = 0 either
+//     way) — proving the pinned nonzero alpha in the other cases is load-bearing, not
+//     an accidental pass.
+//
+// The perturbation touches ONLY the scalar multiplier read, never the buffer contents,
+// so this is purely a "the LLM claimed equivalence but introduced a tiny numeric drift"
+// simulation — exactly the reward-hacking shape @equiv_fp_tol is meant to catch.
+
+@kernel
+@workgroup(64, 1, 1)
+@intent("TOLERANCE fixture: alpha scaled by (1+1e-7) before use — AT-2855")
+@complexity(O(n))
+fn saxpy(n: u32, alpha: f32, x: readonly_buffer[f32], y: buffer[f32]) -> void {
+    let i: u32 = gid(0);
+    let limit: u32 = n;
+    let in_range: bool = i < limit;
+    let xi: f32 = x[i];
+    let yi: f32 = y[i];
+    let alpha_perturbed: f32 = alpha * 1.0000001;
+    let result: f32 = alpha_perturbed * xi + yi;
+    y[i] = result;
+    return;
+}

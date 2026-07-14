@@ -1,0 +1,33 @@
+// saxpy_reassoc.axc — M3.16 (FG.1 / r2 WARN-5) ACCEPT fixture, non-coopmat /
+// subgroup-agnostic: `y[i] = y[i] + alpha*x[i]` instead of saxpy.axc's
+// `y[i] = alpha*x[i] + y[i]`.
+//
+// Purpose: a genuine, LEGAL structural rewrite (single COMMUTATION: `add(A,B)` ->
+// `add(B,A)`, NEVER a re-association across three-plus terms) that the verifier must
+// ACCEPT. IEEE-754 addition is commutative (not associative) for FINITE operands:
+// `a + b == b + a` bit-for-bit for any two non-NaN f32 values — there is no reordering
+// of a summation chain here, just swapping the two operands of the SINGLE top-level
+// add, so this is bit-identical to saxpy.axc for every well-conditioned (non-NaN)
+// input (AT-2859's finite `[-1,1]` seeded fills guarantee that precondition).
+//
+// No `@cooperative_matrix`, no `shared[T,N]` — this kernel runs on Lavapipe (and any
+// subgroup size), so it is the ACCEPT/PASS path CI can exercise end-to-end WITHOUT
+// NVIDIA (the coopmat accept fixtures, AT-2851/2852/2858, typed-skip on Lavapipe).
+//
+// Interface (buffers/scalars/workgroup) is BYTE-IDENTICAL to saxpy.axc — required for
+// diff_interface to pass (§4.1) — only the body's operand order changed.
+
+@kernel
+@workgroup(64, 1, 1)
+@intent("ACCEPT fixture: Y[i] = Y[i] + alpha*X[i] — a single legal commutation, AT-2859")
+@complexity(O(n))
+fn saxpy(n: u32, alpha: f32, x: readonly_buffer[f32], y: buffer[f32]) -> void {
+    let i: u32 = gid(0);
+    let limit: u32 = n;
+    let in_range: bool = i < limit;
+    let xi: f32 = x[i];
+    let yi: f32 = y[i];
+    let result: f32 = yi + alpha * xi;
+    y[i] = result;
+    return;
+}

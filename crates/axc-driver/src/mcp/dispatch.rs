@@ -30,6 +30,8 @@ pub const METHOD_COMPILE_VARIANT: &str = "compile_variant";
 pub const METHOD_BENCH_VARIANT: &str = "bench_variant";
 pub const METHOD_GRID_SEARCH: &str = "grid_search";
 pub const METHOD_OPTIMIZATION_HISTORY: &str = "optimization_history";
+/// M3.16 (FG.1): the LLM structural-rewrite verifier tool.
+pub const METHOD_VERIFY_REWRITE: &str = "verify_rewrite";
 
 /// All registered method names in alphabetical order (for error messages and initialize).
 pub const ALL_METHODS: &[&str] = &[
@@ -40,6 +42,7 @@ pub const ALL_METHODS: &[&str] = &[
     METHOD_BENCH_VARIANT,
     METHOD_GRID_SEARCH,
     METHOD_OPTIMIZATION_HISTORY,
+    METHOD_VERIFY_REWRITE,
 ];
 
 // ── McpContext ────────────────────────────────────────────────────────────────
@@ -347,6 +350,11 @@ fn route(env: RpcEnvelope, ctx: &mut McpContext, resp_id: Value) -> RpcResponse 
                 crate::mcp::tools::optimization_history::handle(req, c)
             })
         }
+        METHOD_VERIFY_REWRITE => {
+            narrow_and_run_ctx(env.params, resp_id, ctx, |req, c| {
+                crate::mcp::tools::verify_rewrite::handle(req, c)
+            })
+        }
         unknown => {
             let data: Value = serde_json::json!({
                 "category": "method_not_found",
@@ -380,6 +388,7 @@ fn handle_initialize(resp_id: Value) -> RpcResponse {
             METHOD_BENCH_VARIANT,
             METHOD_GRID_SEARCH,
             METHOD_OPTIMIZATION_HISTORY,
+            METHOD_VERIFY_REWRITE,
         ],
     };
     match make_result_response(resp_id.clone(), &result) {
@@ -558,7 +567,54 @@ mod tests {
         assert!(tool_list.contains(&"bench_variant"));
         assert!(tool_list.contains(&"grid_search"));
         assert!(tool_list.contains(&"optimization_history"));
-        assert_eq!(tool_list.len(), 6);
+        assert!(tool_list.contains(&"verify_rewrite"));
+        assert_eq!(tool_list.len(), 7);
+    }
+
+    /// AT-2849: `verify_rewrite` appears in `initialize.tools` and its method
+    /// name is registered in `ALL_METHODS` (routes without METHOD_NOT_FOUND).
+    #[test]
+    fn at_2849_verify_rewrite_registered_in_all_methods() {
+        assert!(ALL_METHODS.contains(&METHOD_VERIFY_REWRITE));
+    }
+
+    /// AT-2849: `verify_rewrite` with missing `buffer_sizes` returns `INVALID_PARAMS`.
+    #[test]
+    fn at_2849_verify_rewrite_missing_buffer_sizes_is_invalid_params() {
+        let env = RpcEnvelope {
+            jsonrpc: "2.0".to_string(),
+            id: Some(Value::from(1_i64)),
+            method: METHOD_VERIFY_REWRITE.to_string(),
+            params: serde_json::json!({
+                "original_source": "@kernel fn k() -> void { return; }",
+                "rewritten_source": "@kernel fn k() -> void { return; }",
+            }),
+        };
+        let history_dir = std::path::PathBuf::from("/tmp");
+        let mut ctx = McpContext::new(history_dir);
+        let resp = dispatch_request(env, &mut ctx).expect("non-notification must return Some");
+        let e = resp.error.as_ref().expect("missing buffer_sizes must error");
+        assert_eq!(e.code, ErrorCode::INVALID_PARAMS);
+    }
+
+    /// AT-2849: `verify_rewrite` requiring both source AND path fails the
+    /// exactly-one-of rule (surfaced through `resolve_source`).
+    #[test]
+    fn at_2849_verify_rewrite_source_and_path_both_missing_errors() {
+        let env = RpcEnvelope {
+            jsonrpc: "2.0".to_string(),
+            id: Some(Value::from(1_i64)),
+            method: METHOD_VERIFY_REWRITE.to_string(),
+            params: serde_json::json!({
+                "rewritten_source": "@kernel fn k() -> void { return; }",
+                "buffer_sizes": [],
+            }),
+        };
+        let history_dir = std::path::PathBuf::from("/tmp");
+        let mut ctx = McpContext::new(history_dir);
+        let resp = dispatch_request(env, &mut ctx).expect("non-notification must return Some");
+        let e = resp.error.as_ref().expect("missing original source/path must error");
+        assert_eq!(e.code, ErrorCode::INVALID_PARAMS);
     }
 
     #[test]

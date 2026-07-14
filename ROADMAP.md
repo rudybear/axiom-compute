@@ -332,13 +332,15 @@ Re-blessed per-machine on the EB.2 v2 schema: exactly two keys (`nvidia_rtx_pro_
 
 ## Feature gaps (mentioned in DESIGN.md / CLAUDE.md but never built)
 
-### FG.1 — `axc rewrite` source-to-source LLM rewriter
+### FG.1 — `axc rewrite-verify` structural-rewrite verifier ✅ IMPLEMENTED (M3.16, 2026-07-13)
 
-`@strategy` holes are *parameter* tuning. `axc rewrite` is *structural* — the LLM rewrites the kernel body itself (different loop nest, different memory access pattern, etc.) and the compiler verifies via `@equiv_fp_tol`.
+IMPLEMENTED as M3.16 — v1 is the **verify** primitive, not `propose`. `@strategy` holes are *parameter* tuning; `axc rewrite-verify` is the *structural* half — an LLM agent rewrites a kernel's body (different loop nest, different memory-access pattern) and the compiler machine-checks observational equivalence to the original via a real-GPU differential (A-vs-B) harness, gated by a CPU-only interface anti-cheat check (§4.1) and a verifier-owned tolerance policy (§4.2) that the kernel source can never loosen.
 
-**Scope:** new MCP tool `propose_rewrite(source, hint) -> rewritten_source`; LLM-side prompting infrastructure; correctness verification harness that compares rewritten kernel output to original.
+Three layers over one core: `crates/axc-driver/src/rewrite_verify.rs` (`verify_rewrite(req, vk) -> VerifyReport`, pure orchestration, no LLM/no I/O beyond the two sources), `axc rewrite-verify <original.axc> <rewritten.axc>` (the LLM-free, CI-runnable CLI primitive), and the `verify_rewrite` MCP tool (the 7th tool, server-owned `BitExact` default with a loud `tolerance_overridden` stamp on caller override). Closed verdict taxonomy: `PASS | FAIL | REJECT | SKIPPED | NONDETERMINISTIC_ORACLE | ERROR`. Reuses `compile_source_with_assignments`, `validate_spirv`, `seeded_inputs`, `derive_workgroups`, `within_ulp_f32`, `prepare_kernel_checked`, `dispatch_handle` — zero duplication. New fixtures: `examples/saxpy_wrong.axc` / `saxpy_perturbed.axc` (REJECT/tolerance demonstrations) / `saxpy_reassoc.axc` (a non-coopmat ACCEPT fixture that runs the PASS path on Lavapipe/CI without NVIDIA). The real historical M3.6→M3.11a Q4_K_M rewrite pair re-verified through the new harness reproduces the SAME bit-exact PASS the M3.11a campaign established by hand. See DESIGN.md §3.1.42.
 
-**Effort:** ~2000 LOC.
+**Non-goals (v1, explicit):** no `propose_rewrite`/in-compiler LLM call (generation stays in the agent — the MCP server gains no model-call capability); no `@equiv_fp_tol`-from-source (not yet a real HIR annotation — a separate FG-class feature); no benchmark/perf verdict (correctness-only; a future `--bench` flag can add an optional, separately-reported speedup); no workgroup-size-changing rewrites; no edge-value (NaN/Inf/-0) input probes. Zero compiler changes — the entire deliverable lives in `crates/axc-driver`.
+
+**Effort:** ~2000 LOC. AT-2841..2860.
 
 ### FG.2 — `@transfer { ... }` blocks for inter-agent handoff
 
