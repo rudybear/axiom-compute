@@ -378,11 +378,9 @@ IMPLEMENTED as M3.20: `array name: array[elem, N];` kernel-local Function-storag
 
 IMPLEMENTED as M3.18. `axc verify` = the @strict enforcement point (C1 completeness, C2 predicate-DSL well-formedness incl. the arity-drop diagnostic surfaced WITHOUT changing compile, C3 workgroup sanity, C4 inert-postcondition surfacing, C5 front-end errors). `axc test --fuzz` = precondition-constrained fuzzing with the honest oracle triad: device-fault, **M3.17 postcondition runtime flags as the correctness oracle**, twin-dispatch determinism; all-f32 interval satisfier with unsat detection (exit 3); total 4-quadrant CPU-vs-GPU discriminator (can surface an M3.17 check miscompile honestly); severity ordering ERROR>FAIL>UNSATISFIABLE>UNCONSTRAINED_PRECONDITION_FIRED>SKIPPED>PASS. Zero compiler changes. AT-2881..2899. Pipeline note: 3 design cycles + 1 documented orchestrator resolution (reviewer-specified severity clause), verified by the pessimistic code review as backstop.
 
-### FG.9 — Multi-kernel modules
+### FG.9 — Multi-kernel modules ✅ IMPLEMENTED (M3.21, 2026-07-15)
 
-Currently one `@kernel` per file. DESIGN.md hints at multi-kernel modules with cross-kernel `@strategy` (shared holes). Useful for prefix-sum style kernels with multiple stages.
-
-**Effort:** ~1200 LOC.
+IMPLEMENTED as M3.21 — the LAST substantive non-gated feature gap. N kernels per file emitted as N separate modules through the unchanged emitter (zero codegen-internals/runtime change); cross-kernel `@strategy` hole sharing via a boundary-scan substitution that replaced the raw str::replace (design review empirically proved the ?WG→1282 prefix-collision miscompile — 3rd naive-text-operation instance; code review then caught and fixed a UTF-8 char-boundary panic in the scan itself). Fail-closed `--kernel`/`--all` selection on every CLI/MCP surface (AmbiguousKernel lists names); winner cross-compiled module-wide before ANY output write (zero orphans); `two_pass_reduce.axc` proves two kernels sharing ?WG bit-exact on NVIDIA + Lavapipe. Corpus golden 34/34. AT-2945..2972 (+2963b/2968c). See DESIGN.md §3.1.45.
 
 ---
 
@@ -408,6 +406,8 @@ Currently one `@kernel` per file. DESIGN.md hints at multi-kernel modules with c
 | M3.19 low warts (pessimistic code review, none gate): out-of-i64-range int literals in annotation args silently clamp to i64::MAX/MIN with no diagnostic (parser.rs — reject instead); log-opt inserts LF separator into CRLF files; no per-note length cap on MCP append_optimization_log | low | 100 LOC |
 | `validate()` in axc-hir has ZERO callers workspace-wide (discovered M3.20) — HirError::SharedMemoryTooLarge/LocalArrayTooLarge there are dead code; the reachable checks live in typecheck. Either wire validate() into the pipeline or fold its checks into typecheck and delete | medium | 200 LOC |
 | M3.20 nit: identical same-shape local arrays emit redundant duplicate OpTypeArray ids (valid SPIR-V, minor size waste) | low | 50 LOC |
+| Pre-existing parser gap (discovered M3.21): `shared[T,N]` length position never accepted a `HoleRef` (`shared[i32,?WG]` fails to parse — confirmed on main) — blocks hole-tuned shared tiles; fix in axc-parser + AT | medium | 150 LOC |
+| M3.21 PCR-2 (accepted residual): `--all` multi-file write loop isn't atomic — a mid-loop I/O error leaves partial artifacts (same class as pre-existing single-kernel .spv-then-sidecar); tempfile-rename discipline would close it | low | 100 LOC |
 
 ---
 
