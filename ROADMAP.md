@@ -354,11 +354,9 @@ Per-kernel embedded history of prior optimization runs. Currently stored externa
 
 **Effort:** ~500 LOC.
 
-### FG.4 — `@precondition` / `@postcondition` runtime checks
+### FG.4 — `@precondition` / `@postcondition` runtime checks ✅ IMPLEMENTED (M3.17, 2026-07-14)
 
-Currently parsed and HIR-validated, but never lowered to debug-mode runtime asserts. Spec promises `axc compile --debug` enables them.
-
-**Effort:** ~600 LOC.
+IMPLEMENTED as M3.17 (the first codegen-touching milestone since M3.3d). `axc compile --debug` lowers a whitelisted Call-form predicate DSL (`gt/ge/lt/le/eq/ne/is_finite`, zero parser changes) to an injected atomic debug-flag SSBO (QueueFamily scope under the Vulkan memory model / Device under GLSL450, keyed on `uses_coopmat`); observational-only (no early-return — sidesteps BarrierInDivergentContext); host decodes bitmasks → typed `DispatchError::DebugCheckViolation`. `--debug` off is byte-identical SPIR-V (golden-gated). Metadata schema v4, fail-closed. Buffer (`elem(buf)`) postconditions deferred per §9 (all → non-silent `PostconditionNotLowerable`). AT-2861..2879.
 
 ### FG.5 — Q5_K_M / Q6_K quantization variants ✅ IMPLEMENTED (M3.14, 2026-07-13)
 
@@ -404,7 +402,9 @@ Currently one `@kernel` per file. DESIGN.md hints at multi-kernel modules with c
 | ~~No `CHANGELOG.md`~~ ✅ DONE (M3.15): milestone-level backfill M0→M3.15, AT-2839 | — | — |
 | ~~`strip_strategy_annotation_block` naive substring footgun~~ ✅ FIXED (M3.15): lexer-token anchor, comment/string-safe, AT-2830..2835 incl. examples-corpus regression anchor | — | — |
 | M3.14 golden fixtures are annotated hand-computed-from-formula (permitted §6 fallback); a real ggml-quantized byte-dump cross-check for Q6_K/Q5_K_M is still owed as a drop-in | low | 200 LOC |
-| `at_1115` (M2.4 bench_variant 4-ULP saxpy correctness) fails deterministically on Lavapipe/Mesa 25.2.8 (9/1024 elements) — pre-existing FP drift from a Mesa bump, NOT caused by M3.16 (stash-verified on unmodified HEAD); needs re-baseline or Lavapipe-only ULP-widening with rationale | medium | 100 LOC |
+| ~~`at_1115` Lavapipe failure~~ ✅ FIXED (M3.17): root cause was NOT Mesa drift — a device-independent CPU-oracle NaN bug (`0.0*x` shortcut), fixed at the root; measured genuine ULP delta 0; NVIDIA 4-ULP frozen; defensive llvmpipe→8 keying retained | — | — |
+| M3.17 LOW (pessimistic code review): `@precondition`/`@postcondition` with arity ≠ 1 (e.g. comma-conjunction) is SILENTLY dropped — compile-time fail-open for a verification tool; pre-existing M0 behavior mirrored; needs a v1.1 diagnostic | low | 50 LOC |
+| M3.17 deferred (§9): buffer `elem(buf)` postcondition lowering with the syntactic-dominance gate (design r2-approved, never built — v1 defers all to `PostconditionNotLowerable`) | low | 300 LOC |
 | M3.16 W1/W2 (routed from pessimistic code review, both safe-direction): `rel:` comparator near-zero denominator (seed-pinned in AT-2855) + `within_ulp_f32` sign-boundary false-mismatch — candidates for a condition-aware tolerance follow-up | low | 300 LOC |
 
 ---
