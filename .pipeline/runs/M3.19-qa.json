@@ -1,0 +1,140 @@
+{
+  "verdict": "PASS",
+  "agent": "qa_agent",
+  "milestone_id": "M3.19-agent-annotations",
+  "run_id": "M319-20260714-1400",
+  "branch": "coder/M319-20260714-1400/M3.19-agent-annotations",
+  "requirements_total": 34,
+  "requirements_covered": 34,
+  "requirements_missing": [
+    "[RESOLVED in recheck, commit a11f400] Deviation-2 writer forward-compat gap: axc log-opt does NOT refuse to append into an existing version>1 @optimization_log block, and the coder's stated justification for skipping this is factually wrong (see top_priority_finding below). Fixed by LogOptError::UnsupportedVersion + AT-2926; see \"recheck\" section for independent re-verification."
+  ],
+  "test_results": {
+    "total": 1349,
+    "passed": 1217,
+    "failed": 0,
+    "ignored": 132,
+    "baseline_passed": 1150,
+    "baseline_ignored": 132,
+    "new_passing": 67,
+    "note": "cargo test --workspace: 0 regressions. Ignored count unchanged (132) confirming no new GPU-gated surface, consistent with the milestone's codegen-inert claim."
+  },
+  "verification_results": {
+    "cargo_build_workspace": "PASS (clean)",
+    "clippy_check": "PASS (cargo clippy --workspace --lib --tests -- -D warnings: zero findings)",
+    "diff_check": "PASS — every file in coder's files_created/files_modified appears in `git diff main...HEAD`; no planned change missing",
+    "coder_self_report_matches_reality": false,
+    "self_report_mismatch_reason": "The 'deviations' entry for reviewer resolution (b) asserts 'no real source can carry a block-level version>1 today via this parser's own grammar' as grounds for not implementing LogOptError::UnsupportedVersion. This is materially false: version:2 (or any int) is trivially parseable as the block-level `version` field (only an *unknown block-level KEY* is unreachable, not a *version number greater than 1*). Empirically reproduced end-to-end below."
+  },
+  "top_priority_finding_deviation_2": {
+    "task_question": "Is deviation 2's premise correct, and is AT-2924 testing something real, and is section 1.4a's preserve-and-warn promise vacuous?",
+    "determination": "DEVIATION 2 IS WRONG. FAIL-grade finding, per the explicit criterion given for this investigation.",
+    "evidence": [
+      "1. Constructed /tmp scratchpad v2_block.axc: @optimization_log { version: 2, entry {...one valid v1-shaped entry...} }. `axc verify` → Pass, 0 errors, 0 warnings. `axc compile` → exit 0. This proves the parser DOES produce a real, on-disk, HIR-valid version>1 block — directly contradicting the coder's 'no real source can carry a block-level version>1' claim.",
+      "2. Ran `axc log-opt v2_block_towrite.axc --kernel v2_block --metric 99999 --unit mtflops --verdict PASS --ts ...` against that v2 block. Result: exit 0, JSON {\"status\":\"ok\"} — the writer SPLICED a v1-shaped entry into the version:2 block WITHOUT refusal and WITHOUT any warning. `grep LogOptError crates/axc-driver/src/log_opt.rs` confirms no `UnsupportedVersion` variant exists at all (only Full, Multikernel, Parse, MalformedExistingBlock, NoAnchor, Io).",
+      "3. Re-ran `axc verify` on the post-append file: Pass, 0 errors, 0 warnings — the schema-version mixing the pessimistic design reviewer's SHOULD-FIX #2 (M3.19-pessimistic-design-review.json warnings[1]) explicitly warned about ('splicing a v1 entry into a v2 block... silently mixes schema versions inside one block') is now silently present in the file with zero diagnostic trace.",
+      "4. Separately confirmed the ONE part of the coder's claim that IS true: an unknown BLOCK-LEVEL key (any version) is genuinely unreachable via real parsed source — v1_block_unknown_key.axc with `future_field: 7` at block scope → real PARSE error 'expected `entry` or `version`', regardless of the declared version number. This is because block_item is EBNF-closed to version_field|entry_block — confirmed by inspecting parser.rs's parse_optimization_log_block. The coder conflated 'block-level unknown KEY is unreachable' (true) with 'block-level version>1 is unreachable' (false) — a real error in the technical justification, not a semantic quibble.",
+      "5. Checked what AT-2924 actually exercises: crates/axc-hir/src/opt_log.rs lines 596-610. Both at_2924_v2_unknown_block_key_preserved_not_rejected AND at_2924_v2_unknown_entry_key_preserved_known_fields_still_validated construct RecordField values directly via a Rust-level `field()` helper — NOT through the parser. So AT-2924 is a pure HIR-unit-level test of validate_block/validate_entry's preserve-and-warn logic in isolation; it does not by itself prove the promise is reachable end-to-end.",
+      "6. HOWEVER: I independently constructed real parsed source with an UNKNOWN ENTRY-LEVEL key inside a version:2 block (v2_entry_unknown.axc, future_field:7 inside entry{}) and ran it through `axc verify`/`axc compile`. Result: HirWarning::UnknownOptimizationLogKeyForward correctly fires, the file compiles successfully (0 errors), and forward_unknown is populated. This proves the entry-level direction of section 1.4a's preserve-and-warn promise IS real and delivered end-to-end via the real parser+HIR — it is NOT vacuous for the practically relevant channel (this is also what AT-2925's byte-verbatim round-trip actually exercises)."
+    ],
+    "conclusion": "Two separable claims must not be conflated: (a) '#1.4a preserve-and-warn is vacuous' — FALSE, independently disproven; the entry-level direction works end-to-end through real source, only the block-level direction is dead code by construction of the closed EBNF (and this is honestly disclosed by the coder in known_limitations). (b) 'the writer safely handles an existing version>1 block' — FALSE and NOT disclosed accurately; the writer silently splices into it, exactly the unsafe scenario the pessimistic reviewer flagged, and the coder's justification for skipping the fix rests on a factually incorrect premise (that the scenario is unreachable, when it is directly reachable by any hand-authored or future-writer-produced v2 file).",
+    "severity_and_scope_note": "The pessimistic design review (M3.19-pessimistic-design-review.json) filed this as a SHOULD-FIX under an overall APPROVE verdict, not a blocking MUST-FIX in the adopted r2 spec (section 8 lists only 3 official must-fixes, none of which is 'writer refuses version>1'). So strictly under the r2 contract this omission alone would be a should-fix gap, not automatically FAIL. What elevates it to FAIL here is that the coder's self-report affirmatively claims the scenario is 'structurally' impossible and uses that (incorrect) claim as the basis for skipping the fix — an unverified/false technical claim in the self-report, which is exactly the class of 'agents lie about their own work' the QA process exists to catch, plus a demonstrated real safety gap (silent schema-version mixing with zero diagnostic) that a future consumer would hit.",
+    "recommended_fix": "Small, well-scoped: in splice_optimization_log_entry (crates/axc-driver/src/log_opt.rs), after parsing/validating the existing block, check parsed_version > SUPPORTED_OPT_LOG_VERSION and return LogOptError::UnsupportedVersion{found, supported} (source byte-unchanged, new exit code), plus one AT. Estimated ~15-25 LOC + 1 test."
+  },
+  "grammar_reject_fixtures": {
+    "AT-2919": "PASS (axc-parser + axc-hir, re-run)",
+    "AT-2920": "PASS (axc-hir, re-run)",
+    "AT-2921": "PASS (axc-parser + axc-hir, re-run)",
+    "AT-2913": "PASS — re-run; verified genuine multi-error recovery: fixture with 2 malformed block items (`bogus_one{...}`, `bogus_two{...}`) yields exactly 2 OptimizationLogBlockSyntax errors AND still parses the well-formed `entry{...}` that follows (not bail-on-first-error).",
+    "own_adversarial_probes": [
+      {"case": "nested entry-in-entry", "expected": "reject", "observed": "parse_error: expected `:`, found LBrace — REJECTED as predicted by pessimistic reviewer's SHOULD-FIX #3 (field := ident ':' record_value sees `entry {` and expects `:`)"},
+      {"case": "unit as Str \"mtflops\"", "expected": "reject", "observed": "hir_error: `unit` must be an identifier; got Str(\"mtflops\") — REJECTED, correct shape enforcement"},
+      {"case": "version declared twice", "expected": "reject", "observed": "hir_error: block-level `version` field is declared 2 times; exactly one is required — REJECTED"},
+      {"case": "entry before version (order)", "expected": "accept (block_item order is unconstrained by the EBNF)", "observed": "0 errors, 0 warnings — ACCEPTED, correctly matches the closed EBNF which does not mandate version-first ordering"}
+    ]
+  },
+  "golden_gate_AT_2903": {
+    "status": "PASS — independently reproduced",
+    "method": "Compiled examples/optlog_demo.axc as-is, then compiled a version with the @optimization_log block byte-stripped (regex-anchored strip of the real annotation, not the doc-comment mention of the same string). `cmp` on the two .spv outputs: byte-identical, both 1312 bytes."
+  },
+  "writer_verification": {
+    "explicit_ts_required": "Confirmed by code inspection and by all my own log-opt invocations succeeding only when --ts is passed explicitly; spec-mandated default now() is documented non-reproducible/banned-in-ATs.",
+    "at_64_entries_cap": {
+      "status": "PASS — independently reproduced",
+      "method": "Generated a 64-entry fixture programmatically (Python), confirmed it verifies clean (0 err/0 warn) at exactly the cap. Ran `axc log-opt` to append a 65th entry: refused with LogOptError::Full JSON error, exit code 3, md5sum of the source file identical before and after (byte-unchanged)."
+    },
+    "multikernel_fail_closed": {
+      "status": "PASS — independently reproduced",
+      "method": "2-kernel source; `axc log-opt` refused with LogOptError::Multikernel JSON error, exit code 4, md5sum identical before/after."
+    }
+  },
+  "mcp_tool_8": {
+    "count_check": "PASS — ALL_METHODS in crates/axc-driver/src/mcp/dispatch.rs has exactly 8 tool method constants (load_source, enumerate_variants, compile_variant, bench_variant, grid_search, optimization_history, verify_rewrite, append_optimization_log) plus the separate `initialize` handshake method — matches the claimed 7→8.",
+    "real_jsonrpc_call": "PASS — drove a live `axc mcp` subprocess over stdio with a hand-written append_optimization_log JSON-RPC request against a copy of examples/optlog_demo.axc; got a well-formed result object back, the target file was spliced with the new entry, and `axc verify` on the resulting file passed clean (0 errors, 0 warnings)."
+  },
+  "deviation_1_kernel_keyword": {
+    "status": "VERIFIED — narrow and documented",
+    "evidence": "grep for TokenKind::Kernel in crates/axc-parser/ returns exactly 2 hits: a doc comment and the single match arm inside parse_optimization_log_field. Confirmed `kernel: \"...\"` works as a field key in every hand-written entry fixture used throughout this verification (parses, lowers, compiles)."
+  },
+  "deviation_3_extended_signatures": {
+    "status": "VERIFIED — claims accurate",
+    "evidence": "rewrite_verify::VerifyReport (rewrite_verify.rs:213-233) has no metric/unit/kernel-name field — confirmed by reading the struct (fields: verdict, milestone, policy, tolerance_overridden, seed, stage, original, rewritten, device, buffers_compared, reason, notes). HistoryEntryRecord/GridSearchPersisted (mcp/tools/grid_search.rs:141-165) has no explicit regression-vs-baseline comparator field (only winner_median_ns, no baseline reference) — confirms the coder's engineering-judgment resolution (winner_median_ns > baseline_median_ns) was a necessary interpretation, not a spec-literal signature.",
+    "AT_2907_exhaustive_mapping": "PASS, re-run — verdict_from_rewrite_verify maps all 6 rewrite_verify::Verdict variants 1:1 to the identically-named OptLogVerdict idents; a separate exhaustive loop asserts none of the 6 ever produce OptLogVerdict::Regress."
+  },
+  "AT_2915_2918_paper_finding": {
+    "AT-2915": "PASS, re-run — @transfer(900) call-form (block-form `{...}` is not parseable for @transfer since only strategy/optimization_log get a block arm, correctly documented in the test itself) hits HirError::UnknownAnnotationInM0{name:\"transfer\"}.",
+    "AT-2916": "PASS, re-run — MCP registry method-name constants checked, no transfer/handoff-reader tool present.",
+    "AT-2917": "PASS, re-run — doc-fence test confirms revisit trigger recorded verbatim in DESIGN.md.",
+    "AT-2918": "PASS, re-run — codegen empty-diff grep-fence + AT-2903.",
+    "independent_probe": "Hand-wrote a @transfer(900) kernel and ran `axc verify`: hir_error 'unknown annotation `@transfer` (M0 allows: @kernel, @workgroup, @intent, @complexity, @precondition, @postcondition, @strict, @subgroup_uniform, @cooperative_matrix)' — confirms @transfer is genuinely rejected today, matching the NO-BUILD decision."
+  },
+  "scope_check": {
+    "axc_codegen_diff": "PASS — exactly 1 line changed (`opt_log: None,` added to a test-only KernelAnnotations literal in emit.rs), verified via `git diff main...HEAD -- crates/axc-codegen/`.",
+    "axc_lexer_diff": "PASS — 0 lines changed (`git diff main...HEAD -- crates/axc-lexer/` is empty).",
+    "axc_runtime_diff": "PASS — 0 lines changed (`git diff main...HEAD -- crates/axc-runtime/` is empty).",
+    "frozen_tolerances": "PASS — no frozen-tolerance / equiv_fp_tol source files appear in the diff."
+  },
+  "AT_2925_roundtrip": {
+    "status": "PASS, re-run — rewrite_verify::tests::at_2925_optimization_log_block_survives_rewrite_verify_flow_byte_verbatim passes."
+  },
+  "loc_budget_finding": {
+    "severity": "SHOULD-FIX (non-blocking, but undisclosed)",
+    "spec_budget": "Milestone spec section 6: FG.3 build target ~820 / cap 1000; FG.2 NO-BUILD target ~60 / cap 120; total target ~880 / cap ~1120 (includes tests per the section's own parenthetical 'parser+AST+HIR+writer+MCP+tests').",
+    "observed": "git diff main...HEAD --numstat over crates/ + examples/ (excluding DESIGN.md/ROADMAP.md/the milestone spec doc itself) totals 3111 added / 9 deleted lines — roughly 2.8x the stated ~1120 cap. Largest contributors: opt_log.rs (630, new), log_opt.rs (569, new), parser.rs (+501), lower.rs (+413), append_optimization_log.rs (199, new), main.rs (+157), cli.rs (+154).",
+    "note": "A meaningful fraction of this is test code (opt_log.rs's #[cfg(test)] block starts around line 422/630; log_opt.rs's around line 354/569), but even a generous test/production split leaves production code well above the 820-1000 target range. The coder's self-report (M3.19-coder.json) does not mention or reconcile this against the spec's explicit numbered LOC budget anywhere in its self_assessment. Not gating on its own, but should be surfaced to the Architect/reviewers as an undisclosed budget overrun."
+  },
+  "memory_footprint_ok": true,
+  "summary": "Build, clippy, and full test suite (1217 passed / 0 failed / 132 ignored, +67 new tests, zero regressions vs the 1150/132 baseline) are all clean, and I independently re-verified essentially every acceptance test named in the QA brief (AT-2903, AT-2907, AT-2913, AT-2915..2925, AT-2919/2920/2921) plus 4 of my own adversarial grammar fixtures, the writer's 64-entry cap and multikernel fail-closed paths, a live MCP JSON-RPC call, and confirmed the scope discipline (codegen 1 mechanical line, lexer/runtime untouched). All of that is genuinely solid. But the TOP-PRIORITY deviation-2 investigation surfaces a real problem: the coder's justification for skipping the pessimistic reviewer's SHOULD-FIX ('writer refuses to append into a version>1 block') is factually wrong — I built a real, parseable, HIR-valid version:2 block by hand and then ran the real `axc log-opt` writer against it: it silently spliced a v1-shaped entry into the v2 block with exit 0 and zero warnings, exactly the schema-version-mixing risk the reviewer flagged. The coder's self-report claims this scenario is 'structurally' unreachable via the parser, but only the narrower claim (unknown BLOCK-LEVEL key is unreachable) is true — version>1 itself is trivially reachable. Section 1.4a's preserve-and-warn promise is NOT vacuous overall (the entry-level forward-compat direction is real and independently verified end-to-end), but the writer-side safety gap is real, undisclosed accurately, and unfixed. Combined with an undisclosed ~2.8x LOC budget overrun, verdict is FAIL — recommend a small, scoped fix (add LogOptError::UnsupportedVersion to the writer, ~15-25 LOC + 1 AT) and a corrected self-report, then re-submit for QA.",
+  "recheck": {
+    "verdict": "PASS",
+    "fix_commit": "a11f400a7ea982362b9cea51769fcfc736f06989",
+    "fix_commit_subject": "fix(M3.19): LogOptError::UnsupportedVersion — writer refuses version!=1 blocks fail-closed (QA finding) + AT-2926",
+    "branch": "coder/M319-20260714-1400/M3.19-agent-annotations",
+    "scope": "Scoped re-check of the QA-blocking finding only (deviation-2 writer forward-compat gap + secondary undisclosed LOC overrun). Did not re-audit the rest of the milestone from scratch; that portion was already independently verified PASS in the original QA pass.",
+    "reproduction_of_original_failing_scenario": {
+      "method": "Hand-wrote a fresh /tmp scratchpad fixture (not reusing the coder's own AT-2926 fixture text) with a real @optimization_log { version: 2, entry {...} } block, independently of the coder's test fixtures.",
+      "step1_reader_side_still_permissive": "`axc verify` on the hand-written version:2 fixture -> Pass, 0 errors, 0 warnings. `axc compile` -> exit 0. Confirms the reader-side preserve-semantics behavior (version:2 blocks are still real, parseable, HIR-valid source) is UNCHANGED by the fix — this is expected/correct, the fix is writer-side only.",
+      "step2_cli_writer_now_refuses": "Ran `axc log-opt <file> --kernel v2k --metric 99999 --unit mtflops --verdict PASS --ts ...` against the version:2 fixture. Result: JSON {\"status\":\"error\",\"detail\":\"existing @optimization_log block has version 2; this writer only supports version 1 (refusing to splice a mismatched-schema-version entry into it)\"}, exit code 5. `cmp` on the file before vs. after the refused call: BYTE-IDENTICAL (also confirmed via matching md5sums, d5aa2adc16d43117fd73beb118f186e3 both before and after).",
+      "step3_mcp_writer_now_refuses": "Spawned a real `axc mcp` subprocess (Python driver script over stdin/stdout NDJSON, not the coder's own test harness), sent `initialize` then a hand-written `append_optimization_log` JSON-RPC request against a fresh copy of the version:2 fixture. Result: {\"error\":{\"code\":-32602,\"message\":\"existing @optimization_log block has version 2; this writer only supports version 1 ...\",\"data\":{\"category\":\"invalid_params\",...}}} — InvalidParams-class error (-32602), no `result` key. md5sum of the fixture file before and after the call: identical (d5aa2adc16d43117fd73beb118f186e3 both times), confirming disk is byte-unchanged. Independently confirmed via code read that `log_opt_error_to_mcp` in append_optimization_log.rs maps every non-Io LogOptError variant (including the new UnsupportedVersion) through the same catch-all `other => McpToolError::InvalidParams(other.to_string())` arm — the MCP path shares the CLI's fail-closed check via the same splice_optimization_log_entry core, not a separate reimplementation."
+    },
+    "version1_still_works": {
+      "status": "PASS, independently reproduced",
+      "method": "Hand-wrote a version:1 fixture with one existing entry, ran `axc log-opt --kernel v1k --metric 555 --unit mtflops --verdict PASS --ts ...` against it. Result: exit 0, {\"status\":\"ok\",...}; file on disk now contains 2 entries (the original plus the newly spliced one), version field still 1. Confirms the new check is not over-broad."
+    },
+    "at_2926_and_regression_tests": {
+      "status": "PASS",
+      "method": "cargo test -p axc-driver --lib log_opt::tests: 14/14 pass, including all 3 new AT-2926 tests (at_2926_version2_block_refused_source_byte_unchanged, at_2926_version2_block_refused_file_byte_unchanged_on_disk, at_2926_version1_block_append_still_works) run alongside the pre-existing at_2922_fails_closed_at_capacity and multikernel_source_fails_closed in the same pass — no interference, all unregressed."
+    },
+    "cargo_test_workspace": {
+      "status": "PASS",
+      "totals": "1220 passed / 0 failed / 132 ignored",
+      "vs_baseline": "+3 vs. this QA agent's own prior re-verified baseline of 1217/0/132 -- exactly the 3 new AT-2926 tests, zero regressions, ignored count unchanged (132) confirming no new GPU-gated surface was introduced by the fix.",
+      "clippy": "cargo clippy --workspace --lib --tests -- -D warnings: clean, zero findings."
+    },
+    "run_json_corrections_check": {
+      "deviation_2_retraction": "PASS — M3.19-coder.json self_assessment.deviations[1] is explicitly marked '[RETRACTED, QA-fix pass, run M319-20260714-1400 continuation]' and honestly restates the original false claim, why it was false (conflated 'unknown block-level KEY unreachable' with 'block-level VERSION>1 unreachable'), and the fix applied. No minimization or hedging observed.",
+      "loc_disclosure": "PASS — M3.19-coder.json now has a top-level loc_budget_disclosure section (previously absent) with: spec_budget quoted verbatim from the milestone spec's §6, measured total (3223 added / 9 deleted across 24 files, ~2.9x the ~1120 cap — the QA-fix pass itself added ~112 lines to the prior 3111, consistent), and an honest_breakdown_by_line_type giving production_lines=1902 / test_lines=1277 / fixture_lines=44 plus a per-file top-contributors table with prod/test line splits for the 6 largest files. A why_over_cap rationale and a recommendation to the Architect/reviewers are also present. This matches the QA brief's ask for 'the LOC disclosure present with the production/test/fixture breakdown'."
+    },
+    "conclusion": "Both blocking items from the original FAIL are resolved and independently re-verified end-to-end (CLI + MCP, not just the coder's own tests): the writer now fails closed on any existing @optimization_log block with version != SUPPORTED_OPT_LOG_VERSION, before any write, with a distinct exit code (CLI) / InvalidParams error (MCP), source byte-unchanged in both paths. version:1 append is unregressed. The coder's self-report now honestly retracts the false unreachability claim and discloses the LOC overrun with the requested breakdown. No new issues found in this scoped recheck. Flipping top-level verdict to PASS."
+  }
+}

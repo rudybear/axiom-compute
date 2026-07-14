@@ -1,0 +1,158 @@
+{
+  "verdict": "IMPLEMENTED",
+  "agent": "coder",
+  "milestone_id": "M3.19-agent-annotations",
+  "run_id": "M319-20260714-1400",
+  "branch": "coder/M319-20260714-1400/M3.19-agent-annotations",
+  "summary": "FG.3 @optimization_log minimal-build (parser + AST + HIR + writer CLI/MCP tool) fully implemented and tested; FG.2 @transfer NO-BUILD shipped as spec + verdict + revisit trigger (zero code) per r2 decision. Golden byte-identical-SPIR-V gate green (AT-2903). All four r2 pessimistic-review resolutions applied.",
+  "carrier_shape_decision": {
+    "resolves": "Reviewer note (a) — spec described the AST carrier three inconsistent ways.",
+    "pinned_shape": "Annotation.args (Vec<Spanned<AnnotationArg>>) for @optimization_log is a FLAT list where each element is EITHER (1) AnnotationArg::Record{fields} holding a block-level scalar (currently only `version`), held DIRECTLY (not Call-wrapped), OR (2) AnnotationArg::Call{name:\"entry\", args:[Record{fields}]} — one entry{...} declaration, Call-wrapped so downstream match arms stay uniform with @strategy's Call-wrapped hole declarations (matches AT-2900's literal wording). RecordField.value is the CLOSED RecordValue{Str|Int|Ident} enum (no Record/Call/Hole variant), so nesting is structurally impossible at exactly one level below Annotation.args.",
+    "hir_signature_match": "axc_hir::lower::lower_optimization_log_annotation (new, mirrors lower_strategy_annotation) separates the flat args list into block_fields: Vec<RecordField> (concatenated from every bare Record arg) and per-entry Vec<RecordField> lists (one per Call{\"entry\",...} arg), then calls opt_log::validate_block(&[RecordField], span) -> Result<OptimizationLog, HirError> and opt_log::validate_entry(&[RecordField], version, span) -> Result<OptimizationLogEntry, HirError> exactly matching the spec's §1.4 signatures.",
+    "documented_at": [
+      "crates/axc-parser/src/ast.rs — AnnotationArg::Record doc comment",
+      "crates/axc-hir/src/lower.rs — lower_optimization_log_annotation doc comment",
+      "crates/axc-hir/src/opt_log.rs — module + validate_block/validate_entry doc comments"
+    ]
+  },
+  "files_created": [
+    "crates/axc-hir/src/opt_log.rs",
+    "crates/axc-driver/src/log_opt.rs",
+    "crates/axc-driver/src/mcp/tools/append_optimization_log.rs",
+    "examples/optlog_demo.axc"
+  ],
+  "files_modified": [
+    "crates/axc-parser/src/ast.rs",
+    "crates/axc-parser/src/parser.rs",
+    "crates/axc-parser/src/lib.rs",
+    "crates/axc-hir/src/hir.rs",
+    "crates/axc-hir/src/lower.rs",
+    "crates/axc-hir/src/validate.rs",
+    "crates/axc-hir/src/lib.rs",
+    "crates/axc-driver/src/cli.rs",
+    "crates/axc-driver/src/main.rs",
+    "crates/axc-driver/src/lib.rs",
+    "crates/axc-driver/src/rewrite_verify.rs",
+    "crates/axc-driver/src/verify.rs",
+    "crates/axc-driver/src/mcp/mod.rs",
+    "crates/axc-driver/src/mcp/dispatch.rs",
+    "crates/axc-driver/src/mcp/tools/mod.rs",
+    "crates/axc-driver/tests/mcp_roundtrip.rs",
+    "crates/axc-driver/tests/doc_accuracy.rs",
+    "crates/axc-optimize/src/enumerator.rs",
+    "crates/axc-optimize/src/grid_search.rs",
+    "crates/axc-codegen/src/emit.rs (1 line, test-only KernelAnnotations literal — mechanical, forced by the new opt_log field; see AT-2918)",
+    "DESIGN.md (new §3.1.43 + two §3.2 annotation-table rows)",
+    "ROADMAP.md (FG.2 -> NO-BUILD row, FG.3 -> IMPLEMENTED row)"
+  ],
+  "public_apis_implemented": [
+    "axc_parser::ast::{AnnotationArg::Record, RecordField, RecordValue}",
+    "axc_parser::parser::Parser::{parse_optimization_log_block, parse_optimization_log_entry_fields, parse_optimization_log_field, parse_record_value, recover_to_optlog_boundary, recover_to_comma_or_rbrace}",
+    "axc_parser::parser::ParseError::OptimizationLogBlockSyntax",
+    "axc_hir::opt_log::{OptimizationLog, OptimizationLogEntry, OptLogUnit, OptLogVerdict, MAX_OPT_LOG_ENTRIES, SUPPORTED_OPT_LOG_VERSION, validate_block, validate_entry}",
+    "axc_hir::hir::KernelAnnotations::opt_log: Option<OptimizationLog>",
+    "axc_hir::validate::HirError::{BadOptimizationLog, BadOptimizationLogEntry}",
+    "axc_hir::validate::HirWarning::{EmptyOptimizationLog, UnknownOptimizationLogKeyForward}",
+    "axc_hir::lower::lower_optimization_log_annotation (private, orchestration)",
+    "axc_driver::log_opt::{append_optimization_log, splice_optimization_log_entry, format_optimization_log_block, render_entry, verdict_from_rewrite_verify, entry_from_verify_report, entry_from_grid_record, LogOptError, LogOptError::UnsupportedVersion (added this pass, QA-fix)}",
+    "axc_driver::cli::Command::LogOpt",
+    "axc_driver::mcp::tools::append_optimization_log::{handle, AppendOptimizationLogRequest, AppendOptimizationLogResponse}",
+    "axc_driver::mcp::dispatch::METHOD_APPEND_OPTIMIZATION_LOG (8th MCP tool, registered in ALL_METHODS + initialize.tools)"
+  ],
+  "tests_added_by_at_number": {
+    "AT-2900": ["axc-parser: at_2900_optimization_log_block_parses_call_wrapped_entries", "axc-hir: at_2900_parses_and_lowers_two_entries"],
+    "AT-2901": ["axc-hir: at_2901_bad_entry_shapes_rejected_end_to_end", "axc-hir opt_log unit tests: missing_required_field_rejected, out_of_set_unit_rejected, out_of_set_verdict_rejected, wrong_shape_rejected, duplicate_key_rejected"],
+    "AT-2902": ["axc-hir: at_2902_fields_are_typed_not_a_string_blob"],
+    "AT-2903": ["axc-driver tests/mcp_roundtrip.rs: at_2903_golden_byte_identical_spirv_with_and_without_opt_log_block", "axc-driver src/lib.rs: at_2903_optlog_demo_golden_byte_identical_with_and_without_block"],
+    "AT-2904": ["axc-driver log_opt.rs: at_2904_format_then_parse_is_structurally_equal"],
+    "AT-2905": ["axc-driver log_opt.rs: at_2905_creates_block_when_absent, at_2905_appends_when_present"],
+    "AT-2906": ["axc-driver log_opt.rs: at_2906_preserves_bytes_outside_spliced_region, at_2906_append_preserves_bytes_outside_spliced_region"],
+    "AT-2907": ["axc-driver log_opt.rs: at_2907_all_six_rewrite_verify_verdicts_map_1to1, at_2907_regress_never_produced_by_verify_mapping", "axc-hir opt_log.rs: at_2907_all_seven_verdict_idents_round_trip"],
+    "AT-2908": ["axc-driver src/lib.rs: at_2908_spirv_val_clean_with_optimization_log_block"],
+    "AT-2909": ["axc-hir: at_2909_empty_block_warns"],
+    "AT-2910": ["axc-hir: at_2910_duplicate_annotation_rejected"],
+    "AT-2911": ["axc-hir: at_2911_too_many_entries_rejected"],
+    "AT-2912": ["axc-driver append_optimization_log.rs: at_2912_mcp_and_writer_produce_identical_splice"],
+    "AT-2913": ["axc-parser: at_2913_report_all_malformed_block_items_recovery_continues", "axc-hir: hir_multiple_malformed_entries_all_reported_and_recovery_continues (companion)"],
+    "AT-2914": ["axc-driver cli.rs: at_2914_log_opt_raw_flags_parse, at_2914_log_opt_from_verify_parses, at_2914_log_opt_from_grid_parses, at_2914_log_opt_no_flags_parses_defaults_none"],
+    "AT-2915": ["axc-hir: at_2915_transfer_still_rejected_unknown_annotation"],
+    "AT-2916": ["axc-driver dispatch.rs: at_2916_no_transfer_or_handoff_reader_tool_registered"],
+    "AT-2917": ["axc-driver tests/doc_accuracy.rs: at_2917_transfer_revisit_trigger_recorded_verbatim"],
+    "AT-2918": ["axc-driver tests/doc_accuracy.rs: at_2918_codegen_empty_diff_except_one_mechanical_test_line (+ relies on AT-2903)"],
+    "AT-2919": ["axc-parser: at_2919_closed_value_grammar_rejected_with_recovery", "axc-hir: at_2919_closed_value_grammar_rejects (companion)"],
+    "AT-2920": ["axc-hir opt_log.rs: at_2920_negative_metric_rejected_for_mtflops, at_2920_negative_metric_accepted_for_pct_milli"],
+    "AT-2921": ["axc-parser: at_2921_two_level_trailing_comma_accepted, at_2921_double_comma_reported", "axc-hir: at_2921_trailing_comma_tolerance_both_levels (companion)"],
+    "AT-2922": ["axc-driver log_opt.rs: at_2922_fails_closed_at_capacity"],
+    "AT-2923": ["axc-hir opt_log.rs: at_2923_v1_missing_version_rejected, at_2923_v1_duplicate_version_rejected, at_2923_v1_negative_version_rejected, at_2923_v1_non_int_version_rejected, at_2923_v1_unknown_block_key_rejected, at_2923_v1_unknown_entry_key_rejected"],
+    "AT-2924": ["axc-hir opt_log.rs: at_2924_v2_unknown_block_key_preserved_not_rejected, at_2924_v2_unknown_entry_key_preserved_known_fields_still_validated"],
+    "AT-2925": ["axc-driver rewrite_verify.rs: at_2925_optimization_log_block_survives_rewrite_verify_flow_byte_verbatim"],
+    "AT-2926": ["QA-fix extension (not in the r2 spec's original AT-2900..2925 range; added this pass per QA finding in M3.19-qa.json). axc-driver log_opt.rs: at_2926_version2_block_refused_source_byte_unchanged, at_2926_version2_block_refused_file_byte_unchanged_on_disk, at_2926_version1_block_append_still_works (no-regression companion)"]
+  },
+  "cargo_check_status": "pass",
+  "cargo_build_status": "pass (zero warnings, cargo build --workspace)",
+  "cargo_clippy_status": "pass (cargo clippy --workspace --lib --tests -- -D warnings, zero findings)",
+  "cargo_test_status": "pass (cargo test --workspace: all non-ignored tests green across every crate)",
+  "spirv_val_status": "pass (AT-2908 + golden-gate tests invoke the real spirv-tools validator on SPIR-V compiled from a block-carrying source)",
+  "golden_gate_status": "pass — AT-2903 exercised three ways: inline fixture (mcp_roundtrip.rs), the real examples/optlog_demo.axc fixture (lib.rs), and end-to-end through the axc mcp subprocess -> file on disk -> recompile (mcp_roundtrip.rs at_mcp_append_optimization_log_roundtrip_on_disk)",
+  "mcp_roundtrip_status": "pass — at_mcp_append_optimization_log_roundtrip_on_disk spawns the real `axc mcp` subprocess, calls append_optimization_log over stdin/stdout NDJSON, reads the spliced file back off disk, and re-parses/re-lowers/recompiles it (mirrors the at_1113/at_1114 subprocess-roundtrip pattern; not GPU-gated since this tool never touches Vulkan)",
+  "gpu_spot_check_status": "pass — real Vulkan dispatch confirmed on Lavapipe (VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json, AXC_ENABLE_GPU_TESTS=1): at_1114_bench_variant_returns_median_ns_on_lavapipe passes; broader sweep of dispatch_shared_m32.rs (22/23 pass) and rewrite_verify_gpu.rs (9/9 pass) shows no regression. The one failure (at1707_opphi_coopmat_accumulate_bit_exact_gpu) was verified via `git stash` to be PRE-EXISTING on the unmodified base tree (Lavapipe/llvmpipe coopmat-OpPhi emulation flake, unrelated to this milestone — axc-codegen is untouched except one mechanical test-only line, see AT-2918).",
+  "self_assessment": {
+    "spec_coverage": "All FG.3 build items (§1.1-1.8) + FG.2 NO-BUILD items (§2) implemented per the r2 spec. All four r2 pessimistic-reviewer resolutions applied: (a) carrier shape pinned + documented (see carrier_shape_decision above); (b) writer refuses version>1 blocks -- IMPLEMENTED (LogOptError::UnsupportedVersion, AT-2926; see the corrected deviations entry below -- the original submission's claim that this scenario was unreachable was FALSE and has been retracted per QA finding M3.19-qa.json); (c) entry/version handled as contextual field-key idents (stated in parser.rs code comments); (d) AT-2913 report-ALL recovery written fresh (brace-depth-aware recover_to_optlog_boundary/recover_to_comma_or_rbrace), NOT copied from parse_strategy_block's bail-on-first-error.",
+    "known_limitations": [
+      "Block-level `forward_unknown` (OptimizationLog.forward_unknown) is unreachable via this compiler's own parser today: §1.3a's EBNF pins block_item := version_field | entry_block as CLOSED, so no source-text block-level key other than `version` can ever be produced by parse_optimization_log_block. The HIR validator's block-level preserve-and-warn logic is exercised only via direct Rust-level RecordField construction (opt_log.rs unit tests), not through real parsed source -- it is forward-looking infrastructure for a FUTURE parser version that extends block_item. Entry-level forward_unknown IS reachable via real source today (field := ident \":\" record_value admits any key) and is exercised end-to-end (AT-2925). Documented in opt_log.rs's forward_unknown field doc comment and DESIGN.md §3.1.43.",
+      "entry_from_verify_report's signature could not literally match the spec's `fn(&VerifyReport) -> OptimizationLogEntry` -- rewrite_verify::VerifyReport carries no throughput/timing field (it is a CORRECTNESS report; metric/unit are threaded through as explicit extra parameters). See deviations.",
+      "The CLI's --from-verify ingestion path deserializes a minimal local VerifyReportJson shape (verdict + two optional kernel_name fields), not the real rewrite_verify::VerifyReport struct, because VerifyReport carries `milestone: &'static str` which cannot be Deserialize'd from an arbitrary runtime buffer. verdict_from_rewrite_verify (the real, spec-named, unit-tested function) is exercised directly by the AT-2907 tests for the in-process Rust-value path; the CLI JSON path applies the identical mapping via OptLogUnit::from_ident on the wire-format string (which is byte-identical to the Rust enum's serde rename).",
+      "entry_from_grid_record's REGRESS-vs-baseline comparison logic (winner_median_ns vs an explicit --baseline-median-ns) is an engineering-judgment resolution: HistoryEntryRecord/GridSearchPersisted carry no 'is this a regression' field or reference to a prior baseline, so the spec's 'winner regressed vs baseline' language required a concrete comparison rule, which I implemented as winner_median_ns > baseline_median_ns (slower == regressed).",
+      "AT-2918's codegen empty-diff grep-fence diffs the CURRENT working tree against HEAD (the branch-point commit), since the Coder does not commit. It documents (mirroring AT-2607's own precedent) that a later reviewer should consider re-pinning to fixed base/head SHAs once this milestone is committed, so the fence keeps working after HEAD moves.",
+      "M3.16's rewrite_verify.rs / M3.15's fuzz.rs / M3.18's verify.rs were touched ONLY to add exhaustive-match arms and one AT-2925 test -- no behavioral change to those milestones' own logic."
+    ],
+    "deviations": [
+      "Spec-vs-lexer collision (discovered, resolved): `kernel` is a hard lexer keyword (TokenKind::Kernel, for @kernel) that collides with the REQUIRED schema field name `kernel` inside entry{...} (spec's own §1.3 worked example uses `kernel: \"...\"`). Without a fix, the spec's own examples would be unparseable. Resolved with a narrow, documented parser-local exception in parse_optimization_log_field: TokenKind::Kernel is accepted as the literal field key \"kernel\" (the lexer itself is untouched, matching the spec's 'Lexer: NONE' row).",
+      "[RETRACTED, QA-fix pass, run M319-20260714-1400 continuation] The original text of this entry claimed reviewer resolution (b) could be skipped because 'no real source can carry a block-level version>1 today via this parser's own grammar'. QA (M3.19-qa.json top_priority_finding_deviation_2) built a real, hand-authored `@optimization_log { version: 2, entry {...} }` source, ran it through the real parser + `axc verify` + `axc compile`: it parses and lowers with ZERO errors, and is real, on-disk, HIR-valid source. QA then ran the real `axc log-opt` writer against it and it silently spliced a v1-shaped entry into the v2 block (exit 0, no warning) -- exactly the schema-version-mixing risk the pessimistic reviewer flagged. The original claim was FALSE: it conflated two different things -- 'an unknown BLOCK-LEVEL KEY is unreachable' (TRUE; §1.3a's EBNF pins `block_item := version_field | entry_block` closed, so no key OTHER than `version` can appear at block scope) with 'a block-level VERSION NUMBER greater than 1 is unreachable' (FALSE; `version` is always a plain, parseable, HIR-valid field -- §1.4a's own forward-compat design means version > SUPPORTED_OPT_LOG_VERSION is preserve-and-warn, not reject, so it compiles clean by design). FIX (this pass): added `LogOptError::UnsupportedVersion { found, supported }` to `crates/axc-driver/src/log_opt.rs`. `splice_optimization_log_entry` -- the ONE shared splice core used by both `axc log-opt` (CLI, via `append_optimization_log`) and the `append_optimization_log` MCP tool (`crates/axc-driver/src/mcp/tools/append_optimization_log.rs`, which calls the same `append_optimization_log` function) -- now checks the existing block's HIR-validated `version` field immediately after the existing malformed-block check and BEFORE the capacity check: if `version != SUPPORTED_OPT_LOG_VERSION`, it returns `UnsupportedVersion` and performs NO write (fail-closed, matching the `Full`/`Multikernel` discipline exactly). New exit code `5` (distinct from `Full`=3, `Multikernel`=4, generic usage/parse/malformed=2), documented in `cli.rs`'s `LogOpt` doc comment and `main.rs`'s `run_log_opt` doc comment. New test `AT-2926` (one past the r2 spec's AT-2925 ceiling -- a QA-fix extension, not part of the original spec's AT range) in `log_opt.rs`: (1) `at_2926_version2_block_refused_source_byte_unchanged` -- reproduces the QA scenario exactly (a real parsed+lowered version:2 block, zero HIR errors) and asserts the splice core returns `UnsupportedVersion{found:2,supported:1}`, exit code 5; (2) `at_2926_version2_block_refused_file_byte_unchanged_on_disk` -- file-level `append_optimization_log`, asserts the on-disk file is byte-for-byte unchanged (md5-equivalent `assert_eq!` on the raw bytes) after the refusal; (3) `at_2926_version1_block_append_still_works` -- no-regression companion proving the fix is not over-broad. Independently re-verified end-to-end via a live `axc mcp` subprocess (JSON-RPC `append_optimization_log` against a hand-built version:2 fixture -> `error.code -32602`, file byte-unchanged) and the `axc log-opt` CLI directly (exit code 5, file byte-unchanged, JSON error body). AT-2922 (64-entry cap) and the multikernel fail-closed test were re-run and still pass unmodified -- the new check sits strictly before the capacity check and does not touch that path.",
+      "entry_from_verify_report/entry_from_grid_record signatures carry extra parameters (kernel: Option<String>, ts: String, metric: i64, unit: OptLogUnit / baseline_median_ns: Option<u64>, ts: Option<String>) beyond the spec's terse `fn(&VerifyReport) -> OptimizationLogEntry` / `fn(&HistoryEntryRecord) -> OptimizationLogEntry` sketch, because neither source struct carries all the required OptimizationLogEntry fields (see known_limitations). The verdict-mapping core (verdict_from_rewrite_verify, the AT-2907 subject) matches the spec exactly."
+    ]
+  },
+  "run_as_you_go_evidence": {
+    "cargo_build_workspace": "clean, zero warnings",
+    "cargo_clippy_workspace_lib_tests_D_warnings": "clean, zero findings (iterated twice: fixed a doc_lazy_continuation lint from a doc-comment merge bug and an infallible_destructuring_match lint)",
+    "cargo_test_workspace": "all green (one axc-runtime env-var test, icd::tests::at_709_captured_icd_path_empty_when_no_env, is pre-existing test-parallelism flakiness unrelated to this milestone -- passes in isolation, axc-runtime is untouched by M3.19)",
+    "golden_gate_with_without_block": "pass, three independent exercises",
+    "mcp_tool_roundtrip_on_lavapipe_pattern": "pass, real axc mcp subprocess + real file on disk",
+    "real_gpu_spot": "pass, at_1114 + broader dispatch_shared_m32/rewrite_verify_gpu sweep; one unrelated pre-existing flake confirmed via git stash"
+  },
+  "loc_budget_disclosure": {
+    "status": "CORRECTED (QA-fix pass) -- the original submission did not surface this against the spec's numbered budget anywhere in self_assessment; that omission is the bug being fixed here, per QA's loc_budget_finding.",
+    "spec_budget": "Milestone spec §6: FG.3 build target ~820 / cap 1000; FG.2 NO-BUILD target ~60 / cap 120; total target ~880 / cap ~1120 (the section's own parenthetical states this cap 'includes tests', i.e. it is not a production-code-only budget).",
+    "measured": "git diff main --numstat (working tree, i.e. including this QA-fix pass) over crates/ + examples/: 3223 lines added / 9 deleted, across 24 files -- roughly 2.9x the ~1120 total cap.",
+    "honest_breakdown_by_line_type": {
+      "method": "For each changed file, the line number of the file's first `#[cfg(test)]` marker was used to split ADDED lines (by post-patch line number, from `git diff --unified=0`) into production vs. test-module lines. `examples/optlog_demo.axc` (a worked-example fixture, not compiler source and not a test) is counted separately. This is an approximation (a small number of doc-comments/helpers directly above a file's `mod tests` block get counted as 'production' even though they exist only to support tests, and vice versa a few lines below the marker in files like cli.rs are Clap arg-struct fields that happen to fall after the file's pre-existing test module rather than truly being test code) but is directionally accurate and was spot-checked against the top 5 contributors by hand.",
+      "production_lines": 1902,
+      "test_lines": 1277,
+      "fixture_lines": 44,
+      "total": 3223,
+      "top_contributors_prod_vs_test": [
+        "crates/axc-driver/src/log_opt.rs: 679 added (392 prod / 287 test) -- the writer: splice core, formatter, verdict-mapping adapters, LogOptError (7 variants after this pass), plus this pass's AT-2926",
+        "crates/axc-hir/src/opt_log.rs: 630 added (420 prod / 210 test) -- new crate module: schema types (OptimizationLog/Entry/OptLogUnit/OptLogVerdict) + validate_block/validate_entry (exhaustive-vs-forward-compat dual-mode validation, §1.4/1.4a)",
+        "crates/axc-parser/src/parser.rs: 501 added (359 prod / 142 test) -- new grammar productions (parse_optimization_log_block/_entry_fields/_field/_record_value) PLUS report-ALL error recovery (recover_to_optlog_boundary/recover_to_comma_or_rbrace, AT-2913) -- recovery-on-multi-error is inherently more code than bail-on-first-error",
+        "crates/axc-hir/src/lower.rs: 413 added (148 prod / 265 test) -- lower_optimization_log_annotation orchestration + the carrier-shape separation logic (block_fields vs. per-entry field lists)",
+        "crates/axc-driver/src/mcp/tools/append_optimization_log.rs: 199 added (111 prod / 88 test) -- new MCP tool file (request/response types + handle + error mapping)",
+        "crates/axc-driver/src/cli.rs: 156 added (66 prod / 90 test) -- new LogOpt subcommand (3-way raw/--from-verify/--from-grid flag grammar) + its own AT-2914 flag-parsing tests"
+      ]
+    },
+    "why_over_cap": "Not attributable to duplication (QA's own audit found none) or gold-plating beyond spec scope. Three structural drivers, each individually defensible but additive: (1) the spec's own §1.3/§1.4/§1.4a schema requires a genuinely two-mode validator (exhaustive-reject at the supported version, preserve-and-warn above it) plus a formatter that round-trips it -- this is real state-machine complexity, not boilerplate; (2) AT-2913's report-ALL parser recovery (an explicit r2 pessimistic-reviewer resolution) costs meaningfully more source than the bail-on-first-error precedent it deliberately did NOT copy; (3) the writer/MCP/CLI surface has three independent entry-point shapes (raw flags, --from-verify, --from-grid) each requiring its own resolution logic and its own AT coverage (AT-2914), which the spec's terse function-signature sketches did not fully anticipate (see the entry_from_verify_report / entry_from_grid_record deviations above). None of these individually justify a 2.9x overrun on their own, and the Coder should have flagged the cumulative total against §6 explicitly during implementation rather than only in response to QA -- that process failure (not the code itself) is the actual bug this disclosure fixes.",
+    "recommendation": "Not a rewrite: QA found zero duplication and the test-to-production ratio (1277:1902, ~40% test) is in line with the rest of the codebase's own discipline. Flagging for the Architect/reviewers to decide whether to retroactively widen §6's cap for FG.3-class milestones (schema-validator + writer + 3-surface CLI/MCP integration) or treat this as a one-off scope-estimation miss."
+  },
+  "qa_fix_pass": {
+    "source_finding": ".pipeline/runs/M3.19-qa.json top_priority_finding_deviation_2 (FAIL verdict)",
+    "change_summary": "Added LogOptError::UnsupportedVersion to crates/axc-driver/src/log_opt.rs; splice_optimization_log_entry now refuses (fail-closed, source byte-unchanged, exit code 5) to splice into an existing @optimization_log block whose HIR-validated version != SUPPORTED_OPT_LOG_VERSION, checked immediately after the existing malformed-block check and before the capacity check. Shared by both axc log-opt (CLI) and the append_optimization_log MCP tool since both call the same append_optimization_log -> splice_optimization_log_entry core. Added AT-2926 (3 tests) plus doc-comment updates in log_opt.rs, cli.rs, main.rs. Corrected the deviation-2 self-report entry (retracted the false unreachability claim) and added this loc_budget_disclosure.",
+    "verification": {
+      "cargo_build_workspace": "pass, clean",
+      "cargo_clippy_workspace_lib_tests_D_warnings": "pass, zero findings",
+      "cargo_test_workspace": "pass, 1220 passed / 0 failed / 132 ignored (vs QA's re-verified baseline of 1217 passed / 0 failed / 132 ignored -- +3 = exactly the 3 new AT-2926 tests, zero regressions, ignored count unchanged confirming no new GPU-gated surface)",
+      "at_2926": "pass -- all 3 new tests (version:2 refused in-memory with correct error+exit-code; version:2 refused at the file level with byte-for-byte-unchanged on-disk verification; version:1 append-still-works no-regression companion)",
+      "at_2922_and_multikernel_regression_check": "pass, re-run unmodified -- log_opt::tests::at_2922_fails_closed_at_capacity and log_opt::tests::multikernel_source_fails_closed both still pass",
+      "mcp_roundtrip_lavapipe": "pass -- drove a live `axc mcp` subprocess (VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json) over stdio: (1) a normal append_optimization_log call against a fresh kernel spliced correctly (result.kernel/metric/unit/verdict all echoed correctly, block present on disk); (2) the same call against a hand-built version:2 fixture returned a JSON-RPC error (code -32602, message names LogOptError::UnsupportedVersion's text) and the fixture file was confirmed byte-identical before/after (file bytes compared directly). Also cross-checked the identical version:2 fixture directly through `axc log-opt` (CLI): exit code 5, same error text, byte-unchanged."
+    }
+  },
+  "git_commits": []
+}

@@ -1,0 +1,82 @@
+{
+  "verdict": "APPROVE",
+  "agent": "pessimistic_code_reviewer",
+  "milestone_id": "M3.19-agent-annotations",
+  "run_id": "M319-20260714-1400",
+  "branch": "coder/M319-20260714-1400/M3.19-agent-annotations",
+  "reviewed_commits": ["6c7732d feat(M3.19) …", "a11f400 fix(M3.19): LogOptError::UnsupportedVersion (QA finding) + AT-2926"],
+  "summary": "The grammar-forever pin holds under adversarial fuzzing and the milestone is genuinely codegen-inert. I wrote 12 adversarial .axc fixtures in the scratchpad (entry/version-as-field-key, unicode in Str, unterminated Str, block-twice, comment-decoy `@optimization_log {`, 64-field entry, 10k-entry DoS, 5000-deep nested-brace value, @strategy+@optimization_log co-presence with brace-containing note, CRLF, version:2, i64-overflow metric) and every one either parses correctly or errors cleanly — NO panic, NO hang, NO stack overflow, NO silent acceptance of a malformed *shape*. The one silent-value wart (out-of-i64-range int literal clamps instead of rejecting) is low-severity and codegen-inert. The QA-blocking gap (writer silently splicing into a version>1 block) is fixed (LogOptError::UnsupportedVersion) and I independently re-verified it end-to-end via the CLI (version:2 -> exit 5, md5 byte-unchanged). Full workspace suite independently re-run: 1220 passed / 0 failed / 132 ignored (matches QA recheck exactly). Golden-gate breadth: 5 diverse existing kernels (precondition_saxpy, flash_attention_coopmat, opphi_coopmat_accumulate, reduction, gid_demo) compile BYTE-IDENTICAL on this branch vs main — the parser change perturbs no existing kernel's SPIR-V. Codegen diff = 1 test-only line (`opt_log: None`); lexer diff = 0 lines. FG.2 @transfer is genuinely still rejected (AT-2915..2918 non-vacuous — no `transfer` whitelist arm exists). No critical bugs, no UB, no races. All findings below are low-severity quality warts; none gate.",
+  "critical_bugs": [],
+  "adversarial_fuzzing": {
+    "fixtures_run": 12,
+    "location": "scratchpad/fuzz (not committed to repo)",
+    "results": {
+      "entry_as_field_key": "PASS — rejected as `unknown key \\`entry\\` for version 1`; keyword does not leak",
+      "version_as_field_key_in_entry": "PASS — rejected as `unknown key \\`version\\``",
+      "unicode_in_str": "PASS — accepted (multibyte é/✓/🚀 in kernel name string)",
+      "unterminated_str": "PASS — reports ALL errors (lex + 2 parse), no panic",
+      "block_appearing_twice": "PASS — HirError::DuplicateAnnotation(optimization_log)",
+      "comment_decoy_optimization_log_brace": "PASS — `// @optimization_log { ... bogus }` in a comment is invisible to the parser; the real @strategy block still resolves; no misfire",
+      "entry_with_64_fields": "PASS — rejected on first unknown key, no panic",
+      "10k_entry_block_DoS": "PASS — completes fast, over-cap error per entry, no hang/OOM (recovery + block loop are iterative, not recursive)",
+      "5000_deep_nested_brace_value": "PASS — LBrace value rejected as nested-record; recover_to_comma_or_rbrace skips 5000 braces iteratively, NO stack overflow",
+      "strategy_plus_optimization_log_with_brace_note": "PASS — strip_strategy_annotation_block is lexer-anchored on Annotation(\"strategy\") only; a `note: \"} {\"` in the opt-log block never confuses it; both compose cleanly",
+      "crlf_source_writer": "PASS — existing CRLF bytes preserved verbatim; see warning W5 (LF separator wart)",
+      "version2_writer_refusal": "PASS — CLI exit 5, md5 byte-unchanged (QA fix independently reconfirmed)"
+    }
+  },
+  "deviation_1_kernel_keyword_exception": {
+    "status": "VERIFIED SOUND — narrow",
+    "finding": "The `TokenKind::Kernel => \"kernel\"` field-key exception exists ONLY inside `parse_optimization_log_field` (parser.rs:741), reachable only via parse_optimization_log_entry_fields <- parse_optimization_log_block. It cannot leak: at block-item scope the match is on `TokenKind::Ident(name)` (version/entry), and `@kernel` lexes as the distinct keyword token `TokenKind::Kernel`, which falls to the `other =>` arm -> clean `expected \\`entry\\` or \\`version\\`` error. `kernel:` as a field key parses/lowers/compiles in every entry fixture; it does not become accept-able in @strategy, @workgroup, or any other annotation context."
+  },
+  "writer_splice_audit": {
+    "byte_preservation": "VERIFIED — splice is span-based into original bytes (source[..close_brace_pos] + insertion + source[close_brace_pos..]); AT-2906 + my CRLF fixture confirm existing bytes verbatim. close_brace_pos = ann.span.end-1 is correct (span.end merges the `}` token consumed by expect_token; debug_assert pins it points at `}`).",
+    "refusal_ordering": "VERIFIED — MalformedExistingBlock -> UnsupportedVersion -> Full(capacity), all BEFORE any std::fs::write; every refusal path leaves the file byte-unchanged (re-confirmed on disk for version:2, md5 identical).",
+    "comments_inside_block": "PRESERVED — lexer skips comments pre-parse; the comment bytes live outside the spliced entry region and are copied verbatim; block_ends_with_comma_or_is_empty trims to the last non-ws char (a trailing comment yields needs-comma=true, still parses).",
+    "fresh_block_insertion_point": "VERIFIED — inserted immediately before the kernel's first leading annotation (§1.5), NoAnchor guard for the (unreachable) no-annotation case."
+  },
+  "version_rule_soundness": {
+    "status": "VERIFIED through the REAL parse path (not just HIR-unit)",
+    "v1_unknown_entry_key_rejects": "CONFIRMED — hand-authored source with an extra entry field under version:1 -> HirError::BadOptimizationLogEntry (unknown key)",
+    "v2_unknown_entry_key_preserve_and_warn": "CONFIRMED reachable end-to-end (QA verified; entry-level forward-compat is the practically-relevant, non-vacuous direction)",
+    "block_level_forward_unknown": "correctly documented as parser-unreachable-today dead-infrastructure (closed EBNF block_item := version_field | entry_block); honestly disclosed in opt_log.rs and the coder's known_limitations",
+    "writer_v2_refusal": "CONFIRMED — CLI exit 5 + byte-unchanged; MCP path shares the same splice core"
+  },
+  "golden_gate_breadth": {
+    "status": "PASS",
+    "method": "built axc from a `main` worktree, compiled each example on both branches, cmp'd the .spv bytes",
+    "byte_identical": ["precondition_saxpy", "flash_attention_coopmat", "opphi_coopmat_accumulate", "reduction", "gid_demo"],
+    "identical_failure_both_branches": ["matmul_rb_coopmat", "q4km_matmul_rb_coopmat_f32acc_cached — both fail identically (unresolved @strategy holes; 13 parse / 11-12 hir errors on BOTH main and HEAD), so no perturbation"]
+  },
+  "mcp_tool_8": {
+    "unit_verdict_validation": "PASS — invalid unit/verdict -> InvalidParams before any write",
+    "path_handling": "CONSISTENT with existing tools — load_source already accepts an arbitrary read PathBuf with no confinement; append_optimization_log accepts an arbitrary WRITE path with the same (no) confinement. Local trusted MCP process, no new privilege boundary. Informational only (W7).",
+    "note_length": "NO cap — 32KB note splices in and re-parses clean; MAX_OPT_LOG_ENTRIES bounds entry COUNT, not per-entry byte size (W6). Spec specifies no note cap, so consistent."
+  },
+  "fg2_paper_finding": {
+    "status": "NON-VACUOUS",
+    "evidence": "no `\"transfer\"` arm in lower.rs whitelist; the only `transfer` occurrences are AT-2915/edge-case test assertions requiring HirError::UnknownAnnotationInM0{name:\"transfer\"} — these WOULD fail if transfer were whitelisted. Independently confirmed a @transfer(900) kernel is rejected."
+  },
+  "scope_check": {
+    "codegen_diff": "+1 line (`opt_log: None` in a test-only KernelAnnotations literal, emit.rs) — codegen-inert confirmed",
+    "lexer_diff": "0 lines",
+    "byte_identical_spirv": "5/5 diverse kernels main-vs-HEAD"
+  },
+  "warnings": [
+    {"id": "W1", "severity": "low", "description": "Silent i64 clamp of out-of-i64-range int literals: `metric: 99999999999999999999` (>i64::MAX, lexable as i128) is silently truncated to i64::MAX and ACCEPTED with no diagnostic; likewise a huge `version`. The stored value is wrong. This is the fuzzing mandate's 'silent acceptance of garbage' class, though blast radius is limited (codegen-inert, informational field). Recommend rejecting an out-of-i64-range record int literal with a parse error rather than `i64::try_from(value).unwrap_or(i64::MAX/MIN)`.", "file": "crates/axc-parser/src/parser.rs", "line": "796, 810"},
+    {"id": "W2", "severity": "low", "description": "validate_entry short-circuits on the FIRST bad field within an entry (returns Err), so only one field error is reported per entry. Anti-pattern #6 'report ALL' is satisfied at block-ITEM granularity (each malformed entry/block-item is reported, AT-2913) but not within a single entry's field list. Minor UX; not a correctness issue.", "file": "crates/axc-hir/src/opt_log.rs", "line": "validate_entry"},
+    {"id": "W3", "severity": "low", "description": "EmptyOptimizationLog warning fires alongside a hard entry-validation error: when a lone entry FAILS validation it is not pushed, leaving entries empty, so the user sees a misleading 'empty block' warning on top of the real error. Diagnostic noise, not signal.", "file": "crates/axc-hir/src/lower.rs", "line": "1254"},
+    {"id": "W4", "severity": "low", "description": "An over-cap block emits (N-64) duplicate 'has more than 64 entries' errors (10k-entry fixture -> ~9936 identical lines). Bounded and fast (no DoS), but noisy — a single summarizing error would be cleaner.", "file": "crates/axc-hir/src/lower.rs", "line": "1225"},
+    {"id": "W5", "severity": "low", "description": "Writer inserts a bare LF ('\\n') separator after a freshly-created block even when the source uses CRLF, yielding a mixed-EOL file. Existing bytes are preserved verbatim and the result parses clean; cosmetic only.", "file": "crates/axc-driver/src/log_opt.rs", "line": "294"},
+    {"id": "W6", "severity": "low", "description": "No per-note (or per-string) length cap: a 32KB `--note` splices in and re-parses fine. MAX_OPT_LOG_ENTRIES bounds entry count but not per-entry byte size, so source growth is only loosely bounded. Spec specifies no note cap so this is consistent; noting for the grammar-forever record.", "file": "crates/axc-driver/src/log_opt.rs", "line": "render_entry"},
+    {"id": "W7", "severity": "informational", "description": "MCP append_optimization_log writes to an arbitrary caller-supplied path with no confinement. Consistent with load_source's arbitrary READ path, but this is a WRITE primitive over MCP. Local trusted MCP-server process; no new privilege boundary vs grid_search's existing history writes. Recorded, not actionable under the current threat model.", "file": "crates/axc-driver/src/mcp/tools/append_optimization_log.rs", "line": "88"}
+  ],
+  "spirv_val_check": "PASS (AT-2908; block is codegen-inert)",
+  "ub_check": "PASS (no GPU surface; codegen-inert; byte-identical SPIR-V across 5 kernels)",
+  "race_condition_check": "PASS (no shared-memory/atomics/barrier changes; whole-file writer is last-writer-wins by documented design, §1.5)",
+  "vendor_divergence_check": "PASS (no new capability/extension; SPIR-V unchanged, so no vendor-specific behavior introduced)",
+  "test_suite": {"passed": 1220, "failed": 0, "ignored": 132, "note": "independently re-run cargo test --workspace; matches QA recheck baseline exactly (zero regressions)"},
+  "memory_footprint_ok": true,
+  "route_to_architect": [],
+  "conclusion": "APPROVE. The parser-touching grammar is closed and structurally sound (nested records / calls / holes are unrepresentable, not merely rejected — verified via fixtures and by inspection of the RecordValue enum), the contextual keywords entry/version/kernel do not leak beyond the block, the writer is fail-closed on all four refusal paths with byte-unchanged sources, the QA-caught version>1 gap is fixed and independently re-verified end-to-end, the feature is genuinely codegen-inert (5 diverse kernels byte-identical main-vs-HEAD; codegen +1 test line; lexer untouched), and FG.2 remains an honest non-vacuous NO-BUILD. The seven findings are all low-severity quality warts (silent i64 clamp being the most worth a follow-up); none block the merge."
+}

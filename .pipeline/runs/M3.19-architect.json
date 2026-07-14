@@ -1,0 +1,185 @@
+{
+  "verdict": "PROPOSED",
+  "revision": "r2",
+  "agent": "architect",
+  "milestone_id": "M3.19-agent-annotations",
+  "title": "@optimization_log (FG.3 minimal-build) + @transfer (FG.2 NO-BUILD) — the agent-handoff annotation pair",
+  "r2_note": "Surgical revision of r1 (optimistic APPROVE; pessimistic NEEDS_REVISION: 3 must-fix + 5 should-fix, all spec-level). The two per-half decisions (FG.3 minimal-build / FG.2 NO-BUILD) and the byte-identical-SPIR-V oracle are UNCHANGED — confirmed sound. Changes are grammar/schema tightening only.",
+  "per_half_decision": {
+    "FG.3_optimization_log": {
+      "decision": "MINIMAL-BUILD",
+      "unchanged_from_r1": true,
+      "rationale": "The external JSONL history (M2.4) is keyed by xxh3(source-bytes) via history_path_for_source, so it ORPHANS on every rewrite — the exact operation the agent loop performs. Verified: .pipeline/history/ holds only .gitkeep. Embedding the log in source makes the kernel self-describing across rewrites — a concrete, falsifiable value case that clears the M3.10b bar. Minimal = read+validate+round-trip first-class block + ONE writer (axc log-opt CLI + thin MCP wrapper); codegen-inert (byte-identical SPIR-V golden gate).",
+      "cheap_alternative_weighed_r2": "JSONL-rekey-by-stable-identity (~50 LOC) is weighed in spec §0.5: embedding wins on survives-move/rename + zero side-channel + inline-visible-to-any-reader; the rekey is a COMPLEMENTARY future fix (machine archive), not a substitute. Not asserted strictly-better — costs source bytes + merge noise, stated honestly.",
+      "writer": "axc log-opt <src.axc> (LLM-free, CI-runnable) + append_optimization_log MCP tool; ingests rewrite_verify::VerifyReport / grid_search::HistoryEntryRecord via --from-verify/--from-grid; source-preserving span splice; FAIL-CLOSED at MAX_OPT_LOG_ENTRIES (LogOptError::Full) and on multi-kernel (LogOptError::Multikernel) — never emits an uncompilable file.",
+      "reader": "Minimal = block round-trips error-free through lex/compile/HIR/rewrite-verify (byte-verbatim through the M3.16 rewrite flow, AT-2925) and is visible inline to agents reading the .axc; the merged embedded+JSONL reader is DEFERRED."
+    },
+    "FG.2_transfer": {
+      "decision": "NO-BUILD",
+      "unchanged_from_r1": true,
+      "class": "paper finding (spec+verdict), M3.10b / M3.13-PRONG-B class, AT-2915..2918",
+      "rationale": "No consumer exists today: the 7 MCP tools none read an in-source handoff block; the 7-agent supervisor routes via external .pipeline/runs/*.json; the autotuner reads @strategy. A confidence-scored handoff PROTOCOL with nothing acting on the score is speculative. Unlike FG.3 there is no verified weakness it repairs and no demonstrated producer demand. @transfer remains rejected as UnknownAnnotationInM0; no parser/AST/HIR/codegen change.",
+      "revisit_trigger": "Build @transfer (validate-and-preserve first, then protocol) when a concrete consumer is specified: (1) an agent-orchestration MCP tool designed to READ a kernel's @transfer block to route the next optimization action, OR (2) the 7-agent supervisor changed to consume in-source @transfer handoff instead of/alongside external verdict JSON. Cheap upgrade path (~1 schema over FG.3's block grammar) documented but not taken."
+    }
+  },
+  "must_fix_resolutions": {
+    "grammar_pinned": "RecordField.value is now a NEW CLOSED enum RecordValue { Str(String), Int(i64), Ident(String) } — NOT Spanned<AnnotationArg>. Formal EBNF production added (spec §1.3a): entry/version are contextual hard keywords; record_value closed to 3 scalar shapes; nesting structurally impossible; nested-record / call / hole-ref rejected AT PARSE with recovery. Reject fixtures = AT-2919 (nested/call/hole/nested-entry/typo-keyword), AT-2920 (negative-metric-per-unit + out-of-set ident), AT-2921 (two-level trailing comma).",
+    "writer_fail_closed_at_capacity": "axc log-opt into a 64-entry block -> LogOptError::Full { current, max } (exit-coded, machine-readable), source byte-for-byte UNCHANGED, never emits the 65th uncompilable entry. Rotation DEFERRED (spec §1.8). AT-2922.",
+    "schema_version_forward_compat": "Required block-level `version: 1` (SUPPORTED_OPT_LOG_VERSION=1). RULE (spec §1.4a): version absent/dup/non-Int/<1 -> reject; version==1 + unknown key -> REJECT (typo protection); version>1 + unknown key -> PRESERVE-AND-WARN (forward_unknown + HirWarning::UnknownOptimizationLogKeyForward), known required fields still validated; forward-compat covers ADDITIVE new keys only. Both directions tested: AT-2923 (reject) / AT-2924 (preserve-warn)."
+  },
+  "should_fix_resolutions": {
+    "rekey_alternative_weighed": "spec §0.5 — one honest paragraph; embedding vs JSONL-rekey, complementary not substitute.",
+    "design_subsection_number": "## 3.1.43 (two-hash header, next-sequential after verified ## 3.1.42 M3.16 at DESIGN.md:1421; M3.17/M3.18 added no numbered subsection). Corrects r1's 3.1.44 (skipped one).",
+    "verdict_vocabulary_cited": "OptLogVerdict = the SIX rewrite_verify::Verdict variants verbatim in SCREAMING_SNAKE_CASE {PASS,FAIL,REJECT,SKIPPED,NONDETERMINISTIC_ORACLE,ERROR} (verified rewrite_verify.rs:151-157, #[serde(rename_all=SCREAMING_SNAKE_CASE)], 6-variant enum) + grid-only REGRESS. Ident is NONDETERMINISTIC_ORACLE (not r1's NONDETERMINISTIC); no Regress in rewrite_verify; no M3.17/M3.18 verdict additions. Exhaustive 1:1 mapping table (spec §1.5) + AT-2907 strengthened over all six.",
+    "round_trip_strengthened": "AT-2925 — block (incl. forward_unknown keys) survives the M3.16 rewrite-flow BYTE-VERBATIM, not merely accepted.",
+    "ts_reproducibility": "Default now() documented non-reproducible & production-only; explicit --ts MANDATORY in every AT fixture; MCP wrapper inherits the rule (spec §1.5, §7.1)."
+  },
+  "optimistic_minor_resolutions": {
+    "metric_milli_unit_semantics": "Frozen unit vocabulary {mtflops, pct_milli, ns, us, ms, bytes}: the _milli scaling lives in the UNIT NAME, not the field name. mtflops = TFLOPS*1000, pct_milli = %*1000 (milli-scaled, sub-integer precision); ns/us/ms/bytes = RAW integers. Field renamed metric_milli -> metric (unit-neutral). Per-unit sign rule: mtflops/ns/us/ms/bytes require metric>=0 (reject <0); pct_milli signed (deltas allowed).",
+    "verdict_variant_count_slip": "Corrected 'adopt verbatim (7 values)' -> the enum is SIX variants (spec §7.2).",
+    "design_numbering_practice": "Resolved with should_fix #5 above (## 3.1.43).",
+    "log_opt_no_lock": "Documented last-writer-wins + loud stderr note; --force/lock deferred (unchanged from r1)."
+  },
+  "files_to_create": [
+    {
+      "path": "crates/axc-hir/src/opt_log.rs",
+      "purpose": "OptimizationLog (version + entries + forward_unknown) + OptimizationLogEntry + OptLogUnit/OptLogVerdict closed enums + MAX_OPT_LOG_ENTRIES + SUPPORTED_OPT_LOG_VERSION + validate_block + validate_entry",
+      "public_api": [
+        "pub const MAX_OPT_LOG_ENTRIES: usize = 64",
+        "pub const SUPPORTED_OPT_LOG_VERSION: i64 = 1",
+        "pub struct OptimizationLog { pub version: i64, pub entries: Vec<OptimizationLogEntry>, pub forward_unknown: Vec<(String, RecordValue)> }",
+        "pub struct OptimizationLogEntry { pub ts: String, pub kernel: String, pub metric: i64, pub unit: OptLogUnit, pub verdict: OptLogVerdict, pub note: Option<String>, pub forward_unknown: Vec<(String, RecordValue)> }",
+        "pub enum OptLogUnit { MilliTflops, MilliPercent, Nanoseconds, Microseconds, Milliseconds, Bytes }",
+        "pub enum OptLogVerdict { Pass, Fail, Reject, Skipped, NondeterministicOracle, Error, Regress }",
+        "pub fn validate_block(block_fields: &[RecordField], span: Span) -> Result<OptimizationLog, HirError>",
+        "pub fn validate_entry(fields: &[RecordField], version: i64, span: Span) -> Result<OptimizationLogEntry, HirError>"
+      ]
+    },
+    {
+      "path": "crates/axc-driver/src/log_opt.rs",
+      "purpose": "Writer: source-preserving append of a structured entry to the @optimization_log block; fail-closed at cap and on multi-kernel",
+      "public_api": [
+        "pub fn append_optimization_log(source_path: &Path, entry: OptimizationLogEntry) -> Result<(), LogOptError>",
+        "pub fn entry_from_verify_report(r: &VerifyReport) -> OptimizationLogEntry",
+        "pub fn entry_from_grid_record(r: &HistoryEntryRecord) -> OptimizationLogEntry",
+        "pub enum LogOptError { Parse(..), Io(..), Multikernel, Full { current: usize, max: usize }, .. }"
+      ]
+    },
+    {
+      "path": "crates/axc-driver/src/mcp/tools/append_optimization_log.rs",
+      "purpose": "8th MCP tool: thin server-side wrapper over log_opt::append_optimization_log for the agent loop (inherits fail-closed + explicit-ts rule)",
+      "public_api": [
+        "pub struct AppendOptLogRequest { pub source_path: PathBuf, pub entry: OptimizationLogEntryWire }",
+        "pub(crate) fn handle(req: AppendOptLogRequest, ctx: &mut McpContext) -> Result<AppendOptLogResponse, McpToolError>"
+      ]
+    },
+    {
+      "path": "examples/optlog_demo.axc",
+      "purpose": "Kernel carrying a version:1 two-entry @optimization_log block — round-trip + byte-identical golden fixture (explicit ts)"
+    }
+  ],
+  "files_to_modify": [
+    { "path": "crates/axc-parser/src/ast.rs", "changes": "Add AnnotationArg::Record { fields: Vec<Spanned<RecordField>> }, struct RecordField { key: Spanned<String>, value: Spanned<RecordValue> }, and NEW CLOSED enum RecordValue { Str(String), Int(i64), Ident(String) } (no recursion — see spec §1.3a)" },
+    { "path": "crates/axc-parser/src/parser.rs", "changes": "parse_optimization_log_block (own closed non-recursive value grammar, NOT a strategy mirror) + dispatch arm in parse_annotations when name==optimization_log && peek==LBrace; entry/version contextual hard keywords; parse_record_value accepts only string_lit|int_lit|ident; recover-and-report-all, re-sync at next entry/,/}" },
+    { "path": "crates/axc-hir/src/lower.rs", "changes": "Add \"optimization_log\" whitelist arm (validate_block + store Option<OptimizationLog>); leave \"transfer\" in the other=> reject arm (stays UnknownAnnotationInM0)" },
+    { "path": "crates/axc-hir/src/hir.rs", "changes": "Carry opt_log: Option<OptimizationLog> on the kernel HIR (default None; codegen ignores)" },
+    { "path": "crates/axc-hir/src/validate.rs", "changes": "Add HirError::BadOptimizationLogEntry { detail, span }, HirError::BadOptimizationLog { detail, span }, HirWarning::EmptyOptimizationLog { span }, HirWarning::UnknownOptimizationLogKeyForward { version, key, span }" },
+    { "path": "crates/axc-hir/src/lib.rs", "changes": "pub mod opt_log; re-exports" },
+    { "path": "crates/axc-driver/src/cli.rs", "changes": "Command::LogOpt { source, kernel, metric, unit, verdict, ts, note, from_verify, from_grid } (clap); unit choices {mtflops,pct_milli,ns,us,ms,bytes}; verdict choices {PASS,FAIL,REJECT,SKIPPED,NONDETERMINISTIC_ORACLE,ERROR,REGRESS}" },
+    { "path": "crates/axc-driver/src/main.rs", "changes": "Dispatch Command::LogOpt to log_opt::append_optimization_log; surface LogOptError::Full/Multikernel as distinct exit codes" },
+    { "path": "crates/axc-driver/src/mcp/dispatch.rs", "changes": "Register METHOD_APPEND_OPTIMIZATION_LOG (8th tool) + route to handler" },
+    { "path": "crates/axc-driver/src/mcp/tools/mod.rs", "changes": "pub(crate) mod append_optimization_log;" },
+    { "path": "DESIGN.md", "changes": "Add @optimization_log + @transfer rows to §3.2; new subsection ## 3.1.43 M3.19 (two-hash header, next-sequential after ## 3.1.42 M3.16) incl. FG.2 NO-BUILD verdict + revisit trigger" },
+    { "path": "ROADMAP.md", "changes": "FG.3 -> IMPLEMENTED (M3.19); FG.2 -> NO-BUILD (M3.19, paper finding) with revisit trigger" }
+  ],
+  "dependency_graph": {
+    "axc-parser": [],
+    "axc-hir": ["axc-parser"],
+    "axc-driver": ["axc-hir", "axc-parser"],
+    "axc-codegen": ["axc-hir (UNCHANGED — block never reaches codegen)"]
+  },
+  "grammar_changes_flagged": {
+    "lexer": "NONE — @optimization_log already lexes as TokenKind::Annotation(String)",
+    "parser": "NEW block arm parse_optimization_log_block with its OWN closed non-recursive value grammar (§1.3a) + dispatch; NOT a parse_strategy_block mirror (strategy's value grammar is ?[...]-only)",
+    "ast": "NEW AnnotationArg::Record + RecordField whose value is the NEW CLOSED enum RecordValue { Str|Int|Ident } — no nested record / call / hole; Int-only literal grammar untouched, no float variant",
+    "hir": "NEW \"optimization_log\" whitelist arm in lower.rs + opt_log.rs schema validation (validate_block + validate_entry, version + forward-compat); @transfer stays in other=> reject",
+    "codegen": "NONE — golden byte-identical gate (AT-2903)"
+  },
+  "formal_production_ebnf": "opt_log_block := '{' block_item (',' block_item)* ','? '}' ; block_item := version_field | entry_block ; version_field := 'version' ':' int_lit ; entry_block := 'entry' '{' field (',' field)* ','? '}' ; field := ident ':' record_value ; record_value := string_lit | int_lit | ident ; int_lit := ['-'] DIGIT+  (NO record, NO call, NO hole/holeref; entry & version are contextual hard keywords)",
+  "frozen_unit_vocabulary": {
+    "mtflops": "MilliTflops — TFLOPS*1000 (milli-scaled), metric>=0",
+    "pct_milli": "MilliPercent — %*1000 (milli-scaled), SIGNED (deltas allowed)",
+    "ns": "Nanoseconds — raw, metric>=0",
+    "us": "Microseconds — raw, metric>=0",
+    "ms": "Milliseconds — raw, metric>=0",
+    "bytes": "Bytes — raw, metric>=0"
+  },
+  "frozen_verdict_vocabulary": ["PASS", "FAIL", "REJECT", "SKIPPED", "NONDETERMINISTIC_ORACLE", "ERROR", "REGRESS"],
+  "version_rule": {
+    "supported": 1,
+    "reject": ["version absent", "version duplicated", "version non-Int", "version < 1", "version==1 with any unknown block/entry key (typo protection)"],
+    "preserve_and_warn": ["version > 1 with an unknown ADDITIVE key -> stash in forward_unknown + HirWarning::UnknownOptimizationLogKeyForward; known required fields still validated"],
+    "out_of_scope": "A future version changing an existing field's value-set/type is a breaking change; v1 still validates known fields by v1 rules (forward-compat covers additive new keys only)"
+  },
+  "spirv_capabilities_required": [],
+  "spirv_extensions_required": [],
+  "correctness_oracle": "Byte-identical SPIR-V (AT-2903): compile the same kernel with and without the @optimization_log block -> byte-for-byte equal .spv. Annotations must not perturb codegen. Same discipline as M3.17 --debug-off golden gate. No FP oracle (not a perf milestone). UNCHANGED from r1.",
+  "acceptance_tests_range": "AT-2900..AT-2925 (FG.3 build: AT-2900..2914; FG.2 NO-BUILD: AT-2915..2918; FG.3 r2 grammar/schema hardening: AT-2919..2925). Ceiling AT-2925 honored (<= AT-2925).",
+  "new_acceptance_tests_r2": {
+    "AT-2919": "Closed value grammar rejects (recover-all): nested-record / call / hole / nested-entry / typo-keyword",
+    "AT-2920": "Sign + closed-ident rejects: negative metric under >=0 unit rejected; negative pct_milli accepted; out-of-set unit/verdict rejected",
+    "AT-2921": "Two-level trailing commas accepted; double/leading comma recovers",
+    "AT-2922": "Writer fail-closed at cap -> LogOptError::Full, source byte-unchanged, no 65th entry",
+    "AT-2923": "version==1 typo protection: unknown key -> reject; missing/dup/negative/non-Int version -> reject",
+    "AT-2924": "version>1 forward-compat: unknown key -> preserve-and-warn, entry otherwise accepted, key in forward_unknown",
+    "AT-2925": "Rewrite-flow round-trip verbatim through M3.16 verify_rewrite (incl. forward_unknown), explicit --ts",
+    "AT-2907_strengthened": "--from-verify maps ALL SIX rewrite_verify::Verdict variants 1:1 (incl. NONDETERMINISTIC_ORACLE); REGRESS never from verify",
+    "AT-2904_strengthened": "Round-trip idempotent formatter with explicit --ts (no now())"
+  },
+  "loc_target": 880,
+  "loc_cap": 1120,
+  "edge_cases": [
+    "Float metrics stored as integer metric + unit ident carrying scale (mtflops=TFLOPS*1000); no float grammar, no RecordValue float variant",
+    "Block at capacity -> writer fails closed (LogOptError::Full), source byte-unchanged",
+    "Multi-kernel source -> writer fails closed (LogOptError::Multikernel); one block per single-kernel file (FG.9 not built)",
+    "Future-versioned block (version:2) with unknown additive keys -> preserve-and-warn, not reject; out-of-v1-range value on a known field still rejected",
+    "Duplicate @optimization_log on one kernel -> DuplicateAnnotation (mirror workgroup)",
+    "Empty @optimization_log { version:1 } (zero entries) -> EmptyOptimizationLog warning (mirror EmptyStrategyBlock)",
+    "> MAX_OPT_LOG_ENTRIES at HIR validation -> BadOptimizationLog (compile-side cap; writer-side cap is LogOptError::Full)",
+    "Malformed entry -> parser recovers and reports ALL bad entries, re-syncs at next entry/,/} (anti-pattern #6)",
+    "Writer preserves source outside the spliced region byte-for-byte; fail-closed on syntactically-broken source",
+    "@transfer + @optimization_log on one kernel compose: log accepted, transfer still rejected (UnknownAnnotationInM0)",
+    "External JSONL vs embedded block coexist (rewrite-surviving vs machine-run archive); dedup deferred; JSONL rekey is a complementary future fix"
+  ],
+  "open_questions_resolved_r2": [
+    "--ts default: RESOLVED — default now() (production, non-reproducible), explicit --ts MANDATORY in ATs; MCP wrapper inherits",
+    "Verdict-set alignment: RESOLVED — six rewrite_verify::Verdict variants verbatim (SCREAMING_SNAKE_CASE) + grid-only REGRESS; entry_from_verify_report maps all six 1:1; corrects r1 '7 values' / NONDETERMINISTIC slip",
+    "MCP append_optimization_log: RESOLVED — in-scope for minimal (thin, on-thesis); CLI is the primitive"
+  ],
+  "unchanged_confirmed_sound": [
+    "FG.3 minimal-build vs FG.2 NO-BUILD per-half split (M3.10b bar)",
+    "Byte-identical-SPIR-V oracle (AT-2903)",
+    "All §0.1-§0.4 verified current-state findings",
+    "CLI-primitive + thin-MCP-wrapper architecture (M3.16 pattern)",
+    "No GPU/#[ignore] test required (codegen-inert; anti-pattern #9 satisfied structurally)"
+  ],
+  "self_check": {
+    "read_claude_md": true,
+    "read_design_md": true,
+    "read_roadmap": true,
+    "read_both_reviews": true,
+    "verified_verdict_enum_at_source": "rewrite_verify.rs:151-157 — 6 variants, SCREAMING_SNAKE_CASE",
+    "verified_design_numbering": "## 3.1.42 M3.16 highest (DESIGN.md:1421); next = ## 3.1.43",
+    "verified_current_parse_state": true,
+    "no_implementation_code": true,
+    "honest_value_assessment_per_half": true,
+    "no_build_half_has_exact_revisit_trigger": true,
+    "byte_identical_spirv_gate_specified": true,
+    "grammar_changes_flagged_precisely": true,
+    "closed_record_value_type": true,
+    "writer_fail_closed_at_capacity": true,
+    "schema_version_forward_compat_both_directions": true,
+    "at_range_within_ceiling": "AT-2900..2925 (<= AT-2925)",
+    "per_half_decisions_unchanged": true
+  }
+}
