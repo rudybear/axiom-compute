@@ -178,6 +178,9 @@ pub enum TokenKind {
     Shared,
     Barrier,
     SubgroupUniform,
+    /// `array` — per-invocation sized local array keyword (M3.20). Doubles as the
+    /// statement introducer and the type-name keyword, mirroring `Shared`.
+    Array,
 
     // ── Primitive type keywords ──────────────────────────
     I8, I16, I32, I64,
@@ -256,6 +259,8 @@ impl TokenKind {
             "shared"           => Some(TokenKind::Shared),
             "barrier"          => Some(TokenKind::Barrier),
             "subgroup_uniform" => Some(TokenKind::SubgroupUniform),
+            // M3.20: `array` — per-invocation sized local array keyword.
+            "array"            => Some(TokenKind::Array),
             "true"             => Some(TokenKind::BoolLiteral(true)),
             "false"            => Some(TokenKind::BoolLiteral(false)),
             // Primitive types
@@ -326,6 +331,7 @@ impl TokenKind {
             | TokenKind::Shared
             | TokenKind::Barrier
             | TokenKind::SubgroupUniform
+            | TokenKind::Array
             | TokenKind::I8
             | TokenKind::I16
             | TokenKind::I32
@@ -584,6 +590,45 @@ mod tests {
         assert!(matches!(tokens[1].kind, TokenKind::LBracket));
         assert!(matches!(tokens[2].kind, TokenKind::U32));
         assert!(matches!(tokens[3].kind, TokenKind::RBracket));
+    }
+
+    // ── M3.20: `array` local-array keyword (AT-2927) ─────────────────────────
+
+    #[test]
+    fn at_2927_array_is_a_keyword() {
+        assert_eq!(TokenKind::keyword_from_str("array"), Some(TokenKind::Array));
+    }
+
+    #[test]
+    fn at_2927_array_not_m1_reserved() {
+        // `array` is a hard keyword from M3.20 onward; it is NOT on the
+        // M1-reserved deny-list (that list is for features deferred past M1.3).
+        assert_eq!(TokenKind::Array.m1_reserved_detail(), None);
+    }
+
+    #[test]
+    fn at_2927_array_collision_guard_rejects_bare_identifier_use() {
+        // Mirrors the `shared` collision guard: any prior source using `array` as a
+        // bare identifier now lexes as the Array keyword token, not Ident("array").
+        use crate::Lexer;
+        let (tokens, errs) = Lexer::new("array").tokenize();
+        assert!(errs.is_empty(), "unexpected lex errors: {errs:?}");
+        assert!(matches!(tokens[0].kind, TokenKind::Array));
+        assert!(!matches!(tokens[0].kind, TokenKind::Ident(_)));
+    }
+
+    #[test]
+    fn at_2927_array_bracket_elem_lexes_correctly() {
+        // `array[u32, 8]` should lex as Array, LBracket, U32, Comma, IntLiteral, RBracket.
+        use crate::Lexer;
+        let (tokens, errs) = Lexer::new("array[u32, 8]").tokenize();
+        assert!(errs.is_empty(), "unexpected lex errors: {errs:?}");
+        assert!(matches!(tokens[0].kind, TokenKind::Array));
+        assert!(matches!(tokens[1].kind, TokenKind::LBracket));
+        assert!(matches!(tokens[2].kind, TokenKind::U32));
+        assert!(matches!(tokens[3].kind, TokenKind::Comma));
+        assert!(matches!(tokens[4].kind, TokenKind::IntLiteral { .. }));
+        assert!(matches!(tokens[5].kind, TokenKind::RBracket));
     }
 
     #[test]

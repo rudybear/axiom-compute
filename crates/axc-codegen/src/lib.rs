@@ -13,6 +13,8 @@ pub mod q4_0;
 pub mod ext_inst;
 /// Workgroup-shared array SPIR-V emission (M3.2).
 pub mod shared;
+/// Per-invocation local array SPIR-V emission (M3.20 — Function-storage sibling of `shared`).
+pub mod local;
 /// Runtime `@precondition`/`@postcondition` debug-check SPIR-V support (M3.17).
 pub mod debug_checks;
 
@@ -24,6 +26,7 @@ pub use buffers::{
 };
 pub use subgroup::{SubgroupBuiltinVars, SubgroupVote, SubgroupReduceOp, SubgroupCodegenError};
 pub use shared::{SharedBindings, emit_shared_globals, emit_shared_read, emit_shared_write};
+pub use local::{LocalArrayBindings, emit_local_array_types, emit_local_array_read, emit_local_array_write};
 
 /// Extract the workgroup dimensions from the first kernel in a HIR module.
 ///

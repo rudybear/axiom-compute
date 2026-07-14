@@ -18,6 +18,7 @@ use crate::hir::{
 use crate::typecheck::TypecheckError;
 use crate::param::BindingPlanError;
 use crate::shared::{PORTABLE_MIN_SHARED_BYTES, MAX_SHARED_BYTES};
+use crate::local::{MAX_LOCAL_ARRAY_BYTES, LOCAL_ARRAY_SPILL_ADVISORY_BYTES};
 
 /// Diagnostic error from HIR validation.
 #[derive(Debug, thiserror::Error, miette::Diagnostic)]
@@ -343,6 +344,42 @@ pub enum HirError {
         #[label("here")]
         span: Span,
     },
+
+    // ── M3.20: array[T,N] local-array errors ─────────────────────────────────
+    //
+    // `LocalArrayAsParameter` is constructed at lower.rs param-lowering time — a
+    // REAL, reachable-via-`lower_module` check (mirrors `SharedTypeNotAllowedAsParam`).
+    //
+    // `LocalArrayTooLarge` here mirrors `SharedMemoryTooLarge`'s existence in this
+    // `validate()` pass, which — like `SharedMemoryTooLarge` — is NOT wired into
+    // `lower_module` or the driver's compile path (`validate()` has no caller
+    // outside its own tests as of M3.2/M3.20; a pre-existing, unrelated gap this
+    // milestone does not attempt to fix). The REACHABLE aggregate check is
+    // `TypecheckError::LocalArrayTooLarge` in typecheck.rs's `typecheck_kernel_body`
+    // (mirrors `TypecheckError::SharedMemoryTooLarge`'s real placement); use that
+    // variant (wrapped as `HirError::Typecheck(..)`) to observe the error through
+    // the normal compile pipeline.
+    //
+    // All other per-declaration/per-use local-array diagnostics live in
+    // `TypecheckError` (typecheck.rs) — see that enum's M3.20 section for why.
+
+    /// `array[T, N]` used as a kernel parameter type — not allowed.
+    #[error("local-array type `array[T, N]` cannot be used as a kernel parameter (`{param_name}`); local arrays are kernel-local and consume no descriptor")]
+    LocalArrayAsParameter {
+        param_name: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    /// Aggregate local-array bytes exceed the compiler's static per-kernel maximum
+    /// (4096 bytes — 16x tighter than shared's 65536, because private arrays are
+    /// replicated PER-THREAD; M3.20 spec §6).
+    #[error("kernel uses {total_bytes} bytes of local-array storage (sum of all local arrays), exceeding the compile-time maximum of 4096 bytes; reduce local array sizes or use shared[T,N] for workgroup-cooperative data")]
+    LocalArrayTooLarge {
+        total_bytes: u64,
+        #[label("here")]
+        span: Span,
+    },
 }
 
 /// Non-fatal diagnostic warning from HIR validation.
@@ -455,6 +492,35 @@ pub enum HirWarning {
         key: String,
         span: Span,
     },
+
+    // ── M3.20: array[T,N] local-array warnings ───────────────────────────────
+
+    /// Aggregate local-array bytes exceed the non-blocking spill-risk advisory
+    /// threshold (1024 bytes) but stay within the compile-time ceiling (4096 bytes).
+    ///
+    /// A `Function`-storage array the driver cannot keep in registers spills to
+    /// off-chip "local memory" (M3.12 register-pressure/occupancy lesson — M3.20
+    /// spec §6/§15). Consider `shared[T,N]` for workgroup-cooperative data instead.
+    LocalArrayMaySpill {
+        total_bytes: u64,
+        advisory_bytes: u32,
+        span: Span,
+    },
+
+    /// A `LocalArrayRead` of array X is reached while X's write-set is EMPTY (the
+    /// array has been declared but never written on any path to this read).
+    ///
+    /// Decidable, zero-FALSE-POSITIVE (never warns on a genuinely-written array).
+    /// Honest disclosure (M3.20 spec §5): the write-set is a source-order PRESENCE
+    /// set, not a path-sensitive definite-assignment lattice — it can MISS true
+    /// positives (e.g. a write nested inside an `if` populates the write-set
+    /// unconditionally, so a later read on an uncovered `else` path is NOT
+    /// flagged). Uninitialized-read remains UB-by-design on any path; this catches
+    /// only the common "forgot to zero it at all" foot-gun.
+    LocalArrayReadBeforeAnyWrite {
+        name: String,
+        span: Span,
+    },
 }
 
 /// Run post-lowering validation rules on a `HirModule`.
@@ -516,6 +582,28 @@ pub fn validate(module: &HirModule) -> (Vec<HirError>, Vec<HirWarning>) {
                 warnings.push(HirWarning::SharedMemoryExceedsPortableMinimum {
                     total_bytes,
                     min_bytes: PORTABLE_MIN_SHARED_BYTES,
+                    span: kernel.span,
+                });
+            }
+        }
+
+        // M3.20: Validate aggregate local-array size (the single source of truth for
+        // this check — unlike shared's aggregate check, which is ALSO duplicated at
+        // typecheck.rs lowering time, M3.20 deliberately does not repeat that; see
+        // the TypecheckError M3.20 section's placement note).
+        if let KernelBody::Typed(ref tb) = kernel.body {
+            let total_bytes: u64 = tb.local_arrays.iter()
+                .map(|a| a.ty.total_byte_size())
+                .sum();
+            if total_bytes > MAX_LOCAL_ARRAY_BYTES {
+                errors.push(HirError::LocalArrayTooLarge {
+                    total_bytes,
+                    span: kernel.span,
+                });
+            } else if total_bytes > LOCAL_ARRAY_SPILL_ADVISORY_BYTES {
+                warnings.push(HirWarning::LocalArrayMaySpill {
+                    total_bytes,
+                    advisory_bytes: LOCAL_ARRAY_SPILL_ADVISORY_BYTES as u32,
                     span: kernel.span,
                 });
             }

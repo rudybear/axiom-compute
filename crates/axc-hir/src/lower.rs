@@ -699,6 +699,14 @@ fn lower_type_ref(
             });
             None
         }
+        // M3.20: array[T,N] as a parameter is a hard error (mirrors shared).
+        TypeRef::LocalArray { .. } => {
+            errors.push(HirError::LocalArrayAsParameter {
+                param_name: param_name.to_owned(),
+                span,
+            });
+            None
+        }
     }
 }
 
@@ -867,7 +875,11 @@ fn find_mul_add_in_stmt(stmt: &HirStmt) -> Option<&HirExprKind> {
         | HirStmt::Barrier { .. }
         // M3.2: SharedWrite / SharedDeclMarker don't contain coopmat_mul_add.
         | HirStmt::SharedWrite { .. }
-        | HirStmt::SharedDeclMarker { .. } => None,
+        | HirStmt::SharedDeclMarker { .. }
+        // M3.20: LocalArrayWrite / LocalArrayDeclMarker don't contain coopmat_mul_add
+        // (local arrays never interact with cooperative-matrix ops — mirrors Shared*).
+        | HirStmt::LocalArrayWrite { .. }
+        | HirStmt::LocalArrayDeclMarker { .. } => None,
     }
 }
 
@@ -910,7 +922,10 @@ fn find_mul_add_in_expr(expr: &crate::expr::HirExpr) -> Option<&HirExprKind> {
         | HirExprKind::LocalInvocationIdBuiltin { .. }
         // M3.2: SharedRead carries an index expression; scan it for completeness (unlikely
         // to contain coopmat_mul_add but must be exhaustive).
-        | HirExprKind::SharedRead { .. } => None,
+        | HirExprKind::SharedRead { .. }
+        // M3.20: LocalArrayRead mirrors SharedRead's leaf treatment here — local
+        // arrays never contain coopmat ops.
+        | HirExprKind::LocalArrayRead { .. } => None,
     }
 }
 

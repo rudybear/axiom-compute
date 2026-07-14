@@ -34,6 +34,7 @@ use crate::coopmat::{
     is_allowed_coopmat_element,
 };
 use crate::shared::{SharedId, SharedDecl, SharedTy, MAX_SHARED_ELEMS, is_allowed_shared_element};
+use crate::local::{LocalArrayId, LocalArrayDecl, LocalArrayTy, MAX_LOCAL_ARRAY_ELEMS, is_allowed_local_element};
 
 /// Typecheck error — emitted from `typecheck_kernel_body`.
 ///
@@ -674,6 +675,127 @@ pub enum TypecheckError {
         #[label("here")]
         span: Span,
     },
+
+    // ── M3.20 local-array typecheck errors ───────────────────────────────────
+    //
+    // Placement note: these mirror the M3.2 `Shared*` precedent exactly — the
+    // per-declaration / per-use diagnostics live here (constructed in typecheck.rs,
+    // where the registration and index/value checks happen), NOT in
+    // `validate::HirError` (which only carries the two errors that are genuinely
+    // constructed post-lowering / at param-lowering time: `LocalArrayAsParameter`
+    // and `LocalArrayTooLarge`). Reconciles the r2 review note that shared's
+    // `HirError::Shared*` duplicates are dead code — M3.20 does not repeat that.
+
+    /// `hist[i]` where `i` is not `U32` — no implicit coercion (anti-pattern #1).
+    #[error("local array index must be `u32`; got `{got}` (no implicit coercion — anti-pattern #1)")]
+    LocalArrayIndexNotU32 {
+        got: &'static str,
+        #[label("here")]
+        span: Span,
+    },
+
+    /// `hist[i] = v;` where `v` type does not exactly match elem type.
+    #[error("local array `{name}` element type is `{expected}`; got `{got}` (exact match required — no implicit conversion)")]
+    LocalArrayWriteTypeMismatch {
+        name: String,
+        expected: &'static str,
+        got: &'static str,
+        #[label("here")]
+        span: Span,
+    },
+
+    /// A local-array name collides with a parameter, local binding, or a `shared`
+    /// array name (bidirectional cross-check — M3.20 spec §8).
+    #[error("local array name `{name}` collides with an existing parameter, binding, or shared array")]
+    LocalArrayNameCollision {
+        name: String,
+        #[label("collision here")]
+        span: Span,
+    },
+
+    /// A name reference resolves as a local-array read/write but no `array` decl
+    /// registered it. Defense-in-depth (mirrors the `shared` precedent's
+    /// `SharedNotDeclared`): unreachable through the normal source pipeline because
+    /// index-syntax on an unregistered name falls through to the buffer/binding
+    /// disambiguation chain and is reported as `UnknownBinding`/`IndexOnNonBuffer`
+    /// instead; kept for direct-construction test coverage and API completeness.
+    #[error("local array `{name}` is not declared in this kernel body")]
+    LocalArrayUndeclared {
+        name: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    /// Duplicate local-array name in the same kernel.
+    #[error("duplicate local array name `{name}`")]
+    LocalArrayDuplicateName {
+        name: String,
+        #[label("duplicate here")]
+        span: Span,
+    },
+
+    /// N = 0 in `array[T, 0]` — must be at least 1.
+    #[error("local array `{name}` has length 0; N must be >= 1")]
+    LocalArrayZeroLength {
+        name: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    /// N > MAX_LOCAL_ARRAY_ELEMS.
+    #[error("local array `{name}` length {len} exceeds maximum {max} elements")]
+    LocalArrayTooManyElems {
+        name: String,
+        len: u32,
+        max: u32,
+        #[label("here")]
+        span: Span,
+    },
+
+    /// Disallowed element type (Bool).
+    #[error("local array `{name}` element type `{ty_name}` is not allowed (Bool has no stable Vulkan memory representation)")]
+    LocalArrayElementTypeNotAllowed {
+        name: String,
+        ty_name: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    /// `array name: array[T,N];` declared inside a nested `if`/`for`/`while` block
+    /// (r2, M3.20 spec §5.1). Function-storage `OpVariable`s are hoisted to the
+    /// entry-block prelude with no per-iteration reset, so a nested decl would
+    /// silently diverge from `let`-inside-a-loop intuition; rejected outright.
+    #[error("local array declarations must appear at the top level of the kernel body, before any control-flow block; move `{name}` to the top and index it inside the loop")]
+    LocalArrayDeclNotAtBlockScope {
+        name: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    /// A **constant** index `>= N` on a local array read or write (r2, M3.20 spec
+    /// §5.2) — provably out of bounds, decidable, zero-false-positive. Symbolic
+    /// (non-constant) indices remain UB-by-design and are NOT flagged.
+    #[error("local array `{name}` index {index} is out of bounds (length {len}; valid indices are 0..={max_index})")]
+    LocalArrayConstIndexOutOfBounds {
+        name: String,
+        index: u32,
+        len: u32,
+        max_index: u32,
+        #[label("here")]
+        span: Span,
+    },
+
+    /// Aggregate local-array memory > 4096 bytes — compile-time ceiling exceeded
+    /// (M3.20 spec §6). This is the REACHABLE aggregate check (mirrors
+    /// `SharedMemoryTooLarge`'s placement here in `typecheck_kernel_body`); the
+    /// `HirError::LocalArrayTooLarge` variant in `validate.rs` mirrors the same
+    /// shared precedent's post-lowering `validate()` pass duplication.
+    #[error("kernel uses {total_bytes} bytes of local-array storage (sum of all local arrays), exceeding the compile-time maximum of 4096 bytes; reduce local array sizes or use shared[T,N] for workgroup-cooperative data")]
+    LocalArrayTooLarge {
+        total_bytes: u64,
+        #[label("here")]
+        span: Span,
+    },
 }
 
 // ── Internal binding table ────────────────────────────────────────────────────
@@ -775,6 +897,22 @@ struct TypeChecker<'p> {
     /// A `SharedWrite` of id X appends its index kind to the set.
     /// A `SharedRead` of id X triggers the missing-barrier analysis.
     shared_write_sets: BTreeMap<u32, Vec<HirExprKind>>,
+
+    // ── M3.20 local-array fields ──────────────────────────────────────────────
+
+    /// Declared local arrays in source order.
+    ///
+    /// Indexed by LocalArrayId.0 (monotonically from 0 per kernel).
+    local_array_decls: Vec<LocalArrayDecl>,
+
+    /// Maps local-array name -> index into local_array_decls.
+    local_array_name_map: BTreeMap<String, usize>,
+
+    /// Presence-only write set: key = LocalArrayId.0, present = "written at least
+    /// once, somewhere in the kernel body" (source-order, path-INsensitive — see
+    /// `HirWarning::LocalArrayReadBeforeAnyWrite`'s doc for the honest disclosure).
+    /// Never cleared (no barrier concept for private memory).
+    local_array_write_sets: BTreeMap<u32, ()>,
 }
 
 impl<'p> TypeChecker<'p> {
@@ -793,6 +931,10 @@ impl<'p> TypeChecker<'p> {
             shared_name_map: BTreeMap::new(),
             conditional_depth: 0,
             shared_write_sets: BTreeMap::new(),
+            // M3.20 local-array fields
+            local_array_decls: Vec::new(),
+            local_array_name_map: BTreeMap::new(),
+            local_array_write_sets: BTreeMap::new(),
         };
         // Push the top-level scope frame (pops at end of typecheck_kernel_body).
         tc.scope_stack.push_frame();
@@ -830,6 +972,17 @@ impl<'p> TypeChecker<'p> {
             });
             return None;
         }
+        // M3.20 (r2, §8): bidirectional order-independent cross-check against the
+        // local-array name map — a `shared` decl must not silently shadow (or be
+        // shadowed by) an `array` decl of the same name regardless of declaration
+        // order. See `register_local_array`'s mirror-image check and AT-2942.
+        if self.local_array_name_map.contains_key(name) {
+            self.errors.push(TypecheckError::SharedNameCollision {
+                name: name.to_owned(),
+                span,
+            });
+            return None;
+        }
         let id = SharedId(self.shared_decls.len() as u32);
         let idx = self.shared_decls.len();
         self.shared_decls.push(SharedDecl {
@@ -840,6 +993,73 @@ impl<'p> TypeChecker<'p> {
         });
         self.shared_name_map.insert(name.to_owned(), idx);
         Some(id)
+    }
+
+    /// Look up a local array by name. Returns `(LocalArrayId, elem ScalarTy, len)` or `None`.
+    fn find_local_array(&self, name: &str) -> Option<(LocalArrayId, ScalarTy, u32)> {
+        self.local_array_name_map.get(name).map(|&idx| {
+            let decl = &self.local_array_decls[idx];
+            (decl.id, decl.ty.elem, decl.ty.len)
+        })
+    }
+
+    /// Register a new local-array declaration.
+    ///
+    /// Returns `Some(LocalArrayId)` on success, `None` on duplicate/collision
+    /// (error pushed). Mirrors `register_shared`, PLUS the bidirectional cross-check
+    /// against `shared_name_map` (M3.20 r2, §8 — the #1 non-skippable review item):
+    /// a `shared`/`array` name collision is caught regardless of declaration order,
+    /// because BOTH registrars consult the other's map. See AT-2942.
+    fn register_local_array(
+        &mut self,
+        name: &str,
+        ty: LocalArrayTy,
+        span: Span,
+    ) -> Option<LocalArrayId> {
+        if self.local_array_name_map.contains_key(name) {
+            self.errors.push(TypecheckError::LocalArrayDuplicateName {
+                name: name.to_owned(),
+                span,
+            });
+            return None;
+        }
+        // Also check for collision with param or binding names.
+        if self.find_param(name).is_some() || self.find_binding(name).is_some() {
+            self.errors.push(TypecheckError::LocalArrayNameCollision {
+                name: name.to_owned(),
+                span,
+            });
+            return None;
+        }
+        // M3.20 (r2, §8): bidirectional cross-check against the shared-array name map.
+        if self.shared_name_map.contains_key(name) {
+            self.errors.push(TypecheckError::LocalArrayNameCollision {
+                name: name.to_owned(),
+                span,
+            });
+            return None;
+        }
+        let id = LocalArrayId(self.local_array_decls.len() as u32);
+        let idx = self.local_array_decls.len();
+        self.local_array_decls.push(LocalArrayDecl {
+            id,
+            name: name.to_owned(),
+            ty,
+            span,
+        });
+        self.local_array_name_map.insert(name.to_owned(), idx);
+        Some(id)
+    }
+
+    /// Mark a local array as "written at least once" (§5 empty-write-set advisory).
+    fn mark_local_array_written(&mut self, local_array_id: u32) {
+        self.local_array_write_sets.insert(local_array_id, ());
+    }
+
+    /// True if `local_array_id` has been written at least once so far (presence-only,
+    /// source-order, path-insensitive — see `HirWarning::LocalArrayReadBeforeAnyWrite`).
+    fn local_array_has_been_written(&self, local_array_id: u32) -> bool {
+        self.local_array_write_sets.contains_key(&local_array_id)
     }
 
     /// Clear all shared write sets — called when a Barrier statement is encountered.
@@ -1199,6 +1419,12 @@ pub fn typecheck_kernel_body(
                     hir_stmts.push(stmt);
                 }
             }
+            // M3.20: local-array declaration — ALLOWED at kernel-body top level.
+            past::Stmt::LocalArrayDecl { name, elem, len } => {
+                if let Some(stmt) = check_local_array_decl_stmt(&mut tc, name, elem, len, spanned_stmt.span, true) {
+                    hir_stmts.push(stmt);
+                }
+            }
         }
     }
 
@@ -1228,10 +1454,33 @@ pub fn typecheck_kernel_body(
         }
     }
 
+    // M3.20: Check aggregate local-array size limits (§6).
+    // - > MAX_LOCAL_ARRAY_BYTES (4096) → LocalArrayTooLarge hard error.
+    // - > LOCAL_ARRAY_SPILL_ADVISORY_BYTES (1024) → advisory warning.
+    {
+        use crate::local::{MAX_LOCAL_ARRAY_BYTES, LOCAL_ARRAY_SPILL_ADVISORY_BYTES};
+        let total_bytes: u64 = tc.local_array_decls.iter()
+            .map(|a| a.ty.total_byte_size())
+            .sum();
+        if total_bytes > MAX_LOCAL_ARRAY_BYTES {
+            tc.errors.push(TypecheckError::LocalArrayTooLarge {
+                total_bytes,
+                span: tc.local_array_decls.last().map(|a| a.span).unwrap_or_default(),
+            });
+        } else if total_bytes > LOCAL_ARRAY_SPILL_ADVISORY_BYTES {
+            tc.warns.push(crate::validate::HirWarning::LocalArrayMaySpill {
+                total_bytes,
+                advisory_bytes: LOCAL_ARRAY_SPILL_ADVISORY_BYTES as u32,
+                span: tc.local_array_decls.last().map(|a| a.span).unwrap_or_default(),
+            });
+        }
+    }
+
     let body_typed = KernelBodyTyped {
         bindings: tc.bindings,
         stmts: hir_stmts,
         shared: tc.shared_decls,
+        local_arrays: tc.local_array_decls,
     };
 
     (body_typed, tc.errors, tc.warns)
@@ -1797,6 +2046,15 @@ fn typecheck_block_stmts(tc: &mut TypeChecker<'_>, stmts: &[axc_lexer::Spanned<p
                     hir_stmts.push(stmt);
                 }
             }
+            // M3.20 (r2, §5.1): local-array declarations are REJECTED in nested
+            // blocks (if/for/while bodies) — HardError `LocalArrayDeclNotAtBlockScope`.
+            // Still registers (poisoned) so later in-block uses don't cascade
+            // unrelated errors — see `check_local_array_decl_stmt`'s doc.
+            past::Stmt::LocalArrayDecl { name, elem, len } => {
+                if let Some(stmt) = check_local_array_decl_stmt(tc, name, elem, len, spanned_stmt.span, false) {
+                    hir_stmts.push(stmt);
+                }
+            }
         }
     }
     hir_stmts
@@ -1829,6 +2087,11 @@ fn typeref_to_scalar(tr: &past::TypeRef) -> Result<ScalarTy, &'static str> {
         // It is a declaration statement type, not a let-binding type.
         past::TypeRef::Shared { .. } => {
             Err("shared[T,N] is not a valid let-binding type; use `shared name: shared[T,N];` to declare a shared array")
+        }
+        // M3.20: array[T,N] is not a valid scalar type for let bindings.
+        // It is a declaration statement type, not a let-binding type.
+        past::TypeRef::LocalArray { .. } => {
+            Err("array[T,N] is not a valid let-binding type; use `array name: array[T,N];` to declare a local array")
         }
     }
 }
@@ -2031,7 +2294,15 @@ fn check_expr(
             // Multi-dimensional chained indexing (e.g. buf[i][j]) is not parseable in M1.2.
             match &base.node {
                 past::Expr::Ident(name) => {
-                    // M3.2: Check if this is a shared array read first.
+                    // M3.20: Check if this is a local-array read first (order: local
+                    // array -> shared -> buffer; the bidirectional collision guard in
+                    // register_local_array/register_shared ensures a name is at most
+                    // one of these, so order only fixes the read-node kind).
+                    let local_array_info: Option<(LocalArrayId, ScalarTy, u32)> = tc.find_local_array(name);
+                    if let Some((local_array_id, elem_ty, len)) = local_array_info {
+                        return check_local_array_read(tc, local_array_id, elem_ty, len, index, span);
+                    }
+                    // M3.2: Check if this is a shared array read next.
                     let shared_info: Option<(SharedId, ScalarTy, u32)> = tc.find_shared(name);
                     if let Some((shared_id, elem_ty, _len)) = shared_info {
                         return check_shared_read(tc, shared_id, elem_ty, index, span);
@@ -3640,7 +3911,15 @@ fn check_index_assign_stmt(
 ) -> Option<HirStmt> {
     let name: &str = &target.node;
 
-    // M3.2: Check if the target is a shared array first.
+    // M3.20: Check if the target is a local array first (order: local array ->
+    // shared -> buffer; see the Expr::Index read handler for the collision-guard
+    // rationale).
+    let local_array_info: Option<(LocalArrayId, ScalarTy, u32)> = tc.find_local_array(name);
+    if let Some((local_array_id, elem_ty, len)) = local_array_info {
+        return check_local_array_write(tc, local_array_id, elem_ty, len, name, index, value, stmt_span);
+    }
+
+    // M3.2: Check if the target is a shared array next.
     let shared_info: Option<(SharedId, ScalarTy, u32)> = tc.find_shared(name);
     if let Some((shared_id, elem_ty, _len)) = shared_info {
         // Typecheck the index (must be U32 — no coercion, anti-pattern #1).
@@ -3975,6 +4254,237 @@ fn check_shared_decl_stmt(
     })
 }
 
+// ── M3.20 local-array typecheck helpers ──────────────────────────────────────
+
+/// Returns `Some(value)` if `index` is a constant `u32` integer literal whose value
+/// is `>= len` — a provably out-of-bounds local-array index (M3.20 spec §5.2).
+/// Returns `None` for symbolic (non-constant) indices, which remain UB-by-design
+/// and are NOT flagged, and for in-bounds constants.
+fn local_array_const_index_oob(index: &HirExpr, len: u32) -> Option<u32> {
+    if let HirExprKind::IntLit { value } = &index.kind {
+        if value.ty == ScalarTy::U32 {
+            let v = value.bits as u32;
+            if v >= len {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// Typecheck a local-array read expression: `local_array_name[index]`.
+///
+/// Called from the `Expr::Index` handler when the base ident resolves to a local
+/// array decl. Runs the §5.2 const-index-OOB hard-error check and the §5
+/// empty-write-set advisory (mirrors `check_shared_read` minus the barrier analysis
+/// — private memory has no cross-invocation hazard).
+fn check_local_array_read(
+    tc: &mut TypeChecker<'_>,
+    local_array_id: LocalArrayId,
+    elem_ty: ScalarTy,
+    len: u32,
+    index: &axc_lexer::Spanned<past::Expr>,
+    expr_span: Span,
+) -> Option<HirExpr> {
+    // Index must be U32 (no implicit coercion — anti-pattern #1).
+    let index_hir: HirExpr = check_expr(tc, &index.node, index.span, Some(ScalarTy::U32))?;
+    if index_hir.ty != ScalarTy::U32 {
+        tc.errors.push(TypecheckError::LocalArrayIndexNotU32 {
+            got: index_hir.ty.display_name(),
+            span: index.span,
+        });
+        return None;
+    }
+
+    // §5.2: a constant index >= N is a decidable hard error.
+    if let Some(oob) = local_array_const_index_oob(&index_hir, len) {
+        let array_name: String = tc.local_array_decls.get(local_array_id.0 as usize)
+            .map(|d| d.name.clone())
+            .unwrap_or_else(|| format!("<array#{}>", local_array_id.0));
+        tc.errors.push(TypecheckError::LocalArrayConstIndexOutOfBounds {
+            name: array_name,
+            index: oob,
+            len,
+            max_index: len - 1,
+            span: index.span,
+        });
+        return None;
+    }
+
+    // §5: empty-write-set advisory — fires only when the array's write-set is empty
+    // (never written on any path reaching this read). Zero false positives; path-
+    // insensitive (may miss true positives — see the warning's doc for the honest
+    // disclosure).
+    if !tc.local_array_has_been_written(local_array_id.0) {
+        let array_name: String = tc.local_array_decls.get(local_array_id.0 as usize)
+            .map(|d| d.name.clone())
+            .unwrap_or_else(|| format!("<array#{}>", local_array_id.0));
+        tc.warns.push(crate::validate::HirWarning::LocalArrayReadBeforeAnyWrite {
+            name: array_name,
+            span: expr_span,
+        });
+    }
+
+    Some(HirExpr {
+        kind: HirExprKind::LocalArrayRead {
+            local_array_id: local_array_id.0,
+            index: Box::new(index_hir),
+        },
+        ty: elem_ty,
+        span: expr_span,
+    })
+}
+
+/// Typecheck a local-array write statement: `local_array_name[index] = value;`.
+///
+/// Called from `check_index_assign_stmt` when the target ident resolves to a local
+/// array decl. Mirrors the shared-array write branch minus the barrier write-set
+/// bookkeeping (replaced by the simpler presence-only write-set here).
+#[allow(clippy::too_many_arguments)]
+fn check_local_array_write(
+    tc: &mut TypeChecker<'_>,
+    local_array_id: LocalArrayId,
+    elem_ty: ScalarTy,
+    len: u32,
+    name: &str,
+    index: &axc_lexer::Spanned<past::Expr>,
+    value: &axc_lexer::Spanned<past::Expr>,
+    stmt_span: Span,
+) -> Option<HirStmt> {
+    // Typecheck the index (must be U32 — no coercion, anti-pattern #1).
+    let index_hir: HirExpr = check_expr(tc, &index.node, index.span, Some(ScalarTy::U32))?;
+    if index_hir.ty != ScalarTy::U32 {
+        tc.errors.push(TypecheckError::LocalArrayIndexNotU32 {
+            got: index_hir.ty.display_name(),
+            span: index.span,
+        });
+        return None;
+    }
+
+    // §5.2: a constant index >= N is a decidable hard error.
+    if let Some(oob) = local_array_const_index_oob(&index_hir, len) {
+        tc.errors.push(TypecheckError::LocalArrayConstIndexOutOfBounds {
+            name: name.to_owned(),
+            index: oob,
+            len,
+            max_index: len - 1,
+            span: index.span,
+        });
+        return None;
+    }
+
+    // Typecheck the value (must match elem type exactly).
+    let value_hir: HirExpr = check_expr(tc, &value.node, value.span, Some(elem_ty))?;
+    if value_hir.ty != elem_ty {
+        tc.errors.push(TypecheckError::LocalArrayWriteTypeMismatch {
+            name: name.to_owned(),
+            expected: elem_ty.display_name(),
+            got: value_hir.ty.display_name(),
+            span: value.span,
+        });
+        return None;
+    }
+
+    tc.mark_local_array_written(local_array_id.0);
+
+    Some(HirStmt::LocalArrayWrite {
+        local_array_id: local_array_id.0,
+        index: index_hir,
+        value: value_hir,
+        span: stmt_span,
+    })
+}
+
+/// Typecheck an `array name: array[elem, N];` declaration statement.
+///
+/// Validates N > 0, N <= MAX_LOCAL_ARRAY_ELEMS, allowed elem type, no collision,
+/// then registers the local array in the TypeChecker.
+///
+/// `at_top_level` distinguishes the two call sites (M3.20 spec §5.1): `true` from
+/// `typecheck_kernel_body`'s top-level statement loop (allowed); `false` from
+/// `typecheck_block_stmts` (nested `if`/`for`/`while` bodies — hard error). A
+/// rejected nested decl STILL calls `register_local_array` first (poisoning the
+/// name) so later in-block references resolve as local-array uses and don't
+/// cascade into unrelated `UnknownBinding`/`IndexOnNonBuffer` noise — one root
+/// error (reviewer note (a)).
+fn check_local_array_decl_stmt(
+    tc: &mut TypeChecker<'_>,
+    name: &axc_lexer::Spanned<String>,
+    elem: &axc_parser::ast::ScalarTypeRef,
+    len: &axc_lexer::Spanned<u32>,
+    stmt_span: Span,
+    at_top_level: bool,
+) -> Option<HirStmt> {
+    // Validate element type.
+    let elem_ty: ScalarTy = match elem {
+        past::ScalarTypeRef::I8  => ScalarTy::I8,
+        past::ScalarTypeRef::U8  => ScalarTy::U8,
+        past::ScalarTypeRef::I32 => ScalarTy::I32,
+        past::ScalarTypeRef::U32 => ScalarTy::U32,
+        past::ScalarTypeRef::I64 => ScalarTy::I64,
+        past::ScalarTypeRef::U64 => ScalarTy::U64,
+        past::ScalarTypeRef::F16 => ScalarTy::F16,
+        past::ScalarTypeRef::F32 => ScalarTy::F32,
+        past::ScalarTypeRef::F64 => ScalarTy::F64,
+        past::ScalarTypeRef::Bf16 => {
+            // bf16 is not a valid local-array element type (not even a valid scalar
+            // in SPIR-V without the BF16 extension). Reject with a clear error.
+            tc.errors.push(TypecheckError::LocalArrayElementTypeNotAllowed {
+                name: name.node.clone(),
+                ty_name: "bf16".to_owned(),
+                span: stmt_span,
+            });
+            return None;
+        }
+    };
+
+    if !is_allowed_local_element(elem_ty) {
+        tc.errors.push(TypecheckError::LocalArrayElementTypeNotAllowed {
+            name: name.node.clone(),
+            ty_name: elem_ty.display_name().to_owned(),
+            span: stmt_span,
+        });
+        return None;
+    }
+
+    // Validate N.
+    let n: u32 = len.node;
+    if n == 0 {
+        tc.errors.push(TypecheckError::LocalArrayZeroLength {
+            name: name.node.clone(),
+            span: len.span,
+        });
+        return None;
+    }
+    if n > MAX_LOCAL_ARRAY_ELEMS {
+        tc.errors.push(TypecheckError::LocalArrayTooManyElems {
+            name: name.node.clone(),
+            len: n,
+            max: MAX_LOCAL_ARRAY_ELEMS,
+            span: len.span,
+        });
+        return None;
+    }
+
+    let ty = LocalArrayTy { elem: elem_ty, len: n };
+    let maybe_id = tc.register_local_array(&name.node, ty, stmt_span);
+    let local_array_id = maybe_id?;
+
+    // §5.1 (r2): reject (but keep registered — poisoned) if not at kernel-body top level.
+    if !at_top_level {
+        tc.errors.push(TypecheckError::LocalArrayDeclNotAtBlockScope {
+            name: name.node.clone(),
+            span: stmt_span,
+        });
+        return None;
+    }
+
+    Some(HirStmt::LocalArrayDeclMarker {
+        id: local_array_id,
+        span: stmt_span,
+    })
+}
+
 /// Check a `gid(axis)` call.
 fn check_gid_call(
     tc: &mut TypeChecker<'_>,
@@ -4097,7 +4607,7 @@ mod tests {
             let (typed, errs, _warns) = typecheck_kernel_body(&kd.body.node, &[]);
             return (typed, errs);
         }
-        (KernelBodyTyped { bindings: Vec::new(), stmts: Vec::new(), shared: Vec::new() }, Vec::new())
+        (KernelBodyTyped { bindings: Vec::new(), stmts: Vec::new(), shared: Vec::new(), local_arrays: Vec::new() }, Vec::new())
     }
 
     /// Helper: parse kernel body statements with params and run typecheck. Also returns warnings.
@@ -4112,7 +4622,7 @@ mod tests {
             let axc_parser::Item::Kernel(ref kd) = item.node;
             return typecheck_kernel_body(&kd.body.node, &[]);
         }
-        (KernelBodyTyped { bindings: Vec::new(), stmts: Vec::new(), shared: Vec::new() }, Vec::new(), Vec::new())
+        (KernelBodyTyped { bindings: Vec::new(), stmts: Vec::new(), shared: Vec::new(), local_arrays: Vec::new() }, Vec::new(), Vec::new())
     }
 
     // 1. tc_let_i32_literal_happy
@@ -4380,7 +4890,7 @@ mod tests {
             let (typed, errs, _warns) = typecheck_kernel_body(&kd.body.node, &params);
             return (typed, errs);
         }
-        (KernelBodyTyped { bindings: Vec::new(), stmts: Vec::new(), shared: Vec::new() }, Vec::new())
+        (KernelBodyTyped { bindings: Vec::new(), stmts: Vec::new(), shared: Vec::new(), local_arrays: Vec::new() }, Vec::new())
     }
 
     // AT-210: WriteToReadonlyBuffer
@@ -5724,6 +6234,64 @@ mod tests {
             errors.iter().any(|e| matches!(e, TypecheckError::ReservedExtInstBuiltinName { .. })),
             "M3.2c: expected ReservedExtInstBuiltinName for `let exp`; got: {errors:?}"
         );
+    }
+
+    // ── M3.20: local arrays — white-box unit coverage ─────────────────────────
+
+    // AT-2928 (HIR half): `array h: array[u32, 8];` typechecks clean and populates
+    // `KernelBodyTyped.local_arrays` with one entry.
+    #[test]
+    fn at_2928_local_array_decl_populates_local_arrays_table() {
+        let (body, errors) = tc_body("array h: array[u32, 8]; return;");
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        assert_eq!(body.local_arrays.len(), 1);
+        assert_eq!(body.local_arrays[0].name, "h");
+        assert_eq!(body.local_arrays[0].ty.elem, ScalarTy::U32);
+        assert_eq!(body.local_arrays[0].ty.len, 8);
+        assert!(matches!(body.stmts[0], HirStmt::LocalArrayDeclMarker { .. }));
+    }
+
+    // AT-2931 (defense-in-depth): `TypecheckError::LocalArrayUndeclared` exists,
+    // formats via thiserror's `#[error(...)]`, and is distinct from the generic
+    // `UnknownBinding`/`IndexOnNonBuffer` fallback the normal source pipeline
+    // actually produces for a never-declared array name (see
+    // `local_array_typecheck.rs`'s integration test for the reachable path).
+    // Mirrors the `shared` precedent's `SharedNotDeclared`, which is likewise
+    // never constructed through normal parsing — kept for API completeness.
+    #[test]
+    fn at_2931_local_array_undeclared_variant_shape() {
+        let err = TypecheckError::LocalArrayUndeclared {
+            name: "hist".to_owned(),
+            span: axc_lexer::Span::new(0, 4),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("hist"), "message must name the array: {msg}");
+        assert!(msg.contains("not declared"), "message must say not declared: {msg}");
+    }
+
+    // AT-2944: `local_array_const_index_oob` boundary — exact.
+    #[test]
+    fn at_2944_const_index_oob_boundary_exact() {
+        let in_bounds = HirExpr {
+            kind: HirExprKind::IntLit { value: crate::ty::IntLiteralValue { ty: ScalarTy::U32, bits: 7 } },
+            ty: ScalarTy::U32,
+            span: axc_lexer::Span::new(0, 0),
+        };
+        assert_eq!(local_array_const_index_oob(&in_bounds, 8), None, "index 7 < N=8 must be in-bounds");
+
+        let at_n = HirExpr {
+            kind: HirExprKind::IntLit { value: crate::ty::IntLiteralValue { ty: ScalarTy::U32, bits: 8 } },
+            ty: ScalarTy::U32,
+            span: axc_lexer::Span::new(0, 0),
+        };
+        assert_eq!(local_array_const_index_oob(&at_n, 8), Some(8), "index 8 == N=8 must be OOB");
+
+        let symbolic = HirExpr {
+            kind: HirExprKind::LocalRead(BindingId(0)),
+            ty: ScalarTy::U32,
+            span: axc_lexer::Span::new(0, 0),
+        };
+        assert_eq!(local_array_const_index_oob(&symbolic, 8), None, "symbolic index must never be flagged");
     }
 }
 

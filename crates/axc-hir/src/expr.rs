@@ -216,6 +216,17 @@ pub enum HirExprKind {
         /// Index expression — must be U32.
         index: Box<HirExpr>,
     },
+    /// Read one element from a per-invocation local array: `hist[index]` (M3.20).
+    ///
+    /// `local_array_id` is the 0-based index into `KernelBodyTyped.local_arrays`.
+    /// `index` must have type `U32` (no implicit coercion — anti-pattern #1).
+    /// Result type is the local array's element `ScalarTy`.
+    LocalArrayRead {
+        /// Id of the local array being read.
+        local_array_id: u32,
+        /// Index expression — must be U32.
+        index: Box<HirExpr>,
+    },
 }
 
 /// Unary operator.
@@ -355,6 +366,32 @@ pub enum HirStmt {
         id: crate::shared::SharedId,
         span: Span,
     },
+    /// Write one element to a per-invocation local array: `hist[index] = value;` (M3.20).
+    ///
+    /// `local_array_id` is the 0-based index into `KernelBodyTyped.local_arrays`.
+    /// `index` must have type `U32` (no implicit coercion).
+    /// `value` must match the local array's element type exactly.
+    LocalArrayWrite {
+        /// Id of the local array being written.
+        local_array_id: u32,
+        /// Index expression — must be U32.
+        index: HirExpr,
+        /// Value to write — must match elem ScalarTy exactly.
+        value: HirExpr,
+        span: Span,
+    },
+    /// No-op marker preserving local-array declaration order in the statement list (M3.20).
+    ///
+    /// The actual `OpVariable Function` is emitted in the function entry-block prelude
+    /// (`body.rs`) from the `KernelBodyTyped.local_arrays` table, NOT from this statement.
+    /// This marker exists to preserve lexical ordering of declarations in diagnostic
+    /// messages and preserves the correspondence between source order and emission order.
+    /// Mirrors `SharedDeclMarker`.
+    LocalArrayDeclMarker {
+        /// Id of the declared local array.
+        id: crate::local::LocalArrayId,
+        span: Span,
+    },
 }
 
 /// The typed body of a kernel: a binding table plus ordered statements.
@@ -372,4 +409,11 @@ pub struct KernelBodyTyped {
     /// resolves `name[i]` references into `SharedRead`/`SharedWrite` HIR nodes
     /// using the ids from this table.
     pub shared: Vec<crate::shared::SharedDecl>,
+    /// Per-invocation local array declarations in source order (M3.20).
+    ///
+    /// Each entry is a `LocalArrayDecl` with a unique `LocalArrayId`. The codegen uses
+    /// this table to emit `OpVariable Function` in the function entry-block prelude. The
+    /// typecheck resolves `name[i]` references into `LocalArrayRead`/`LocalArrayWrite`
+    /// HIR nodes using the ids from this table.
+    pub local_arrays: Vec<crate::local::LocalArrayDecl>,
 }

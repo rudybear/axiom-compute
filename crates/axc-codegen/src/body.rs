@@ -359,6 +359,15 @@ struct BodyEmitter<'a> {
     coopmat_binding_ids: std::collections::HashSet<BindingId>,
     /// Cache of emitted OpTypeCooperativeMatrixKHR type IDs (AT-619).
     coopmat_type_cache: CoopMatTypeCache,
+    /// Local-array (Function-storage) bindings (M3.20). `None` for kernels without
+    /// local arrays. Unlike `res.shared_bindings` (a `&'r` ref to an ALREADY-COMPLETE
+    /// struct built before `begin_function`), this is OWNED and MUTATED here: the
+    /// caller passes in a partial `LocalArrayBindings` (types only — `arr_ptr_ids`/
+    /// `elem_ptr_ids` populated, `var_ids` empty) built before `begin_block`, and the
+    /// prelude loop below fills in `var_ids` as it creates each `OpVariable Function`
+    /// (SPIR-V §2.16.1 requires the `OpVariable` itself to live INSIDE the function's
+    /// first block, unlike shared's Workgroup-class global `OpVariable`).
+    local_array_bindings: Option<crate::local::LocalArrayBindings>,
 }
 
 impl<'a> BodyEmitter<'a> {
@@ -480,6 +489,7 @@ pub fn emit_kernel_body(
     type_cache: &mut ScalarTypeCache,
     caps: &mut CapabilitiesRequired,
     res: &KernelResources<'_>,
+    local_array_types: Option<crate::local::LocalArrayBindings>,
 ) -> Result<Word, BodyCodegenError> {
     // The first block's label is the one that was opened before we were called.
     let first_block_label = match (b.selected_function(), b.selected_block()) {
@@ -504,6 +514,7 @@ pub fn emit_kernel_body(
         current_block_terminated: false,
         coopmat_binding_ids: std::collections::HashSet::new(),
         coopmat_type_cache: CoopMatTypeCache::new(),
+        local_array_bindings: local_array_types,
     };
 
     // ── Prelude: emit ALL OpVariable declarations in the first block ──────────
@@ -528,6 +539,24 @@ pub fn emit_kernel_body(
                 emitter.coopmat_binding_ids.insert(binding.id);
             }
         }
+    }
+
+    // M3.20: local-array OpVariable prelude — the ONLY place a Function-storage
+    // local-array OpVariable may be emitted (SPIR-V §2.16.1). Types (arr_ptr_ids)
+    // were already created by `emit_local_array_types` before `begin_block`;
+    // here we create the actual `OpVariable Function` and record its id.
+    for decl in &body.local_arrays {
+        let arr_ptr_ty = emitter.local_array_bindings.as_ref()
+            .and_then(|lb| lb.arr_ptr_ty(decl.id.0))
+            .ok_or(BodyCodegenError::UnexpectedHir(
+                "local-array prelude: missing arr_ptr_ty for local_array_id (emit_local_array_types not called)"
+            ))?;
+        let var_id = emitter.b.variable(arr_ptr_ty, None, StorageClass::Function, None);
+        emitter.local_array_bindings.as_mut()
+            .ok_or(BodyCodegenError::UnexpectedHir(
+                "local-array prelude: no LocalArrayBindings in BodyEmitter"
+            ))?
+            .var_ids.insert(decl.id.0, var_id);
     }
 
     // ── M3.17 (FG.4): entry-point precondition checks ─────────────────────────
@@ -802,6 +831,27 @@ fn emit_stmt(em: &mut BodyEmitter<'_>, stmt: &HirStmt) -> Result<(), BodyCodegen
                 em.b,
                 shared_bindings,
                 *shared_id,
+                index_id,
+                value_id,
+            )
+        }
+
+        // M3.20: LocalArrayDeclMarker is a no-op in codegen (OpVariable emitted by
+        // the entry-block prelude loop in emit_kernel_body).
+        HirStmt::LocalArrayDeclMarker { .. } => Ok(()),
+
+        // M3.20: LocalArrayWrite → OpAccessChain (single index, Function storage) + OpStore.
+        HirStmt::LocalArrayWrite { local_array_id, index, value, .. } => {
+            let index_id = emit_expr(em, index)?;
+            let value_id = emit_expr(em, value)?;
+            let local_array_bindings = em.local_array_bindings.as_ref()
+                .ok_or(BodyCodegenError::UnexpectedHir(
+                    "LocalArrayWrite: no LocalArrayBindings in BodyEmitter"
+                ))?;
+            crate::local::emit_local_array_write(
+                em.b,
+                local_array_bindings,
+                *local_array_id,
                 index_id,
                 value_id,
             )
@@ -1787,6 +1837,23 @@ fn emit_expr(em: &mut BodyEmitter<'_>, expr: &HirExpr) -> Result<Word, BodyCodeg
                 em.b,
                 shared_bindings,
                 *shared_id,
+                index_id,
+                elem_ty_id,
+            )
+        }
+
+        // M3.20: LocalArrayRead → emit_local_array_read (SINGLE-index, Function storage).
+        HirExprKind::LocalArrayRead { local_array_id, index } => {
+            let index_id = emit_expr(em, index)?;
+            let elem_ty_id = em.type_id(expr.ty);
+            let local_array_bindings = em.local_array_bindings.as_ref()
+                .ok_or(BodyCodegenError::UnexpectedHir(
+                    "LocalArrayRead: no LocalArrayBindings in BodyEmitter"
+                ))?;
+            crate::local::emit_local_array_read(
+                em.b,
+                local_array_bindings,
+                *local_array_id,
                 index_id,
                 elem_ty_id,
             )
