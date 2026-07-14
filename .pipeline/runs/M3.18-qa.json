@@ -1,0 +1,105 @@
+{
+  "verdict": "PASS",
+  "agent": "qa_agent",
+  "milestone_id": "M3.18-verify-fuzz",
+  "spec_revision_verified_against": "r4 (orchestrator resolution, 2026-07-14)",
+  "branch": "coder/M318-20260714-0600/M3.18-verify-fuzz",
+  "summary": "The implementation is broad, careful, and verifiably correct on every dimension EXCEPT one: the literal CLI invocation the spec itself names for AT-2893 ('axc test --fuzz examples/fuzz_unsat.axc' with no other flags) does NOT produce the documented UNSATISFIABLE/exit-3 result -- it produces a usage ERROR/exit-2 ('must supply --buffer-sizes or --size') because main.rs::run_test requires --buffer-sizes/--size before ever calling fuzz_kernel (which is where the UNSATISFIABLE short-circuit actually lives, ahead of any buffer-size check). The coder's own AT-2893 unit test bypasses this gap by calling fuzz_kernel() directly with a hand-supplied buffer_sizes vec, so the gap was never caught by the test suite despite the test's 'end_to_end' name. Independently re-run with echo $? per the QA task's explicit instruction: exit=2, not exit=3. This is a real, reproducible, spec-literal discrepancy in a named acceptance test, not a nitpick -- hence FAIL. Every other verification axis (build/clippy/tests, GPU legs on real NVIDIA + Lavapipe, severity-ordering comparator, oracle wiring, LOC honesty, AT-2885/AT-2883 deviations, scope) checks out clean; this is a single, narrow, easily-fixable defect (move the buffer-size usage-gate in main.rs::run_test to AFTER front-end parse + solve(), mirroring fuzz_kernel's own internal ordering -- or special-case UNSATISFIABLE detection to run before the buffer-size gate).",
+
+  "requirements_total": 19,
+  "requirements_covered": 18,
+  "requirements_missing": [
+    "AT-2893 (fuzz UNSATISFIABLE end-to-end via CLI): the literal spec command 'axc test --fuzz examples/fuzz_unsat.axc' returns verdict ERROR / exit 2 ('must supply --buffer-sizes or --size'), NOT verdict UNSATISFIABLE / exit 3 as the r3/fix-3 spec text and §3.6 mandate. The coder's unit test (fuzz.rs::at_2893_fuzz_unsat_end_to_end_no_gpu_needed) only exercises fuzz_kernel() directly with buffer_sizes:[64] pre-supplied, sidestepping main.rs's CLI-level usage gate -- so this AT is unit-covered but NOT CLI-end-to-end-covered, despite its name. Independently reproduced (see verification_results.cli_hands_on below)."
+  ],
+
+  "test_results": {
+    "cpu_baseline_claimed": "1102 passed / 128 ignored",
+    "cpu_observed_this_branch": "1150 passed / 132 ignored / 0 failed",
+    "cpu_delta": "+48 passed, +4 ignored -- exactly matches new CPU unit tests (verify.rs 16 + fuzz.rs 27 + cli.rs 5 = 48) and new GPU-gated tests (fuzz_gpu.rs 4, #[ignore]-gated)",
+    "cpu_regressions": 0,
+    "clippy_workspace_all_targets_D_warnings": "clean, zero warnings",
+    "build_release_workspace": "pass",
+    "gpu_nvidia_ignored_suite_full_workspace": "0 failed across the entire `cargo test --workspace -- --ignored` run (AXC_ENABLE_GPU_TESTS=1, native nvidia_icd.json, device: NVIDIA RTX PRO 6000 Blackwell); fuzz_gpu.rs AT-2896/2897/2898/2899: 4/4 pass; dispatch_debug_checks.rs (M3.17 frozen invariants, file untouched by this branch -- 0-line diff): 7/7 pass",
+    "gpu_lavapipe_targeted": "fuzz_gpu.rs AT-2896/2897/2898/2899: 4/4 pass; dispatch_debug_checks.rs: 7/7 pass; debug_checks_codegen.rs (golden-identity, file untouched -- 0-line diff): 5/5 pass. VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json, device: llvmpipe (LLVM 20.1.2, 256 bits)",
+    "at_2897_pinned_triple_determinism_recheck": "re-ran (seed=0, window=1500, runs=4) 3x on NVIDIA and 3x on Lavapipe independently of the coder's own measurement: 6/6 green, same counterexample (run 0, alpha>=1000, postcondition_violation) every time -- confirms the pinned triple is genuinely deterministic, not a lucky one-off",
+    "note_on_unrelated_slow_test": "crates/axc-runtime/tests/resident_timing.rs::at_1579_dispatch_resident_rejects_oversize_workgroups took ~56s on NVIDIA during the full ignored-suite run (briefly looked hung, resolved on its own with 0 failures); this file has a 0-line diff on this branch and is unrelated to M3.18 -- not a regression, not investigated further since it is out of scope"
+  },
+
+  "verification_results": {
+    "clippy_check": "PASS (0 warnings, --all-targets included)",
+    "diff_check": "PASS -- git diff main...HEAD --stat: 11 files, all match the coder's files_created/files_modified claim exactly (verify.rs, fuzz.rs, fuzz_gpu.rs, 3 example fixtures created; cli.rs, main.rs, lib.rs, rewrite_verify.rs modified). Zero diff on axc-lexer/axc-parser/axc-hir/axc-codegen/axc-runtime -- zero-compiler-change gate holds",
+    "scope_check": "PASS -- compiler crates diff is empty (git diff main...HEAD -- crates/axc-lexer crates/axc-parser crates/axc-hir crates/axc-codegen crates/axc-runtime | wc -l == 0). Frozen invariant test files dispatch_debug_checks.rs and debug_checks_codegen.rs are themselves 0-line diff (used as regression guards only, not modified)",
+    "oracle_wiring_check": "PASS -- grepped fuzz.rs for dispatch_handle/dispatch_debug_checked: ALL 4 dispatch call sites use dispatch_debug_checked (lines 872, 1027, 1077, 1082); dispatch_handle never appears in fuzz.rs. run_once()'s non-debug-oracle branch correctly calls vk.dispatch() (the raw DispatchRequest path), not dispatch_handle, for the release-artifact smoke case -- consistent with spec",
+    "severity_ordering_check": "PASS -- real comparator, not ad-hoc ifs. fuzz.rs defines RunOutcome enum + severity_rank() (Error=0 < Fail=1 < UnconstrainedPreconditionFired=2 < Pass=3) used uniformly in TWO places via the SAME function: (1) classify_run()'s per-run candidate list is resolved via `candidates.sort_by_key(severity_rank); candidates.into_iter().next()` (a genuine max-fold over up to 3 simultaneous signals -- quadrant/post-fail/deferred-fire), and (2) record_worst() folds across all runs in the report via the same severity_rank comparison. Both per-run and aggregate precedence are therefore structurally guaranteed to agree with the r4 ordering, not duplicated/hand-rolled logic that could drift",
+    "at_2892_composition_unit_check": "PASS -- fuzz.rs::at_2892_composition_deferred_fire_does_not_mask_postcondition_fail exists (line 1376) and asserts classify_run(host_sat=true, gpu_pre_bits=deferred-bit-fired, gpu_post_bits=Some(1), ...) resolves to RunOutcome::Fail{reason_kind:\"postcondition_violation\"} (exit 1), i.e. the deferred-condition fire is correctly demoted to a note and does not mask the real postcondition failure. Independently re-derived the expected outcome by hand from classify_run's logic and it matches",
+    "cli_hands_on_verify": "PASS on all 3 named fixtures: verify_strict_incomplete.axc -> FAIL/exit1, diagnostic strict_missing_complexity, line 15 (matches C1); verify_arity_drop.axc -> FAIL/exit1, diagnostic predicate_arity_dropped (matches C2b); precondition_saxpy.axc -> PASS/exit0, 0 errors/0 warnings (good kernel). --json verdict is the first serialized key in every case (spot-checked with jq/eyeball). axc verify on an unreadable file -> ERROR/exit2 (AT-2887 case) confirmed",
+    "cli_hands_on_fuzz": "PARTIAL FAIL -- see requirements_missing. `axc test --fuzz examples/fuzz_unsat.axc --buffer-sizes 64` (buffer size supplied) DOES correctly produce UNSATISFIABLE/exit3 with reason 'scalar `n`: interval empty: [11, 4]', proving the satisfier/verdict machinery itself is correct. But the literal spec command with NO --buffer-sizes returns ERROR/exit2 instead. `axc test --fuzz examples/precondition_saxpy.axc --runs 4 --buffer-sizes 256,256` on Lavapipe: verdict PASS, exit 0, full triad green, host_recheck reported, notes correct (DEBUG artifact, determinism leg byte-identical) -- exactly per spec. `axc test` (no --fuzz) -> ERROR/exit2 as spec'd",
+    "at_2885_deviation_check": "CONFIRMED LEGITIMATE -- read axc-hir/src/hir.rs and validate.rs directly: DESKTOP_MAX_WORKGROUP_INVOCATIONS=1024 (hard ceiling, HirError::BadWorkgroupDim), PORTABLE_MIN_WORKGROUP_INVOCATIONS=128 (warn floor, HirWarning::WorkgroupExceedsPortableFloor). product=2048 (the spec's illustrative example) > 1024 therefore hard-errors at HIR-lowering, contradicting the spec's own illustrative 'PASS with warning' framing. The coder's substituted fixture value of 256 falls inside the real (128,1024] warn band. This is a pre-existing, frozen, untouched threshold (0-line diff on hir.rs/validate.rs) -- the coder could not have changed it without breaching the zero-compiler-change gate. Deviation is honestly flagged in the coder's self-report and does not misrepresent behavior",
+    "at_2883_differential_guard_check": "PASS, independently re-verified beyond the coder's own unit test -- built the axc binary on a fresh `main` worktree and compiled examples/verify_arity_drop.axc with both HEAD's and main's binaries; SPIR-V outputs are byte-identical (diff of xxd dumps: empty). Combined with the empty compiler-crate diff, this proves compile behavior for the arity-drop fixture is unchanged by this milestone, independent of the coder's AT-2883b in-process assertion",
+    "loc_audit": "see loc_audit_independent below",
+    "coder_self_report_matches_reality": true
+  },
+
+  "loc_audit_independent": {
+    "method": "Independently counted raw line counts per file via `wc -l` and `git diff --stat`, then separated product vs test code using each file's `#[cfg(test)] mod tests` boundary (grep for the marker line, split file at that line number).",
+    "new_files_raw_total": 2270,
+    "new_files_breakdown": {
+      "verify.rs": "570 total (386 product / 184 test, split at line 387)",
+      "fuzz.rs": "1476 total (1157 product / 319 test, split at line 1158)",
+      "fuzz_gpu.rs": "164 (all GPU acceptance-test code, no product)",
+      "examples_3_fixtures": "60 (19+22+19)"
+    },
+    "modified_files_inserted_total": 311,
+    "modified_files_breakdown": {
+      "cli.rs": "133 inserted (63 product: the Command::Verify/Command::Test enum variants; 70 test: AT-2894/AT-2887c CLI-parse units)",
+      "main.rs": "167 inserted, all product (run_verify + run_test handlers, no test module in this file)",
+      "lib.rs": "5 inserted, all product (pub mod verify; pub mod fuzz;)",
+      "rewrite_verify.rs": "6 net inserted (7 added / 1 removed), all product (pub(crate) visibility bump + doc comment on find_nondeterminism)"
+    },
+    "grand_total_raw": 2581,
+    "grand_total_matches_coder_claim": true,
+    "product_only_sloc": 1785,
+    "test_only_sloc": 737,
+    "fixture_sloc": 60,
+    "cross_check": "product(1785) + test(737) + fixtures(60) = 2582, off-by-1 from the coder's 2581 due to rounding in which boundary line is counted -- immaterial",
+    "comparison_to_spec_table": "The spec's own §12 LOC table sums its PRODUCT-only rows (verify.rs 350 + fuzz.rs satisfier 400 + fuzz.rs orchestration 300 + discriminator helper 55 + rewrite_verify bump 1 + CLI 120 + main.rs 130) to 1356 -- already close to my independently-measured product-only total of 1785 as an order of magnitude, but 429 lines (32%) over the spec's own product estimate BEFORE counting a single test line. The stated 'hard cap ~1700' therefore appears to have been intended as a whole-milestone (product+test) budget (consistent with the table's own 'Tests ~250 in-file+fixtures' row and total row of ~1355 which only reconciles if read that way) -- under that reading, product-only (1785) alone already exceeds the entire hard cap, and total (2581) is 1.52x the cap.",
+    "overage_source_analysis": {
+      "verify.rs": "386 actual vs ~350 est. -- +36, in line with estimate, not a driver of overage",
+      "fuzz.rs_product": "1157 actual vs ~755 est. (400 satisfier + 300 orchestration + 55 discriminator) -- +402 lines, the single largest contributor to the overage (~47% of the ~860-line product overage)",
+      "cli.rs_product": "63 actual vs ~120 est. -- UNDER estimate, not a contributor",
+      "main.rs_product": "167 actual vs ~130 est. -- +37, minor",
+      "test_code": "737 actual vs ~250 est. (in-file+fixtures) -- +487 lines, roughly 3x the estimate; attributable to per-AT multi-sub-case coverage (e.g. AT-2888 has 4 sub-tests, AT-2891 has the full 4-quadrant discriminator unit x4 quadrants, AT-2892 has 3 sub-tests) rather than the AT-count minimum"
+    },
+    "violate_leg_contribution_estimate": "Measured the --violate-specific code directly: negate_one() (~35 lines) + is_eligible_for_violate/appears_inside_brackets/word_contains/select_violate_target (~55 lines) + the --violate orchestration block in fuzz_kernel (~55 lines) + AT-2899 in fuzz_gpu.rs (~26 lines) + CPU unit tests for negate_one/select_violate_target (~35 lines) totals roughly 200-210 lines. This is a real but MINORITY contributor -- shedding --violate per the defer-list's stated first-shed order would reduce total LOC from 2581 to roughly 2371-2381, still ~40% over the 1700 cap. The coder's claim that --violate was 'not the main driver of the overage' is CORRECT",
+    "duplication_check": "Grepped for reuse vs reinvention: fuzz.rs correctly imports and reuses seeded_inputs/derive_workgroups from mcp::tools::bench_variant (same functions rewrite_verify.rs uses) and find_nondeterminism from rewrite_verify.rs via the mandated pub(crate) bump -- confirmed NOT reimplemented. encode_push_constants (13 lines) is genuinely new logic (map-of-named-scalars -> byte buffer via ScalarPushConstantSlot offsets) with no pre-existing analog in rewrite_verify.rs (which takes caller-supplied Option<Vec<u8>> directly, a different data flow). No duplicated logic found.",
+    "full_scalarty_generality_check": "Confirmed axc_hir::ScalarTy has 12 variants (I8/I16/I32/I64/U8/U16/U64/F16/F32/F64/Bool + already-noted U32). fuzz.rs's default_fuzz_value() and the JSON scalar-serialization match arm both handle all 12, even though DebugCheck predicates are restricted to U32/I32/F32 per M3.17 -- this breadth is legitimately required because §3.4 mandates fuzzing EVERY kernel scalar param (not just ones with preconditions), and kernel params are not type-restricted. This is genuine required breadth, not padding.",
+    "verdict_on_loc": "PASS-with-recommendation (per the QA task's own framing) -- confirmed NOT duplication/padding. The overage is dominated by fuzz.rs's product code (satisfier + orchestration, +402 over estimate) and by test thoroughness (+487 over estimate), both legitimate; --violate is a real but minority contributor. Recommend the orchestrator/reviewer accept the overage as an honest, disclosed miss on the Architect's own estimate rather than a Coder discipline failure, OR direct a follow-up trim pass on fuzz.rs's orchestration/satisfier functions specifically (the largest single delta) if the cap is to be enforced retroactively -- but this is a recommendation, not a blocking finding; it did not on its own drive the FAIL verdict above."
+  },
+
+  "memory_footprint_ok": true,
+  "compiler_crates_touched": [],
+  "frozen_invariants_status": "intact -- equiv_fp_tol/within_ulp_f32/production kernels/M3.17 golden gates (AT-2838, AT-2866, AT-2867x2, AT-2869: 5/5 pass) all verified unaffected",
+
+  "blocking_finding_for_orchestrator": {
+    "what": "AT-2893's literal CLI command ('axc test --fuzz examples/fuzz_unsat.axc') returns ERROR/exit2 instead of the spec-mandated UNSATISFIABLE/exit3, because main.rs::run_test's buffer-size usage gate (line ~189) runs BEFORE any front-end parse/solve() call, whereas fuzz_kernel()'s own internal ordering (correctly) checks solve()/UNSATISFIABLE before touching buffer_sizes at all (fuzz.rs lines 901-926 vs 956-965).",
+    "reproduction": "cd axiom-compute && ./target/release/axc test --fuzz examples/fuzz_unsat.axc; echo $?  # prints exit=2 with reason.kind=usage, detail='must supply --buffer-sizes or --size', NOT verdict=UNSATISFIABLE/exit=3",
+    "suggested_fix": "In main.rs::run_test, defer the buffer_sizes-required usage check until AFTER a cheap front-end parse+lower_module+solve() pass has determined the kernel is not already UNSATISFIABLE by source alone -- mirroring fuzz_kernel's own internal short-circuit order -- OR thread the buffer_sizes-optional path through fuzz_kernel itself (call it with an empty/placeholder buffer_sizes when none was supplied, and let fuzz_kernel's own internal buffer_sizes.len()-mismatch check at line 956 raise the usage error AFTER the solve()-based UNSATISFIABLE check has had first refusal, exactly as it already does when buffer_sizes IS supplied but count-mismatched).",
+    "scope_of_fix": "small, CLI-layer only, does not touch the satisfier/oracle/discriminator (all independently verified correct)"
+  },
+
+  "recheck": {
+    "date": "2026-07-14",
+    "commit_verified": "64b47b8638efb8a98b2c3cd95934f8828cf63e31",
+    "branch": "coder/M318-20260714-0600/M3.18-verify-fuzz",
+    "scope": "Scoped re-check of the single prior FAIL finding (AT-2893 CLI-level UNSATISFIABLE ordering) plus the fix's blast radius. Full matrix not redone -- all other axes from the original PASS set stand.",
+    "checks": {
+      "1_literal_repro_fixed": "PASS -- `./target/release/axc test --fuzz examples/fuzz_unsat.axc` (no flags) now returns verdict=UNSATISFIABLE, reason 'scalar `n`: interval empty: [11, 4]', runs_executed=0, and `echo $?` prints 3. Matches the spec-literal AT-2893 command exactly.",
+      "2_preserved_usage_gate": "PASS -- `./target/release/axc test --fuzz examples/precondition_saxpy.axc` (no flags, satisfiable kernel) still returns verdict=ERROR, reason.kind=usage, detail='buffer_sizes.len()==0 but kernel has 2 buffer bindings', exit=2. Confirms the fix only reordered refusal precedence and did not silently drop the buffer-size requirement for kernels that would genuinely dispatch.",
+      "3_fuzz_cli_tests_and_rename": "PASS -- `cargo test -p axc-driver --test fuzz_cli`: 2/2 pass (at_2893_cli_fuzz_unsat_no_size_flags_end_to_end, at_2893b_cli_fuzz_satisfiable_kernel_missing_size_flags_is_still_usage_error), both drive the real built binary via subprocess (rewrite_verify_cli.rs convention), both assert exit code + verdict + verdict-serializes-first. The old fuzz.rs unit test is renamed to at_2893_fuzz_unsat_library_level_fuzz_kernel_no_gpu_needed with an accurate doc comment explaining it only covers fuzz_kernel() directly (library-level) and pointing at the new CLI-level counterpart -- honestly labeled, not misleading.",
+      "4_diff_is_reorder_only": "PASS -- read the full commit diff. main.rs: the missing-size branch no longer calls emit_fuzz_usage_error directly; it now passes Vec::new() through to fuzz_kernel unconditionally, with a doc comment explaining solve()'s UNSATISFIABLE short-circuit must run before the buffer-size gate (mirrors fuzz_kernel's own internal ordering at lines ~901-926 vs ~956-965, unchanged by this commit). fuzz.rs diff is test-only: a doc-comment block plus the rename above -- zero product-code lines touched. No satisfier/oracle/discriminator logic changed, confirmed by diff inspection (15 lines in fuzz.rs, all inside `mod tests`).",
+      "5_cargo_test_workspace": "PASS -- `cargo test --workspace`: 0 failed across all crates (spot-checked via grep for 'FAILED'/'error:' across full output -- none found; every `test result:` line is `0 failed`). Doc-tests also clean.",
+      "6_lavapipe_fuzz_gpu_spot": "PASS -- `VK_DRIVER_FILES=lvp_icd.json AXC_ENABLE_GPU_TESTS=1 cargo test -p axc-driver --test fuzz_gpu -- --ignored`: 4/4 pass (AT-2896/2897/2898/2899) on llvmpipe, same as original QA pass -- no regression from the fix."
+    },
+    "verdict_rationale": "The single blocking finding from the prior FAIL is fixed exactly as diagnosed and exactly as scoped: main.rs::run_test now lets fuzz_kernel's own solve()-based UNSATISFIABLE short-circuit run before the CLI buffer-size usage gate, verified against the literal spec command with echo $?. The preserved-behavior path (satisfiable kernel, no size flags -> usage ERROR/exit 2) is intact. The fuzz.rs diff in this commit is test-rename/doc-comment only -- no satisfier/oracle/discriminator risk introduced. New fuzz_cli.rs subprocess tests close the coverage gap that let the original bug through unit tests. Full cargo test --workspace is clean and a Lavapipe GPU spot-check remains green. All 19 requirements now covered; no new findings. Flipping verdict to PASS."
+  }
+}

@@ -1,0 +1,70 @@
+{
+  "verdict": "APPROVE",
+  "agent": "pessimistic_code_reviewer",
+  "milestone_id": "M3.18-verify-fuzz",
+  "spec_revision_reviewed_against": "r4 (orchestrator resolution, 2026-07-14)",
+  "branch": "coder/M318-20260714-0600/M3.18-verify-fuzz",
+  "commit_verified": "64b47b8638efb8a98b2c3cd95934f8828cf63e31",
+
+  "headline": "The r4 severity-ordering implementation (the orchestrator-resolution backstop I was specifically instructed to verify) is CORRECT, and the AT-2892 composition unit exists, fires, and proves the demotion-to-note semantics. The verification/fuzzing tool does NOT lie: I proved on real NVIDIA hardware that the postcondition oracle genuinely FIRES (AT-2897 -> 0x00000001, FAIL/exit 1, alpha=1237>1000) and the violate leg fires the precondition bit (AT-2899). The satisfier is robust to every adversarial case I threw at it. Two NON-BLOCKING warnings, neither reachable by shipped fixtures nor v1 scope, and both fail LOUD (never silently false-pass).",
+
+  "r4_severity_ordering_verification": {
+    "status": "PASS",
+    "evidence": "fuzz.rs:560-567 severity_rank maps Error=0 < Fail=1 < UnconstrainedPreconditionFired=2 < Pass=3 (lower = more severe). The RunOutcome enum (fuzz.rs:549-555) deliberately OMITS Unsatisfiable/Skipped -- correct, because those are whole-request outcomes resolved by early-return BEFORE/AROUND the run loop, never per-run (comment fuzz.rs:546-548 is accurate). The subset ordering ERROR > FAIL > UNCONSTRAINED > PASS that RunOutcome represents matches r4 exactly.",
+    "per_run_max_fold": "classify_run (fuzz.rs:578-640) is a GENUINE max-fold: it builds up to 3 simultaneous candidate signals (quadrant, post_fail, deferred_fire), `candidates.sort_by_key(severity_rank); candidates.into_iter().next()` -- not hand-rolled if/else that could drift. Empty -> Pass. Verified the deferred-condition exemption is applied via mask attribution (constrained_mask vs deferred_mask, fuzz.rs:585-588) and that a deferred fire is only ever ONE candidate among the others, so it cannot short-circuit.",
+    "aggregate_fold": "record_worst (fuzz.rs:878-886) folds across all runs using the SAME severity_rank function, keeping the most-severe (earliest run on ties). Per-run and aggregate precedence are therefore structurally guaranteed to agree -- single source of truth, no duplication.",
+    "early_return_trace": "Traced every early-return that bypasses the fold: (1) UNSATISFIABLE (fuzz.rs:921-926) short-circuits from solve() before any dispatch -- no ERROR/FAIL can co-occur (nothing dispatched), and it is CPU-deterministic (AT-2893 CLI-proven exit 3). (2) gpu_unavailable SKIPPED (fuzz.rs:929-931) short-circuits before the loop. (3) coopmat/device-feature SKIPPED early-returns mid-dispatch (fuzz.rs:1002,1009,1042,1053,1107) -- see warning W1: theoretically discards accumulated `worst`, but NOT reachable to downgrade a real FAIL because these are STATIC device-capability errors that fire on the FIRST successful-or-not dispatch (run 0 / determinism leg), before any FAIL can be recorded; once a real dispatch succeeds they cannot recur. The debug-oracle Ok branch (fuzz.rs:1028-1040) correctly does NOT break -- it accumulates via record_worst across all runs; only device_fault breaks (after recording).",
+    "composition_unit_AT2892": "PASS -- fuzz.rs:1376-1385 at_2892_composition_deferred_fire_does_not_mask_postcondition_fail asserts classify_run(host_sat=true, gpu_pre=1<<0 [deferred bit], gpu_post=Some(1), constrained={}, deferred={0}) resolves to Fail{postcondition_violation}/exit 1. I re-derived by hand: quadrant=None, post_fail=Fail(rank1), deferred_fire=Unconstrained(rank2) -> sort -> Fail wins. Correct. The deferred fire is demoted to a note (fuzz.rs:1134-1136). This is exactly the masking hazard the orchestrator resolution closed, and it is closed."
+  },
+
+  "critical_bugs": [],
+
+  "warnings": [
+    {
+      "id": "W1",
+      "severity": "low",
+      "description": "Defense-in-depth: several early-return paths (coopmat/device-feature SKIPPED at fuzz.rs:1042-1043/1053-1054/1107; compile_failed in the --violate leg at fuzz.rs:1084) discard the already-accumulated `worst` (which may hold a FAIL/ERROR from a prior run or the determinism leg). Not a demonstrable severity-inversion TODAY: coopmat/DeviceFeatureUnsupported are static capability errors that fire on run 0 / the determinism leg before any FAIL is recorded (and cannot recur once a dispatch has succeeded), and the compile_failed path returns ERROR which out-ranks FAIL anyway. But it is latent fragility -- a future dispatch path with a non-deterministic skip condition could mask a real failure with SKIPPED (exit 0). Recommend folding these into record_worst rather than raw early-return so the max-fold is the ONLY exit.",
+      "file": "crates/axc-driver/src/fuzz.rs",
+      "line": "1042, 1053, 1107, 1084"
+    },
+    {
+      "id": "W2",
+      "severity": "low",
+      "description": "negate_one (fuzz.rs:452-485) is sound for the shipped/pinned violate target gt(alpha,0)->0.0 (verified on real GPU: AT-2899 fires) but its GENERAL negation is not guaranteed to land OUT of the satisfying set for two under-tested shapes: (a) f32 Ge/Le/Eq use k+/-1.0, which for large-magnitude literals (|k| >= 2^24) collapses to k in f32, so the 'violating' value still satisfies the predicate; (b) trivially-un-violatable predicates (u32 ge(x,0), or an unbounded le) whose complement is empty -- negate returns a non-violating value. In both cases the --violate leg would emit a FALSE precondition_check_did_not_fire FAIL, wrongly implicating the M3.17 lowering. NOT reachable by any shipped fixture (v1 pins alpha/gt, --violate is opt-in and defer-list-first-shed), and it fails toward a loud FAIL not a silent PASS -- so it does not make the tool LIE about a clean kernel. But a general-purpose negation function on a verification tool should either guard these shapes (skip a check whose complement is empty/ULP-degenerate) or document the restriction. Same class: an adjacent-ULP open float interval (e.g. two float preconditions with near-2^24 integer literals) escapes FloatDomain::check_sat and surfaces as a LOUD satisfier_unsound ERROR (exit 2) rather than Unsat -- acceptable (fails loud, no false pass), noted for completeness.",
+      "file": "crates/axc-driver/src/fuzz.rs",
+      "line": "452-485, 173-188"
+    }
+  ],
+
+  "f32_discipline_check": "PASS -- the entire float path is f32. sample_float_constrained draws f32 (draw_f32_inclusive, fuzz.rs:384-386); the only f64 touch is the round-trip through fit_float_literal(f32-as-f64, F32) which is provably lossless (f32->f64 exact, fit back to nearest-f32 = same f32). Open bounds use f32::next_up/next_down (fuzz.rs:308-317), never an f64 nextafter; open-lower-at-0 floors at f32::MIN_POSITIVE (FTZ-safe). The host re-check (eval_check_host, fuzz.rs:646-664) decodes f32::from_le_bytes and compares in f32 (eval_cmp_f32). AT-2891 std430-bytes-not-f64 unit (fuzz.rs:1336-1346) pins this with 0.1f32. The host re-check reads the SAME `sampled` byte map that encode_push_constants memcpys verbatim into the push-constant buffer (fuzz.rs:436-448 -- a copy, NOT a re-encode), so there is ZERO drift between the value the host evaluates and the value the GPU saw. Confirmed empirically on real NVIDIA: host_recheck={gpu_flag_words0:0, host_constrained_satisfied:true} in the top-left quadrant.",
+
+  "satisfier_adversarial_check": "PASS -- I drove all of these through the built binary end-to-end: gt(n, u32::MAX) -> UNSATISFIABLE 'interval empty: [4294967296, 4294967295]' exit 3; lt(n, 0) on u32 -> UNSATISFIABLE '[0, -1]' exit 3; eq(alpha,3) & ne(alpha,3) f32 -> UNSATISFIABLE 'eq pin 3 conflicts with ne 3' exit 3; gt(alpha,10) & lt(alpha,5) f32 -> UNSATISFIABLE '(10, 5)' exit 3. i128 integer arithmetic prevents overflow at the u32/i32 extremes; ne resample is bounded (64 tries then linear scan, fuzz.rs:369-380 -- no infinite loop); draw_int_inclusive guards lo>=hi. All 27 shipped satisfier/discriminator units pass.",
+
+  "oracle_integrity_check": "PASS -- grepped fuzz.rs: all 4 flag-decoding dispatch sites use dispatch_debug_checked (fuzz.rs:872, 1027, 1077, 1082); dispatch_handle NEVER appears (the release smoke path correctly uses vk.dispatch, which needs no decode). Per-dispatch flag zero-init confirmed in the UNTOUCHED runtime (dispatch.rs:170-171: fresh [0u8;8] pushed every call, popped back) -- flag state cannot leak between runs. Determinism leg (fuzz.rs:987-1014) dispatches identical (words,meta,inputs,pc) twice and compares via the reused find_nondeterminism (byte-exact over every non-skipped output buffer, rewrite_verify.rs). AT-2897 GUARD independently reproduced on real NVIDIA: the postcondition oracle FIRES (flag word 0x00000001), proving a dispatch_handle-style mis-wire would be caught.",
+
+  "verify_c2_walk_check": "PASS -- check_arity_drop (verify.rs:225-245) walks raw AST annotations by name+args.len()!=1; it cannot false-positive on a legitimate single-arg call regardless of whitespace/nesting because it counts AnnotationArg nodes (args.len()), not text. AT-2883 differential guard (verify.rs:459-473) independently re-walks the AST and asserts {verify-flagged set} == {lower.rs args.len()!=1 drop set}, and the control (verify.rs:450-451) asserts compile_source_with_meta STILL SUCCEEDS on the arity-drop fixture -- proving compile behavior byte-unchanged. QA additionally byte-diffed SPIR-V from a fresh main worktree (empty diff). C1 strict scan reads kd.annotations directly (verify.rs:176-219), correct since HIR no-ops @strict.",
+
+  "exit_code_truthfulness": "PASS -- ran the built binary across the full matrix: verify PASS->0, FAIL(strict)->1, FAIL(arity)->1, ERROR(missing file)->2; fuzz UNSATISFIABLE->3, ERROR(no --fuzz)->2, ERROR(runs 0)->2, ERROR(satisfiable no size)->2, PASS->0 (real NVIDIA), FAIL(postcondition)->1 (AT-2897 pinned triple). Every code matches the spec §2.5/§3.6 tables literally. The QA-blocking AT-2893 CLI ordering defect is FIXED (main.rs:196-206 threads Vec::new() through so fuzz_kernel's solve()-based UNSATISFIABLE short-circuit runs before the buffer-size gate); the satisfiable-kernel-still-usage-errors regression guard (at_2893b) passes.",
+
+  "test_integrity_check": "PASS -- no vacuous tests found. AT-2897 asserts on REAL decoded output (verdict==Fail, reason.kind==postcondition_violation, counterexample alpha>=1000, flag word set) -- it FIRES, not merely runs (independently reproduced on NVIDIA: alpha=1237.4, 0x00000001). The 4-quadrant units (fuzz.rs:1293-1333) and composition unit (fuzz.rs:1376-1385) assert the classifier's actual output. AT-2892 relational-defer unit asserts the note + bit partition. fuzz_cli.rs drives the real binary as a subprocess (not an internal shortcut).",
+
+  "spirv_val_check": "N/A -- zero SPIR-V/codegen change (git diff main...HEAD on crates/axc-lexer|axc-parser|axc-hir|axc-codegen|axc-runtime is empty; the fuzzer reuses the M3.17 GPU-proven debug pipeline verbatim).",
+  "ub_check": "PASS -- no unwrap/panic on library paths that can be reached with adversarial input; the two expect() calls in the --violate orchestration (fuzz.rs:1067) are guarded by a prior select_violate_target Some-check; i128 arithmetic avoids integer overflow; encode_push_constants bounds-checks slot ranges (fuzz.rs:442).",
+  "race_condition_check": "PASS -- no new shared-memory/barrier code; single-threaded orchestration over an existing dispatch API.",
+  "vendor_divergence_check": "PASS -- non-coopmat/non-shared fixture; GPU ATs typed-skip on CoopMatUnsupported/DeviceFeatureUnsupported/gpu_unavailable; I confirmed the tool runs on the picked-up NVIDIA ICD and the design notes Lavapipe cross-vendor coverage.",
+
+  "build_and_tests": {
+    "clippy_all_targets_D_warnings": "clean",
+    "fuzz_lib_units": "27/27 pass",
+    "verify_and_cli_units": "included in axc-driver lib pass",
+    "fuzz_cli_subprocess": "2/2 pass",
+    "fuzz_gpu_nvidia_ignored": "4/4 pass (AT-2896/2897/2898/2899 on NVIDIA RTX PRO 6000 Blackwell)",
+    "full_driver_integration_suite": "0 failed across all test binaries"
+  },
+
+  "frozen_invariants_status": "intact -- zero diff on all compiler/runtime crates; the only non-create edit is the rewrite_verify.rs pub(crate) visibility bump on find_nondeterminism (+ doc), which does not breach the zero-compiler-change gate.",
+
+  "design_issues_for_architect": [],
+
+  "summary": "APPROVE. The clause the orchestrator resolution specifically routed to me -- the r4 severity ordering ERROR > FAIL > UNSATISFIABLE > UNCONSTRAINED_PRECONDITION_FIRED > SKIPPED > PASS with demotion-to-note -- is implemented via a single severity_rank comparator used for BOTH the per-run max-fold (classify_run) and the aggregate fold (record_worst), with UNSATISFIABLE/SKIPPED correctly modeled as pre-loop short-circuits rather than per-run outcomes. The AT-2892 composition unit exists, fires, and proves a deferred-condition fire cannot mask a same-run postcondition FAIL. I independently confirmed on real NVIDIA that the oracle is not a liar: the postcondition guard (AT-2897) genuinely fires, the violate leg (AT-2899) fires, PASS engages the debug oracle with a populated f32 host re-check in the top-left quadrant. The satisfier withstood every adversarial input (integer-extreme overflow, u32<0, float eq/ne conflict, crossed float bounds -- all loud UNSATISFIABLE/exit 3). Exit codes match the spec tables literally and the prior QA-blocking AT-2893 CLI ordering bug is fixed. Two low-severity, non-blocking warnings (W1 early-return worst-discard fragility; W2 general negate_one soundness for ge/le-large-literal and un-violatable predicates) -- both latent, unreachable by shipped fixtures/v1 scope, and both fail toward a LOUD verdict rather than a silent false-pass, so neither breaches the 'a verification tool's lies are worse than its absence' bar. Recommend they be tracked as follow-ups, not gates."
+}
