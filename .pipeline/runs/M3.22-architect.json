@@ -1,0 +1,55 @@
+{
+  "verdict": "REVISED",
+  "agent": "architect",
+  "milestone_id": "M3.22-cleanup",
+  "review_cycle": "r3",
+  "cycle": "FINAL",
+  "responds_to": ".pipeline/runs/M3.22-pessimistic-design-review.json (cycle r2: optimistic APPROVE, pessimistic NEEDS_REVISION, ONE HIGH + two MEDIUM, spec-text-only)",
+  "code_delta_vs_r2": "ZERO. Every r3 change is spec text. The resolve_single_variant ~15-LOC fix and AT-2983 are UNCHANGED. LOC ~165 net and AT range AT-2973..2984 both UNCHANGED.",
+  "summary": "r3 applies the single HIGH (spec-text) fix from pessimistic cycle 2 and folds the two MEDIUM framing notes. r2 mis-stated which code path the MCP grid_search tool uses and shipped an UNSATISFIABLE AT-2984 (it required both variants to dispatch bit-exact through run_optimize, whose bench is a mock). r3 re-verified all three source facts before rewriting: (1) run_optimize uses a MOCK bench (fixed 1000ns, correctness_fn=None, optimize.rs:127-134) and compiles its final winner artifact TEXTUALLY (compile_source_with_assignments_kernel, optimize.rs:~157); (2) MCP grid_search resolves variants TEXTUALLY via bench_variant::handle -> compile_source_with_assignments_kernel (bench_variant.rs:234) and bench_variant GENUINELY dispatches (vk.prepare_kernel -> vk.dispatch_handle) + runs check_correctness (bench_variant.rs:~283..~312); (3) resolve_single_variant's ONLY consumer is run_optimize. §1.2b is reworded to this verified two-entry-point reality; AT-2984 is replaced by a satisfiable two-leg test; the mock-bench and single-kernel-scope MEDIUMs are folded; the @workgroup(?WG) convention-keyed asymmetry is recorded as a §7 defer. The resolve_single_variant fix + AT-2983 stay correct. Core design UNCHANGED.",
+  "fixes_applied": [
+    {
+      "severity": "HIGH",
+      "reviewer_finding": "AT-2984 UNSATISFIABLE + §1.2b mis-states the MCP path (MCP grid_search is textual via bench_variant, never touches resolve_single_variant; run_optimize's only consumer of resolve_single_variant uses a mock bench + correctness_fn=None, never dispatches, never checks correctness; and the real-dispatch route hits the @workgroup(?WG) convention-key trap).",
+      "resolution": "SPEC-TEXT. (i) §1.2b rewritten to the verified two-entry-point map: TEXTUAL path (axc compile / MCP bench_variant / MCP grid_search, all via compile_source_with_assignments_kernel) already benchmarks shared-len variants FOR REAL once the parser accepts ?WG; NON-TEXTUAL path (run_optimize -> resolve_single_variant -> emit_module) is the ONLY consumer of the fix, whose honest bounded payoff is SOLELY to stop `axc optimize` failing-closed (NoSuccessfulVariants) on a shared-len hole. The r2 headline 'the autotuner truly benchmarks shared-tile variants' is DOWNGRADED. (ii) AT-2984 replaced by a satisfiable two-leg test: Leg A (no GPU) run_optimize returns Ok, writes a winner, and the textually-compiled winner .spv's OpTypeArray shared length == winning WG (disasm/metadata-checkable), explicitly NOT asserting any timing/GPU output (mock bench); Leg B (GPU) the textual MCP grid_search path genuinely dispatches BOTH WG in {32,64} variants on Lavapipe with real non-mock timings, neither correctness_rejected (oracle Ok or NotChecked acceptable). AT-2983 kept as the honest unit proof of the fix; AT-2977 kept as textual GPU proof."
+    },
+    {
+      "severity": "MEDIUM",
+      "reviewer_finding": "The headline 'unblocks hole-tuned shared tiles THROUGH THE AUTOTUNER' / 'truly benchmarks shared-tile variants' is not honestly delivered on the run_optimize path (mock bench, correctness_fn=None; winner is ordinal-0 by tie).",
+      "resolution": "SPEC-TEXT. §1.2b now states plainly that run_optimize's bench is a mock and correctness_fn=None, so no variant is dispatched or correctness-checked on that path; the fix's only real deliverable there is preventing NoSuccessfulVariants. The real per-variant shared-tile benchmark is relocated to the textual MCP grid_search path (AT-2984 Leg B). Pre-existing M2.3 mock, honestly noted, not introduced or fixed by this milestone."
+    },
+    {
+      "severity": "MEDIUM",
+      "reviewer_finding": "resolve_single_variant is single-kernel (grid_search wraps one resolved kernel; run_optimize benches only the select_kernel-chosen kernel); the multi-kernel sibling's shared[?WG] is resolved textually by the F4 cross-validate, not by the fix. 'makes both entry points first-class' over-generalizes.",
+      "resolution": "SPEC-TEXT. §1.2b adds an explicit 'Scope' paragraph: the fix resolves the SINGLE benched kernel's shared-len hole only; siblings remain textual via F4 (substitute_strategy_holes -> compile_module_all, optimize.rs:~155). The Files-to-modify enumerator.rs row carries the same scope note. The over-general 'first-class both entry points' phrasing is removed."
+    }
+  ],
+  "mcp_leg_reality_check": {
+    "claim": "AT-2984 Leg B (textual MCP grid_search) genuinely benchmarks shared-len variants for real on Lavapipe.",
+    "verified": true,
+    "evidence": "crates/axc-driver/src/mcp/tools/bench_variant.rs: handle() compiles textually (compile_source_with_assignments_kernel, line 234), validates SPIR-V, then vk.prepare_kernel(...) and, per sample, vk.dispatch_handle(...) (REAL GPU dispatch, ~line 296), and finally check_correctness(...) (real oracle). crates/axc-driver/src/mcp/tools/grid_search.rs:307-321 loops variants calling bench_variant::handle. Confirmed NOT a mock. HONEST CAVEAT recorded in AT-2984 Leg B: the correctness oracle is device-keyed and may return CorrectnessStatus::NotChecked for the two-pass reduction (outside its reference set); Leg B's load-bearing claim is therefore genuine dispatch + real non-mock timings + no correctness_rejected, NOT an oracle Ok verdict. The @workgroup trap does not apply to Leg B because the MCP path substitutes ?WG textually in BOTH @workgroup and shared."
+  },
+  "unchanged_from_r2": [
+    "resolve_single_variant ~15-LOC code fix (by-name shared-len substitution; SharedTy.len stays u32; clears len_hole; leaves unmatched names for the fail-closed backstop).",
+    "AT-2983 (unit): resolve_single_variant substitution + fail-closed negative arm.",
+    "AT-2977 (textual GPU): restored two_pass_reduce.axc via substitute_strategy_holes -> compile_source_with_meta_kernel -> dispatch, out[0]==Sigma(input) bit-exact.",
+    "validate() deletion scope (§2.2): three direct callers (workgroup_dim_tiers, product_128_is_clean_no_warning, product_over_ceiling_is_error) + orphaned make_module + two dead HirError twins (SharedMemoryTooLarge/LocalArrayTooLarge); seven lower_module/pipeline_errors tests KEPT; lower.rs:1439/1450/1460/1434 boundary coverage confirmed.",
+    "Stale-comment list (local.rs:24, shared.rs:27, tests/local_array_typecheck.rs:151, tests/shared_typecheck.rs:165).",
+    "SharedDecl citation shared.rs:105 / SharedTy.len shared.rs:46.",
+    "Minimal-sound representation (SharedTy.len u32 + additive len_hole + emit_module UnresolvedSharedLenHole backstop), FOLD-AND-DELETE -> DELETE, shared-only/local-array-deferred asymmetry (§3), golden-identity (byte-identical corpus)."
+  ],
+  "new_defer_item": "§7 item 6 (r3): resolving @workgroup(?WG) by the hole's own name in resolve_single_variant (today convention-keyed on workgroup_x/y/z, so a WG-named workgroup hole stays (1,1,1) on the HIR path). HARMLESS today (path is mock-benched and never dispatches; winner artifact is textual). Recorded as a deliberate limitation, not fixed.",
+  "at_range": "AT-2973 .. AT-2984 (UNCHANGED; AT-2984 rewritten to two legs A+B, not renumbered).",
+  "loc": "~165 net UNCHANGED (r3 is spec-text only). Cap 300.",
+  "outputs_written": [
+    ".pipeline/milestones/M3.22-cleanup.md (r3: status line, §1.2b rewrite, AT-2984 two-leg replacement, enumerator.rs Files row scope note, §7 defer item 6, self-check, r3-changelog appended; r2-changelog retained as history)",
+    ".pipeline/runs/M3.22-architect.json (this file)"
+  ],
+  "self_check": {
+    "responded_to_all_findings": true,
+    "spec_text_only_zero_code_delta": true,
+    "at_satisfiable": "AT-2984 Leg A is checkable without GPU (run_optimize returns Ok + winner .spv OpTypeArray length == WG via disasm/metadata); Leg B is GPU-gated and rides the verified-real bench_variant dispatch path. AT-2983 and AT-2977 unchanged and satisfiable.",
+    "mcp_dispatch_verified_in_source": true,
+    "core_design_unchanged": true
+  }
+}

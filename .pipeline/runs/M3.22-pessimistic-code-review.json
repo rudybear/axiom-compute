@@ -1,0 +1,63 @@
+{
+  "verdict": "APPROVE",
+  "agent": "pessimistic_code_reviewer",
+  "milestone_id": "M3.22-cleanup",
+  "spec_revision": "r3",
+  "branch": "coder/M322-20260715-0900/M3.22-cleanup",
+  "commit_reviewed": "73bb76e",
+  "critical_bugs": [],
+  "warnings": [
+    {
+      "id": "PW-1",
+      "severity": "low",
+      "title": "Spurious UnusedStrategyHole warning for a hole referenced ONLY in a shared-len position",
+      "file": "crates/axc-hir/src/lower.rs",
+      "line": "1326-1354 (collect_hole_refs_in_args / referenced_holes) + 288-306 (new shared-len check)",
+      "description": "The unused-hole tracking set `referenced_holes` is populated ONLY by `collect_hole_refs_in_args`, which walks annotation args (@workgroup etc.). M3.22 introduced a NEW hole reference site — `shared[T, ?name]` length — but that site is NOT added to `referenced_holes`. Consequence: a @strategy hole used exclusively in a shared-len position (e.g. AT-2984·A's own fixture `@workgroup(64,1,1) @strategy { WG: ?[32,64] } ... shared t: shared[i32, ?WG]`) is spuriously reported `HirWarning::UnusedStrategyHole { name: \"WG\" }` on the RAW lower path (discovery / run_optimize / fail-closed compile), even though WG IS genuinely used.",
+      "evidence": "Reproduced directly: `axc compile fixture.axc` (no assignment) emits `warning: UnusedStrategyHole { name: \"WG\" }` immediately before the (correct) `UnresolvedStrategyHole` codegen error. two_pass_reduce and the AT-2984·B fixture do NOT trip it only because WG is ALSO used in `@workgroup(?WG)` there (collected from the annotation). The textual --strategy-value path never trips it because substitution removes the hole pre-parse.",
+      "impact": "Cosmetic / diagnostic-accuracy only. NON-BLOCKING: the hole is still discovered and enumerated (AT-2984·A completes, winner .spv correctly sized to WG, both AT-2984·B variants enumerate), codegen and correctness are unaffected. Not covered by any AT. Route to Architect as a one-line follow-up (add shared-decl len_hole names to `referenced_holes`) or a defer-list row.",
+      "route": "Architect (minor follow-up / defer-list)"
+    },
+    {
+      "id": "PW-2",
+      "severity": "low",
+      "title": "AT-2984·A's OpTypeArray-length assertion is a loose OpConstant scan, not an OpTypeArray-length-operand check",
+      "file": "crates/axc-driver/src/optimize.rs",
+      "line": "306-317 (asm_has_opconstant_value) used at at_2984a_... 388-391",
+      "description": "AT-2984·A verifies the winner .spv's shared length via `asm_has_opconstant_value(asm, winning_wg)`, which returns true if ANY disassembled line contains `OpConstant` and ends with the winning value's token. It does NOT resolve the OpTypeArray's length-operand id back to its OpConstant. If a future codegen change introduced an unrelated `OpConstant <winning_wg>` (e.g. a loop bound coincidentally equal to WG) the assertion could pass even if the array were mis-sized. Also, the .spv and the sidecar are both written from the SAME in-memory winner_assignments, so this is winner-internal-consistency, not a recompile-and-cmp cross-validation.",
+      "evidence": "Independently disassembled the substituted artifacts by parsing OpTypeArray(op=28) -> length-operand -> OpConstant(op=43): WG=32 yields OpTypeArray length constant 32, WG=64 yields 64 (the STRONG check the test approximates). Byte-cmp of the two variants differs at the length constant only. So the fix is correct; the test's phrasing of the check is just weaker than its own docstring claims (\"OpTypeArray shared length equal to the winning WG\").",
+      "impact": "Test-robustness nit. The underlying behavior is correct (verified by exact operand-resolving disasm + AT-2975 byte-identity + AT-2984·B real dispatch). Not blocking.",
+      "route": "defer / test-hardening backlog"
+    },
+    {
+      "id": "PW-3",
+      "severity": "informational",
+      "title": "Spec §1.3's F2-strip justification for the codegen backstop is slightly imprecise (defense is actually stronger)",
+      "file": ".pipeline/milestones/M3.22-cleanup.md",
+      "line": "80 (§1.3)",
+      "description": "§1.3 motivates `CodegenError::UnresolvedSharedLenHole` by 'F2 strips the @strategy block, so a shared-len hole would slip past the strategy-hole backstop'. In reality, on ANY textual F2-strip path the NEW lower.rs check (288-306) fires `HirError::UndefinedStrategyHole` at the driver's HIR-error gate BEFORE codegen (verified: MCP compile_variant with empty map fails HIR-level, never reaches emit). The codegen backstop's genuinely-sole-guard role is the ENUMERATOR path (`resolve_single_variant` -> `emit_module`), where @strategy is present at lower time (so no UndefinedStrategyHole) but the variant assignment may omit the hole name (AT-2983 negative). Both paths fail closed; the guarantee holds. This is a doc-precision note, not a code defect — QA flagged the same nuance.",
+      "impact": "None. Fail-closed is proven on every path exercised.",
+      "route": "none (informational)"
+    }
+  ],
+  "adversarial_probes": {
+    "f2_strip_hazard": "COVERED. Textual F2-strip path -> lower.rs UndefinedStrategyHole (HIR gate, pre-codegen). Enumerator path -> codegen UnresolvedSharedLenHole (AT-2983 negative, re-ran green). No path reaches OpTypeArray sized from placeholder 1. Fail-closed everywhere.",
+    "placeholder_leakage": "CLEAN. shared_memory_bytes metadata is computed at lib.rs:215-223 AFTER emit_module_bytes at lib.rs:193 (the backstop) — a holed kernel errors at emit before any metadata is built, so placeholder-1 never surfaces in metadata/verify/log-opt. typecheck.rs aggregate shared-byte check is skipped (typecheck.rs:1443) only while a hole is present; discovery never codegens, so undercount is harmless; the cap re-engages the instant the value is concrete (independently reconfirmed). Per-decl SharedZeroLength/SharedTooLarge pass at len=1. No misleading diagnostic before the backstop except PW-1 (cosmetic).",
+    "enumerator_substitution": "CLEAN. resolve_shared_len_holes keys on the hole's OWN name, clears len_hole on positive value, leaves Some(_) (fail-closed) on absent/<=0. KernelBody has only {Empty,Typed}, so the `else -> Empty` cannot silently drop a Typed body. Pathological 'hole named workgroup_x used as a shared len' is benign: resolve_wg_dim and resolve_shared_len_holes would both read the same assignment value (same value, no crash, fail-closed preserved). The @workgroup(?WG)-convention-vs-own-name asymmetry is recorded §7 defer #6, harmless (run_optimize path is mock-benched and never dispatches; winner artifact is compiled textually where ?WG resolves in both positions).",
+    "cross_kernel_sharing_regression": "NONE. The new shared-len UndefinedStrategyHole check (lower.rs:296-303) is EXACT parity with the pre-existing @workgroup hole-ref check (validate_hole_refs_in_args, lower.rs:1396-1404): both test the kernel's OWN @strategy map and push the same variant. two_pass_reduce declares @strategy{WG:?[64]} in BOTH kernels (self-contained), AT-2974 lowers with zero hir errors. No new asymmetry vs @workgroup.",
+    "deletion_completeness": "CLEAN. No .rs references to HirError::SharedMemoryTooLarge / HirError::LocalArrayTooLarge or pub fn validate() remain (grep). Remaining textual hits are (a) surviving TypecheckError:: twins, (b) prose in ROADMAP.md / the M3.22 spec, (c) HISTORICAL milestone docs M3.20-local-arrays.md:222/421 (immutable pipeline records, out of this milestone's file scope). All exhaustive HirError matches compile (build + clippy -D warnings clean). No doc_accuracy/CHANGELOG stringly-ref now lies about a live symbol.",
+    "two_pass_reduce_disasm": "CLEAN. Operand-resolving disasm (OpTypeArray op=28 length-operand -> OpConstant op=43): WG=32 -> array length 32, WG=64 -> array length 64. AT-2975 proves substituted ?WG->64 is byte-identical to the literal shared[i32,64] form. QA confirmed bit-exact GPU (gpu_sum==cpu_sum==-3) on real NVIDIA RTX PRO 6000 AND Lavapipe. Corpus-golden exclusion of the now-holed two_pass_reduce is principled (it is dispatched only via the substitution path in dispatch_two_pass_reduce.rs; no in-repo test compiles it raw + byte-cmps).",
+    "at2984_leg_a_integrity": "PASS with PW-2 nit. Leg A re-ran green; sidecar winner_assignments.WG and the winner .spv share one in-memory assignment (winner-internal-consistency). The .spv-length check is a loose OpConstant scan (PW-2) but the exact behavior is correct by operand-resolving disasm.",
+    "seven_kept_tests_run": "CONFIRMED. validate.rs has exactly 7 #[test] fns; all 7 spec-named kept tests present and PASS (cargo test -p axc-hir --lib: 318 passed / 0 failed / 0 filtered-out mismatch). The 4 lower.rs boundary tests (zero_dim, product_128/129/1024) present and passing. 3 direct-caller tests + make_module deleted, nothing else."
+  },
+  "build_check": "PASS (cargo build --workspace clean)",
+  "clippy_check": "PASS (cargo clippy --workspace --lib --tests -- -D warnings, exit 0)",
+  "test_suite": "PASS (cargo test --workspace: 1339 passed / 0 failed / 135 ignored — reproduced independently, matches QA + coder exactly)",
+  "spirv_val_check": "PASS (validation-only milestone; no codegen-output change on the substituted/literal path — AT-2975 byte-identity + AT-2958 spirv-val on both two_pass_reduce kernels)",
+  "ub_check": "PASS (no new codegen, no atomics/barriers/subgroup ops touched; SharedTy.len stays u32; no array sized from a placeholder — fail-closed backstop verified on every reachable path)",
+  "race_condition_check": "PASS (no shared-memory access pattern, barrier, or execution-scope change; two_pass_reduce keeps its existing workgroup_barrier discipline, GPU bit-exact)",
+  "vendor_divergence_check": "PASS (byte-identical example corpus vs main per QA's fresh-worktree cmp; GPU bit-exact on both NVIDIA and Lavapipe)",
+  "memory_footprint_ok": true,
+  "repo_writes": "ONLY this verdict file. All scratch fixtures/spv removed; git working tree otherwise matches commit 73bb76e.",
+  "summary": "APPROVE. M3.22 is a clean, validation-only cleanup: the shared[T,?name] parser fix carries the hole as additive metadata (SharedTy.len stays u32), resolves it at both the textual-substitution and enumerator points, and fails closed via a single codegen backstop; validate() and its two dead HirError twins are deleted with exactly the 3 direct-caller tests + make_module removed and 7 end-to-end tests kept. I independently reproduced build/clippy/full-suite (1339/0/135), operand-resolved the OpTypeArray length to 32/64 at the two WG candidates, confirmed fail-closed on every reachable path (lower UndefinedStrategyHole on textual F2-strip; codegen UnresolvedSharedLenHole on the enumerator variant), confirmed shared_memory_bytes metadata is computed strictly AFTER the emit backstop (no placeholder-1 leakage), and confirmed the new shared-len hole-ref check is exact parity with the existing @workgroup check (no cross-kernel-sharing regression). No critical bugs, no UB, no races, no vendor divergence. Three non-blocking findings: PW-1 (LOW) a hole used only in a shared-len position is spuriously flagged UnusedStrategyHole because reference-tracking scans annotations only — cosmetic, does not affect discovery/enumeration/codegen; PW-2 (LOW) AT-2984·A's length assertion is a loose OpConstant scan rather than an OpTypeArray-length-operand check; PW-3 (informational) the spec's F2-strip justification is imprecise (the real defense is stronger). PW-1 routes to the Architect as a minor follow-up/defer; none block merge."
+}

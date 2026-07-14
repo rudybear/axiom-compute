@@ -1,0 +1,33 @@
+{
+  "verdict": "APPROVE",
+  "agent": "optimistic_code_reviewer",
+  "milestone_id": "M3.22-cleanup",
+  "spec_revision": "r3",
+  "branch": "coder/M322-20260715-0900/M3.22-cleanup",
+  "spec_compliance": true,
+  "positive_feedback": [
+    "ParsedSharedLen { Lit(u32), Hole(String) } is exactly the minimal-sound representation the spec called for: parser.rs's two call sites (parse_shared_type_args, parse_shared_decl_stmt) each handle it correctly -- type-position collapses Hole to the documented placeholder 1 (unreachable downstream anyway), decl-stmt carries (len=1, len_hole=Some(name)) additively.",
+    "SharedDecl.len_hole threading is genuinely additive: SharedTy.len stays u32 everywhere (shared.rs, typecheck.rs's register_shared/check_shared_decl_stmt gained a parameter but no existing call-site semantics changed), and every touch-site doc-comment correctly cross-references the invariant ('ty.len stays u32', 'placeholder 1').",
+    "The lower.rs hole-ref validation (UndefinedStrategyHole against declared @strategy holes) and typecheck.rs's aggregate-shared-byte skip (`if !tc.shared_decls.iter().any(|s| s.len_hole.is_some())`) both mirror the spec's cited @workgroup-hole precedent exactly, including the comment linking them.",
+    "emit.rs's UnresolvedSharedLenHole backstop is placed and worded as a direct sibling of the existing UnresolvedStrategyHole backstop, scans tb.shared before any emission, and is unit-tested (AT-2976) with a hand-built undeclared-hole fixture -- fail-closed, no placeholder-1 array possible.",
+    "enumerator.rs's resolve_shared_len_holes is correctly scoped to the single benched kernel (matches KernelBody's only two variants, Empty/Typed, so the KernelBody::Empty fallback for non-Typed bodies is behaviorally identical to the old kernel.body.clone()), keys substitution by the hole's OWN name (correctly distinct from resolve_wg_dim's convention-keyed @workgroup logic), and leaves len_hole untouched (fail-closed) both when the name is absent AND when the assigned value is <= 0 -- a defensive case the spec's prose didn't spell out but is clearly correct.",
+    "The validate() deletion is surgically exact: grep/diff confirm precisely the three named tests (workgroup_dim_tiers, product_128_is_clean_no_warning, product_over_ceiling_is_error) plus the orphaned make_module helper were removed, the seven lower_module/pipeline_errors tests are untouched, and both dead HirError twins (SharedMemoryTooLarge, LocalArrayTooLarge) are gone from validate.rs with lib.rs's re-export list correctly dropping `validate` (keeping HirError/HirWarning).",
+    "All four stale-comment sites named in the r2 LOW fix (local.rs:24, shared.rs:27, local_array_typecheck.rs:151, shared_typecheck.rs:165) are updated to point at the surviving TypecheckError variants instead of the deleted HirError twins; shared_typecheck.rs's SharedDecl pattern match also correctly gained a `..` to tolerate the new len_hole field.",
+    "examples/two_pass_reduce.axc restoration matches the M3.21-documented original intent precisely: both kernels' shared decls flipped from the literal 64 back to ?WG, the DEVIATION comment block replaced with a one-line M3.22 note, and @strategy { WG: ?[64] } (single-candidate) left unchanged -- exactly the 'closes the M3.21 deviation' claim the spec makes.",
+    "ROADMAP.md rows are accurate: both backlog rows struck through and marked RESOLVED(M3.22) with correct AT citations, plus the new array[T,N]-HoleRef deferral row citing AT-2978 as its guard -- matches spec Section 3/7 exactly. Test-count baseline (1339) matches QA's independently-measured figure.",
+    "AT-2984's two-leg split (Leg A: run_optimize completes + winner .spv's OpTypeArray constant matches its own sidecar WG assignment via rspirv disassembly, deliberately NOT asserting which candidate wins since the mock bench ties; Leg B: MCP grid_search genuinely dispatches both WG=32/64 variants with real median_ns and ok/not_checked correctness) is a faithful, honestly-scoped implementation of the r3 rewrite, and QA independently re-ran and hand-verified both legs including out-of-harness JSON-RPC driving on Lavapipe."
+  ],
+  "minor_issues": [
+    {
+      "file": ".pipeline/runs/M3.22-coder.json",
+      "field": "loc_self_report.cap_status",
+      "description": "QA already flagged this (LOW): the coder's self-report states 'even the full raw diff (358 net) stays under cap' which is literally false against the spec's stated 'Cap: 300' (358 > 300). The adjacent implementation_only_estimate (~-49 net, i.e. the test/GPU-scaffolding-excluded figure) is the honest reading and does stay under cap -- the AT-2973..2984 range (12 ATs incl. 2 GPU legs) is spec-mandated acceptance-test surface, not scope creep, so this is a wording defect in the coder's own report file, not a repo code issue and not a cap violation in substance. Does not block approval; would be worth a one-sentence correction in the coder's self-report if this milestone iterates again."
+    }
+  ],
+  "spec_deviations_found": "none",
+  "quality_notes": [
+    "Doc comments throughout the diff consistently cross-reference the spec's own reasoning (why len stays u32, why the codegen backstop exists, why resolve_wg_dim and resolve_shared_len_holes key differently) -- reads as maintainable, not just correct.",
+    "Test additions are proportionate to and clearly traceable to individual AT numbers (AT-2973/2974/2975/2976/2977/2978/2983 x2/2984 A+B), each with a comment explaining what it pins and why."
+  ],
+  "summary": "Implementation matches the r3 spec precisely across both items: the shared-len HoleRef parser/HIR/codegen plumbing is additive and minimal (SharedTy.len stays u32, single emit_module chokepoint backstop), resolve_single_variant's ~15-LOC fix is correctly scoped to the single benched kernel and fail-closed on unmatched names, the validate() deletion removes exactly the three direct-caller tests plus make_module and the two dead HirError twins while preserving all seven end-to-end-coverage tests, two_pass_reduce.axc's restoration matches the original M3.21 intent, and ROADMAP.md accurately reflects both resolutions plus the new deferred array[T,N] row. QA's PASS (9/9 requirements, independently re-verified GPU legs and corpus golden) is corroborated by this read of the diff. One pre-existing LOW wording nit in the coder's self-report JSON (not the codebase) does not affect correctness or scope. APPROVE."
+}

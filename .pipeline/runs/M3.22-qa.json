@@ -1,0 +1,88 @@
+{
+  "verdict": "PASS",
+  "agent": "qa_agent",
+  "milestone_id": "M3.22-cleanup",
+  "spec_revision": "r3",
+  "branch": "coder/M322-20260715-0900/M3.22-cleanup",
+  "requirements_total": 9,
+  "requirements_covered": 9,
+  "requirements_missing": [],
+  "test_results": {
+    "total": 1474,
+    "passed": 1339,
+    "failed": 0,
+    "ignored": 135,
+    "note": "cargo test --workspace, matches coder's claimed 1339 passed / 0 failed exactly; baseline was 1333/135 per project memory, so +6 non-GPU passing tests (the new AT-2973/2978 parser unit tests, AT-2976 codegen unit test, AT-2983 x2 enumerator unit tests, AT-2984 Leg A) with ignored count UNCHANGED at 135 (AT-2974/2975/2977/2984B are folded into existing/GPU-gated ignored tests, not net-new ignored entries)."
+  },
+  "verification_results": {
+    "build_check": "PASS (cargo build --workspace clean)",
+    "clippy_check": "PASS (cargo clippy --workspace --lib --tests -- -D warnings, exit 0, zero warnings)",
+    "diff_check": "PASS — all 17 files.plan-listed (excl. milestone spec doc) match git diff main...HEAD --stat exactly: ast.rs +23/-0, parser.rs +87/-11, shared.rs +15/-2, local.rs +1/-1, typecheck.rs +33/-13, lower.rs +23/-0, validate.rs +20/-236, lib.rs +1/-1, shared_typecheck.rs +1/-1, local_array_typecheck.rs +2/-3, emit.rs +57/-0, enumerator.rs +146/-6, optimize.rs +71/-0, dispatch_two_pass_reduce.rs +67/-7, mcp_roundtrip.rs +101/-0, two_pass_reduce.axc +5/-15, ROADMAP.md +4/-3",
+    "coder_self_report_matches_reality": true
+  },
+  "checks": {
+    "1_build_clippy_suite": {
+      "status": "PASS",
+      "measured": "build clean; clippy --workspace --lib --tests -D warnings exit 0; cargo test --workspace: 1339 passed / 0 failed / 135 ignored (matches coder's claim of 1339 exactly; baseline 1333/135 -> +6 passed, ignored unchanged)"
+    },
+    "2_backstop_fail_closed_own_fixtures": {
+      "status": "PASS (with a nuance noted)",
+      "findings": [
+        "Built fresh QA fixtures (not reused from coder's tests) with shared[i32,?WG].",
+        "axc compile, no assignment (compile_file_kernel path, @strategy present, @workgroup(?WG,1,1) also holed): fails closed with CodegenError::UnresolvedStrategyHole (codegen-level backstop) -- never emits SPIR-V, never sizes an array from placeholder-1.",
+        "MCP compile_variant, no/empty assignments (compile_source_with_assignments_kernel path, which unconditionally strips @strategy text via F2 even with an empty map): fails closed with a HIR-level HirError::UndefinedStrategyHole (2 occurrences: @workgroup hole ref + shared-decl hole ref) -- again never reaches codegen, never emits placeholder-1 SPIR-V.",
+        "WITH assignment (axc compile --strategy-value WG=64 AND MCP compile_variant {\"WG\":64}): both compile successfully; disassembled the emitted SPIR-V (rspirv) and confirmed OpConstant %13 64 / OpTypeArray %4 %18 -- the shared array length is correctly 64 on BOTH entry points.",
+        "NUANCE (informational, not a defect): the literal CodegenError::UnresolvedSharedLenHole variant is NOT reachable via axc compile / MCP compile_variant / bench_variant on any input I could construct, because those entry points always hit an earlier backstop first (UnresolvedStrategyHole at codegen if @strategy survives with a still-holed @workgroup, or HirError::UndefinedStrategyHole at the driver's HIR-error gate if @strategy is textually stripped or the hole is undeclared). This is architecturally correct and matches the spec's own §1.3 explanation (the codegen backstop exists specifically to guard the axc-optimize enumerator's direct emit_module call, which bypasses the driver's HIR-error gate) -- I independently confirmed CodegenError::UnresolvedSharedLenHole DOES fire exactly as designed via AT-2976 (hand-built HIR, workgroup literal + no @strategy block) and AT-2983's negative arm (resolve_single_variant with a mismatched assignment name), both of which I re-ran in isolation and both PASS. Net effect for the user-facing guarantee (\"never placeholder-1 silent miscompile\"): verified true on every path I exercised, via one fail-closed mechanism or another."
+      ]
+    },
+    "3_AT_2984_both_legs": {
+      "status": "PASS",
+      "leg_A": "cargo test -p axc-driver --lib at_2984a_run_optimize_completes_on_shared_len_hole_fixture -> PASS in isolation. Independently re-read the test: run_optimize on shared[i32,?WG] with @strategy{WG:?[32,64]} returns Ok, writes winner .spv + sidecar; sidecar's winner_assignments.WG and the winner .spv's OpConstant/OpTypeArray length were asserted equal by the test itself.",
+      "leg_B": "Ran on Lavapipe (VK_DRIVER_FILES=lvp_icd.json, AXC_ENABLE_GPU_TESTS=1): cargo test -p axc-driver --test mcp_roundtrip at_2984b_grid_search_genuinely_dispatches_both_shared_len_variants -> PASS (device=llvmpipe). Additionally hand-drove the raw MCP grid_search JSON-RPC request myself outside the test harness: both WG=32 and WG=64 variants dispatched with median_ns=156642 and median_ns=150386 respectively -- REAL, DISTINCT, non-mock timings (far from the 1000ns run_optimize mock), correctness.status='not_checked' (acceptable per spec, no CPU oracle registered for this fixture kernel), winner correctly selected (WG=64, lower median). Confirms 'genuine dispatch, real timings' claim end-to-end, not just via the test's own assertions."
+    },
+    "4_gpu_dispatch_two_pass_reduce": {
+      "status": "PASS",
+      "nvidia": "device=NVIDIA RTX PRO 6000 Blackwell Workstation Edition; gpu_sum=-3, cpu_sum=-3; bit-exact (VK_ICD_FILENAMES=nvidia_icd.json)",
+      "lavapipe": "device=llvmpipe (LLVM 20.1.2, 256 bits); gpu_sum=-3, cpu_sum=-3; bit-exact (VK_DRIVER_FILES=lvp_icd.json)",
+      "note": "examples/two_pass_reduce.axc's shared tiles are restored to shared[i32,?WG] in both kernels per spec; both real-hardware and CI-fallback dispatch confirmed bit-exact on n=4096, wg=64, n_parts=64."
+    },
+    "5_deletion_verification": {
+      "status": "PASS",
+      "findings": [
+        "grep confirms `pub fn validate()` no longer exists anywhere in the workspace (only a doc-comment in validate.rs mentioning it was deleted); every remaining `.validate(&words, None)` hit across the tree is spirv-tools' unrelated Validator::validate method.",
+        "grep confirms HirError::SharedMemoryTooLarge and HirError::LocalArrayTooLarge no longer exist; every remaining textual hit of those names is prose/doc-comment/assert-message referring to the surviving TypecheckError:: variants (confirmed by reading local.rs:24, shared.rs:27 -- both now say 'rejected with TypecheckError::...').",
+        "git diff of validate.rs confirms EXACTLY the 3 spec-named tests deleted (workgroup_dim_tiers, product_128_is_clean_no_warning, product_over_ceiling_is_error) plus the orphaned make_module helper -- nothing else removed from that module.",
+        "Confirmed by name-grep that all 7 kept tests (validate_break_outside_loop_rejected_end_to_end, validate_continue_outside_loop_rejected_end_to_end, validate_sg_invocation_id_no_error_no_warning, validate_sg_any_in_if_body_produces_warning, validate_sg_reduce_add_arity_error_is_fatal, tc_coopmat_type_bf16_element_rejected, tc_coopmat_as_kernel_param_rejected) are present and validate.rs now has exactly 7 #[test] fns.",
+        "Confirmed the 4 lower.rs boundary-coverage tests the spec requires to still exist (workgroup_zero_dim_is_error, workgroup_product_128_is_clean, workgroup_product_129_is_warning, workgroup_product_1024_is_warning) are all present."
+      ]
+    },
+    "6_corpus_golden": {
+      "status": "PASS",
+      "method": "Set up a read-only git worktree at main (697c840), built axc there, compiled all 54 non-two_pass_reduce examples/*.axc on BOTH main-worktree and this branch (no assignments), then byte-cmp'd every emitted .spv.",
+      "result": "34/34 successfully-compiling examples byte-IDENTICAL SPIR-V between main and this branch (cmp -s all pass). Exit codes matched exactly (0 vs 1) for all 54 files on both sides -- no file that compiled on one side and failed on the other. For the 20 template files that fail to fully compile on BOTH sides (matmul_*_coopmat*, q4km/q5km_matmul_*_coopmat* -- other unrelated unresolved holes), independently re-extracted every file's exact parse/hir error counts and confirmed this branch's counts are LOWER than main's on every single one (e.g. matmul_shared_f32: main 16 parse/7 hir vs branch 14 parse/6 hir, matching the coder's own cited example exactly), with the error category staying 'N parse errors, M hir errors' on both sides (no new/different error class introduced). Matches the coder's self-reported corpus_golden section exactly."
+    },
+    "7_AT_2978_and_aggregate_cap_skip": {
+      "status": "PASS",
+      "AT_2978_negative": "Built a fresh fixture (array[i32,?N]) independent of the coder's own test and confirmed axc compile rejects it at parse (1 parse error, exit 1) -- array[T,N] hole deferral pinned as claimed.",
+      "aggregate_cap_skip_scoping": "Built two fixtures to isolate the skip: (a) shared[i32,?N] with @strategy{N:?[20000]} (80000 bytes, over the 65536-byte cap) compiled RAW/unresolved -- reaches only the UnresolvedStrategyHole codegen backstop, proving the aggregate shared-memory check was correctly SKIPPED during discovery (0 hir errors, not a spurious SharedMemoryTooLarge on the len=1 placeholder). (b) the SAME fixture compiled WITH --strategy-value N=20000 (a resolved, over-cap variant) correctly REJECTS with TypecheckError::SharedMemoryTooLarge{total_bytes:80000} -- confirmed via a direct compile_source_with_assignments() call. This proves the skip fires ONLY while a hole is present and the cap re-engages the instant the value is concrete, exactly as spec'd."
+    },
+    "8_scope": {
+      "status": "PASS",
+      "runtime_untouched": "git diff main...HEAD --stat -- crates/axc-runtime/ is empty -- zero changes.",
+      "frozen_tolerances_untouched": "no files referencing FROZEN/equiv_fp_tol appear in the diff.",
+      "roadmap_diff": "Both backlog rows (validate() dead-code row from M3.20, shared[T,N] HoleRef parser gap row from M3.21) correctly struck through and marked RESOLVED(M3.22) with accurate one-line summaries; a new deferred array[T,N]-HoleRef backlog row added per spec §3, correctly citing AT-2978 as its guard. Test-count baseline line updated to 1339, matching my measured value exactly."
+    },
+    "9_LOC_reconciliation": {
+      "status": "PASS with one self-report accuracy nit (LOW severity)",
+      "measured": "git diff main...HEAD --shortstat excluding .pipeline/: 17 files changed, 657 insertions(+), 299 deletions(-), net +358 -- matches the coder's self-report exactly (total_diff_vs_main and the '358 net raw' figure both confirmed).",
+      "nit": "The coder's own loc_self_report.cap_status states '...even the full raw diff (358 net) stays under cap' -- this is factually inconsistent with the spec's own stated 'Cap: 300' (358 > 300 by 58 lines, ~19% over the raw cap). The coder's OWN adjacent implementation_only_estimate ('approximately -49 net lines') is the figure that actually stays under cap, and is a defensible reading given the spec's own '~165 net' LOC TARGET is explicitly implementation-scoped (item (a) ~130 + item (b) ~0, NOT counting the AT-2973..2984 test surface, which the spec itself mandates as a 12-item AT range including 2 GPU legs). The large test/GPU-scaffolding addition (dispatch_two_pass_reduce.rs, mcp_roundtrip.rs, and portions of emit.rs/optimize.rs/enumerator.rs/parser.rs) is legitimate, spec-mandated acceptance-test coverage, not scope creep -- so this is a self-report WORDING inaccuracy (a literally false sentence), not a substantive cap violation or scope problem. Recommend the coder correct that one sentence in a future revision, but it does not affect the milestone's correctness or scope."
+    }
+  },
+  "memory_footprint_ok": true,
+  "gpu_hardware_used": {
+    "nvidia": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition (VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json)",
+    "lavapipe": "llvmpipe (LLVM 20.1.2, 256 bits) (VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json)"
+  },
+  "cleanup_note": "All QA-scratch test files (crates/axc-driver/tests/zz_qa_scratch_disasm.rs, zz_qa_scratch2.rs) and stray MCP-history artifacts (.pipeline/history/eefd0cca29ddf43d.jsonl) created during verification were deleted before finishing; git status is clean, working tree matches origin coder commit 73bb76e exactly, no writes made to the repository.",
+  "summary": "All 9 QA directives independently verified against source, not just the coder's self-report. Build/clippy/test suite reproduced exactly (1339/0/135, matches claim). Both entry points (axc compile, MCP compile_variant) fail closed on a missing shared-len-hole assignment (never emit a placeholder-1 array) and correctly resolve to len=64 when assigned, confirmed via independent disassembly. AT-2984 Leg A and Leg B both independently re-run and pass; Leg B additionally hand-verified with real, distinct, non-mock timings on Lavapipe (150386ns / 156642ns vs the 1000ns run_optimize mock). dispatch_two_pass_reduce is bit-exact on both real NVIDIA RTX PRO 6000 and Lavapipe. validate() and its two dead HirError twins are fully deleted with EXACTLY the 3 specified tests + make_module removed and the 7 specified tests kept; no stale comments reference deleted types. Corpus golden reproduced independently via a fresh git worktree at main: 34/34 byte-identical, and the 20 template-file failures show a strictly lower, same-shape error count on this branch, matching the coder's own cited numbers exactly. AT-2978's deferral guard and the aggregate-shared-cap skip's precise hole-present-only scoping were both independently pinned with fresh fixtures I built myself (not reused from the coder's test suite). Scope is clean: axc-runtime and frozen-tolerance surfaces untouched, ROADMAP updated accurately. LOC accounting (657/-299, net 358) matches exactly; one LOW-severity wording nit flagged in the coder's self-report (it claims 358 net 'stays under cap' when the spec's stated cap is 300) that does not affect correctness or scope. VERDICT: PASS."
+}
