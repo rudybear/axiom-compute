@@ -14,6 +14,8 @@ pub mod cli;
 pub mod optimize;
 pub mod mcp;
 pub mod q4km_oracle;
+pub mod q6k_oracle;
+pub mod q5k_oracle;
 
 pub use cli::{Command, Cli};
 
