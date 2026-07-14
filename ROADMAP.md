@@ -320,15 +320,13 @@ Goal: real users.
 
 **Effort:** ~300 LOC.
 
-### EB.3 — `axc bench` CLI subcommand
+### EB.3 — `axc bench` CLI subcommand ✅ DONE (M3.15, 2026-07-13)
 
-**Currently:** users run `cargo bench -p axc-driver` directly. Should have an `axc bench [--filter NAME] [--bless]` wrapper that's easier to discover.
+`axc bench [--filter NAME] [--bless]` wrapper (arg-vector spawn, child-only env; help text carries the don't-run-via-cargo-run target-dir-lock note). AT-2826..2829.
 
-**Effort:** ~200 LOC.
+### EB.4 — Baseline drift fix in current `baselines.json` ✅ DONE (M3.15, 2026-07-13)
 
-### EB.4 — Baseline drift fix in current `baselines.json`
-
-`baselines.json` was reblessed multiple times during the autonomous run; some entries reflect Lavapipe, some NVIDIA, some interleaved. Re-bless on a single machine after EB.2 lands.
+Re-blessed per-machine on the EB.2 v2 schema: exactly two keys (`nvidia_rtx_pro_6000_blackwell_workstation_edition` + `llvmpipe_llvm_20_1_2_256_bits`), 15 full-field entries each, round-trip + two-key-shape enforced (AT-2836/2837, green, not #[ignore]-gated). Box-local Lavapipe ICD is `lvp_icd.json`; CI-canonical Ubuntu name stays `lvp_icd.x86_64.json` (both documented in CLAUDE.md, fenced by AT-2840).
 
 ---
 
@@ -394,15 +392,15 @@ Currently one `@kernel` per file. DESIGN.md hints at multi-kernel modules with c
 
 | Item | Severity | Effort |
 |---|---|---|
-| `BENCHMARKS.md` says "(M2.2)" in heading; should reflect current state | low | 5 min |
-| `M2.6 dispatch_q4km_128` baseline label is `dispatch_q4km_128` while spec says `dispatch_gpu_q4km_128` — naming inconsistency | low | 30 min |
-| `axc lex` output format human-only; spec mentions JSON for M1+ | low | 200 LOC |
-| Stale doc-comment `Float64 cap = 6` in `body.rs:902` (caught by M1.5 reviewer) | trivial | 1 line |
-| AT-103 empty-kernel "bit-exact" test only does determinism guard, not stored golden bytes | medium | 100 LOC |
-| `dispatch_gpu_amortized` has only 1 entry (saxpy_1m); should add q4_0/q4_km amortized too | low | 100 LOC |
-| `axc-runtime` exposed surface includes some `pub(crate)` items leaking into `pub` | low | review pass |
-| No `CHANGELOG.md` | low | 30 min |
-| `strip_strategy_annotation_block` naive first-occurrence `source.find("@strategy")` latches onto the substring in comments/prose — footgun hit + dodged in M3.14; needs a durable fix or doc warning | medium | 100 LOC |
+| ~~`BENCHMARKS.md` says "(M2.2)" in heading~~ ✅ resolved pre-M3.15; freshness note added (M3.15) | — | — |
+| `M2.6 dispatch_q4km_128` baseline label naming inconsistency — DEFERRED in M3.15 (breaking baseline-key churn, low value) | low | 30 min |
+| `axc lex` output format human-only; spec mentions JSON for M1+ — DEFERRED in M3.15 | low | 200 LOC |
+| ~~Stale doc-comment `Float64 cap = 6` in `body.rs:902`~~ ✅ already fixed in-tree (verified M3.15, grep-fenced) | — | — |
+| ~~AT-103 empty-kernel golden bytes~~ ✅ DONE (M3.15): full-byte golden `.spv` committed, AT-2838 | — | — |
+| `dispatch_gpu_amortized` has only 1 entry (saxpy_1m) — DEFERRED in M3.15 (GPU-measured bench surface, widens re-bless scope) | low | 100 LOC |
+| `axc-runtime` pub-surface review — DEFERRED in M3.15 (needs cargo-public-api tooling; no concrete leak found) | low | review pass |
+| ~~No `CHANGELOG.md`~~ ✅ DONE (M3.15): milestone-level backfill M0→M3.15, AT-2839 | — | — |
+| ~~`strip_strategy_annotation_block` naive substring footgun~~ ✅ FIXED (M3.15): lexer-token anchor, comment/string-safe, AT-2830..2835 incl. examples-corpus regression anchor | — | — |
 | M3.14 golden fixtures are annotated hand-computed-from-formula (permitted §6 fallback); a real ggml-quantized byte-dump cross-check for Q6_K/Q5_K_M is still owed as a drop-in | low | 200 LOC |
 
 ---
