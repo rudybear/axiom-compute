@@ -18,6 +18,11 @@ pub mod q6k_oracle;
 pub mod q5k_oracle;
 /// M3.16 (FG.1): `verify_rewrite` — the LLM structural-rewrite verifier core.
 pub mod rewrite_verify;
+/// M3.18 (FG.8): `axc verify` — static annotation/consistency checker (front-end only).
+pub mod verify;
+/// M3.18 (FG.8): `axc test --fuzz` — precondition-satisfying input fuzzer with a
+/// runtime debug-check oracle.
+pub mod fuzz;
 
 pub use cli::{Command, Cli};
 

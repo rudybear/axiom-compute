@@ -81,7 +81,190 @@ fn main() -> miette::Result<()> {
                 workgroups, push_constants_base64, seed, strategy_values,
             )
         }
+        Command::Verify { input, json } => run_verify(input, json),
+        Command::Test {
+            input, fuzz, runs, seed, debug_oracle, no_debug_oracle, violate,
+            buffer_sizes, size, workgroups, scalar_window, strategy_values,
+        } => run_test(
+            input, fuzz, runs, seed, debug_oracle, no_debug_oracle, violate,
+            buffer_sizes, size, workgroups, scalar_window, strategy_values,
+        ),
     }
+}
+
+/// M3.18 (FG.8): `axc verify` handler.
+///
+/// Pure front-end (no GPU, no Vulkan probe at all). Reads the source, calls
+/// `verify::verify_source`, prints the human summary (default) or `--json`, and
+/// exits per `exit_code_for_verify`. An unreadable file is the ONLY way
+/// `verify_source` itself never sees — mapped directly to the `ERROR` verdict here.
+fn run_verify(input: PathBuf, json: bool) -> ! {
+    use axc_driver::verify::{exit_code_for_verify, verify_source, VerifyReport, VerifyVerdict, VerifySummary};
+
+    let source: String = match std::fs::read_to_string(&input) {
+        Ok(s) => s,
+        Err(e) => {
+            let report = VerifyReport {
+                verdict: VerifyVerdict::Error,
+                milestone: "M3.18",
+                file: input.display().to_string(),
+                kernel: None,
+                checks: Vec::new(),
+                diagnostics: vec![axc_driver::verify::VerifyDiag {
+                    severity: "error".to_string(),
+                    code: "io_error".to_string(),
+                    message: format!("io error reading {input:?}: {e}"),
+                    line: None,
+                }],
+                summary: VerifySummary { errors: 1, warnings: 0 },
+            };
+            print_verify_report(&report, json);
+            std::process::exit(exit_code_for_verify(VerifyVerdict::Error));
+        }
+    };
+
+    let report = verify_source(&source, &input.display().to_string());
+    print_verify_report(&report, json);
+    std::process::exit(exit_code_for_verify(report.verdict));
+}
+
+fn print_verify_report(report: &axc_driver::verify::VerifyReport, json: bool) {
+    if json {
+        let s: String = serde_json::to_string_pretty(report).unwrap_or_else(|e| format!("{{\"error\":\"serialize failed: {e}\"}}"));
+        println!("{s}");
+    } else {
+        print!("{}", axc_driver::verify::render_human(report));
+    }
+}
+
+/// M3.18 (FG.8): `axc test --fuzz` handler.
+///
+/// `--fuzz` is currently the ONLY mode; its absence is a usage ERROR (§3.1).
+/// Resolves the CLI surface into a `fuzz::FuzzRequest`, probes for a local
+/// Vulkan device (absence -> `SKIPPED`/`gpu_unavailable`, first-class per §3.1
+/// step 5), calls the core, prints the `FuzzReport` JSON, and exits per
+/// `exit_code_for_fuzz`. Never returns.
+///
+/// QA-fix (post-M3.18): missing `--buffer-sizes`/`--size` is NOT gated here
+/// before calling `fuzz_kernel` -- doing so pre-empted `fuzz_kernel`'s own
+/// `solve()`-based UNSATISFIABLE short-circuit, which must run first (§3.1
+/// step 2 precedes step 5). An empty `Vec` is threaded through instead;
+/// `fuzz_kernel` raises the equivalent usage ERROR/exit 2 itself, but only
+/// AFTER `solve()` has had first refusal.
+#[allow(clippy::too_many_arguments)]
+fn run_test(
+    input: PathBuf,
+    fuzz_mode: bool,
+    runs: u32,
+    seed: u64,
+    debug_oracle_flag: bool,
+    no_debug_oracle_flag: bool,
+    violate: bool,
+    buffer_sizes_arg: Vec<usize>,
+    size: Option<usize>,
+    workgroups: Option<Vec<u32>>,
+    scalar_window: i64,
+    strategy_values: Vec<axc_driver::cli::StrategyValue>,
+) -> ! {
+    use axc_driver::fuzz::{exit_code_for_fuzz, fuzz_kernel, FuzzRequest};
+
+    if !fuzz_mode {
+        emit_fuzz_usage_error("--fuzz is the only axc test mode in v1; pass --fuzz (e.g. `axc test --fuzz <file>`)".to_string());
+    }
+    if runs == 0 {
+        emit_fuzz_usage_error("--runs must be >= 1".to_string());
+    }
+
+    let source: String = match std::fs::read_to_string(&input) {
+        Ok(s) => s,
+        Err(e) => emit_fuzz_usage_error(format!("io error reading {input:?}: {e}")),
+    };
+
+    let mut assignments: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    for sv in strategy_values {
+        assignments.insert(sv.name, sv.value);
+    }
+
+    let resolved_buffer_sizes: Vec<usize> = if !buffer_sizes_arg.is_empty() {
+        buffer_sizes_arg
+    } else if let Some(n) = size {
+        match resolve_size_shortcut(&source, &assignments, n) {
+            Ok(sizes) => sizes,
+            Err(e) => emit_fuzz_usage_error(e),
+        }
+    } else {
+        // Neither `--buffer-sizes` nor `--size` was supplied. Do NOT usage-error
+        // here: `fuzz_kernel`'s own internal ordering resolves UNSATISFIABLE (via
+        // `solve()` over the kernel's `@precondition`s) BEFORE buffer sizes are
+        // ever consulted (§3.1: constraint solving precedes dispatch prep).
+        // Pass an empty `Vec` through unconditionally; if the kernel turns out
+        // to be satisfiable and genuinely needs to dispatch, `fuzz_kernel`'s own
+        // `buffer_sizes.len()` mismatch check (which fires AFTER `solve()`)
+        // raises the identical usage ERROR/exit 2 -- this only fixes the
+        // refusal ORDER, not the outcome, for kernels that would dispatch.
+        Vec::new()
+    };
+
+    let workgroups_arr: Option<[u32; 3]> = match workgroups {
+        None => None,
+        Some(v) if v.len() == 3 => Some([v[0], v[1], v[2]]),
+        Some(v) => emit_fuzz_usage_error(format!("--workgroups must have exactly 3 comma-separated values (x,y,z); got {}", v.len())),
+    };
+
+    let debug_oracle: Option<bool> = match (debug_oracle_flag, no_debug_oracle_flag) {
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        (false, false) => None,
+        (true, true) => emit_fuzz_usage_error("--debug-oracle and --no-debug-oracle are mutually exclusive".to_string()),
+    };
+
+    let req = FuzzRequest {
+        source,
+        runs,
+        seed,
+        debug_oracle,
+        violate,
+        buffer_sizes: resolved_buffer_sizes,
+        workgroups: workgroups_arr,
+        scalar_window,
+        strategy_assignments: assignments,
+    };
+
+    let vk: Option<axc_runtime::VulkanContext> = if axc_runtime::probe_vulkan_available() {
+        axc_runtime::VulkanContext::new().ok()
+    } else {
+        None
+    };
+
+    let report = fuzz_kernel(&req, vk.as_ref());
+    let json: String = serde_json::to_string_pretty(&report).unwrap_or_else(|e| format!("{{\"error\":\"serialize failed: {e}\"}}"));
+    println!("{json}");
+    std::process::exit(exit_code_for_fuzz(report.verdict));
+}
+
+/// Emit a minimal `FuzzReport`-shaped `ERROR` JSON to stdout and exit 2. Mirrors
+/// `emit_usage_error` (rewrite-verify's CLI-layer usage-failure convention).
+fn emit_fuzz_usage_error(detail: String) -> ! {
+    use axc_driver::fuzz::{exit_code_for_fuzz, FuzzReason, FuzzReport, FuzzVerdict};
+    let report = FuzzReport {
+        verdict: FuzzVerdict::Error,
+        milestone: "M3.18",
+        kernel: String::new(),
+        seed: 0,
+        runs_requested: 0,
+        runs_executed: 0,
+        debug_oracle: false,
+        violate_leg: false,
+        device: None,
+        constraints: Vec::new(),
+        counterexample: None,
+        reason: Some(FuzzReason { kind: "usage".to_string(), detail: Some(serde_json::json!({ "detail": detail })) }),
+        host_recheck: None,
+        notes: Vec::new(),
+    };
+    let json: String = serde_json::to_string_pretty(&report).unwrap_or_else(|e| format!("{{\"error\":\"serialize failed: {e}\"}}"));
+    println!("{json}");
+    std::process::exit(exit_code_for_fuzz(FuzzVerdict::Error));
 }
 
 /// M3.16 (FG.1): `axc rewrite-verify` handler.

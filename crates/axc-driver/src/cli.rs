@@ -213,6 +213,69 @@ pub enum Command {
         #[arg(long = "strategy-value", value_name = "name=value")]
         strategy_values: Vec<StrategyValue>,
     },
+    /// Static annotation/consistency checker (M3.18 / FG.8).
+    ///
+    /// Front-end only (lex -> parse -> HIR); never touches codegen or Vulkan.
+    /// Writes a `VerifyReport` (human summary by default, `--json` for the
+    /// machine-readable form) and exits `0` (PASS), `1` (FAIL), or `2` (ERROR —
+    /// usage/IO).
+    Verify {
+        /// Input source file (`.axc`)
+        input: PathBuf,
+        /// Emit the machine-readable JSON report instead of the human summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run a test mode against a kernel (M3.18 / FG.8). `--fuzz` is currently the
+    /// ONLY mode; its absence is a usage ERROR (reserves `axc test` for future modes).
+    ///
+    /// `axc test --fuzz` generates precondition-satisfying inputs (the interval
+    /// satisfier, §3.4) and dispatches them through the M3.17 debug-check runtime
+    /// oracle (`dispatch_debug_checked`), checking the honest oracle triad: no
+    /// device fault, postconditions hold, and the kernel is deterministic. Writes
+    /// a `FuzzReport` JSON to stdout and exits per `exit_code_for_fuzz`
+    /// (`PASS|SKIPPED|UNCONSTRAINED_PRECONDITION_FIRED -> 0`, `FAIL -> 1`,
+    /// `ERROR -> 2`, `UNSATISFIABLE -> 3`).
+    Test {
+        /// Input source file (`.axc`)
+        input: PathBuf,
+        /// Select fuzz mode (the only mode in v1; required).
+        #[arg(long)]
+        fuzz: bool,
+        /// Number of fuzz runs.
+        #[arg(long, default_value_t = 32)]
+        runs: u32,
+        /// Seed for deterministic input generation.
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+        /// Force the debug-check runtime oracle ON (recompiles with `--debug`).
+        /// Default (neither flag): auto-ON only when the kernel has >=1 lowered
+        /// `@postcondition`.
+        #[arg(long, conflicts_with = "no_debug_oracle")]
+        debug_oracle: bool,
+        /// Force the debug-check runtime oracle OFF (legs a+c only, on a release compile).
+        #[arg(long)]
+        no_debug_oracle: bool,
+        /// Also run the `--violate` leg: negate one eligible precondition and
+        /// assert its check fires (validates the oracle itself, §3.3).
+        #[arg(long)]
+        violate: bool,
+        /// One size (bytes) per buffer binding. Required unless `--size` is used.
+        #[arg(long, value_delimiter = ',')]
+        buffer_sizes: Vec<usize>,
+        /// Uniform-element-count shortcut (same convention as `rewrite-verify --size`).
+        #[arg(long)]
+        size: Option<usize>,
+        /// Explicit dispatch grid `x,y,z`. Mandatory for coopmat/shared kernels.
+        #[arg(long, value_delimiter = ',')]
+        workgroups: Option<Vec<u32>>,
+        /// Default per-scalar sampling window width (§3.4). Default 256.
+        #[arg(long, default_value_t = 256)]
+        scalar_window: i64,
+        /// Shared `@strategy` hole assignment: `name=value`.
+        #[arg(long = "strategy-value", value_name = "name=value")]
+        strategy_values: Vec<StrategyValue>,
+    },
 }
 
 #[cfg(test)]
@@ -346,5 +409,75 @@ mod tests {
             help.to_lowercase().contains("baseline"),
             "help must mention 'baseline'; got:\n{help}"
         );
+    }
+
+    // ── AT-2894: `axc test --fuzz` CLI parsing (M3.18) ─────────────────────────
+
+    /// AT-2894: `axc test --fuzz f.axc --runs 16 --seed 3 --debug-oracle` parses
+    /// to `Command::Test{ fuzz:true, runs:16, seed:3, debug_oracle:true, .. }`.
+    #[test]
+    fn at_2894_test_fuzz_parses_runs_seed_debug_oracle() {
+        let cli = Cli::parse_from(["axc", "test", "--fuzz", "f.axc", "--runs", "16", "--seed", "3", "--debug-oracle"]);
+        match cli.command {
+            Command::Test { input, fuzz, runs, seed, debug_oracle, no_debug_oracle, .. } => {
+                assert_eq!(input, PathBuf::from("f.axc"));
+                assert!(fuzz);
+                assert_eq!(runs, 16);
+                assert_eq!(seed, 3);
+                assert!(debug_oracle);
+                assert!(!no_debug_oracle);
+            }
+            other => panic!("expected Command::Test, got: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    /// AT-2894: `axc test f.axc` (no `--fuzz`) parses fine at the CLI layer
+    /// (`fuzz: false`) — the usage ERROR is raised by the `main.rs` handler, not
+    /// by clap parsing (mirrors the `RewriteVerify`/`emit_usage_error` split).
+    #[test]
+    fn at_2894b_test_without_fuzz_parses_flag_false() {
+        let cli = Cli::parse_from(["axc", "test", "f.axc"]);
+        match cli.command {
+            Command::Test { fuzz, runs, seed, scalar_window, .. } => {
+                assert!(!fuzz, "absence of --fuzz must parse to fuzz:false");
+                assert_eq!(runs, 32, "default --runs must be 32");
+                assert_eq!(seed, 0, "default --seed must be 0");
+                assert_eq!(scalar_window, 256, "default --scalar-window must be 256");
+            }
+            other => panic!("expected Command::Test, got: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    /// AT-2894: no OTHER subcommand exposes `--fuzz`.
+    #[test]
+    fn at_2894c_no_other_subcommand_exposes_fuzz() {
+        let mut cmd = Cli::command();
+        for name in ["compile", "optimize", "mcp", "rewrite-verify", "lex", "bench", "verify"] {
+            let sub = cmd.find_subcommand_mut(name).unwrap_or_else(|| panic!("Cli must have a `{name}` subcommand"));
+            let help: String = sub.render_long_help().to_string();
+            assert!(!help.contains("--fuzz"), "`{name}` must NOT expose --fuzz; got help:\n{help}");
+        }
+    }
+
+    /// `axc verify a.axc --json` parses to `Command::Verify{ input, json:true }`.
+    #[test]
+    fn at_2887c_verify_parses_input_and_json_flag() {
+        let cli = Cli::parse_from(["axc", "verify", "a.axc", "--json"]);
+        match cli.command {
+            Command::Verify { input, json } => {
+                assert_eq!(input, PathBuf::from("a.axc"));
+                assert!(json);
+            }
+            other => panic!("expected Command::Verify, got: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn verify_json_defaults_false() {
+        let cli = Cli::parse_from(["axc", "verify", "a.axc"]);
+        match cli.command {
+            Command::Verify { json, .. } => assert!(!json),
+            other => panic!("expected Command::Verify, got: {:?}", std::mem::discriminant(&other)),
+        }
     }
 }
