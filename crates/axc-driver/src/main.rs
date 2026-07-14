@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 
 use clap::Parser as ClapParser;
-use axc_driver::{Cli, Command, compile_file_debug, build_bench_command};
+use axc_driver::{Cli, Command, build_bench_command};
 use axc_driver::optimize::run_optimize;
 use axc_driver::mcp::{run_mcp_server, LogTarget};
 
@@ -20,26 +20,8 @@ fn main() -> miette::Result<()> {
     let cli: Cli = Cli::parse();
 
     match cli.command {
-        Command::Compile { input, output, strategy_values, debug } => {
-            if strategy_values.is_empty() {
-                compile_file_debug(&input, &output, debug).map_err(|e| {
-                    miette::miette!("{}", e)
-                })
-            } else {
-                // M2.3: per-variant compilation with explicit hole assignments.
-                let mut assignments: std::collections::BTreeMap<String, i64> =
-                    std::collections::BTreeMap::new();
-                for sv in strategy_values {
-                    assignments.insert(sv.name, sv.value);
-                }
-                let source: String = std::fs::read_to_string(&input)
-                    .map_err(|e| miette::miette!("io error reading {:?}: {}", input, e))?;
-                let (bytes, _meta) = axc_driver::compile_source_with_assignments(&source, &assignments)
-                    .map_err(|e| miette::miette!("{}", e))?;
-                std::fs::write(&output, &bytes)
-                    .map_err(|e| miette::miette!("io error writing {:?}: {}", output, e))?;
-                Ok(())
-            }
+        Command::Compile { input, output, strategy_values, debug, kernel, all } => {
+            run_compile(input, output, strategy_values, debug, kernel, all)
         }
         Command::Lex { input } => {
             let source: String = std::fs::read_to_string(&input).map_err(|e| {
@@ -51,8 +33,8 @@ fn main() -> miette::Result<()> {
             }
             Ok(())
         }
-        Command::Optimize { input, output, correctness } => {
-            run_optimize(&input, &output, &correctness)
+        Command::Optimize { input, output, correctness, kernel } => {
+            run_optimize(&input, &output, &correctness, kernel.as_deref())
                 .map_err(|e| miette::miette!("{}", e))
         }
         Command::Mcp { log } => {
@@ -74,20 +56,20 @@ fn main() -> miette::Result<()> {
         Command::Bench { filter, bless } => run_bench(filter.as_deref(), bless),
         Command::RewriteVerify {
             original, rewritten, tol, buffer_sizes, size, output_sizes,
-            workgroups, push_constants_base64, seed, strategy_values,
+            workgroups, push_constants_base64, seed, strategy_values, kernel,
         } => {
             run_rewrite_verify(
                 original, rewritten, tol, buffer_sizes, size, output_sizes,
-                workgroups, push_constants_base64, seed, strategy_values,
+                workgroups, push_constants_base64, seed, strategy_values, kernel,
             )
         }
         Command::Verify { input, json } => run_verify(input, json),
         Command::Test {
             input, fuzz, runs, seed, debug_oracle, no_debug_oracle, violate,
-            buffer_sizes, size, workgroups, scalar_window, strategy_values,
+            buffer_sizes, size, workgroups, scalar_window, strategy_values, kernel,
         } => run_test(
             input, fuzz, runs, seed, debug_oracle, no_debug_oracle, violate,
-            buffer_sizes, size, workgroups, scalar_window, strategy_values,
+            buffer_sizes, size, workgroups, scalar_window, strategy_values, kernel,
         ),
         Command::LogOpt {
             source, kernel, metric, unit, verdict, ts, note,
@@ -266,6 +248,7 @@ fn run_verify(input: PathBuf, json: bool) -> ! {
                 milestone: "M3.18",
                 file: input.display().to_string(),
                 kernel: None,
+                kernels: Vec::new(),
                 checks: Vec::new(),
                 diagnostics: vec![axc_driver::verify::VerifyDiag {
                     severity: "error".to_string(),
@@ -322,6 +305,7 @@ fn run_test(
     workgroups: Option<Vec<u32>>,
     scalar_window: i64,
     strategy_values: Vec<axc_driver::cli::StrategyValue>,
+    kernel: Option<String>,
 ) -> ! {
     use axc_driver::fuzz::{exit_code_for_fuzz, fuzz_kernel, FuzzRequest};
 
@@ -345,7 +329,7 @@ fn run_test(
     let resolved_buffer_sizes: Vec<usize> = if !buffer_sizes_arg.is_empty() {
         buffer_sizes_arg
     } else if let Some(n) = size {
-        match resolve_size_shortcut(&source, &assignments, n) {
+        match resolve_size_shortcut(&source, &assignments, n, kernel.as_deref()) {
             Ok(sizes) => sizes,
             Err(e) => emit_fuzz_usage_error(e),
         }
@@ -385,6 +369,7 @@ fn run_test(
         workgroups: workgroups_arr,
         scalar_window,
         strategy_assignments: assignments,
+        kernel,
     };
 
     let vk: Option<axc_runtime::VulkanContext> = if axc_runtime::probe_vulkan_available() {
@@ -442,6 +427,7 @@ fn run_rewrite_verify(
     push_constants_base64: Option<String>,
     seed: u64,
     strategy_values: Vec<axc_driver::cli::StrategyValue>,
+    kernel: Option<String>,
 ) -> ! {
     use axc_driver::rewrite_verify::{
         exit_code_for_verdict, verify_rewrite, TolerancePolicy, VerifyRequest,
@@ -469,7 +455,7 @@ fn run_rewrite_verify(
     let resolved_buffer_sizes: Vec<usize> = if !buffer_sizes_arg.is_empty() {
         buffer_sizes_arg
     } else if let Some(n) = size {
-        match resolve_size_shortcut(&original_src, &assignments, n) {
+        match resolve_size_shortcut(&original_src, &assignments, n, kernel.as_deref()) {
             Ok(sizes) => sizes,
             Err(e) => emit_usage_error(&tol, e),
         }
@@ -504,6 +490,7 @@ fn run_rewrite_verify(
         workgroups: workgroups_arr,
         push_constants,
         seed,
+        kernel,
     };
 
     // Absence of a usable Vulkan device is a first-class SKIPPED outcome for
@@ -525,12 +512,22 @@ fn run_rewrite_verify(
 /// kernels whose buffers are all the SAME `ScalarTy`, with no coopmat and no
 /// shared memory (a matmul with differently-shaped buffers would otherwise
 /// silently get equal-and-wrong sizes and a trivial partial-coverage PASS).
+///
+/// QA-fix (post-M3.21, MEDIUM finding): `kernel` MUST be threaded into the
+/// same kernel-aware compile surface (`compile_source_with_assignments_kernel`)
+/// that the non-`--size` `--buffer-sizes` path already uses, not the
+/// kernel-agnostic `compile_source_with_assignments`. Before this fix, any
+/// `--size` invocation on a 2+-kernel source always failed closed with
+/// `AmbiguousKernel` regardless of `--kernel`, silently making `--kernel`
+/// inert for this one flag combination (fails closed, not a correctness bug,
+/// but a real functional gap — see M3.21-qa.json discrepancy #1).
 fn resolve_size_shortcut(
     original_src: &str,
     assignments: &std::collections::BTreeMap<String, i64>,
     n: usize,
+    kernel: Option<&str>,
 ) -> Result<Vec<usize>, String> {
-    let (_bytes, meta) = axc_driver::compile_source_with_assignments(original_src, assignments)
+    let (_bytes, meta) = axc_driver::compile_source_with_assignments_kernel(original_src, assignments, kernel)
         .map_err(|e| format!("--size: failed to compile original to determine buffer layout: {e}"))?;
     if meta.coopmat.is_some() || meta.shared_memory_bytes > 0 {
         return Err(
@@ -579,6 +576,63 @@ fn emit_usage_error(policy: &str, detail: String) -> ! {
         .unwrap_or_else(|e| format!("{{\"error\":\"serialize failed: {e}\"}}"));
     println!("{json}");
     std::process::exit(2);
+}
+
+/// M3.21 (FG.9): `axc compile` handler — routes to the plain single-output
+/// path (byte-identical to pre-M3.21 when `kernel`/`all` are both absent),
+/// the `--kernel NAME` single-select path, or the `--all` multi-emit path.
+/// `--kernel` and `--all` are mutually exclusive at the clap layer
+/// (`conflicts_with`), so at most one of `kernel`/`all` is set here.
+fn run_compile(
+    input: PathBuf,
+    output: PathBuf,
+    strategy_values: Vec<axc_driver::cli::StrategyValue>,
+    debug: bool,
+    kernel: Option<String>,
+    all: bool,
+) -> miette::Result<()> {
+    let mut assignments: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    for sv in strategy_values {
+        assignments.insert(sv.name, sv.value);
+    }
+
+    if all {
+        let source: String = std::fs::read_to_string(&input)
+            .map_err(|e| miette::miette!("io error reading {:?}: {}", input, e))?;
+        let substituted: String = if assignments.is_empty() {
+            source
+        } else {
+            axc_driver::substitute_strategy_holes(&source, &assignments)
+        };
+        let compiled = axc_driver::compile_module_all(&substituted, debug)
+            .map_err(|e| miette::miette!("{}", e))?;
+        let stem: PathBuf = axc_driver::all_output_stem(&output);
+        for ck in &compiled {
+            let spv_path: PathBuf = axc_driver::per_kernel_output_path(&stem, &ck.name);
+            std::fs::write(&spv_path, &ck.spirv)
+                .map_err(|e| miette::miette!("io error writing {:?}: {}", spv_path, e))?;
+            let sidecar_path: PathBuf = axc_driver::metadata_sidecar_path(&spv_path);
+            ck.metadata.save(&sidecar_path)
+                .map_err(|e| miette::miette!("metadata emit failed: {}", e))?;
+        }
+        return Ok(());
+    }
+
+    if assignments.is_empty() {
+        // Byte-identical to the pre-M3.21 single-kernel path when kernel==None
+        // (golden-identity gate, §7 of the spec).
+        axc_driver::compile_file_kernel(&input, &output, kernel.as_deref(), debug)
+            .map_err(|e| miette::miette!("{}", e))
+    } else {
+        // M2.3: per-variant compilation with explicit hole assignments.
+        let source: String = std::fs::read_to_string(&input)
+            .map_err(|e| miette::miette!("io error reading {:?}: {}", input, e))?;
+        let (bytes, _meta) = axc_driver::compile_source_with_assignments_kernel(&source, &assignments, kernel.as_deref())
+            .map_err(|e| miette::miette!("{}", e))?;
+        std::fs::write(&output, &bytes)
+            .map_err(|e| miette::miette!("io error writing {:?}: {}", output, e))?;
+        Ok(())
+    }
 }
 
 /// M3.15 (EB.3): spawn `cargo bench -p axc-driver` per `build_bench_command`'s

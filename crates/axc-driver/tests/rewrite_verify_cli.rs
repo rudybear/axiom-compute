@@ -154,6 +154,7 @@ fn verify_rewrite_non_compiling_original_fails_compile_original() {
         workgroups: None,
         push_constants: Some(vec![0_u8; 8]),
         seed: 0,
+        kernel: None,
     };
     let report = verify_rewrite(&req, None);
     assert_eq!(report.verdict, Verdict::Fail);

@@ -191,6 +191,12 @@ pub struct BenchVariantRequest {
     /// Optional output buffer sizes (defaults to matching input_sizes).
     #[serde(default)]
     pub output_sizes: Option<Vec<usize>>,
+    /// M3.21 (FG.9): the kernel to dispatch+time. `None` on an ambiguous (2+
+    /// kernel) source fails closed (`McpToolError::Compile(AmbiguousKernel)`).
+    /// `pick_cpu_reference` keys off the SELECTED kernel's name (from the
+    /// returned `KernelMetadata`), not a hardcoded/first-kernel name.
+    #[serde(default)]
+    pub kernel: Option<String>,
 }
 
 /// Response from the `bench_variant` tool.
@@ -225,7 +231,7 @@ pub(crate) fn handle(
     let source: String = crate::mcp::dispatch::resolve_source(&req.source, &req.path)?;
 
     let (spirv_bytes, metadata) =
-        crate::compile_source_with_assignments(&source, &req.assignments)
+        crate::compile_source_with_assignments_kernel(&source, &req.assignments, req.kernel.as_deref())
             .map_err(McpToolError::Compile)?;
 
     // In-process spirv-val
@@ -750,5 +756,37 @@ mod tests {
             reason: "no oracle".to_string()
         }).unwrap();
         assert!(s.contains("not_checked"), "must contain 'not_checked'");
+    }
+
+    // ── AT-2962 (M3.21 / FG.9): bench_variant `kernel` param, ambiguous fails
+    //    closed BEFORE touching Vulkan (compile runs first in `handle`) ────────
+
+    #[test]
+    fn at_2962_bench_variant_ambiguous_kernel_fails_closed_no_vulkan_touch() {
+        let multi_src = concat!(
+            "@kernel @workgroup(64, 1, 1) fn kernel_a(x: buffer[u32]) -> void { return; }\n",
+            "@kernel @workgroup(32, 1, 1) fn kernel_b(y: buffer[u32]) -> void { return; }\n",
+        );
+        let mut ctx = McpContext::new(std::env::temp_dir());
+        let req = BenchVariantRequest {
+            source: Some(multi_src.to_string()),
+            path: None,
+            assignments: BTreeMap::new(),
+            input_sizes: vec![64],
+            sample_count: 1,
+            workgroup_override: None,
+            push_constants_base64: None,
+            output_sizes: None,
+            kernel: None,
+        };
+        let err = handle(req, &mut ctx).unwrap_err();
+        match err {
+            McpToolError::Compile(crate::DriverError::AmbiguousKernel { available }) => {
+                assert_eq!(available, vec!["kernel_a".to_string(), "kernel_b".to_string()]);
+            }
+            other => panic!("expected AmbiguousKernel (compile runs before any Vulkan touch); got {other:?}"),
+        }
+        // The failure happened before Vulkan was ever probed.
+        assert!(matches!(ctx.vulkan, crate::mcp::dispatch::OnceVulkan::NotTried));
     }
 }

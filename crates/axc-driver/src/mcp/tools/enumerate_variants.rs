@@ -19,6 +19,12 @@ pub struct EnumerateVariantsRequest {
     /// Path to an `.axc` source file. Mutually exclusive with `source`.
     #[serde(default)]
     pub path: Option<PathBuf>,
+    /// M3.21 (FG.9): optional bench-target kernel name. Enumeration itself
+    /// is ALWAYS module-global (`union_module_holes`, across every kernel);
+    /// this param is accepted for symmetry with the other tools but does not
+    /// change the enumerated variant set.
+    #[serde(default)]
+    pub kernel: Option<String>,
 }
 
 /// Response from the `enumerate_variants` tool.
@@ -77,15 +83,16 @@ pub(crate) fn enumerate_source(source: &str) -> Result<EnumerateVariantsResponse
         }));
     }
 
-    let kernel = hir.kernels.into_iter().next()
-        .ok_or_else(|| McpToolError::InvalidParams(
-            "source must declare exactly one @kernel function".to_string()
-        ))?;
-
-    let strategy = kernel.annotations.strategy
-        .ok_or(McpToolError::Enumerate(
-            axc_optimize::EnumerateError::EmptyStrategy
-        ))?;
+    // M3.21 (FG.9): module-global union across ALL kernels — this is the
+    // "sole liar" fix (this tool previously silently picked `kernels[0]` AND
+    // carried the false "source must declare exactly one @kernel function"
+    // text; that text is now gone). `union_module_holes` itself real-counts:
+    // an empty union (no kernel declares any hole) is `EnumerateError::EmptyStrategy`.
+    let strategy = axc_optimize::enumerator::union_module_holes(&hir)
+        .map_err(McpToolError::Enumerate)?;
+    if strategy.map.is_empty() {
+        return Err(McpToolError::Enumerate(axc_optimize::EnumerateError::EmptyStrategy));
+    }
 
     let raw_variants = enumerate_strategy(&strategy)
         .map_err(McpToolError::Enumerate)?;
@@ -158,5 +165,28 @@ mod tests {
         for (v1, v2) in resp1.variants.iter().zip(resp2.variants.iter()) {
             assert_eq!(v1.variant_id, v2.variant_id, "variant_id must be deterministic");
         }
+    }
+
+    // ── AT-2962 (M3.21 / FG.9): module-global union across 2 kernels ───────────
+
+    /// AT-2962: `enumerate_variants` on a 2-kernel module unions holes across
+    /// BOTH kernels (F3), not just the first — and no longer carries the
+    /// "source must declare exactly one @kernel function" lying text (that
+    /// error path is gone entirely; ambiguity is a non-issue for enumeration,
+    /// which is always module-global).
+    #[test]
+    fn at_2962_enumerate_unions_holes_across_two_kernels() {
+        let src = concat!(
+            "@kernel @workgroup(?a, 1, 1)\n",
+            "@strategy { a: ?[1, 2] }\n",
+            "fn k1() -> void { return; }\n",
+            "@kernel @workgroup(?b, 1, 1)\n",
+            "@strategy { b: ?[10, 20] }\n",
+            "fn k2() -> void { return; }\n",
+        );
+        let resp = enumerate_source(src).expect("must union both kernels' holes");
+        // 2 x 2 = 4 variants over the UNION {a, b}, even though neither
+        // kernel alone declares both names.
+        assert_eq!(resp.variants.len(), 4);
     }
 }

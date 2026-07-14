@@ -81,7 +81,17 @@ impl Default for CodegenOptions {
 pub enum CodegenError {
     #[error("HIR module contains no kernels")]
     NoKernels,
-    #[error("M0 supports exactly one kernel per module; got {got}")]
+    /// `emit_module` operates on exactly one kernel per call — this is an
+    /// INTERNAL INVARIANT, not a user-facing "M0 only supports one kernel"
+    /// limitation. M3.21 (FG.9) lifted the driver-level restriction to N
+    /// kernels per `.axc` file by having the driver split upstream: each
+    /// kernel is wrapped in its own 1-kernel `HirModule` (see
+    /// `axc_driver::compile_module_all` / `compile_source_with_meta_kernel`)
+    /// and emitted as its own SPIR-V module before this function ever sees
+    /// it. The driver never feeds `emit_module` more than one kernel; this
+    /// error firing indicates a caller bug upstream of codegen, not a
+    /// language limitation.
+    #[error("emit_module operates on exactly one kernel; split upstream (got {got})")]
     TooManyKernelsInM0 { got: usize },
     #[error("internal rspirv assembly error: {0}")]
     Rspirv(String),
@@ -102,7 +112,9 @@ pub enum CodegenError {
 /// Emit a SPIR-V word stream (`Vec<u32>`) from a validated HIR module.
 ///
 /// Returns `CodegenError::NoKernels` if the module is empty.
-/// Returns `CodegenError::TooManyKernelsInM0` if there is more than one kernel.
+/// Returns `CodegenError::TooManyKernelsInM0` if there is more than one kernel
+/// (M3.21: an internal invariant — the driver splits multi-kernel modules
+/// into N one-kernel `HirModule`s upstream; see `TooManyKernelsInM0`'s doc).
 pub fn emit_module(hir: &HirModule, opts: &CodegenOptions) -> Result<Vec<u32>, CodegenError> {
     if hir.kernels.is_empty() {
         return Err(CodegenError::NoKernels);
@@ -1096,9 +1108,16 @@ mod tests {
         assert!(matches!(result, Err(CodegenError::NoKernels)));
     }
 
+    /// AT-2967 (M3.21 / FG.9): `emit_module` called DIRECTLY with 2 kernels
+    /// still returns the (redoc'd) internal-invariant error. The driver never
+    /// feeds `emit_module` more than one kernel (`compile_module_all` /
+    /// `compile_source_with_meta_kernel` always wrap exactly one kernel per
+    /// call) — this test locks the internal guard itself, independent of the
+    /// driver's own splitting behavior.
     #[test]
-    fn too_many_kernels_error() {
-        // Two kernels → TooManyKernelsInM0
+    fn at_2967_too_many_kernels_error() {
+        // Two kernels → TooManyKernelsInM0 (an internal invariant post-M3.21 —
+        // see the variant's doc comment).
         use axc_hir::{Kernel, KernelId, KernelAnnotations, WorkgroupDims, KernelBody, ParamBindingPlan};
         use axc_lexer::Span;
         let mk_k = |id: u32, name: &str| Kernel {

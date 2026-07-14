@@ -733,6 +733,11 @@ pub struct FuzzRequest {
     /// `crate::substitute_strategy_holes` BEFORE the front-end runs (same
     /// source-text-substitution technique `compile_source_with_assignments` uses).
     pub strategy_assignments: BTreeMap<String, i64>,
+    /// M3.21 (FG.9): the kernel to fuzz when `source` declares 2+ kernels.
+    /// `None` on an ambiguous (2+ kernel) source fails closed listing kernel
+    /// names (`FuzzVerdict::Error`/`"ambiguous_kernel"`). Ignored (no-op) on
+    /// a single-kernel source.
+    pub kernel: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -910,8 +915,14 @@ pub fn fuzz_kernel(req: &FuzzRequest, vk: Option<&VulkanContext>) -> FuzzReport 
             Vec::new(),
         );
     }
-    let Some(kernel) = hir.kernels.into_iter().next() else {
+    if hir.kernels.is_empty() {
         return empty_report(req, "", FuzzVerdict::Error, "compile_failed", Some(serde_json::json!({"detail": "no kernel declared"})), Vec::new());
+    }
+    let kernel = match crate::select_kernel(&hir.kernels, req.kernel.as_deref()) {
+        Ok(k) => k.clone(),
+        Err(e) => {
+            return empty_report(req, "", FuzzVerdict::Error, "ambiguous_kernel", Some(serde_json::json!({"detail": e.to_string()})), Vec::new());
+        }
     };
     let kernel_name = kernel.name.clone();
 
@@ -1400,7 +1411,7 @@ mod tests {
     #[test]
     fn at_2893_fuzz_unsat_library_level_fuzz_kernel_no_gpu_needed() {
         let src = include_str!("../../../examples/fuzz_unsat.axc");
-        let req = FuzzRequest { source: src.to_string(), runs: 8, seed: 0, debug_oracle: None, violate: false, buffer_sizes: vec![64], workgroups: None, scalar_window: DEFAULT_SCALAR_WINDOW, strategy_assignments: BTreeMap::new() };
+        let req = FuzzRequest { source: src.to_string(), runs: 8, seed: 0, debug_oracle: None, violate: false, buffer_sizes: vec![64], workgroups: None, scalar_window: DEFAULT_SCALAR_WINDOW, strategy_assignments: BTreeMap::new(), kernel: None };
         let report = fuzz_kernel(&req, None);
         assert_eq!(report.verdict, FuzzVerdict::Unsatisfiable);
         assert_eq!(exit_code_for_fuzz(report.verdict), 3);
@@ -1412,7 +1423,7 @@ mod tests {
     #[test]
     fn at_2895_satisfiable_kernel_vk_none_is_skipped_with_constraints() {
         let src = include_str!("../../../examples/precondition_saxpy.axc");
-        let req = FuzzRequest { source: src.to_string(), runs: 4, seed: 0, debug_oracle: None, violate: false, buffer_sizes: vec![256, 256], workgroups: None, scalar_window: DEFAULT_SCALAR_WINDOW, strategy_assignments: BTreeMap::new() };
+        let req = FuzzRequest { source: src.to_string(), runs: 4, seed: 0, debug_oracle: None, violate: false, buffer_sizes: vec![256, 256], workgroups: None, scalar_window: DEFAULT_SCALAR_WINDOW, strategy_assignments: BTreeMap::new(), kernel: None };
         let report = fuzz_kernel(&req, None);
         assert_eq!(report.verdict, FuzzVerdict::Skipped);
         assert_eq!(exit_code_for_fuzz(report.verdict), 0);
@@ -1427,12 +1438,57 @@ mod tests {
     #[test]
     fn constraint_report_renders_expected_intervals() {
         let src = include_str!("../../../examples/precondition_saxpy.axc");
-        let req = FuzzRequest { source: src.to_string(), runs: 4, seed: 0, debug_oracle: None, violate: false, buffer_sizes: vec![256, 256], workgroups: None, scalar_window: 256, strategy_assignments: BTreeMap::new() };
+        let req = FuzzRequest { source: src.to_string(), runs: 4, seed: 0, debug_oracle: None, violate: false, buffer_sizes: vec![256, 256], workgroups: None, scalar_window: 256, strategy_assignments: BTreeMap::new(), kernel: None };
         let report = fuzz_kernel(&req, None);
         let n = report.constraints.iter().find(|c| c.scalar == "n").unwrap();
         assert_eq!(n.interval, "[1, 257]");
         let alpha = report.constraints.iter().find(|c| c.scalar == "alpha").unwrap();
         assert_eq!(alpha.interval, "(0, 256]");
+    }
+
+    // ── AT-2964 (M3.21 / FG.9): `test --fuzz --kernel` selection ────────────────
+
+    const MULTI_KERNEL_FUZZ_SRC: &str = concat!(
+        "@kernel @workgroup(64, 1, 1) @intent(\"a\") @complexity(O(n)) fn kernel_a(x: buffer[u32]) -> void {\n",
+        "    let i: u32 = gid(0u32);\n    x[i] = i;\n    return;\n}\n",
+        "@kernel @workgroup(32, 1, 1) @intent(\"b\") @complexity(O(n)) fn kernel_b(y: buffer[u32]) -> void {\n",
+        "    let i: u32 = gid(0u32);\n    y[i] = i;\n    return;\n}\n",
+    );
+
+    /// AT-2964: `kernel: Some(name)` fuzzes the NAMED kernel (not a silent
+    /// first pick) — proceeds past kernel selection to the (GPU-free)
+    /// SKIPPED/gpu_unavailable outcome, reporting the SELECTED kernel's name.
+    #[test]
+    fn at_2964_kernel_param_selects_named_kernel() {
+        let req = FuzzRequest {
+            source: MULTI_KERNEL_FUZZ_SRC.to_string(), runs: 4, seed: 0, debug_oracle: None,
+            violate: false, buffer_sizes: vec![64], workgroups: None,
+            scalar_window: DEFAULT_SCALAR_WINDOW, strategy_assignments: BTreeMap::new(),
+            kernel: Some("kernel_b".to_string()),
+        };
+        let report = fuzz_kernel(&req, None);
+        assert_eq!(report.kernel, "kernel_b");
+        assert_eq!(report.verdict, FuzzVerdict::Skipped);
+        assert_eq!(report.reason.unwrap().kind, "gpu_unavailable");
+    }
+
+    /// AT-2964: ambiguous (no `--kernel`) on a 2-kernel source fails closed
+    /// listing kernel names (`FuzzVerdict::Error`/`"ambiguous_kernel"`), NOT
+    /// a silent `kernels[0]` pick.
+    #[test]
+    fn at_2964_ambiguous_kernel_fails_closed() {
+        let req = FuzzRequest {
+            source: MULTI_KERNEL_FUZZ_SRC.to_string(), runs: 4, seed: 0, debug_oracle: None,
+            violate: false, buffer_sizes: vec![64], workgroups: None,
+            scalar_window: DEFAULT_SCALAR_WINDOW, strategy_assignments: BTreeMap::new(),
+            kernel: None,
+        };
+        let report = fuzz_kernel(&req, None);
+        assert_eq!(report.verdict, FuzzVerdict::Error);
+        let reason = report.reason.expect("reason must be present");
+        assert_eq!(reason.kind, "ambiguous_kernel");
+        let detail = reason.detail.unwrap().to_string();
+        assert!(detail.contains("kernel_a") && detail.contains("kernel_b"), "detail must list both names: {detail}");
     }
 
     // ── negate_one / eligibility sanity ─────────────────────────────────────────
@@ -1478,7 +1534,7 @@ mod tests {
     #[test]
     fn verdict_first_key_and_screaming_snake_case() {
         let src = include_str!("../../../examples/fuzz_unsat.axc");
-        let req = FuzzRequest { source: src.to_string(), runs: 1, seed: 0, debug_oracle: None, violate: false, buffer_sizes: vec![64], workgroups: None, scalar_window: DEFAULT_SCALAR_WINDOW, strategy_assignments: BTreeMap::new() };
+        let req = FuzzRequest { source: src.to_string(), runs: 1, seed: 0, debug_oracle: None, violate: false, buffer_sizes: vec![64], workgroups: None, scalar_window: DEFAULT_SCALAR_WINDOW, strategy_assignments: BTreeMap::new(), kernel: None };
         let report = fuzz_kernel(&req, None);
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.starts_with("{\"verdict\":"), "verdict must be first key; got {json}");

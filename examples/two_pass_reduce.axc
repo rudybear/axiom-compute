@@ -1,0 +1,121 @@
+// examples/two_pass_reduce.axc — M3.21 (FG.9): multi-kernel modules.
+//
+// TWO @kernel functions in ONE file, sharing a strategy hole (?WG) across
+// BOTH kernels' @workgroup(...) annotations: N kernels/file + cross-kernel
+// hole binding + sequential multi-stage GPU dispatch + a bit-exact CPU
+// oracle, via the simplest honest multi-stage shape (partial-sums, then a
+// final reduce).
+//
+// DEVIATION (documented): the spec's illustrative text also puts `?WG`
+// inside `shared[i32, ?WG]`, but `parse_shared_len` (axc-parser) only
+// accepts an unsuffixed integer LITERAL there, not a HoleRef — confirmed
+// empirically (matmul_shared_f32.axc already relies on this gap and is
+// ONLY EVER compiled via text substitution, never a raw parse). M3.21's
+// NEW union_module_holes-based discovery (axc optimize/verify/MCP) parses
+// the RAW file first, so a hole in `shared[T,N]` here would break discovery
+// for this file. Fixing the grammar is out of scope (axc-parser untouched
+// by M3.21). So `?WG` lives ONLY in `@workgroup(?WG,1,1)`; the shared-array
+// size and tree-reduction stride are FIXED LITERALS matching the hole's
+// sole candidate (64) — single-candidate, mirroring the spec's own
+// authorized fallback. AT-2956's inline two-kernel string fixture (not this
+// file) separately proves the literal `shared[i32,?WG]` substitution text.
+//
+// Stage 1 (partial_reduce): each of n/64 workgroups reduces its 64-element
+// chunk of `input` to one partial, written to partials[workgroup_index].
+// Stage 2 (final_reduce): ONE 64-thread workgroup reduces the 64 partials
+// (n=4096 is fixed so n_parts = n/64 = 64 == workgroup size exactly — no
+// padding needed, mirrors M3.3b).
+//
+// i32 addition is associative, so the two-stage grouped result equals
+// Sigma(input) EXACTLY regardless of partitioning — bit-exact by
+// construction, sidestepping f32 reassociation entirely.
+//
+// Barrier structure: a workgroup-uniform `while stride > 0u32` loop with
+// workgroup_barrier() at the loop body's top level (outside the `if lid <
+// stride` guard), generalizing shared_reduce.axc's unrolled discipline to
+// an N-level loop. Sound against OQ2 (divergent-barrier hard error fires
+// only at conditional_depth > 0; `while` does NOT bump conditional_depth,
+// only if/else do) and OQ1 (every shared write is followed by a barrier
+// before the next cross-lane read of that slot).
+//
+// GPU test (anti-pattern #9): dispatch stage1 then stage2 IN SEQUENCE on a
+// real GPU — two host-orchestrated pipelines, proving the "N separate
+// SPIR-V modules" v1 architecture (§3). `out[0] == Sigma(input)` exactly
+// on NVIDIA (AXC_ENABLE_GPU_TESTS=1) AND Lavapipe (CI fallback).
+//
+// Anti-pattern #8: lshr() for stride halving. Anti-pattern #2: explicit `return;`.
+
+@kernel
+@workgroup(?WG, 1, 1)
+@strategy { WG: ?[64] }
+@intent("two-pass i32 sum reduction, stage 1: each workgroup reduces its 64-element chunk of input to one partial sum")
+@complexity(O(n))
+fn partial_reduce(input: readonly_buffer[i32], partials: buffer[i32], n: u32) -> void {
+    shared tile: shared[i32, 64];
+
+    let gi: u32 = gid(0u32);
+    let lid: u32 = local_invocation_id(0u32);
+
+    // Cooperative load: each invocation loads its own global element into
+    // shared memory at its local slot.
+    tile[lid] = input[gi];
+    workgroup_barrier();
+
+    // Workgroup-uniform tree reduction: every invocation evaluates the SAME
+    // `stride` each iteration (loop-carried via Function storage), so the
+    // barrier below sits in uniform control flow throughout.
+    let mut stride: u32 = 32u32;
+    while stride > 0u32 {
+        if lid < stride {
+            tile[lid] = tile[lid] + tile[lid + stride];
+        }
+        workgroup_barrier();
+        stride = lshr(stride, 1u32);
+    }
+
+    // Lane 0 writes this workgroup's partial sum. The workgroup index is
+    // gi/64 (gi = workgroup_id*64 + lid by definition of GlobalInvocationId
+    // under a 1-D dispatch with @workgroup(64,1,1); dividing out `lid` via
+    // integer division recovers the workgroup id without a dedicated
+    // WorkgroupId builtin).
+    let is_lane0: bool = lid == 0u32;
+    if is_lane0 {
+        let wg_index: u32 = gi / 64u32;
+        partials[wg_index] = tile[0u32];
+    }
+
+    return;
+}
+
+@kernel
+@workgroup(?WG, 1, 1)
+@strategy { WG: ?[64] }
+@intent("two-pass i32 sum reduction, stage 2: the single workgroup reduces the 64 partial sums to out[0]")
+@complexity(O(1))
+fn final_reduce(partials: readonly_buffer[i32], out: buffer[i32], n_parts: u32) -> void {
+    shared acc: shared[i32, 64];
+
+    let lid: u32 = local_invocation_id(0u32);
+
+    // n_parts == 64 == the workgroup size exactly for the fixed n=4096
+    // dispatch this example is sized for (n_parts = n/64); every lane loads
+    // exactly one partial, no padding branch needed.
+    acc[lid] = partials[lid];
+    workgroup_barrier();
+
+    let mut stride: u32 = 32u32;
+    while stride > 0u32 {
+        if lid < stride {
+            acc[lid] = acc[lid] + acc[lid + stride];
+        }
+        workgroup_barrier();
+        stride = lshr(stride, 1u32);
+    }
+
+    let is_lane0: bool = lid == 0u32;
+    if is_lane0 {
+        out[0u32] = acc[0u32];
+    }
+
+    return;
+}

@@ -141,6 +141,13 @@ pub struct VerifyRequest {
     /// Seed for deterministic input generation. Default `0`.
     #[serde(default)]
     pub seed: u64,
+    /// M3.21 (FG.9): the kernel to verify, applied to BOTH `original` and
+    /// `rewritten`. `None` on an ambiguous (2+ kernel) source in EITHER file
+    /// fails closed (`Verdict::Fail`/`"compile_fail_original"` or
+    /// `"compile_fail_rewritten"`, carrying the `AmbiguousKernel` detail).
+    /// Ignored on single-kernel sources.
+    #[serde(default)]
+    pub kernel: Option<String>,
 }
 
 // ── Verdict / report types ───────────────────────────────────────────────────
@@ -692,8 +699,8 @@ fn preflight_check(
 /// verdict is `SKIPPED`/`gpu_unavailable`. Never panics: a non-compiling or
 /// structurally-invalid rewrite becomes a `FAIL`/`REJECT` report, never an `Err`.
 pub fn verify_rewrite(req: &VerifyRequest, vk: Option<&VulkanContext>) -> VerifyReport {
-    // ── Step 1: compile both ──────────────────────────────────────────────
-    let orig_compiled = crate::compile_source_with_assignments(&req.original, &req.assignments);
+    // ── Step 1: compile both (M3.21: same --kernel selector on both sides) ──
+    let orig_compiled = crate::compile_source_with_assignments_kernel(&req.original, &req.assignments, req.kernel.as_deref());
     let (orig_bytes, meta_orig) = match orig_compiled {
         Ok(v) => v,
         Err(e) => {
@@ -704,7 +711,7 @@ pub fn verify_rewrite(req: &VerifyRequest, vk: Option<&VulkanContext>) -> Verify
         }
     };
 
-    let rewritten_compiled = crate::compile_source_with_assignments(&req.rewritten, &req.assignments);
+    let rewritten_compiled = crate::compile_source_with_assignments_kernel(&req.rewritten, &req.assignments, req.kernel.as_deref());
     let (rewritten_bytes, meta_rewritten) = match rewritten_compiled {
         Ok(v) => v,
         Err(e) => {
@@ -995,6 +1002,7 @@ mod tests {
             workgroups: None,
             push_constants: None,
             seed: 0,
+            kernel: None,
         }
     }
 
@@ -1128,6 +1136,61 @@ mod tests {
         assert!(report.rewritten.is_some());
     }
 
+    // ── AT-2963 (M3.21 / FG.9): rewrite-verify `kernel` selects on BOTH sides ──
+
+    const MULTI_KERNEL_SRC: &str = concat!(
+        "@kernel @workgroup(64, 1, 1) fn kernel_a(x: buffer[u32]) -> void {\n",
+        "    let i: u32 = gid(0u32);\n    x[i] = i;\n    return;\n}\n",
+        "@kernel @workgroup(32, 1, 1) fn kernel_b(y: buffer[u32]) -> void {\n",
+        "    let i: u32 = gid(0u32);\n    y[i] = i;\n    return;\n}\n",
+    );
+
+    /// AT-2963: `kernel: Some(name)` selects K on BOTH `original` and
+    /// `rewritten` — the compile stage succeeds and the report proceeds past
+    /// it (SKIPPED at dispatch with `vk=None`, not FAIL at compile).
+    #[test]
+    fn at_2963_kernel_selects_on_both_sides() {
+        let req = VerifyRequest {
+            original: MULTI_KERNEL_SRC.to_string(),
+            rewritten: MULTI_KERNEL_SRC.to_string(),
+            assignments: BTreeMap::new(),
+            tolerance: TolerancePolicy::BitExact,
+            buffer_sizes: vec![64],
+            output_sizes: None,
+            workgroups: None,
+            push_constants: None,
+            seed: 0,
+            kernel: Some("kernel_b".to_string()),
+        };
+        let report = verify_rewrite(&req, None);
+        assert_eq!(report.stage, "dispatch", "compile must succeed for BOTH sides with kernel=Some(\"kernel_b\"): {report:?}");
+        assert_eq!(report.verdict, Verdict::Skipped);
+        assert_eq!(report.original.as_ref().unwrap().kernel_name, "kernel_b");
+        assert_eq!(report.rewritten.as_ref().unwrap().kernel_name, "kernel_b");
+    }
+
+    /// AT-2963: `kernel: None` on an ambiguous (2+ kernel) source fails at
+    /// the compile stage, naming `compile_fail_original`.
+    #[test]
+    fn at_2963_ambiguous_kernel_fails_at_compile_stage() {
+        let req = VerifyRequest {
+            original: MULTI_KERNEL_SRC.to_string(),
+            rewritten: MULTI_KERNEL_SRC.to_string(),
+            assignments: BTreeMap::new(),
+            tolerance: TolerancePolicy::BitExact,
+            buffer_sizes: vec![64],
+            output_sizes: None,
+            workgroups: None,
+            push_constants: None,
+            seed: 0,
+            kernel: None,
+        };
+        let report = verify_rewrite(&req, None);
+        assert_eq!(report.verdict, Verdict::Fail);
+        assert_eq!(report.stage, "compile");
+        assert_eq!(report.reason.unwrap().kind, "compile_fail_original");
+    }
+
     // ── AT-2848: kernel-name rename is legal; WriteOnly<->ReadWrite flip is not ─
 
     #[test]
@@ -1175,6 +1238,7 @@ mod tests {
             workgroups: None, // MISSING — must ERROR
             push_constants: Some(vec![0_u8; 12]),
             seed: 0,
+            kernel: None,
         };
         let report = verify_rewrite(&req, None);
         assert_eq!(report.verdict, Verdict::Error);

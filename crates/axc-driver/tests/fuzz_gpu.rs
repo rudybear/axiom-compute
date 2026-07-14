@@ -41,6 +41,7 @@ fn base_request() -> FuzzRequest {
         workgroups: None,
         scalar_window: 256,
         strategy_assignments: BTreeMap::new(),
+        kernel: None,
     }
 }
 
@@ -98,6 +99,7 @@ fn at_2897_fuzz_fail_postcondition_counterexample_always_pass_oracle_guard() {
         workgroups: None,
         scalar_window: AT2897_WINDOW,
         strategy_assignments: BTreeMap::new(),
+        kernel: None,
     };
     let report = fuzz_kernel(&req, Some(&vk));
 

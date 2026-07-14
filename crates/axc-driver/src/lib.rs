@@ -78,6 +78,15 @@ pub enum DriverError {
         /// Debug representation of the unsupported `ScalarTy`.
         ty: String,
     },
+    /// M3.21 (FG.9): the source declares 2+ kernels and no `--kernel NAME` (or
+    /// equivalent `kernel: Option<&str>` selector) was given to disambiguate.
+    /// Fails closed — NEVER silently picks `kernels[0]`.
+    #[error("source declares {} kernels; specify --kernel NAME (available: {})", available.len(), available.join(", "))]
+    AmbiguousKernel { available: Vec<String> },
+    /// M3.21 (FG.9): `--kernel NAME` (or equivalent selector) named a kernel
+    /// that does not exist in this module.
+    #[error("no kernel named `{name}` in this module (available: {})", available.join(", "))]
+    UnknownKernel { name: String, available: Vec<String> },
 }
 
 impl DriverError {
@@ -107,8 +116,35 @@ pub fn compile_source_with_meta(source: &str) -> Result<(Vec<u8>, KernelMetadata
 /// `compile_source_with_meta` except `debug_checks` threads to `CodegenOptions` and
 /// the metadata sidecar; `debug_checks == false` is byte-identical to release
 /// (golden-identity gate, §6 of the spec).
+///
+/// Delegates to `compile_source_with_meta_kernel(source, None, debug_checks)` —
+/// unchanged behavior for every existing single-kernel caller (M3.21, FG.9).
 pub fn compile_source_with_meta_debug(
     source: &str,
+    debug_checks: bool,
+) -> Result<(Vec<u8>, KernelMetadata), DriverError> {
+    compile_source_with_meta_kernel(source, None, debug_checks)
+}
+
+/// M3.21 (FG.9): select ONE kernel by name (or the sole kernel if exactly one
+/// and `kernel == None`), compile it, and build its metadata.
+///
+/// **WRONG-METADATA GUARD**: this function builds a SINGLE 1-kernel
+/// `HirModule { kernels: vec![selected.clone()] }` and threads THAT SAME
+/// module through BOTH `emit_module_bytes` AND the metadata block below
+/// (`extract_workgroup_dims`, the coopmat/shared-bytes/debug-checks reads).
+/// It must NEVER emit from a filtered module while building metadata from the
+/// original multi-kernel HIR — that would pair a non-first kernel's SPIR-V
+/// with kernel[0]'s workgroup_size/name (AT-2969 pins this with a fixture
+/// carrying DISTINCT per-kernel `@workgroup` dims).
+///
+/// `None` on a single-kernel source behaves exactly as
+/// `compile_source_with_meta_debug` always has (golden-identity gate, §7).
+/// `None` on a 2+-kernel source is `DriverError::AmbiguousKernel`.
+/// `Some(name)` not present in the module is `DriverError::UnknownKernel`.
+pub fn compile_source_with_meta_kernel(
+    source: &str,
+    kernel: Option<&str>,
     debug_checks: bool,
 ) -> Result<(Vec<u8>, KernelMetadata), DriverError> {
     // ── Step 0: BOM rejection (anti-pattern #1) ─────────────────────────────
@@ -145,13 +181,21 @@ pub fn compile_source_with_meta_debug(
         });
     }
 
-    // ── Phase 4: Codegen (only when all phases are clean) ────────────────────
-    let bytes: Vec<u8> = emit_module_bytes(&hir, &CodegenOptions { debug_checks, ..CodegenOptions::default() })?;
+    // ── Phase 3.5: select the ONE kernel to compile (fail closed) ────────────
+    let selected: &axc_hir::Kernel = select_kernel(&hir.kernels, kernel)?;
 
-    // ── Phase 5: Build metadata from HIR ─────────────────────────────────────
-    let workgroup_size: [u32; 3] = extract_workgroup_dims(&hir);
-    let kernel = hir.kernels.first()
-        .expect("codegen succeeded, so at least one kernel exists");
+    // The WRONG-METADATA GUARD: one 1-kernel module, threaded through BOTH
+    // emit AND metadata below. Never feed emit a different module than the
+    // one metadata is built from.
+    let one: HirModuleType = axc_hir::HirModule { kernels: vec![selected.clone()] };
+
+    // ── Phase 4: Codegen (only when all phases are clean) ────────────────────
+    let bytes: Vec<u8> = emit_module_bytes(&one, &CodegenOptions { debug_checks, ..CodegenOptions::default() })?;
+
+    // ── Phase 5: Build metadata from the SAME 1-kernel module ────────────────
+    let workgroup_size: [u32; 3] = extract_workgroup_dims(&one);
+    let kernel_hir = one.kernels.first()
+        .expect("`one` was constructed with exactly one kernel");
     // The SPIR-V emitter writes `OpEntryPoint GLCompute %main "<kernel.name>"`
     // (see axc-codegen/src/emit.rs — `b.entry_point(..., &kernel.name, ...)`),
     // so the runtime must pass `kernel.name` as `pName` to vkCreateComputePipelines
@@ -162,13 +206,13 @@ pub fn compile_source_with_meta_debug(
     // M3.1: Fill coopmat shape from HIR (CRITICAL-1). The runtime reads the required
     // shape FROM METADATA — nothing is hardcoded in the runtime or tests (HN-10/AT-1552).
     // M3.1.5 (D): hir_coopmat_shape_to_meta now returns Result to avoid panic.
-    let coopmat_meta: Option<CoopMatShapeMeta> = kernel.annotations.coop_matrix.as_ref()
+    let coopmat_meta: Option<CoopMatShapeMeta> = kernel_hir.annotations.coop_matrix.as_ref()
         .map(hir_coopmat_shape_to_meta)
         .transpose()?;
 
     // M3.2: Compute aggregate shared_memory_bytes from the typed body's shared decls.
     // This is Σ total_byte_size() for all shared[T,N] declarations in the kernel body.
-    let shared_memory_bytes: u32 = match &kernel.body {
+    let shared_memory_bytes: u32 = match &kernel_hir.body {
         axc_hir::KernelBody::Typed(tb) => {
             let total: u64 = tb.shared.iter().map(|s| s.ty.total_byte_size()).sum();
             // Saturate to u32::MAX if somehow overflow occurs (should not in practice
@@ -181,21 +225,114 @@ pub fn compile_source_with_meta_debug(
     // M3.17 (FG.4): debug-check metadata, present only under `--debug` (§7/§6 —
     // `skip_serializing_if` on the field keeps a release sidecar unperturbed).
     let debug_checks_meta: Option<DebugChecksMeta> = if debug_checks {
-        Some(build_debug_checks_meta(kernel, source))
+        Some(build_debug_checks_meta(kernel_hir, source))
     } else {
         None
     };
 
     let metadata: KernelMetadata = KernelMetadata::new(
-        kernel.name.clone(),
+        kernel_hir.name.clone(),
         workgroup_size,
-        kernel.binding_plan.clone(),
-        kernel.name.clone(),
+        kernel_hir.binding_plan.clone(),
+        kernel_hir.name.clone(),
     ).with_coopmat(coopmat_meta)
      .with_shared_memory_bytes(shared_memory_bytes)
      .with_debug_checks(debug_checks_meta);
 
     Ok((bytes, metadata))
+}
+
+/// Alias used only to keep the WRONG-METADATA-GUARD doc comment above legible
+/// (`axc_hir::HirModule` and `axc_hir::Module` are the same type; both names
+/// are re-exported by `axc-hir`).
+type HirModuleType = axc_hir::HirModule;
+
+/// M3.21 (FG.9): select ONE kernel from `kernels` by name, or the sole kernel
+/// if `kernels.len() == 1` and `kernel == None`.
+///
+/// Fail-closed, NEVER a silent `kernels[0]` pick:
+/// - `kernel == None` and `kernels.len() > 1` -> `DriverError::AmbiguousKernel`
+///   listing every kernel name (source declaration order).
+/// - `kernel == Some(name)` not present -> `DriverError::UnknownKernel`.
+/// - `kernels.is_empty()` — unreachable in practice (an empty module fails
+///   HIR/codegen's `NoKernels` earlier), but returns `AmbiguousKernel` with an
+///   empty `available` list rather than panicking, per the no-panic rule.
+pub fn select_kernel<'a>(
+    kernels: &'a [axc_hir::Kernel],
+    kernel: Option<&str>,
+) -> Result<&'a axc_hir::Kernel, DriverError> {
+    match kernel {
+        Some(name) => kernels.iter().find(|k| k.name == name).ok_or_else(|| {
+            DriverError::UnknownKernel {
+                name: name.to_string(),
+                available: kernels.iter().map(|k| k.name.clone()).collect(),
+            }
+        }),
+        None => match kernels.len() {
+            1 => Ok(&kernels[0]),
+            _ => Err(DriverError::AmbiguousKernel {
+                available: kernels.iter().map(|k| k.name.clone()).collect(),
+            }),
+        },
+    }
+}
+
+/// One compiled kernel out of a (possibly multi-kernel) module.
+#[derive(Debug, Clone)]
+pub struct CompiledKernel {
+    /// `== entry_point == metadata.kernel_name`.
+    pub name: String,
+    pub spirv: Vec<u8>,
+    pub metadata: KernelMetadata,
+}
+
+/// M3.21 (FG.9): compile EVERY `@kernel` in `source` to its own SPIR-V module
+/// + metadata (the "N separate modules" v1 decision — §3 of the spec).
+///
+/// Iterates `hir.kernels`; each is wrapped as its own 1-kernel `HirModule` and
+/// run through the unchanged single-kernel emit + metadata path (reuses
+/// `compile_source_with_meta_kernel`'s per-kernel logic via `select_kernel`
+/// with an explicit name, so the WRONG-METADATA GUARD applies here too).
+///
+/// This is also the F4 winner cross-validator (§4): `axc optimize` calls this
+/// on the winner-substituted source and fails closed if ANY sibling kernel
+/// fails to compile/validate, before writing any output.
+///
+/// Empty module (0 kernels) -> `DriverError::Compile` (unchanged `NoKernels`
+/// path, surfaced as an HIR error from the normal pipeline).
+pub fn compile_module_all(source: &str, debug_checks: bool) -> Result<Vec<CompiledKernel>, DriverError> {
+    // Reuse the same lex/parse/HIR front end as compile_source_with_meta_kernel
+    // (BOM check + collect-all aggregation) so an empty/erroring module reports
+    // through the identical DriverError::Compile path.
+    if source.as_bytes().starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return Err(DriverError::UnexpectedByteOrderMark {
+            span: Span { start: 0, end: 3 },
+        });
+    }
+    let (tokens, lex_errors) = tokenize(source);
+    let mut parser: Parser = Parser::new(&tokens);
+    let (ast, parse_errors) = parser.parse_module();
+    let (hir, hir_errors, hir_warnings) = lower_module(&ast);
+    for w in &hir_warnings {
+        eprintln!("warning: {:?}", w);
+    }
+    if !lex_errors.is_empty() || !parse_errors.is_empty() || !hir_errors.is_empty() {
+        return Err(DriverError::Compile {
+            lex: lex_errors,
+            parse: parse_errors,
+            hir: hir_errors,
+        });
+    }
+    if hir.kernels.is_empty() {
+        return Err(DriverError::Codegen(axc_codegen::CodegenError::NoKernels));
+    }
+
+    let mut out: Vec<CompiledKernel> = Vec::with_capacity(hir.kernels.len());
+    for k in &hir.kernels {
+        let (spirv, metadata) = compile_source_with_meta_kernel(source, Some(k.name.as_str()), debug_checks)?;
+        out.push(CompiledKernel { name: k.name.clone(), spirv, metadata });
+    }
+    Ok(out)
 }
 
 /// M3.17 (FG.4): build the sidecar's `DebugChecksMeta` from a compiled kernel's
@@ -254,13 +391,31 @@ pub fn compile_source_with_assignments(
     source: &str,
     assignments: &std::collections::BTreeMap<String, i64>,
 ) -> Result<(Vec<u8>, KernelMetadata), DriverError> {
+    compile_source_with_assignments_kernel(source, assignments, None)
+}
+
+/// M3.21 (FG.9): `compile_source_with_assignments` with an explicit kernel
+/// selector — the multi-kernel-aware sibling used by callers that need to
+/// name which kernel a `@strategy`-substituted, possibly-multi-kernel source
+/// should compile (the autotuner's per-kernel bench target; MCP
+/// `compile_variant`/`bench_variant` with a `kernel` param).
+///
+/// `assignments` substitutes module-wide (F1, boundary-safe) BEFORE kernel
+/// selection — a shared hole referenced in a non-selected sibling kernel is
+/// still resolved, matching §4's "the resolved value substitutes into all
+/// references module-wide" rule.
+pub fn compile_source_with_assignments_kernel(
+    source: &str,
+    assignments: &std::collections::BTreeMap<String, i64>,
+    kernel: Option<&str>,
+) -> Result<(Vec<u8>, KernelMetadata), DriverError> {
     // Strategy substitution: rewrite `?hole` references in the source text to
     // their concrete integer values before lexing.  This is source-text
     // substitution (NOT AST rewrite) for byte-identical SPIR-V reproducibility.
     //
     // The substituted source is fed to the normal pipeline.
     let substituted: String = substitute_strategy_holes(source, assignments);
-    compile_source_with_meta(&substituted)
+    compile_source_with_meta_kernel(&substituted, kernel, false)
 }
 
 /// M3.1: Map a HIR `CoopMatrixShape` to a `CoopMatShapeMeta` for the metadata sidecar.
@@ -324,25 +479,112 @@ fn scalar_ty_to_coopmat_scalar_meta(ty: ScalarTy) -> Result<CoopMatScalarMeta, D
 /// The strip is simple-text-level: finds the first `@strategy` followed by
 /// whitespace and `{`, then removes through the matching `}`.  This handles
 /// the common single-level case.  Nested braces are not supported (M2.3 scope).
-pub(crate) fn substitute_strategy_holes(
+///
+/// M3.21 (FG.9): Pass 2 strips ALL `@strategy { ... }` blocks (not just the
+/// first) via `strip_all_strategy_annotation_blocks` (F2) — a multi-kernel
+/// module can carry one block per kernel. Identical behavior to the old
+/// single-block strip on any source with 0 or 1 blocks (the loop terminates
+/// after its first no-op pass).
+pub fn substitute_strategy_holes(
     source: &str,
     assignments: &std::collections::BTreeMap<String, i64>,
 ) -> String {
-    // Pass 1: substitute ?name references.
-    let mut result: String = source.to_string();
-    for (name, value) in assignments {
-        let hole_ref: String = format!("?{name}");
-        let replacement: String = value.to_string();
-        result = result.replace(&hole_ref, &replacement);
+    // Pass 1: substitute ?name references (F1, M3.21 — boundary-safe single scan).
+    let result: String = substitute_strategy_holes_boundary_safe(source, assignments);
+
+    // Pass 2: strip every @strategy { ... } block (F2).
+    // After Pass 1 the hole refs in @workgroup are integers, but @strategy still
+    // has ?[...] candidate lists. Removing the block(s) prevents HIR from lowering
+    // the residual candidates into StrategyHoles (which would trip the backstop).
+    strip_all_strategy_annotation_blocks(&result)
+}
+
+/// M3.21 (FG.9) F1 — the boundary-safe `?name` substitution scan.
+///
+/// Replaces the OLD Pass-1 algorithm (`result.replace("?name", value)` iterated
+/// over a `BTreeMap` in ascending name order), which was a PROVEN MISCOMPILE
+/// once two hole names prefix-collide: `?WG` is a substring-prefix of `?WG2`,
+/// and ascending order replaces the SHORT name first, corrupting the longer
+/// reference (`shared[i32,?WG2]` with `{WG=128, WG2=64}` produced
+/// `shared[i32,1282]` — the `128` splice plus the orphaned `2` — NOT `64`, with
+/// no error). See the spec's §4 for the full incident writeup.
+///
+/// The fix is a SINGLE left-to-right scan over the raw source bytes: at each
+/// `?`, greedily try the LONGEST hole name from `assignments` that occurs at
+/// that position AND whose following byte is NOT an identifier-continuation
+/// char (`[A-Za-z0-9_]`). The following-byte boundary check is the actual
+/// correctness guarantee (it is what makes `?WG` followed by `2` refuse to
+/// match the shorter `WG`); longest-name-first is belt-and-suspenders on top
+/// of it (picks `?WG2` over `?WG` when both are viable at the same offset).
+/// A single forward scan also means each source position is decided exactly
+/// once, entirely removing the ascending-BTreeMap ordering hazard.
+///
+/// Deliberately NOT comment-aware: this operates on raw text, so a `?name`
+/// sitting inside a `//` comment is still substituted. That is harmless (the
+/// lexer discards comments before HIR — a rewritten comment cannot change
+/// compiled SPIR-V or hole resolution), unlike the STRIP path (which IS
+/// lexer-anchored, because a comment decoy THERE could remove the wrong
+/// block). See the spec's §4 "Comment-scope decision" for the full rationale.
+fn substitute_strategy_holes_boundary_safe(
+    source: &str,
+    assignments: &std::collections::BTreeMap<String, i64>,
+) -> String {
+    if assignments.is_empty() {
+        return source.to_string();
     }
 
-    // Pass 2: strip @strategy { ... } block.
-    // After Pass 1 the hole refs in @workgroup are integers, but @strategy still
-    // has ?[...] candidate lists. Removing the block prevents HIR from lowering
-    // the residual candidates into StrategyHoles (which would trip the backstop).
-    result = strip_strategy_annotation_block(&result);
+    // Longest-name-first candidate order (tiebreak only — the boundary check
+    // above is the soundness guarantee, not this ordering).
+    let mut names: Vec<(&str, i64)> = assignments.iter().map(|(n, &v)| (n.as_str(), v)).collect();
+    names.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
-    result
+    let bytes: &[u8] = source.as_bytes();
+    let mut out: String = String::with_capacity(source.len());
+    let mut i: usize = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'?' {
+            let after_q: usize = i + 1;
+            let mut matched: Option<(&str, i64)> = None;
+            for &(name, value) in &names {
+                let end: usize = after_q + name.len();
+                // `source.get(..)` returns `None` on out-of-bounds AND on a
+                // non-char-boundary `end` — both cases panic a raw `&source[..]`
+                // slice. Using the Option form makes the scan panic-free: a
+                // candidate whose length reaches into a following multibyte
+                // UTF-8 char can never equal an ASCII hole `name` anyway (PCR-1,
+                // M3.21 pessimistic code review — the old direct-slice form
+                // panicked on `?W` immediately followed by `€`), so refusing to
+                // match there and falling through to verbatim-copy is correct.
+                if source.get(after_q..end) == Some(name) {
+                    // Boundary check: the byte immediately after the matched
+                    // name must NOT be an identifier-continuation char.
+                    let boundary_ok: bool = match bytes.get(end) {
+                        Some(&b) => !(b.is_ascii_alphanumeric() || b == b'_'),
+                        None => true,
+                    };
+                    if boundary_ok {
+                        matched = Some((name, value));
+                        break; // `names` is longest-first, so the first hit wins.
+                    }
+                }
+            }
+            if let Some((name, value)) = matched {
+                out.push_str(&value.to_string());
+                i = after_q + name.len();
+                continue;
+            }
+        }
+        // Copy this byte's UTF-8 char verbatim (source is valid UTF-8; `?`
+        // and identifier-continuation bytes are all single-byte ASCII, so
+        // stepping by the char's byte length here keeps multi-byte UTF-8
+        // sequences elsewhere in the source intact).
+        let ch_len: usize = source[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        out.push_str(&source[i..i + ch_len]);
+        i += ch_len;
+    }
+
+    out
 }
 
 /// Strip the first `@strategy { ... }` annotation block from source text.
@@ -431,6 +673,33 @@ pub(crate) fn strip_strategy_annotation_block(source: &str) -> String {
     format!("{before}{after}")
 }
 
+/// M3.21 (FG.9) F2 — strip ALL `@strategy { ... }` blocks from `source`.
+///
+/// A multi-kernel module can carry one brace-form `@strategy { ... }` block
+/// PER kernel (e.g. `two_pass_reduce.axc`'s two kernels each declaring `?WG`).
+/// `strip_strategy_annotation_block` only strips the FIRST one it finds; this
+/// loops it.
+///
+/// Termination predicate: loop WHILE the last strip actually changed the
+/// source (`prev != next`) — NOT "while an `Annotation("strategy")` token
+/// still exists". The underlying single-block strip returns the source
+/// UNCHANGED for the call-form `@strategy(...)` (not followed by `{`), so a
+/// token-existence predicate would infinite-loop on a residual call-form
+/// annotation. Keying on "did this pass change anything" always terminates —
+/// the first no-op pass ends the loop, whether that's because every
+/// brace-form block is gone or because only a harmless call-form annotation
+/// remains.
+pub(crate) fn strip_all_strategy_annotation_blocks(source: &str) -> String {
+    let mut current: String = source.to_string();
+    loop {
+        let next: String = strip_strategy_annotation_block(&current);
+        if next == current {
+            return current;
+        }
+        current = next;
+    }
+}
+
 /// Compute the metadata sidecar path from an output path.
 ///
 /// Appends `.axc.meta.json` to the full filename (including any extension).
@@ -438,7 +707,7 @@ pub(crate) fn strip_strategy_annotation_block(source: &str) -> String {
 /// - `out.spv` → `out.spv.axc.meta.json`
 /// - `kernel` → `kernel.axc.meta.json`
 /// - `/a/b.c/d.spv` → `/a/b.c/d.spv.axc.meta.json`
-pub(crate) fn metadata_sidecar_path(output: &Path) -> PathBuf {
+pub fn metadata_sidecar_path(output: &Path) -> PathBuf {
     let filename: String = output
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -461,11 +730,61 @@ pub fn compile_file(input: &Path, output: &Path) -> Result<(), DriverError> {
     compile_file_debug(input, output, false)
 }
 
+/// M3.21 (FG.9): the `--all` output stem — `output` with a trailing `.spv`
+/// extension (case-sensitive) stripped, preserving the parent directory.
+/// A non-`.spv` (or extensionless) `output` is used verbatim as the stem.
+///
+/// # Examples
+/// - `build/scan.spv` -> `build/scan`
+/// - `build/scan` -> `build/scan` (no `.spv` to strip)
+pub fn all_output_stem(output: &Path) -> PathBuf {
+    match output.extension() {
+        Some(ext) if ext == "spv" => output.with_extension(""),
+        _ => output.to_path_buf(),
+    }
+}
+
+/// M3.21 (FG.9): the per-kernel output path for one kernel of an `--all`
+/// multi-emit: `<stem>.<kernel_name>.spv`.
+///
+/// # Examples
+/// - `per_kernel_output_path("build/scan", "partial_reduce")` ->
+///   `build/scan.partial_reduce.spv`
+pub fn per_kernel_output_path(stem: &Path, kernel_name: &str) -> PathBuf {
+    let mut name: std::ffi::OsString = stem.file_name().map(|n| n.to_owned()).unwrap_or_default();
+    name.push(".");
+    name.push(kernel_name);
+    name.push(".spv");
+    match stem.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
+        _ => PathBuf::from(name),
+    }
+}
+
 /// M3.17 (FG.4): `compile_file` with an explicit `--debug` flag. See
 /// `compile_source_with_meta_debug` for the behavioral contract.
 pub fn compile_file_debug(input: &Path, output: &Path, debug_checks: bool) -> Result<(), DriverError> {
     let source: String = std::fs::read_to_string(input)?;
     let (bytes, metadata) = compile_source_with_meta_debug(&source, debug_checks)?;
+    std::fs::write(output, &bytes)?;
+    let sidecar_path: PathBuf = metadata_sidecar_path(output);
+    metadata.save(&sidecar_path)
+        .map_err(DriverError::MetadataEmitFailed)?;
+    Ok(())
+}
+
+/// M3.21 (FG.9): `compile_file_debug` with an explicit kernel selector. See
+/// `compile_source_with_meta_kernel` for the behavioral contract (fail-closed
+/// `AmbiguousKernel`/`UnknownKernel`; `None` on a single-kernel source is
+/// byte-identical to `compile_file_debug`, the golden-identity gate).
+pub fn compile_file_kernel(
+    input: &Path,
+    output: &Path,
+    kernel: Option<&str>,
+    debug_checks: bool,
+) -> Result<(), DriverError> {
+    let source: String = std::fs::read_to_string(input)?;
+    let (bytes, metadata) = compile_source_with_meta_kernel(&source, kernel, debug_checks)?;
     std::fs::write(output, &bytes)?;
     let sidecar_path: PathBuf = metadata_sidecar_path(output);
     metadata.save(&sidecar_path)
@@ -969,6 +1288,10 @@ mod tests {
             }
             checked += 1;
 
+            // Equality clause: the load-bearing OLD-vs-NEW pin. Both algorithms
+            // strip only the FIRST block, identically, regardless of how many
+            // blocks the file has — this must NOT be weakened for any file
+            // (M3.21 / AT-2971 r2 changelog item 4).
             let naive: String = naive_strip_reference(&src);
             let robust: String = strip_strategy_annotation_block(&src);
             assert_eq!(
@@ -977,10 +1300,25 @@ mod tests {
                  algorithm on {path:?} (zero behavior change on the real corpus)"
             );
 
-            // Residual `@strategy {` check, scoped to NON-COMMENT lines only —
-            // mirrors AT-1576 above. An unscoped check would wrongly flag
-            // matmul_f32_tiled.axc's comment-form decoy at line 13.
-            let has_live_strategy_block: bool = robust
+            // Residual clause: M3.21 (FG.9) block-count branch (AT-2971). A
+            // multi-kernel file (e.g. two_pass_reduce.axc) can carry MORE
+            // THAN ONE brace-form `@strategy {` block (one per kernel) — the
+            // single-block `strip_strategy_annotation_block` above only ever
+            // removes the FIRST one, so a >1-block file's residual check must
+            // run against `strip_all_strategy_annotation_blocks` (F2) instead,
+            // which loops until no more blocks change. Single-block files keep
+            // asserting against the single-block `robust` result unchanged.
+            let non_comment_strategy_block_count: usize = src
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .filter(|line| line.contains("@strategy {"))
+                .count();
+            let residual_source: String = if non_comment_strategy_block_count > 1 {
+                strip_all_strategy_annotation_blocks(&src)
+            } else {
+                robust
+            };
+            let has_live_strategy_block: bool = residual_source
                 .lines()
                 .filter(|line| !line.trim_start().starts_with("//"))
                 .any(|line| line.contains("@strategy {"));
@@ -1135,6 +1473,347 @@ mod tests {
             "SPIR-V magic must be correct");
         assert_eq!(meta.workgroup_size, [128, 1, 1],
             "workgroup_size must reflect resolved wg_x=128");
+    }
+
+    // ── M3.21 (FG.9): multi-kernel modules ──────────────────────────────────
+
+    const TWO_KERNEL_SRC: &str = concat!(
+        "@kernel\n",
+        "@workgroup(64, 1, 1)\n",
+        "@intent(\"stage 1\")\n",
+        "@complexity(O(n))\n",
+        "fn stage_one(x: buffer[u32]) -> void {\n",
+        "    let i: u32 = gid(0u32);\n",
+        "    x[i] = i;\n",
+        "    return;\n",
+        "}\n",
+        "@kernel\n",
+        "@workgroup(32, 1, 1)\n",
+        "@intent(\"stage 2\")\n",
+        "@complexity(O(n))\n",
+        "fn stage_two(y: buffer[u32]) -> void {\n",
+        "    let i: u32 = gid(0u32);\n",
+        "    y[i] = i;\n",
+        "    return;\n",
+        "}\n",
+    );
+
+    /// AT-2945: parser + lower_module accept 2 `@kernel` items ->
+    /// `HirModule.kernels.len() == 2` (locks pre-existing front-end behavior).
+    #[test]
+    fn at_2945_lower_module_accepts_two_kernels() {
+        let (ast, lex_errs, parse_errs) = axc_parser::parse(TWO_KERNEL_SRC);
+        assert!(lex_errs.is_empty() && parse_errs.is_empty(), "lex/parse errors: {lex_errs:?} {parse_errs:?}");
+        let (hir, hir_errs, _warns) = lower_module(&ast);
+        assert!(hir_errs.is_empty(), "hir errors: {hir_errs:?}");
+        assert_eq!(hir.kernels.len(), 2);
+        assert_eq!(hir.kernels[0].name, "stage_one");
+        assert_eq!(hir.kernels[1].name, "stage_two");
+    }
+
+    /// AT-2946: `compile_module_all` on a 2-kernel source -> 2 `CompiledKernel`
+    /// with distinct names, distinct spirv, distinct metadata.
+    #[test]
+    fn at_2946_compile_module_all_two_distinct_kernels() {
+        let compiled = compile_module_all(TWO_KERNEL_SRC, false).expect("must compile");
+        assert_eq!(compiled.len(), 2);
+        assert_eq!(compiled[0].name, "stage_one");
+        assert_eq!(compiled[1].name, "stage_two");
+        assert_ne!(compiled[0].spirv, compiled[1].spirv, "distinct workgroup sizes must yield distinct SPIR-V");
+        assert_eq!(compiled[0].metadata.workgroup_size, [64, 1, 1]);
+        assert_eq!(compiled[1].metadata.workgroup_size, [32, 1, 1]);
+        assert_eq!(compiled[0].metadata.entry_point, "stage_one");
+        assert_eq!(compiled[1].metadata.entry_point, "stage_two");
+    }
+
+    /// `compile_module_all` on an empty module (0 kernels) -> DriverError
+    /// (the unchanged `NoKernels` codegen path, surfaced through the driver).
+    #[test]
+    fn compile_module_all_empty_module_errors() {
+        let result = compile_module_all("", false);
+        assert!(result.is_err(), "empty module must error, not silently return an empty Vec");
+    }
+
+    /// AT-2947: per-kernel golden. `compile_module_all` on a 1-kernel example
+    /// produces exactly 1 module, byte-identical (spv + metadata's serialized
+    /// shape) to `compile_source_with_meta`.
+    #[test]
+    fn at_2947_single_kernel_golden_matches_compile_source_with_meta() {
+        let src = include_str!("../../../examples/saxpy.axc");
+        let (direct_bytes, direct_meta) = compile_source_with_meta(src).expect("saxpy.axc must compile");
+        let compiled = compile_module_all(src, false).expect("compile_module_all must succeed");
+        assert_eq!(compiled.len(), 1, "single-kernel source must produce exactly 1 CompiledKernel");
+        assert_eq!(compiled[0].spirv, direct_bytes, "SPIR-V must be byte-identical");
+        assert_eq!(
+            serde_json::to_string(&compiled[0].metadata).unwrap(),
+            serde_json::to_string(&direct_meta).unwrap(),
+            "metadata must be identical (serialized-shape comparison; KernelMetadata has no PartialEq)"
+        );
+    }
+
+    /// AT-2948: corpus golden. ALL `examples/*.axc` single-kernel files compile
+    /// byte-identical (spv + metadata) through `compile_module_all` vs the
+    /// pre-M3.21 `compile_source_with_meta` path. Multi-kernel files (i.e.
+    /// `two_pass_reduce.axc`) are skipped here (`compile_source_with_meta`
+    /// itself would reject them with `AmbiguousKernel` — this anchor is
+    /// specifically the single-kernel golden-identity gate, §7 of the spec).
+    #[test]
+    fn at_2948_corpus_golden_all_single_kernel_examples() {
+        let manifest_dir: PathBuf = PathBuf::from(
+            std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"),
+        );
+        let examples_dir: PathBuf = manifest_dir.join("..").join("..").join("examples");
+        let mut checked: usize = 0;
+        for entry in std::fs::read_dir(&examples_dir)
+            .unwrap_or_else(|e| panic!("failed to read {examples_dir:?}: {e}"))
+        {
+            let entry = entry.expect("dir entry read failed");
+            let path: PathBuf = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("axc") {
+                continue;
+            }
+            let src: String = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("failed to read {path:?}: {e}"));
+
+            // Multi-kernel files (the golden-identity gate covers single-kernel
+            // only; a multi-kernel source can't compile via compile_source_with_meta
+            // at all — it fails closed with AmbiguousKernel — so there is no
+            // single-kernel baseline to compare against for such a file).
+            let (ast, lex_errs, parse_errs) = axc_parser::parse(&src);
+            if !lex_errs.is_empty() || !parse_errs.is_empty() {
+                continue; // template-only files with unresolved holes in body/shared position
+            }
+            let (hir, hir_errs, _warns) = lower_module(&ast);
+            if !hir_errs.is_empty() || hir.kernels.len() != 1 {
+                continue;
+            }
+
+            checked += 1;
+            let direct = compile_source_with_meta(&src);
+            let via_all = compile_module_all(&src, false);
+            match (direct, via_all) {
+                (Ok((direct_bytes, direct_meta)), Ok(compiled)) => {
+                    assert_eq!(compiled.len(), 1, "{path:?}: expected exactly 1 compiled kernel");
+                    assert_eq!(compiled[0].spirv, direct_bytes, "{path:?}: SPIR-V must be byte-identical");
+                    assert_eq!(
+                        serde_json::to_string(&compiled[0].metadata).unwrap(),
+                        serde_json::to_string(&direct_meta).unwrap(),
+                        "{path:?}: metadata must be identical"
+                    );
+                }
+                (Err(_), Err(_)) => {
+                    // Both paths agree the file doesn't compile standalone
+                    // (e.g. a template file with holes only resolvable via
+                    // compile_source_with_assignments) — consistent, not a regression.
+                }
+                (d, v) => panic!("{path:?}: compile_source_with_meta and compile_module_all DISAGREE on success: direct={d:?} via_all_is_ok={}", v.is_ok()),
+            }
+        }
+        assert!(checked > 0, "expected at least one single-kernel examples/*.axc to exercise the corpus golden gate");
+    }
+
+    /// AT-2955: `strip_all_strategy_annotation_blocks` removes BOTH `@strategy`
+    /// blocks from a 2-kernel source (no residual `@strategy`/`?hole`).
+    #[test]
+    fn at_2955_strip_all_removes_both_strategy_blocks() {
+        let src = concat!(
+            "@kernel @workgroup(?a,1,1) @strategy { a: ?[32, 64] } fn k1() -> void { return; }\n",
+            "@kernel @workgroup(?b,1,1) @strategy { b: ?[16, 32] } fn k2() -> void { return; }\n",
+        );
+        let result = strip_all_strategy_annotation_blocks(src);
+        assert!(!result.contains("@strategy"), "no @strategy block may survive; got {result:?}");
+        assert!(!result.contains("?["), "no candidate list may survive; got {result:?}");
+        assert!(result.contains("fn k1()") && result.contains("fn k2()"), "both kernels must survive: {result:?}");
+    }
+
+    /// `strip_all_strategy_annotation_blocks` on a single-block source is
+    /// identical to the single-block strip (the "while changed" loop
+    /// terminates after its first pass — no behavior change for the common case).
+    #[test]
+    fn strip_all_single_block_matches_single_block_strip() {
+        let src = "@kernel @workgroup(64,1,1) @strategy { rb_m: ?[2] } fn k() -> void { return; }";
+        assert_eq!(strip_all_strategy_annotation_blocks(src), strip_strategy_annotation_block(src));
+    }
+
+    /// `strip_all_strategy_annotation_blocks` does not infinite-loop on a
+    /// residual call-form `@strategy(...)` annotation (F2's termination
+    /// predicate: "while changed", not "while an @strategy token exists" —
+    /// the call form is a strip no-op, so a token-existence predicate would hang).
+    #[test]
+    fn strip_all_terminates_on_call_form_residual() {
+        let src = "@kernel @strategy(foo) fn k() -> void { return; }";
+        let result = strip_all_strategy_annotation_blocks(src);
+        assert_eq!(result, src, "@strategy(...) call form must be left unchanged, and the loop must terminate");
+    }
+
+    /// AT-2968(a): F1 prefix-collision — the PROVEN miscompile. `?WG` is a
+    /// substring-prefix of `?WG2`; substituting `{WG: 128, WG2: 64}` must
+    /// produce `@workgroup(128,1,1)` AND `shared[i32,64]`, and must NOT
+    /// contain `1282` (the old ascending-BTreeMap-order splice bug).
+    #[test]
+    fn at_2968a_prefix_collision_no_miscompile() {
+        let src = "@workgroup(?WG,1,1) shared[i32,?WG2]";
+        let mut assignments: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+        assignments.insert("WG".to_string(), 128);
+        assignments.insert("WG2".to_string(), 64);
+        let result = substitute_strategy_holes(src, &assignments);
+        assert!(result.contains("@workgroup(128,1,1)"), "?WG must resolve to 128; got {result:?}");
+        assert!(result.contains("shared[i32,64]"), "?WG2 must resolve to 64; got {result:?}");
+        assert!(!result.contains("1282"), "the proven miscompile (128 splice + orphaned 2) must NOT occur; got {result:?}");
+    }
+
+    /// AT-2968(b): comment-decoy. A `?WG2` sitting in a `//` comment does not
+    /// block the LIVE `?WG2` from resolving to 64 (the comment occurrence is
+    /// ALSO substituted — harmless, since the lexer discards comments before
+    /// HIR — but must not produce `1282` either).
+    #[test]
+    fn at_2968b_prefix_collision_comment_decoy_harmless() {
+        let src = "// note: ?WG2 tile\n@workgroup(?WG,1,1) shared[i32,?WG2]";
+        let mut assignments: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+        assignments.insert("WG".to_string(), 128);
+        assignments.insert("WG2".to_string(), 64);
+        let result = substitute_strategy_holes(src, &assignments);
+        assert!(result.contains("shared[i32,64]"), "the LIVE ?WG2 must resolve to 64; got {result:?}");
+        assert!(!result.contains("1282"), "no miscompile via the comment decoy; got {result:?}");
+        // The comment's OWN ?WG2 occurrence is also substituted (harmless —
+        // comments never reach the lexer/HIR); it must be 64, never 1282.
+        assert!(result.contains("// note: 64 tile"), "comment substitution is harmless but still boundary-safe; got {result:?}");
+    }
+
+    /// AT-2968(c): char-boundary panic (PCR-1, M3.21 pessimistic code review).
+    ///
+    /// `substitute_strategy_holes_boundary_safe` used to slice
+    /// `&source[after_q..end]` directly. When a candidate hole name's byte
+    /// length reaches PAST the start of a following multibyte UTF-8
+    /// character, `end` lands mid-character (not a char boundary) and the
+    /// direct slice panics — a regression from the OLD `str::replace`
+    /// algorithm, which silently left such input untouched. Reproduces the
+    /// review's exact fixture: a `//` comment containing `?W` immediately
+    /// followed by `€` (a 3-byte char), with `WG` (len 2) a registered hole
+    /// name. `after_q` points at `W` (1 ASCII byte); `end = after_q + 2`
+    /// therefore lands 1 byte into `€`'s 3-byte encoding — the exact
+    /// panicking offset before the fix (`source.get(after_q..end) ==
+    /// Some(name)` now returns `None` there instead of panicking).
+    #[test]
+    fn at_2968c_multibyte_boundary_no_panic_comment_untouched() {
+        let src = "// tuned ?W\u{20AC} budget\n@kernel @workgroup(?WG, 1, 1)\n@strategy { WG: ?[32, 64, 128] }\nfn tune() -> void { return; }\n";
+        let mut assignments: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+        assignments.insert("WG".to_string(), 64);
+
+        // Low-level scan: must not panic, and the truncated comment
+        // candidate (`?W` immediately followed by `€`) must be left
+        // untouched verbatim since `WG` cannot match a boundary that falls
+        // mid-character.
+        let scanned = substitute_strategy_holes_boundary_safe(src, &assignments);
+        assert!(
+            scanned.contains("?W\u{20AC} budget"),
+            "the non-char-boundary candidate must be left verbatim, not substituted or corrupted; got {scanned:?}"
+        );
+
+        // End-to-end: the whole module must still compile clean (the hole
+        // in the comment is invisible to the lexer regardless; the LIVE
+        // `?WG` in `@workgroup` resolves normally).
+        let (bytes, meta) = compile_source_with_assignments(src, &assignments)
+            .expect("AT-2968c: multibyte-adjacent comment text must not panic and must compile clean");
+        assert_eq!(&bytes[0..4], &[0x03, 0x02, 0x23, 0x07], "SPIR-V magic must be correct");
+        assert_eq!(meta.workgroup_size, [64, 1, 1], "workgroup_size must reflect resolved WG=64");
+    }
+
+    /// AT-2968(c) variant: a REAL multibyte-adjacent hole still substitutes
+    /// correctly. `?WG` immediately followed by `€` (not a truncated
+    /// candidate — `WG` matches in full, and `end` lands exactly on the char
+    /// boundary right before `€`) must still resolve to its value; the fix
+    /// must not overcorrect into refusing valid matches merely because a
+    /// multibyte char follows.
+    #[test]
+    fn at_2968c_multibyte_adjacent_hole_substitutes_correctly() {
+        let src = "?WG\u{20AC}";
+        let mut assignments: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+        assignments.insert("WG".to_string(), 128);
+        let result = substitute_strategy_holes_boundary_safe(src, &assignments);
+        assert_eq!(
+            result, "128\u{20AC}",
+            "a full-length hole name immediately followed by a multibyte char must still substitute; got {result:?}"
+        );
+    }
+
+    /// AT-2969: the WRONG-METADATA GUARD. A 2-kernel source with DISTINCT
+    /// `@workgroup` dims: `compile_source_with_meta_kernel(Some("second"), ..)`
+    /// must produce a sidecar whose `workgroup_size` matches SECOND's dims
+    /// (128,1,1) — NOT first's (64,1,1) — proving emit + metadata are built
+    /// from the SAME 1-kernel module. (AT-2950 can't catch this bug since the
+    /// real `two_pass_reduce.axc` example shares one `?WG` value across both
+    /// kernels; this fixture uses distinct LITERAL dims specifically to expose
+    /// a metadata/emit mismatch.)
+    #[test]
+    fn at_2969_wrong_metadata_guard_distinct_dims() {
+        let src = concat!(
+            "@kernel\n",
+            "@workgroup(64, 1, 1)\n",
+            "@intent(\"first\")\n",
+            "@complexity(O(n))\n",
+            "fn first(x: buffer[u32]) -> void {\n",
+            "    let i: u32 = gid(0u32);\n",
+            "    x[i] = i;\n",
+            "    return;\n",
+            "}\n",
+            "@kernel\n",
+            "@workgroup(128, 1, 1)\n",
+            "@intent(\"second\")\n",
+            "@complexity(O(n))\n",
+            "fn second(y: buffer[u32]) -> void {\n",
+            "    let i: u32 = gid(0u32);\n",
+            "    y[i] = i;\n",
+            "    return;\n",
+            "}\n",
+        );
+        let (_bytes, meta) = compile_source_with_meta_kernel(src, Some("second"), false)
+            .expect("must compile with kernel=Some(\"second\")");
+        assert_eq!(meta.entry_point, "second");
+        assert_eq!(meta.workgroup_size, [128, 1, 1], "metadata must reflect SECOND's dims, not first's (64,1,1)");
+
+        // Sanity: the FIRST kernel's own metadata is unaffected (distinct selection).
+        let (_bytes1, meta1) = compile_source_with_meta_kernel(src, Some("first"), false)
+            .expect("must compile with kernel=Some(\"first\")");
+        assert_eq!(meta1.entry_point, "first");
+        assert_eq!(meta1.workgroup_size, [64, 1, 1]);
+    }
+
+    /// `compile_source_with_meta_kernel(None, ..)` on a 2-kernel source ->
+    /// `DriverError::AmbiguousKernel` listing both names, never a silent pick.
+    #[test]
+    fn compile_source_with_meta_kernel_none_on_multi_kernel_is_ambiguous() {
+        let result = compile_source_with_meta_kernel(TWO_KERNEL_SRC, None, false);
+        match result {
+            Err(DriverError::AmbiguousKernel { available }) => {
+                assert_eq!(available, vec!["stage_one".to_string(), "stage_two".to_string()]);
+            }
+            other => panic!("expected AmbiguousKernel; got {other:?}"),
+        }
+    }
+
+    /// `compile_source_with_meta_kernel(Some("nonexistent"), ..)` ->
+    /// `DriverError::UnknownKernel` listing the available names.
+    #[test]
+    fn compile_source_with_meta_kernel_unknown_name_errors() {
+        let result = compile_source_with_meta_kernel(TWO_KERNEL_SRC, Some("nonexistent"), false);
+        match result {
+            Err(DriverError::UnknownKernel { name, available }) => {
+                assert_eq!(name, "nonexistent");
+                assert_eq!(available, vec!["stage_one".to_string(), "stage_two".to_string()]);
+            }
+            other => panic!("expected UnknownKernel; got {other:?}"),
+        }
+    }
+
+    /// `compile_source_with_meta_kernel(None, ..)` on a SINGLE-kernel source
+    /// is byte-identical to `compile_source_with_meta` (golden-identity gate).
+    #[test]
+    fn compile_source_with_meta_kernel_none_single_kernel_matches_compile_source_with_meta() {
+        let src = include_str!("../../../examples/saxpy.axc");
+        let (bytes_a, _meta_a) = compile_source_with_meta(src).unwrap();
+        let (bytes_b, _meta_b) = compile_source_with_meta_kernel(src, None, false).unwrap();
+        assert_eq!(bytes_a, bytes_b);
     }
 
     // ── AT-2828: build_bench_command — pure argv/env mapping (EB.3, M3.15) ─────

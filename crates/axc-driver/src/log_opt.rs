@@ -17,7 +17,10 @@
 //!   written (§1.5, AT-2922). Rotation is deferred (§1.8).
 //! - A source with two or more `@kernel` items is refused
 //!   (`LogOptError::Multikernel`) — which of several kernels owns the block is
-//!   FG.9 territory, not built.
+//!   ambiguous; multi-kernel `log-opt --kernel` selection is deferred past
+//!   M3.21 (FG.9 shipped `--kernel` on compile/optimize/rewrite-verify/test,
+//!   but `log-opt` keeps this fail-closed refusal — split the file or target
+//!   a single-kernel source).
 //! - A source that fails to parse, or whose EXISTING `@optimization_log` block
 //!   is itself malformed, is refused rather than spliced blind.
 //! - A source whose EXISTING `@optimization_log` block declares
@@ -54,8 +57,8 @@ pub enum LogOptError {
     #[error("@optimization_log block is at capacity ({current}/{max} entries); refusing to write the {}th entry (rotation is not built in the minimal writer — see spec §1.8)", current + 1)]
     Full { current: usize, max: usize },
     /// The source declares != 1 `@kernel` item. One block per single-kernel
-    /// file; multi-kernel modules are FG.9 territory (not built).
-    #[error("source has {0} @kernel item(s); @optimization_log requires exactly one kernel per file (multi-kernel modules are FG.9, not built)")]
+    /// file; multi-kernel log-opt selection is deferred (M3.21 §5).
+    #[error("source has {0} @kernel item(s); @optimization_log requires exactly one kernel per file (multi-kernel log-opt selection is deferred — split or target a single-kernel file)")]
     Multikernel(usize),
     /// The source itself failed to lex/parse.
     #[error("source failed to parse: {detail}")]
@@ -567,16 +570,33 @@ mod tests {
         assert_eq!(hir.kernels[0].annotations.opt_log.as_ref().unwrap().entries.len(), 2);
     }
 
-    // ── Multikernel fail-closed ────────────────────────────────────────────────
+    // ── AT-2966 (M3.21 / FG.9): Multikernel fail-closed, message updated ───────
 
+    /// AT-2966: `log-opt` on a 2-kernel file still fails closed
+    /// `Multikernel(2)` (exit 4), source byte-unchanged, and the message no
+    /// longer claims "FG.9, not built" (FG.9 shipped `--kernel` elsewhere;
+    /// `log-opt` itself still declines multi-kernel selection — updated text
+    /// says so honestly instead).
     #[test]
-    fn multikernel_source_fails_closed() {
+    fn at_2966_multikernel_source_fails_closed() {
         let src = concat!(
             "@kernel @workgroup(1,1,1) fn a() -> void { return; } ",
             "@kernel @workgroup(1,1,1) fn b() -> void { return; }",
         );
         let result = splice_optimization_log_entry(src, &sample_entry());
-        assert!(matches!(result, Err(LogOptError::Multikernel(2))), "expected Multikernel(2): {result:?}");
+        match &result {
+            Err(LogOptError::Multikernel(2)) => {}
+            other => panic!("expected Multikernel(2): {other:?}"),
+        }
+        let err = result.unwrap_err();
+        assert_eq!(err.exit_code(), 4, "Multikernel must map to exit code 4");
+        assert!(
+            !err.to_string().contains("FG.9, not built"),
+            "message must no longer claim FG.9 is unbuilt (M3.21 shipped --kernel elsewhere): {err}"
+        );
+        // splice_optimization_log_entry is a pure fn (source in, Result out) —
+        // returning Err here IS the "source byte-unchanged" guarantee: the
+        // caller (append_optimization_log) never writes on Err.
     }
 
     #[test]

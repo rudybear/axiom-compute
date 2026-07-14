@@ -224,6 +224,12 @@ pub struct GridSearchRequest {
     /// Correctness policy string: `"none"`, `"bit-exact"`, `"fp-tol:<ulp>"`.
     #[serde(default)]
     pub correctness: Option<String>,
+    /// M3.21 (FG.9): the bench-target kernel. Hole discovery is ALWAYS
+    /// module-global (`union_module_holes`); this only names which ONE
+    /// kernel is dispatched+timed. `None` on an ambiguous (2+ kernel) source
+    /// fails closed (`McpToolError::Compile(AmbiguousKernel)`).
+    #[serde(default)]
+    pub kernel: Option<String>,
 }
 
 /// Response from the `grid_search` tool.
@@ -261,9 +267,11 @@ pub(crate) fn handle(
         ));
     }
 
-    // Parse source to get the kernel + strategy
+    // Parse source to get the bench-target kernel's binding plan + the
+    // MODULE-GLOBAL union of @strategy holes (F3 — a hole declared only in a
+    // sibling kernel still enumerates and binds here).
     let (_kernel_name, binding_plan, strategy_holes, _workgroup_size) =
-        parse_source_for_grid_search(&source)?;
+        parse_source_for_grid_search(&source, req.kernel.as_deref())?;
 
     // Apply holes_override (REPLACE semantics — N-4)
     let effective_holes: axc_hir::hir::StrategyHoles = match req.holes_override {
@@ -307,6 +315,7 @@ pub(crate) fn handle(
             workgroup_override: None,
             push_constants_base64: None,
             output_sizes: None,
+            kernel: req.kernel.clone(),
         };
 
         let bench_result = crate::mcp::tools::bench_variant::handle(bench_req, ctx);
@@ -409,9 +418,13 @@ pub(crate) fn handle(
     })
 }
 
-/// Parse source string to extract kernel name, binding plan, strategy holes, workgroup_size.
+/// Parse source string to extract the bench-target kernel's name, binding
+/// plan, and workgroup_size, plus the MODULE-GLOBAL union of `@strategy`
+/// holes (F3 — `union_module_holes`, across every kernel, not just the
+/// bench target's own block).
 fn parse_source_for_grid_search(
     source: &str,
+    kernel: Option<&str>,
 ) -> Result<
     (String, axc_hir::ParamBindingPlan, axc_hir::hir::StrategyHoles, [u32; 3]),
     McpToolError
@@ -440,17 +453,23 @@ fn parse_source_for_grid_search(
         }));
     }
 
-    let kernel = hir.kernels.into_iter().next()
-        .ok_or(McpToolError::GridSearch(axc_optimize::GridSearchError::NoStrategy))?;
+    let strategy = axc_optimize::enumerator::union_module_holes(&hir)
+        .map_err(McpToolError::Enumerate)?;
+    if strategy.map.is_empty() {
+        return Err(McpToolError::GridSearch(axc_optimize::GridSearchError::NoStrategy));
+    }
 
-    let strategy = kernel.annotations.strategy.unwrap_or_else(axc_hir::hir::StrategyHoles::new);
+    let selected = crate::select_kernel(&hir.kernels, kernel)
+        .map_err(McpToolError::Compile)?;
     let wg: [u32; 3] = [
-        kernel.annotations.workgroup.x,
-        kernel.annotations.workgroup.y,
-        kernel.annotations.workgroup.z,
+        selected.annotations.workgroup.x,
+        selected.annotations.workgroup.y,
+        selected.annotations.workgroup.z,
     ];
+    let name: String = selected.name.clone();
+    let binding_plan = selected.binding_plan.clone();
 
-    Ok((kernel.name, kernel.binding_plan, strategy, wg))
+    Ok((name, binding_plan, strategy, wg))
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -628,6 +647,47 @@ mod tests {
                     git_sha: None,
                 },
             },
+        }
+    }
+
+    // ── AT-2962 (M3.21 / FG.9): grid_search (MCP tool) union holes + kernel ────
+
+    /// AT-2962: `parse_source_for_grid_search` unions holes across BOTH
+    /// kernels (F3) and selects the NAMED kernel's own binding plan/workgroup.
+    #[test]
+    fn at_2962_parse_source_for_grid_search_unions_and_selects_kernel() {
+        let src = concat!(
+            "@kernel @workgroup(?a, 1, 1)\n",
+            "@strategy { a: ?[1, 2] }\n",
+            "fn k1(x: buffer[u32]) -> void { return; }\n",
+            "@kernel @workgroup(?b, 1, 1)\n",
+            "@strategy { b: ?[10, 20] }\n",
+            "fn k2(y: buffer[u32]) -> void { return; }\n",
+        );
+        let (name, _plan, holes, wg) = parse_source_for_grid_search(src, Some("k2"))
+            .expect("must select k2 and union both kernels' holes");
+        assert_eq!(name, "k2");
+        assert_eq!(holes.map.len(), 2, "union must carry BOTH a and b: {:?}", holes.map);
+        assert_eq!(wg, [1, 1, 1], "wg reflects k2's OWN (unresolved-hole placeholder) dims");
+    }
+
+    /// AT-2962: ambiguous (no `kernel`) -> fail closed listing kernel names.
+    #[test]
+    fn at_2962_parse_source_for_grid_search_ambiguous_fails_closed() {
+        let src = concat!(
+            "@kernel @workgroup(?a, 1, 1)\n",
+            "@strategy { a: ?[1, 2] }\n",
+            "fn k1(x: buffer[u32]) -> void { return; }\n",
+            "@kernel @workgroup(?b, 1, 1)\n",
+            "@strategy { b: ?[10, 20] }\n",
+            "fn k2(y: buffer[u32]) -> void { return; }\n",
+        );
+        let err = parse_source_for_grid_search(src, None).unwrap_err();
+        match err {
+            McpToolError::Compile(crate::DriverError::AmbiguousKernel { available }) => {
+                assert_eq!(available, vec!["k1".to_string(), "k2".to_string()]);
+            }
+            other => panic!("expected AmbiguousKernel; got {other:?}"),
         }
     }
 }

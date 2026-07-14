@@ -247,6 +247,10 @@ pub struct CompileVariantRequest {
     /// Holes absent here retain the source's first candidate.
     #[serde(default)]
     pub assignments: BTreeMap<String, i64>,
+    /// M3.21 (FG.9): the kernel to compile. `None` on an ambiguous (2+
+    /// kernel) source fails closed (`McpToolError::Compile(AmbiguousKernel)`).
+    #[serde(default)]
+    pub kernel: Option<String>,
 }
 
 /// Response from the `compile_variant` tool.
@@ -269,15 +273,17 @@ pub struct CompileVariantResponse {
 /// Handle a `compile_variant` request.
 pub(crate) fn handle(req: CompileVariantRequest) -> Result<CompileVariantResponse, McpToolError> {
     let source: String = crate::mcp::dispatch::resolve_source(&req.source, &req.path)?;
-    compile_variant_str(&source, &req.assignments)
+    compile_variant_str_kernel(&source, &req.assignments, req.kernel.as_deref())
 }
 
-/// Shared helper: compile with assignments, validate, return response.
-pub(crate) fn compile_variant_str(
+/// Shared helper: compile with assignments, validate, return response, for
+/// the selected kernel (`None` = the sole kernel, fail-closed on 2+).
+pub(crate) fn compile_variant_str_kernel(
     source: &str,
     assignments: &BTreeMap<String, i64>,
+    kernel: Option<&str>,
 ) -> Result<CompileVariantResponse, McpToolError> {
-    let (spirv_bytes, metadata) = crate::compile_source_with_assignments(source, assignments)
+    let (spirv_bytes, metadata) = crate::compile_source_with_assignments_kernel(source, assignments, kernel)
         .map_err(McpToolError::Compile)?;
 
     // In-process spirv-val
@@ -424,12 +430,39 @@ mod tests {
             "fn empty() -> void { return; }\n",
         );
         let assignments: BTreeMap<String, i64> = BTreeMap::new();
-        let resp = compile_variant_str(src, &assignments).expect("must compile");
+        let resp = compile_variant_str_kernel(src, &assignments, None).expect("must compile");
 
         // Decode and check magic
         let decoded = base64_decode(&resp.spirv_base64).expect("must decode");
         assert_eq!(&decoded[0..4], &[0x03, 0x02, 0x23, 0x07], "SPIR-V magic mismatch");
         assert!(resp.capabilities.contains(&"Shader".to_string()), "Shader capability required");
         assert_eq!(resp.size_bytes, decoded.len(), "size_bytes must match decoded length");
+    }
+
+    // ── AT-2962 (M3.21 / FG.9): compile_variant `kernel` param ─────────────────
+
+    const MULTI_SRC: &str = concat!(
+        "@kernel @workgroup(64, 1, 1) fn kernel_a() -> void { return; }\n",
+        "@kernel @workgroup(32, 1, 1) fn kernel_b() -> void { return; }\n",
+    );
+
+    /// AT-2962: `kernel: Some(name)` compiles the named kernel; ambiguous
+    /// (no selector) fails closed.
+    #[test]
+    fn at_2962_compile_variant_kernel_param_selects_and_ambiguous_fails_closed() {
+        let assignments: BTreeMap<String, i64> = BTreeMap::new();
+
+        let resp = compile_variant_str_kernel(MULTI_SRC, &assignments, Some("kernel_b"))
+            .expect("must compile kernel_b");
+        assert_eq!(resp.metadata.entry_point, "kernel_b");
+        assert_eq!(resp.metadata.workgroup_size, [32, 1, 1]);
+
+        let err = compile_variant_str_kernel(MULTI_SRC, &assignments, None).unwrap_err();
+        match err {
+            McpToolError::Compile(crate::DriverError::AmbiguousKernel { available }) => {
+                assert_eq!(available, vec!["kernel_a".to_string(), "kernel_b".to_string()]);
+            }
+            other => panic!("expected AmbiguousKernel; got {other:?}"),
+        }
     }
 }

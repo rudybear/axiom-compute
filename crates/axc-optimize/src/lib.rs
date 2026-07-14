@@ -39,6 +39,18 @@ pub enum EnumerateError {
     UnknownHole { name: String },
     #[error("workgroup dimension `{key}` resolved to non-positive value {value}")]
     NegativeWorkgroupDim { key: String, value: i64 },
+    /// M3.21 (FG.9): a hole name declared with a candidate list in >=2 kernels'
+    /// `@strategy` blocks (module-global sharing by name) must have a
+    /// BYTE-IDENTICAL candidate list in every declaration — else "shared" is
+    /// ambiguous (which kernel's list wins?).
+    #[error("strategy hole `{name}` is declared with conflicting candidate lists across kernels in this module")]
+    ConflictingHoleCandidates { name: String },
+    /// M3.21 (FG.9) F1 defense-in-depth: a module declares both `?WG` and
+    /// `?WG2` (one hole name is a byte-prefix of another). The boundary-safe
+    /// substitution (F1) already makes this safe to substitute, but the
+    /// authoring pattern is ambiguous/confusing, so discovery fails closed.
+    #[error("strategy hole name `{shorter}` is a prefix of `{longer}`; rename one to avoid an ambiguous authoring pattern")]
+    PrefixCollidingHoleNames { shorter: String, longer: String },
 }
 
 /// Errors from the grid search harness.
