@@ -144,6 +144,13 @@ fn print_verify_report(report: &axc_driver::verify::VerifyReport, json: bool) {
 /// Vulkan device (absence -> `SKIPPED`/`gpu_unavailable`, first-class per §3.1
 /// step 5), calls the core, prints the `FuzzReport` JSON, and exits per
 /// `exit_code_for_fuzz`. Never returns.
+///
+/// QA-fix (post-M3.18): missing `--buffer-sizes`/`--size` is NOT gated here
+/// before calling `fuzz_kernel` -- doing so pre-empted `fuzz_kernel`'s own
+/// `solve()`-based UNSATISFIABLE short-circuit, which must run first (§3.1
+/// step 2 precedes step 5). An empty `Vec` is threaded through instead;
+/// `fuzz_kernel` raises the equivalent usage ERROR/exit 2 itself, but only
+/// AFTER `solve()` has had first refusal.
 #[allow(clippy::too_many_arguments)]
 fn run_test(
     input: PathBuf,
@@ -186,7 +193,16 @@ fn run_test(
             Err(e) => emit_fuzz_usage_error(e),
         }
     } else {
-        emit_fuzz_usage_error("must supply --buffer-sizes or --size".to_string());
+        // Neither `--buffer-sizes` nor `--size` was supplied. Do NOT usage-error
+        // here: `fuzz_kernel`'s own internal ordering resolves UNSATISFIABLE (via
+        // `solve()` over the kernel's `@precondition`s) BEFORE buffer sizes are
+        // ever consulted (§3.1: constraint solving precedes dispatch prep).
+        // Pass an empty `Vec` through unconditionally; if the kernel turns out
+        // to be satisfiable and genuinely needs to dispatch, `fuzz_kernel`'s own
+        // `buffer_sizes.len()` mismatch check (which fires AFTER `solve()`)
+        // raises the identical usage ERROR/exit 2 -- this only fixes the
+        // refusal ORDER, not the outcome, for kernels that would dispatch.
+        Vec::new()
     };
 
     let workgroups_arr: Option<[u32; 3]> = match workgroups {

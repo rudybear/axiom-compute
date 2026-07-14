@@ -1384,10 +1384,21 @@ mod tests {
         assert_eq!(exit_code_for_fuzz(FuzzVerdict::Fail), 1);
     }
 
-    // ── AT-2893: fuzz UNSATISFIABLE end-to-end (CPU, vk=None) ──────────────────
+    // ── AT-2893: fuzz UNSATISFIABLE, LIBRARY level (CPU, vk=None) ──────────────
+    //
+    // This exercises `fuzz_kernel()` directly with a hand-supplied
+    // `buffer_sizes`, i.e. it proves the satisfier/orchestration core resolves
+    // UNSATISFIABLE correctly and BEFORE any dispatch attempt -- but it does
+    // NOT exercise `main.rs::run_test`'s CLI-layer buffer-size handling (a
+    // QA-caught gap: the CLI used to usage-error on missing `--buffer-sizes`
+    // before ever reaching this code path, so this test alone could not catch
+    // that regression). The CLI-level counterpart that drives the literal
+    // spec command (`axc test --fuzz examples/fuzz_unsat.axc`, no flags) via a
+    // real subprocess lives in `tests/fuzz_cli.rs`
+    // (`at_2893_cli_fuzz_unsat_no_size_flags_end_to_end`).
 
     #[test]
-    fn at_2893_fuzz_unsat_end_to_end_no_gpu_needed() {
+    fn at_2893_fuzz_unsat_library_level_fuzz_kernel_no_gpu_needed() {
         let src = include_str!("../../../examples/fuzz_unsat.axc");
         let req = FuzzRequest { source: src.to_string(), runs: 8, seed: 0, debug_oracle: None, violate: false, buffer_sizes: vec![64], workgroups: None, scalar_window: DEFAULT_SCALAR_WINDOW, strategy_assignments: BTreeMap::new() };
         let report = fuzz_kernel(&req, None);
