@@ -160,8 +160,15 @@ mod tests {
         assert!(result.is_err(), "buffer_sizes is required; missing field must fail to deserialize");
     }
 
-    /// AT-2849: `tolerance: "rel:1e-3"` is a non-BitExact caller override —
-    /// asserted purely on the request-struct + parse logic (no GPU needed).
+    /// AT-2849 (CPU-checkable parse-level half): `tolerance: "rel:1e-3"` is a
+    /// non-BitExact caller override — asserted purely on the parse logic (no
+    /// GPU needed). This is the pure-`TolerancePolicy` complement only; the
+    /// full end-to-end assertion that a real `verify_rewrite` MCP call with
+    /// this tolerance string stamps `tolerance_overridden: true` + a
+    /// `tolerance_loosened_by_caller` notes entry on the returned report
+    /// lives in `at_2849_verify_rewrite_tolerance_overridden_stamp_on_lavapipe`
+    /// in `crates/axc-driver/tests/mcp_roundtrip.rs` (drives the real
+    /// `handle()` through the actual MCP dispatch path on Lavapipe).
     #[test]
     fn non_bit_exact_tolerance_string_parses_and_is_flagged_overridden() {
         let policy: TolerancePolicy = "rel:1e-3".parse().expect("must parse");
