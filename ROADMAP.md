@@ -407,6 +407,7 @@ Currently one `@kernel` per file. DESIGN.md hints at multi-kernel modules with c
 | M3.17 deferred (§9): buffer `elem(buf)` postcondition lowering with the syntactic-dominance gate (design r2-approved, never built — v1 defers all to `PostconditionNotLowerable`) | low | 300 LOC |
 | M3.18 W1/W2 (pessimistic code review, both fail-loud): early-return SKIPPED paths discard accumulated `worst` (latent, unreachable today — fold into record_worst) + `negate_one` unsound for f32 ge/le at large magnitudes (unreachable by v1 alpha-pin) | low | 100 LOC |
 | M3.16 W1/W2 (routed from pessimistic code review, both safe-direction): `rel:` comparator near-zero denominator (seed-pinned in AT-2855) + `within_ulp_f32` sign-boundary false-mismatch — candidates for a condition-aware tolerance follow-up | low | 300 LOC |
+| M3.19 low warts (pessimistic code review, none gate): out-of-i64-range int literals in annotation args silently clamp to i64::MAX/MIN with no diagnostic (parser.rs — reject instead); log-opt inserts LF separator into CRLF files; no per-note length cap on MCP append_optimization_log | low | 100 LOC |
 
 ---
 
