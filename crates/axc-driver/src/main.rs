@@ -329,7 +329,7 @@ fn run_test(
     let resolved_buffer_sizes: Vec<usize> = if !buffer_sizes_arg.is_empty() {
         buffer_sizes_arg
     } else if let Some(n) = size {
-        match resolve_size_shortcut(&source, &assignments, n) {
+        match resolve_size_shortcut(&source, &assignments, n, kernel.as_deref()) {
             Ok(sizes) => sizes,
             Err(e) => emit_fuzz_usage_error(e),
         }
@@ -455,7 +455,7 @@ fn run_rewrite_verify(
     let resolved_buffer_sizes: Vec<usize> = if !buffer_sizes_arg.is_empty() {
         buffer_sizes_arg
     } else if let Some(n) = size {
-        match resolve_size_shortcut(&original_src, &assignments, n) {
+        match resolve_size_shortcut(&original_src, &assignments, n, kernel.as_deref()) {
             Ok(sizes) => sizes,
             Err(e) => emit_usage_error(&tol, e),
         }
@@ -512,12 +512,22 @@ fn run_rewrite_verify(
 /// kernels whose buffers are all the SAME `ScalarTy`, with no coopmat and no
 /// shared memory (a matmul with differently-shaped buffers would otherwise
 /// silently get equal-and-wrong sizes and a trivial partial-coverage PASS).
+///
+/// QA-fix (post-M3.21, MEDIUM finding): `kernel` MUST be threaded into the
+/// same kernel-aware compile surface (`compile_source_with_assignments_kernel`)
+/// that the non-`--size` `--buffer-sizes` path already uses, not the
+/// kernel-agnostic `compile_source_with_assignments`. Before this fix, any
+/// `--size` invocation on a 2+-kernel source always failed closed with
+/// `AmbiguousKernel` regardless of `--kernel`, silently making `--kernel`
+/// inert for this one flag combination (fails closed, not a correctness bug,
+/// but a real functional gap — see M3.21-qa.json discrepancy #1).
 fn resolve_size_shortcut(
     original_src: &str,
     assignments: &std::collections::BTreeMap<String, i64>,
     n: usize,
+    kernel: Option<&str>,
 ) -> Result<Vec<usize>, String> {
-    let (_bytes, meta) = axc_driver::compile_source_with_assignments(original_src, assignments)
+    let (_bytes, meta) = axc_driver::compile_source_with_assignments_kernel(original_src, assignments, kernel)
         .map_err(|e| format!("--size: failed to compile original to determine buffer layout: {e}"))?;
     if meta.coopmat.is_some() || meta.shared_memory_bytes > 0 {
         return Err(

@@ -219,6 +219,96 @@ fn m321_real_two_pass_reduce_kernel_selector_with_strategy_value() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ── AT-2963b (QA-gap closure, post-M3.21) ──────────────────────────────────
+//
+// M3.21-qa.json's MEDIUM finding: `axc rewrite-verify --kernel K --size N`
+// (the `--size`-shortcut buffer-layout path) never threaded `--kernel` into
+// `resolve_size_shortcut` in `main.rs`, which still called the
+// kernel-agnostic `compile_source_with_assignments` — so `--size` on a
+// 2+-kernel source always failed closed with `AmbiguousKernel` regardless of
+// `--kernel`. AT-2963 (rewrite_verify.rs) only ever exercised `verify_rewrite`
+// with an explicit `buffer_sizes` Vec, never the CLI's `--size` shortcut, so
+// the gap slipped past that test. These two tests are the CLI-subprocess,
+// `--size`-shortcut counterpart of AT-2963, closing that gap: (b1) `--kernel`
+// + `--size` on a genuinely multi-kernel source now resolves the buffer
+// layout from the SELECTED kernel and reaches past the compile stage; (b2)
+// the ambiguous case (`--size`, no `--kernel`) is confirmed UNCHANGED
+// (still fails closed with `AmbiguousKernel`, no partial output).
+
+/// AT-2963b: `axc rewrite-verify multi.axc multi.axc --kernel final_reduce
+/// --size 64` on the real 2-kernel fixture — `--size`'s buffer-layout
+/// resolution must now honor `--kernel` and reach the `dispatch` stage
+/// (compile succeeded on BOTH sides), exiting 0 (`PASS` if a real Vulkan
+/// device is available to the subprocess, `SKIPPED`/`gpu_unavailable`
+/// otherwise — both map to exit 0, matching AT-2850's GPU-independent CLI
+/// test tier so this runs deterministically with no `VK_DRIVER_FILES` setup).
+#[test]
+fn at_2963b_size_shortcut_honors_kernel_selector_on_multi_kernel_source() {
+    let bin = axc_binary_path();
+    let dir = tempfile_dir("at_2963b");
+    let src = write_multi_fixture(&dir);
+
+    let output = Command::new(&bin)
+        .args([
+            "rewrite-verify",
+            src.to_str().unwrap(),
+            src.to_str().unwrap(),
+            "--kernel", "final_reduce",
+            "--size", "64",
+        ])
+        .output()
+        .expect("spawn axc rewrite-verify");
+
+    assert!(
+        output.status.code() == Some(0),
+        "AT-2963b: --kernel + --size on a multi-kernel source must exit 0 (PASS or SKIPPED), got {:?}; stdout={} stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("stdout must be valid JSON");
+    assert_ne!(report["verdict"], "ERROR", "AT-2963b: report={report}");
+    assert_ne!(report["stage"], "preflight", "AT-2963b: --size must have resolved a buffer layout, not usage-errored; report={report}");
+    assert_ne!(report["stage"], "compile", "AT-2963b: compile must succeed on BOTH sides when --kernel names an existing kernel; report={report}");
+    if let Some(orig) = report["original"].as_object() {
+        assert_eq!(orig["kernel_name"], "final_reduce", "AT-2963b: report={report}");
+    }
+    if let Some(rewritten) = report["rewritten"].as_object() {
+        assert_eq!(rewritten["kernel_name"], "final_reduce", "AT-2963b: report={report}");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// AT-2963b: the ambiguous case is UNCHANGED by this fix — `--size` with NO
+/// `--kernel` on the same 2-kernel source still fails closed with
+/// `AmbiguousKernel` (exit 2, `ERROR` verdict), exactly as it did before
+/// `--kernel` existed at all.
+#[test]
+fn at_2963b_size_shortcut_still_fails_closed_when_ambiguous() {
+    let bin = axc_binary_path();
+    let dir = tempfile_dir("at_2963b_ambiguous");
+    let src = write_multi_fixture(&dir);
+
+    let output = Command::new(&bin)
+        .args([
+            "rewrite-verify",
+            src.to_str().unwrap(),
+            src.to_str().unwrap(),
+            "--size", "64",
+        ])
+        .output()
+        .expect("spawn axc rewrite-verify");
+
+    assert_eq!(output.status.code(), Some(2), "AT-2963b: ambiguous --size (no --kernel) must still exit 2; stdout={}", String::from_utf8_lossy(&output.stdout));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("stdout must be valid JSON");
+    assert_eq!(report["verdict"], "ERROR", "AT-2963b: report={report}");
+    let detail = report["reason"]["detail"]["detail"].as_str().unwrap_or_default();
+    assert!(detail.contains("partial_reduce") && detail.contains("final_reduce"), "AT-2963b: ambiguity error must list both kernel names; report={report}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Single-kernel file through `--kernel`/`--all`-aware CLI is
 /// behavior-identical to the plain (no-flag) path — the golden gate holds
 /// end-to-end through the actual binary, not just the library.
