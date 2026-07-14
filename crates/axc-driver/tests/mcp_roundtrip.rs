@@ -192,6 +192,7 @@ fn at_1101_initialize_returns_server_info() {
             "grid_search",
             "optimization_history",
             "verify_rewrite",
+            "append_optimization_log",
         ],
         "tool list mismatch"
     );
@@ -337,9 +338,9 @@ fn at_1106_unknown_method_returns_method_not_found_error() {
         .iter()
         .map(|v: &serde_json::Value| v.as_str().expect("method name is string"))
         .collect();
-    // Must include "initialize" plus the 7 tool methods (M3.16 adds verify_rewrite).
+    // Must include "initialize" plus the 8 tool methods (M3.19 adds append_optimization_log).
     assert!(methods.contains(&"initialize"), "available must include 'initialize'");
-    assert_eq!(methods.len(), 8, "must list all 8 methods; got {methods:?}");
+    assert_eq!(methods.len(), 9, "must list all 9 methods; got {methods:?}");
 }
 
 // ── AT-1107: malformed JSON returns -32700 ────────────────────────────────────
@@ -1332,8 +1333,8 @@ fn at_1132_mcp_rejects_malformed_jsonrpc_field() {
     );
     assert_eq!(
         available_c.as_array().unwrap().len(),
-        8,
-        "(c) must list 8 methods (M3.16 adds verify_rewrite)"
+        9,
+        "(c) must list 9 methods (M3.19 adds append_optimization_log)"
     );
 }
 
@@ -1462,4 +1463,87 @@ fn at_2849_verify_rewrite_tolerance_overridden_stamp_on_lavapipe() {
     );
 
     eprintln!("AT-2849: PASS — rel:1e-3 stamps tolerance_overridden=true+notes, default leaves it false");
+}
+
+// ── M3.19 (FG.3): append_optimization_log MCP roundtrip ────────────────────────
+//
+// Mirrors the at_1113/at_1114 subprocess-roundtrip pattern: spawn the real
+// `axc mcp` subprocess, call the tool over stdin/stdout NDJSON, then read the
+// file BACK OFF DISK and assert it round-trips through the real parser/HIR
+// pipeline. No GPU needed (this tool never touches Vulkan), so it is NOT
+// gated behind AXC_ENABLE_GPU_TESTS — unlike AT-1114/AT-1115/AT-1116/AT-1117.
+
+#[test]
+fn at_mcp_append_optimization_log_roundtrip_on_disk() {
+    let dir: tempfile::TempDir = tempfile::tempdir().expect("tempdir");
+    let file_path: PathBuf = dir.path().join("fixture.axc");
+    std::fs::write(&file_path, EMPTY_KERNEL_SRC).expect("write fixture");
+
+    let req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 20,
+        "method": "append_optimization_log",
+        "params": {
+            "source_path": file_path.to_str().unwrap(),
+            "kernel": "empty",
+            "metric": 42860,
+            "unit": "mtflops",
+            "verdict": "PASS",
+            "ts": "2026-07-14T12:00:00.000Z",
+            "note": "M3.19 roundtrip smoke",
+        }
+    });
+    let resp: serde_json::Value = rpc(&req.to_string());
+    assert!(resp["error"].is_null(), "append_optimization_log error: {}", resp["error"]);
+    assert_eq!(resp["result"]["kernel"], "empty");
+    assert_eq!(resp["result"]["metric"], 42860);
+    assert_eq!(resp["result"]["unit"], "mtflops");
+    assert_eq!(resp["result"]["verdict"], "PASS");
+
+    let on_disk: String = std::fs::read_to_string(&file_path).expect("read spliced fixture");
+    assert!(on_disk.contains("@optimization_log {"), "block must be present on disk: {on_disk}");
+    assert!(on_disk.contains("entry { ts: \"2026-07-14T12:00:00.000Z\""), "entry must be present on disk: {on_disk}");
+    // The pre-existing kernel body/annotations must be preserved verbatim.
+    assert!(on_disk.contains("fn empty() -> void"), "kernel body must be preserved: {on_disk}");
+
+    // Full front-end round-trip: the spliced file must parse and lower clean,
+    // and be byte-identical SPIR-V to the un-annotated original (AT-2903's
+    // golden gate is exercised end-to-end here too, via the same file).
+    let (ast, lex_errs, parse_errs) = axc_parser::parse(&on_disk);
+    assert!(lex_errs.is_empty() && parse_errs.is_empty(), "spliced fixture must re-parse clean: {lex_errs:?} {parse_errs:?}");
+    let (hir, hir_errs, _warns) = axc_hir::lower_module(&ast);
+    assert!(hir_errs.is_empty(), "spliced fixture must lower clean: {hir_errs:?}");
+    assert_eq!(hir.kernels[0].annotations.opt_log.as_ref().unwrap().entries.len(), 1);
+
+    let spliced_bytes = axc_driver::compile_source_to_spirv(&on_disk).expect("spliced fixture must compile");
+    let original_bytes = axc_driver::compile_source_to_spirv(EMPTY_KERNEL_SRC).expect("original must compile");
+    assert_eq!(spliced_bytes, original_bytes, "AT-2903 golden gate: @optimization_log must not perturb SPIR-V bytes");
+}
+
+// ── AT-2903: golden byte-identical SPIR-V gate ──────────────────────────────────
+
+/// AT-2903: the SAME kernel compiled WITH vs WITHOUT an `@optimization_log`
+/// block produces byte-for-byte identical `.spv` output (annotations must
+/// not perturb codegen — same discipline as M3.17's `--debug`-off gate).
+#[test]
+fn at_2903_golden_byte_identical_spirv_with_and_without_opt_log_block() {
+    const WITHOUT: &str = EMPTY_KERNEL_SRC;
+    const WITH: &str = r#"
+@kernel
+@workgroup(64, 1, 1)
+@intent("smoke-test: smallest valid kernel for SPIR-V emission")
+@complexity(O(1))
+@precondition(true)
+@optimization_log {
+  version: 1,
+  entry { ts: "2026-07-14T12:00:00.000Z", kernel: "empty", metric: 42860, unit: mtflops, verdict: PASS },
+  entry { ts: "2026-07-14T12:00:01.000Z", kernel: "empty", metric: 41640, unit: mtflops, verdict: REGRESS }
+}
+fn empty() -> void {
+    return;
+}
+"#;
+    let without_bytes = axc_driver::compile_source_to_spirv(WITHOUT).expect("must compile without block");
+    let with_bytes = axc_driver::compile_source_to_spirv(WITH).expect("must compile with block");
+    assert_eq!(without_bytes, with_bytes, "AT-2903: @optimization_log presence must not perturb SPIR-V bytes");
 }

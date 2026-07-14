@@ -173,6 +173,48 @@ pub enum AnnotationArg {
     /// Must reference a hole declared in `@strategy { ident: ?[...] }` on the same kernel;
     /// the HIR validator rejects dangling references with `UndefinedStrategyHole`.
     HoleRef(String),
+    /// `{ key: value, ... }` — a record of `RecordField`s, produced by
+    /// `@optimization_log { ... }` block parsing (M3.19 / FG.3).
+    ///
+    /// # AST shape (the r2-pinned decision — see `parser.rs::parse_optimization_log_block`)
+    ///
+    /// `@optimization_log`'s `Annotation.args` is a flat `Vec<Spanned<AnnotationArg>>`
+    /// where each element is EITHER:
+    ///
+    /// - `Record { fields }` — a **block-level scalar** (currently only `version`),
+    ///   held DIRECTLY (not `Call`-wrapped); or
+    /// - `Call { name: "entry", args: [Record { fields }] }` — one `entry { ... }`
+    ///   declaration, `Call`-wrapped so downstream match arms stay uniform with
+    ///   `@strategy`'s `Call`-wrapped hole declarations (mirrors AT-2900).
+    ///
+    /// `Record` is intentionally NOT reused as a general-purpose nested-value
+    /// carrier: `RecordField.value` is the CLOSED `RecordValue` enum below, which
+    /// has no `Record`/`Call`/`Hole` variant, so `entry { entry { ... } } ` and
+    /// `k: { ... }` are structurally impossible to parse (§1.3a of the spec) —
+    /// nesting stops at exactly one level (`Annotation.args` → `Record`/`Call`),
+    /// never inside a `RecordValue`.
+    Record { fields: Vec<Spanned<RecordField>> },
+}
+
+/// One `key: value` pair inside an `@optimization_log` block-level scalar or
+/// `entry { ... }` (M3.19 / FG.3, §1.2/§1.3a).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordField {
+    pub key: Spanned<String>,
+    pub value: Spanned<RecordValue>,
+}
+
+/// The CLOSED value grammar for `RecordField.value` (M3.19 §1.3a — the
+/// "grammar-forever pin"). Exactly three scalar shapes; deliberately NOT
+/// `Spanned<AnnotationArg>` (which would admit nested records, `Call`, and
+/// `Hole`/`HoleRef` — see `AnnotationArg::Record`'s doc comment). This makes
+/// `entry { entry { ... } } `, `k: f(3)`, and `k: ?x` structurally
+/// unrepresentable, not merely rejected by a later validation pass.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RecordValue {
+    Str(String),
+    Int(i64),
+    Ident(String),
 }
 
 /// The body of a function: a braced list of statements.

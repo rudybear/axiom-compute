@@ -23,6 +23,8 @@ pub mod verify;
 /// M3.18 (FG.8): `axc test --fuzz` — precondition-satisfying input fuzzer with a
 /// runtime debug-check oracle.
 pub mod fuzz;
+/// M3.19 (FG.3): `axc log-opt` — the ONE writer for `@optimization_log { ... }`.
+pub mod log_opt;
 
 pub use cli::{Command, Cli};
 
@@ -1046,6 +1048,71 @@ mod tests {
         // 3 buffer bindings: a_buf (readonly), b_buf (readonly), c_buf (readwrite).
         assert_eq!(meta.binding_plan.buffers.len(), 3,
             "matmul_f32_tiled must have 3 buffer bindings");
+    }
+
+    // ── M3.19 (FG.3): examples/optlog_demo.axc ────────────────────────────────
+
+    /// The `examples/optlog_demo.axc` fixture compiles clean and lowers its
+    /// two-entry `@optimization_log` block (round-trip + golden fixture, per
+    /// the spec's Files list).
+    #[test]
+    fn optlog_demo_example_compiles_and_lowers_two_entries() {
+        let src = include_str!("../../../examples/optlog_demo.axc");
+        let (ast, lex_errs, parse_errs) = axc_parser::parse(src);
+        assert!(lex_errs.is_empty() && parse_errs.is_empty(), "lex/parse errors: {lex_errs:?} {parse_errs:?}");
+        let (hir, hir_errs, _warnings) = axc_hir::lower_module(&ast);
+        assert!(hir_errs.is_empty(), "hir errors: {hir_errs:?}");
+        let log = hir.kernels[0].annotations.opt_log.as_ref().expect("opt_log must be Some");
+        assert_eq!(log.entries.len(), 2);
+
+        let result = compile_source_with_meta(src);
+        assert!(result.is_ok(), "optlog_demo.axc must compile: {result:?}");
+    }
+
+    /// AT-2903 (golden gate, exercised on the real example file): compiling
+    /// `examples/optlog_demo.axc` WITH its `@optimization_log` block vs a
+    /// version with the block manually removed produces byte-identical
+    /// SPIR-V (annotations must not perturb codegen).
+    #[test]
+    fn at_2903_optlog_demo_golden_byte_identical_with_and_without_block() {
+        let with_block = include_str!("../../../examples/optlog_demo.axc");
+        // Strip everything from "@optimization_log {" through its matching
+        // "}" (inclusive), leaving the rest of the source byte-identical.
+        let start = with_block.find("@optimization_log {").expect("fixture must carry the block");
+        let bytes = with_block.as_bytes();
+        let mut depth: i32 = 0;
+        let mut end: Option<usize> = None;
+        for (i, &b) in bytes.iter().enumerate().skip(start) {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end.expect("matching close brace must be found");
+        let without_block: String = format!("{}{}", &with_block[..start], &with_block[end + 1..]);
+
+        let (_ast, lex_errs, parse_errs) = axc_parser::parse(&without_block);
+        assert!(lex_errs.is_empty() && parse_errs.is_empty(), "stripped fixture must still parse clean: {lex_errs:?} {parse_errs:?}");
+
+        let with_bytes = compile_source_to_spirv(with_block).expect("must compile with block");
+        let without_bytes = compile_source_to_spirv(&without_block).expect("must compile without block");
+        assert_eq!(with_bytes, without_bytes, "AT-2903: @optimization_log presence must not perturb SPIR-V bytes");
+    }
+
+    /// AT-2908: `spirv-val` is clean on a kernel carrying an `@optimization_log` block.
+    #[test]
+    fn at_2908_spirv_val_clean_with_optimization_log_block() {
+        let src = include_str!("../../../examples/optlog_demo.axc");
+        let bytes = compile_source_to_spirv(src).expect("optlog_demo.axc must compile");
+        crate::mcp::tools::compile_variant::validate_spirv(&bytes)
+            .expect("AT-2908: spirv-val must accept SPIR-V compiled from a source carrying @optimization_log");
     }
 
     /// AT-1045: compile_source_with_assignments + strategy strips correctly produce valid SPIR-V.

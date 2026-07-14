@@ -19,7 +19,7 @@
 use axc_lexer::{Token, TokenKind, Span, Spanned, LexError, is_reserved_subgroup_builtin};
 use crate::ast::{
     Module, Item, KernelDecl, Annotation, AnnotationArg, Block, Stmt, Expr, TypeRef, Param,
-    BinOp, UnaryOp, ShortCircuitOp, ScalarTypeRef, ElseArm, CoopMatUseAst,
+    BinOp, UnaryOp, ShortCircuitOp, ScalarTypeRef, ElseArm, CoopMatUseAst, RecordField, RecordValue,
 };
 
 /// Maximum expression nesting depth before emitting ExpressionNestingTooDeep.
@@ -190,6 +190,24 @@ pub enum ParseError {
         #[label("here")]
         span: Span,
     },
+
+    // ── M3.19 (FG.3): @optimization_log block parse errors ──────────────────
+
+    /// Any malformed `@optimization_log { ... }` construct: an unrecognized
+    /// block-item keyword (expected `entry`/`version`), a bad field key, a
+    /// closed-value-grammar violation (nested record/call/hole as a value —
+    /// §1.3a), a missing `:`/`{`/`}`, etc. `detail` carries the specific shape.
+    ///
+    /// One error variant covers every case (mirrors `StrategyBlockSyntax`'s
+    /// single-variant-with-detail convention) since `@optimization_log`'s
+    /// recovery policy re-syncs and keeps reporting (AT-2913) rather than
+    /// needing per-case programmatic dispatch on the error type.
+    #[error("malformed @optimization_log block: {detail}")]
+    OptimizationLogBlockSyntax {
+        detail: String,
+        #[label("here")]
+        span: Span,
+    },
 }
 
 /// Internal enum for infix operators used by the Pratt parser.
@@ -336,6 +354,18 @@ impl<'tok> Parser<'tok> {
                 match self.parse_strategy_block() {
                     Some(a) => a,
                     None => return result, // error already pushed
+                }
+            } else if name_str == "optimization_log"
+                && self.peek_kind() == &TokenKind::LBrace
+            {
+                // M3.19 (FG.3): `@optimization_log { version: N, entry {...}, ... }`.
+                // Unlike `parse_strategy_block` (bail-on-first-error), this block
+                // uses report-ALL recovery (AT-2913 / anti-pattern #6) so a single
+                // malformed entry does not abort the rest of the file — it always
+                // returns `Some` except on a truly unterminated block.
+                match self.parse_optimization_log_block() {
+                    Some(a) => a,
+                    None => return result, // error(s) already pushed
                 }
             } else if self.peek_kind() == &TokenKind::LParen {
                 self.advance(); // consume `(`
@@ -545,6 +575,273 @@ impl<'tok> Parser<'tok> {
         }
 
         Some(candidates)
+    }
+
+    // ── M3.19 (FG.3): @optimization_log block ───────────────────────────────
+
+    /// Parse `{ version: N, entry { ... }, entry { ... } }` — the
+    /// `@optimization_log` curly-brace block (§1.2/§1.3a of the spec).
+    ///
+    /// Report-ALL recovery (AT-2913, anti-pattern #6): unlike
+    /// `parse_strategy_block` (which bails on the first malformed item), this
+    /// function keeps parsing after a malformed block-item, re-syncing at the
+    /// next `,` / `}` / `entry`-keyword boundary (`recover_to_optlog_boundary`),
+    /// so ONE bad entry never aborts the rest of the file. It returns `None`
+    /// only when the block itself is unterminated (no matching `}` found) —
+    /// every other malformed shape is reported and skipped, returning `Some`
+    /// with whatever well-formed items were collected.
+    ///
+    /// `entry` and `version` are CONTEXTUAL keywords here (§1.3a): they lex as
+    /// ordinary `TokenKind::Ident` tokens (the lexer is untouched) and are
+    /// recognized by string match only inside this block's item position.
+    fn parse_optimization_log_block(&mut self) -> Option<Vec<Spanned<AnnotationArg>>> {
+        let open_brace_span: Span = self.peek_span();
+        if !self.expect_token(TokenKind::LBrace, "{") {
+            return None;
+        }
+
+        let mut args: Vec<Spanned<AnnotationArg>> = Vec::new();
+
+        loop {
+            while self.peek_kind().is_error() {
+                self.advance();
+            }
+            if self.peek_kind() == &TokenKind::RBrace || self.is_at_end() {
+                break;
+            }
+
+            let item_start: Span = self.peek_span();
+            match self.peek_kind().clone() {
+                TokenKind::Ident(name) if name == "version" => {
+                    self.advance(); // consume `version`
+                    if !self.expect_token(TokenKind::Colon, ":") {
+                        self.recover_to_optlog_boundary();
+                    } else {
+                        match self.parse_record_value("version") {
+                            Some(value) => {
+                                let value_span: Span = value.span;
+                                let field = RecordField {
+                                    key: Spanned::new("version".to_string(), item_start),
+                                    value,
+                                };
+                                let field_span: Span = item_start.merge(value_span);
+                                let rec = AnnotationArg::Record { fields: vec![Spanned::new(field, field_span)] };
+                                args.push(Spanned::new(rec, field_span));
+                            }
+                            None => {
+                                // Error already pushed by parse_record_value.
+                                self.recover_to_optlog_boundary();
+                            }
+                        }
+                    }
+                }
+                TokenKind::Ident(name) if name == "entry" => {
+                    self.advance(); // consume `entry`
+                    match self.parse_optimization_log_entry_fields() {
+                        Some(fields) => {
+                            let rec_span: Span = item_start.merge(self.last_span());
+                            let rec = AnnotationArg::Record { fields };
+                            let call = AnnotationArg::Call {
+                                name: "entry".to_string(),
+                                args: vec![Spanned::new(rec, rec_span)],
+                            };
+                            args.push(Spanned::new(call, item_start.merge(self.last_span())));
+                        }
+                        None => {
+                            // Error(s) already pushed; recovery already applied
+                            // internally by parse_optimization_log_entry_fields.
+                        }
+                    }
+                }
+                other => {
+                    self.errors.push(ParseError::OptimizationLogBlockSyntax {
+                        detail: format!("expected `entry` or `version`, got {other:?}"),
+                        span: item_start,
+                    });
+                    self.recover_to_optlog_boundary();
+                }
+            }
+
+            // Two-level trailing/leading/double comma tolerance (AT-2921): a
+            // stray leading or double comma is left in place by the recovery
+            // helpers above (they treat `,` as a boundary, not consuming it),
+            // so it is uniformly consumed here regardless of which arm ran.
+            if self.peek_kind() == &TokenKind::Comma {
+                self.advance();
+            }
+        }
+
+        if !self.expect_token(TokenKind::RBrace, "}") {
+            self.errors.push(ParseError::OptimizationLogBlockSyntax {
+                detail: "expected `}` to close @optimization_log block".into(),
+                span: open_brace_span,
+            });
+            return None;
+        }
+
+        Some(args)
+    }
+
+    /// Parse `{ field: value, field: value, ... }` — one `entry { ... }` body.
+    ///
+    /// The leading `entry` keyword has already been consumed by the caller.
+    /// Field-local recovery (`recover_to_comma_or_rbrace`) re-syncs on a
+    /// malformed field without abandoning the rest of the entry.
+    fn parse_optimization_log_entry_fields(&mut self) -> Option<Vec<Spanned<RecordField>>> {
+        let open_span: Span = self.peek_span();
+        if !self.expect_token(TokenKind::LBrace, "{") {
+            self.recover_to_optlog_boundary();
+            return None;
+        }
+
+        let mut fields: Vec<Spanned<RecordField>> = Vec::new();
+
+        loop {
+            while self.peek_kind().is_error() {
+                self.advance();
+            }
+            if self.peek_kind() == &TokenKind::RBrace || self.is_at_end() {
+                break;
+            }
+
+            match self.parse_optimization_log_field() {
+                Some(f) => fields.push(f),
+                None => {
+                    // Error already pushed; re-sync within this entry only.
+                    self.recover_to_comma_or_rbrace();
+                }
+            }
+
+            if self.peek_kind() == &TokenKind::Comma {
+                self.advance();
+            }
+        }
+
+        if !self.expect_token(TokenKind::RBrace, "}") {
+            self.errors.push(ParseError::OptimizationLogBlockSyntax {
+                detail: "expected `}` to close @optimization_log entry".into(),
+                span: open_span,
+            });
+            self.recover_to_optlog_boundary();
+            return None;
+        }
+
+        Some(fields)
+    }
+
+    /// Parse one `key: record_value` field (§1.3a `field := ident ":" record_value`).
+    fn parse_optimization_log_field(&mut self) -> Option<Spanned<RecordField>> {
+        let key_span: Span = self.peek_span();
+        let key_name: String = match self.peek_kind().clone() {
+            TokenKind::Ident(n) => { self.advance(); n }
+            // `kernel` is the ONE schema field name that collides with a hard
+            // lexer keyword (`TokenKind::Kernel`, for `@kernel`) — accepted here
+            // as the literal field name "kernel" (the lexer is otherwise
+            // untouched; this is a parser-local exception, not a new keyword).
+            TokenKind::Kernel => { self.advance(); "kernel".to_string() }
+            other => {
+                self.errors.push(ParseError::OptimizationLogBlockSyntax {
+                    detail: format!("expected a field name (identifier), got {other:?}"),
+                    span: key_span,
+                });
+                return None;
+            }
+        };
+
+        if !self.expect_token(TokenKind::Colon, ":") {
+            return None;
+        }
+
+        let value: Spanned<RecordValue> = self.parse_record_value(&key_name)?;
+        let field_span: Span = key_span.merge(value.span);
+        Some(Spanned::new(RecordField { key: Spanned::new(key_name, key_span), value }, field_span))
+    }
+
+    /// Parse the CLOSED `record_value := string_lit | int_lit | ident` grammar
+    /// (§1.3a — the "grammar-forever pin"). Structurally rejects (with a
+    /// precise error, no `RecordValue` produced): a nested record (`k: {…}`),
+    /// a call (`k: f(3)`), and a hole/hole-ref (`k: ?x`, `k: ?[a,b]`) — these
+    /// can never reach the HIR validator because `RecordValue` has no variant
+    /// to hold them (AT-2919).
+    fn parse_record_value(&mut self, field_key: &str) -> Option<Spanned<RecordValue>> {
+        let start: Span = self.peek_span();
+        let value: RecordValue = match self.peek_kind().clone() {
+            TokenKind::StringLiteral(s) => {
+                self.advance();
+                RecordValue::Str(s)
+            }
+            TokenKind::Ident(n) => {
+                self.advance();
+                // Call-as-value rejection (`k: f(3)`): an identifier immediately
+                // followed by `(` is the call-form, structurally excluded from
+                // RecordValue.
+                if self.peek_kind() == &TokenKind::LParen {
+                    let call_span: Span = start.merge(self.peek_span());
+                    self.errors.push(ParseError::OptimizationLogBlockSyntax {
+                        detail: format!(
+                            "field `{field_key}` value must be a string literal, integer literal, or \
+                             identifier; a call-form `{n}(...)` is not permitted inside @optimization_log"
+                        ),
+                        span: call_span,
+                    });
+                    return None;
+                }
+                RecordValue::Ident(n)
+            }
+            TokenKind::Minus => {
+                self.advance();
+                match self.peek_kind().clone() {
+                    TokenKind::IntLiteral { value, .. } => {
+                        self.advance();
+                        let v: i64 = i64::try_from(value.wrapping_neg()).unwrap_or(i64::MIN);
+                        RecordValue::Int(v)
+                    }
+                    other => {
+                        self.errors.push(ParseError::OptimizationLogBlockSyntax {
+                            detail: format!("field `{field_key}`: expected an integer literal after `-`, got {other:?}"),
+                            span: self.peek_span(),
+                        });
+                        return None;
+                    }
+                }
+            }
+            TokenKind::IntLiteral { value, .. } => {
+                self.advance();
+                let v: i64 = i64::try_from(value).unwrap_or(i64::MAX);
+                RecordValue::Int(v)
+            }
+            TokenKind::Question => {
+                self.errors.push(ParseError::OptimizationLogBlockSyntax {
+                    detail: format!(
+                        "field `{field_key}` value must be a string literal, integer literal, or \
+                         identifier; a strategy-hole (`?...`) is not permitted inside @optimization_log"
+                    ),
+                    span: start,
+                });
+                return None;
+            }
+            TokenKind::LBrace => {
+                self.errors.push(ParseError::OptimizationLogBlockSyntax {
+                    detail: format!(
+                        "field `{field_key}` value must be a string literal, integer literal, or \
+                         identifier; a nested record (`{{...}}`) is not permitted inside @optimization_log"
+                    ),
+                    span: start,
+                });
+                return None;
+            }
+            other => {
+                self.errors.push(ParseError::OptimizationLogBlockSyntax {
+                    detail: format!(
+                        "field `{field_key}` value must be a string literal, integer literal, or identifier; got {other:?}"
+                    ),
+                    span: start,
+                });
+                return None;
+            }
+        };
+        let span: Span = start.merge(self.last_span());
+        Some(Spanned::new(value, span))
     }
 
     fn parse_annotation_args(&mut self) -> Option<Vec<Spanned<AnnotationArg>>> {
@@ -1950,6 +2247,67 @@ impl<'tok> Parser<'tok> {
         }
     }
 
+    /// M3.19 (FG.3): re-sync to the next `,` / `}` / `entry`-keyword-ident token
+    /// AT THE CURRENT BRACE DEPTH (all left in place, not consumed) or EOF.
+    /// This is the spec's `@optimization_log` block-item recovery rule (§1.2
+    /// parser row): "re-sync at the next `entry` / `,` / `}`".
+    ///
+    /// Brace-depth-aware: a malformed block-item frequently itself contains a
+    /// `{ ... }` (e.g. a bogus `bogus_name { x: 1 }` item, or the AT-2919
+    /// nested-record-as-value reject fixture `k: { ... }`) — an inner closing
+    /// `}` must be skipped OVER, not mistaken for the enclosing block's
+    /// terminator (which would truncate the block and cascade into a bogus
+    /// "expected `fn`" error on the token after it, silently dropping every
+    /// item that should have followed). Depth starts at 0 relative to the
+    /// call site; `{`/`}` are tracked so only a `}`/`,`/`entry` seen while
+    /// depth == 0 counts as the boundary.
+    fn recover_to_optlog_boundary(&mut self) {
+        let mut depth: i32 = 0;
+        loop {
+            match self.peek_kind() {
+                TokenKind::Eof => break,
+                TokenKind::LBrace => { depth += 1; self.advance(); }
+                TokenKind::RBrace => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                    self.advance();
+                }
+                TokenKind::Comma if depth == 0 => break,
+                TokenKind::Ident(n) if depth == 0 && n == "entry" => break,
+                _ => { self.advance(); }
+            }
+        }
+    }
+
+    /// M3.19 (FG.3): field-local recovery inside `entry { ... }` — skip tokens
+    /// until `,` / `}` AT THE CURRENT BRACE DEPTH (left in place) or EOF. Used
+    /// when a single field inside an entry is malformed, so the rest of the
+    /// entry's fields (and the rest of the block) are still parsed and
+    /// reported (AT-2913). Brace-depth-aware for the same reason as
+    /// `recover_to_optlog_boundary` (a malformed field value like the
+    /// AT-2919 `k: { ... }` reject fixture contains an inner `{ ... }` that
+    /// must be skipped over, not mistaken for the entry's closing `}`).
+    fn recover_to_comma_or_rbrace(&mut self) {
+        let mut depth: i32 = 0;
+        loop {
+            match self.peek_kind() {
+                TokenKind::Eof => break,
+                TokenKind::LBrace => { depth += 1; self.advance(); }
+                TokenKind::RBrace => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                    self.advance();
+                }
+                TokenKind::Comma if depth == 0 => break,
+                _ => { self.advance(); }
+            }
+        }
+    }
+
     fn peek_kind(&self) -> &TokenKind {
         &self.tokens[self.pos.min(self.tokens.len() - 1)].kind
     }
@@ -3081,5 +3439,147 @@ mod tests {
         } else {
             panic!("expected Call arg for strategy; got {call_arg:?}");
         }
+    }
+
+    // ── M3.19 (FG.3): @optimization_log block parsing ─────────────────────────
+
+    fn find_kernel(ast: &Module) -> &crate::ast::KernelDecl {
+        let crate::ast::Item::Kernel(kd) = &ast.items[0].node;
+        kd
+    }
+
+    /// AT-2900: `@optimization_log { version:1, entry {…}, entry {…} }` parses
+    /// with no parse error to `Call{"entry",[Record]}` args + a block-level
+    /// `version` `Record` (not `Call`-wrapped).
+    #[test]
+    fn at_2900_optimization_log_block_parses_call_wrapped_entries() {
+        let src = concat!(
+            "@kernel @workgroup(1,1,1)\n",
+            "@optimization_log {\n",
+            "  version: 1,\n",
+            "  entry { ts: \"2026-07-14T12:00:00.000Z\", kernel: \"k\", metric: 42860, unit: mtflops, verdict: PASS },\n",
+            "  entry { ts: \"2026-07-14T12:00:01.000Z\", kernel: \"k\", metric: 41640, unit: mtflops, verdict: REGRESS }\n",
+            "}\n",
+            "fn k() -> void { return; }\n",
+        );
+        let (ast, errors) = parse_src(src);
+        assert!(errors.is_empty(), "unexpected parse errors: {errors:?}");
+        let kd = find_kernel(&ast);
+        let ann = kd.annotations.iter().find(|a| a.node.name.node == "optimization_log")
+            .expect("must have an @optimization_log annotation");
+
+        let mut version_records = 0;
+        let mut entry_calls = 0;
+        for arg in &ann.node.args {
+            match &arg.node {
+                AnnotationArg::Record { fields } => {
+                    assert_eq!(fields.len(), 1);
+                    assert_eq!(fields[0].node.key.node, "version");
+                    assert_eq!(fields[0].node.value.node, crate::ast::RecordValue::Int(1));
+                    version_records += 1;
+                }
+                AnnotationArg::Call { name, args: inner } if name == "entry" => {
+                    assert_eq!(inner.len(), 1);
+                    assert!(matches!(&inner[0].node, AnnotationArg::Record { .. }), "entry must wrap exactly one Record");
+                    entry_calls += 1;
+                }
+                other => panic!("unexpected arg shape: {other:?}"),
+            }
+        }
+        assert_eq!(version_records, 1, "exactly one block-level version Record");
+        assert_eq!(entry_calls, 2, "exactly two Call{{\"entry\",[Record]}} args");
+    }
+
+    /// AT-2913: report-ALL recovery — TWO separate malformed top-level block
+    /// items (neither `entry` nor `version`) are BOTH reported (not just the
+    /// first), and a well-formed `entry { ... }` appearing after them is still
+    /// parsed successfully (the parser does not abort the block on error).
+    #[test]
+    fn at_2913_report_all_malformed_block_items_recovery_continues() {
+        let src = concat!(
+            "@kernel @workgroup(1,1,1) @optimization_log {\n",
+            "  version: 1,\n",
+            "  bogus_one { x: 1 },\n",
+            "  bogus_two { y: 2 },\n",
+            "  entry { ts: \"2026-07-14T12:00:00.000Z\", kernel: \"k\", metric: 1, unit: ns, verdict: PASS }\n",
+            "}\n",
+            "fn k() -> void { return; }\n",
+        );
+        let (ast, errors) = parse_src(src);
+        let bad_block_item_count = errors.iter()
+            .filter(|e| matches!(e, ParseError::OptimizationLogBlockSyntax { detail, .. } if detail.contains("expected `entry` or `version`")))
+            .count();
+        assert_eq!(bad_block_item_count, 2, "BOTH malformed block items must be reported (report-ALL): {errors:?}");
+
+        let kd = find_kernel(&ast);
+        let ann = kd.annotations.iter().find(|a| a.node.name.node == "optimization_log")
+            .expect("must still have an @optimization_log annotation despite the two bad items");
+        let entry_calls = ann.node.args.iter()
+            .filter(|a| matches!(&a.node, AnnotationArg::Call { name, .. } if name == "entry"))
+            .count();
+        assert_eq!(entry_calls, 1, "the well-formed entry after the bad items must still be parsed: {:?}", ann.node.args);
+    }
+
+    /// AT-2919 (parser half): each closed-value-grammar violation produces a
+    /// parse error and no `RecordValue` is produced for that field (asserted
+    /// indirectly: the annotation's args never contain the illegal shape).
+    #[test]
+    fn at_2919_closed_value_grammar_rejected_with_recovery() {
+        let cases: &[&str] = &[
+            "entry { ts: { x: 1 } }",         // nested record as value
+            "entry { ts: f(3) }",             // call as value
+            "entry { ts: ?x }",               // hole-ref as value
+            "entry { ts: ?[a,b] }",           // hole-decl as value
+            "entry { entry { ts: \"x\" } }",  // nested entry
+            "netry { ts: \"x\" }",            // typo keyword
+        ];
+        for item in cases {
+            let src = format!(
+                "@kernel @workgroup(1,1,1) @optimization_log {{ version: 1, {item} }} fn k() -> void {{ return; }}"
+            );
+            let (_ast, errors) = parse_src(&src);
+            assert!(!errors.is_empty(), "case `{item}` must produce a parse error");
+        }
+    }
+
+    /// AT-2921 (parser half): trailing comma after the last `entry` AND after
+    /// the last field inside an `entry` — both accepted (no parse error).
+    #[test]
+    fn at_2921_two_level_trailing_comma_accepted() {
+        let src = concat!(
+            "@kernel @workgroup(1,1,1) @optimization_log {\n",
+            "  version: 1,\n",
+            "  entry { ts: \"2026-07-14T12:00:00.000Z\", kernel: \"k\", metric: 1, unit: ns, verdict: PASS, },\n",
+            "}\n",
+            "fn k() -> void { return; }\n",
+        );
+        let (_ast, errors) = parse_src(src);
+        assert!(errors.is_empty(), "two-level trailing commas must be tolerated: {errors:?}");
+    }
+
+    /// AT-2921 (parser half): a leading/double comma is reported (not silently
+    /// swallowed) but recovered from.
+    #[test]
+    fn at_2921_double_comma_reported() {
+        let src = concat!(
+            "@kernel @workgroup(1,1,1) @optimization_log { version: 1,, ",
+            "entry { ts: \"2026-07-14T12:00:00.000Z\", kernel: \"k\", metric: 1, unit: ns, verdict: PASS } ",
+            "} fn k() -> void { return; }",
+        );
+        let (_ast, errors) = parse_src(src);
+        assert!(!errors.is_empty(), "a double comma must be reported: {errors:?}");
+    }
+
+    /// `entry`/`version` are CONTEXTUAL keywords only inside the
+    /// `@optimization_log` block — a kernel body may still use `entry`/`version`
+    /// as ordinary identifiers elsewhere without error.
+    #[test]
+    fn entry_and_version_are_contextual_not_reserved_elsewhere() {
+        let src = concat!(
+            "@kernel @workgroup(1,1,1) fn k() -> void { ",
+            "let entry: u32 = 1u32; let version: u32 = 2u32; return; }",
+        );
+        let (_ast, errors) = parse_src(src);
+        assert!(errors.is_empty(), "entry/version must remain ordinary idents outside @optimization_log: {errors:?}");
     }
 }

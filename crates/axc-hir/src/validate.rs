@@ -320,6 +320,29 @@ pub enum HirError {
         #[label("here")]
         span: Span,
     },
+
+    // ── M3.19 (FG.3): @optimization_log block-level errors ──────────────────
+
+    /// Block-level `@optimization_log { ... }` malformation: missing/duplicate/
+    /// negative/non-`Int` `version`, or (for `version == SUPPORTED_OPT_LOG_VERSION`)
+    /// an unknown block-level key.
+    #[error("malformed @optimization_log block: {detail}")]
+    BadOptimizationLog {
+        detail: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    /// One `entry { ... }` malformation: missing/duplicate/wrong-shape field,
+    /// out-of-set `unit`/`verdict`, a negative `metric` under a non-negative-only
+    /// unit, more than `MAX_OPT_LOG_ENTRIES` entries, or (for `version ==
+    /// SUPPORTED_OPT_LOG_VERSION`) an unknown entry-level key.
+    #[error("malformed @optimization_log entry: {detail}")]
+    BadOptimizationLogEntry {
+        detail: String,
+        #[label("here")]
+        span: Span,
+    },
 }
 
 /// Non-fatal diagnostic warning from HIR validation.
@@ -412,6 +435,24 @@ pub enum HirWarning {
     PostconditionNotLowerable {
         buf: String,
         reason: String,
+        span: Span,
+    },
+
+    // ── M3.19 (FG.3): @optimization_log warnings ─────────────────────────────
+
+    /// `@optimization_log { version: N }` with zero entries — the block is a
+    /// no-op (mirrors `EmptyStrategyBlock`).
+    EmptyOptimizationLog {
+        span: Span,
+    },
+
+    /// §1.4a forward-compat: a `version > SUPPORTED_OPT_LOG_VERSION` block or
+    /// entry carried a key unknown to this compiler; it was preserved into
+    /// `forward_unknown` rather than rejected (an old compiler must not
+    /// hard-fail on a newer, additively-extended block).
+    UnknownOptimizationLogKeyForward {
+        version: i64,
+        key: String,
         span: Span,
     },
 }
@@ -509,6 +550,7 @@ mod tests {
                     coop_matrix: None,
                     strategy: None,
                     debug_checks: Vec::new(),
+                    opt_log: None,
                 },
                 params: Vec::new(),
                 binding_plan: ParamBindingPlan {

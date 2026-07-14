@@ -125,6 +125,13 @@ pub struct KernelAnnotations {
     /// runtime debug checks. Empty when no real predicate was declared, or every
     /// one was rejected/deferred (see `HirError`/`HirWarning::PostconditionNotLowerable`).
     pub debug_checks: Vec<DebugCheck>,
+    /// M3.19 (FG.3): validated `@optimization_log { ... }` block, if present.
+    ///
+    /// `None` when the kernel has no `@optimization_log` annotation (or when
+    /// the block failed HIR validation — an `HirError` was already pushed in
+    /// that case, so the field is simply left empty rather than half-populated).
+    /// CODEGEN-INERT: never read by `axc-codegen` (golden-gated at AT-2903).
+    pub opt_log: Option<crate::opt_log::OptimizationLog>,
 }
 
 /// M3.17 (FG.4): which flag word a debug check targets. `Pre` = entry, word 0;

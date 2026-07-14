@@ -89,7 +89,164 @@ fn main() -> miette::Result<()> {
             input, fuzz, runs, seed, debug_oracle, no_debug_oracle, violate,
             buffer_sizes, size, workgroups, scalar_window, strategy_values,
         ),
+        Command::LogOpt {
+            source, kernel, metric, unit, verdict, ts, note,
+            from_verify, from_grid, baseline_median_ns,
+        } => run_log_opt(
+            source, kernel, metric, unit, verdict, ts, note,
+            from_verify, from_grid, baseline_median_ns,
+        ),
     }
+}
+
+/// M3.19 (FG.3): `axc log-opt` handler.
+///
+/// Resolves the CLI surface into one `OptimizationLogEntry` (raw flags,
+/// `--from-verify`, or `--from-grid` — see `cli.rs::Command::LogOpt`'s doc
+/// comment for the exact three-way grammar), calls the fail-closed writer,
+/// prints a small JSON status to stdout, and exits: `0` on success,
+/// `LogOptError::exit_code()` on a writer failure (`3` = Full, `4` =
+/// Multikernel, `5` = UnsupportedVersion, `2` = any other writer error), `2`
+/// on a CLI-layer usage error (bad flag combination, unreadable/malformed
+/// `--from-*` JSON, bad `--unit`/`--verdict` string). Never returns.
+#[allow(clippy::too_many_arguments)]
+fn run_log_opt(
+    source: PathBuf,
+    kernel: Option<String>,
+    metric: Option<i64>,
+    unit: Option<String>,
+    verdict: Option<String>,
+    ts: Option<String>,
+    note: Option<String>,
+    from_verify: Option<PathBuf>,
+    from_grid: Option<PathBuf>,
+    baseline_median_ns: Option<u64>,
+) -> ! {
+    use axc_driver::log_opt::{append_optimization_log, entry_from_grid_record};
+    use axc_hir::opt_log::{OptLogUnit, OptLogVerdict, OptimizationLogEntry};
+    use axc_driver::mcp::format_rfc3339_utc;
+
+    if from_verify.is_some() && from_grid.is_some() {
+        log_opt_usage_error("--from-verify and --from-grid are mutually exclusive".to_string());
+    }
+
+    // §1.5: default `now()` is non-reproducible and production-only; every
+    // golden/round-trip test fixture MUST pass an explicit `--ts`.
+    let resolved_ts: String = ts.unwrap_or_else(|| format_rfc3339_utc(std::time::SystemTime::now()));
+
+    let entry: OptimizationLogEntry = if let Some(verify_path) = from_verify {
+        // Minimal on-disk-JSON shape (deliberately NOT `rewrite_verify::VerifyReport`
+        // itself, which carries a `milestone: &'static str` field that cannot be
+        // `Deserialize`d from an arbitrary runtime buffer): only `verdict` and the
+        // two optional `kernel_name`s are needed here. `verdict`'s JSON string is
+        // ALREADY the identical SCREAMING_SNAKE_CASE ident `OptLogVerdict` uses
+        // (`rewrite_verify::Verdict`'s `#[serde(rename_all = "SCREAMING_SNAKE_CASE")]`),
+        // so `OptLogVerdict::from_ident` on it IS `verdict_from_rewrite_verify`
+        // (the same exhaustive §1.5 mapping, applied to the wire format instead of
+        // the Rust enum — `log_opt::verdict_from_rewrite_verify` is exercised
+        // directly by the AT-2907 unit tests for the in-process Rust-value path).
+        #[derive(serde::Deserialize)]
+        struct VerifyReportJson {
+            verdict: String,
+            original: Option<KernelSummaryJson>,
+            rewritten: Option<KernelSummaryJson>,
+        }
+        #[derive(serde::Deserialize)]
+        struct KernelSummaryJson {
+            kernel_name: String,
+        }
+
+        let text: String = match std::fs::read_to_string(&verify_path) {
+            Ok(t) => t,
+            Err(e) => log_opt_usage_error(format!("io error reading {verify_path:?}: {e}")),
+        };
+        let report: VerifyReportJson = match serde_json::from_str(&text) {
+            Ok(r) => r,
+            Err(e) => log_opt_usage_error(format!("--from-verify: failed to parse {verify_path:?} as a VerifyReport: {e}")),
+        };
+        let resolved_verdict: OptLogVerdict = match OptLogVerdict::from_ident(&report.verdict) {
+            Some(v) => v,
+            None => log_opt_usage_error(format!("--from-verify: unrecognized verdict `{}` in {verify_path:?}", report.verdict)),
+        };
+        let resolved_kernel: String = kernel
+            .or_else(|| report.rewritten.map(|k| k.kernel_name))
+            .or_else(|| report.original.map(|k| k.kernel_name))
+            .unwrap_or_default();
+        let resolved_unit: OptLogUnit = match unit.as_deref() {
+            Some(u) => match OptLogUnit::from_ident(u) {
+                Some(u) => u,
+                None => log_opt_usage_error(format!("invalid --unit `{u}`; expected one of mtflops, pct_milli, ns, us, ms, bytes")),
+            },
+            None => OptLogUnit::Nanoseconds,
+        };
+        OptimizationLogEntry {
+            ts: resolved_ts,
+            kernel: resolved_kernel,
+            metric: metric.unwrap_or(0),
+            unit: resolved_unit,
+            verdict: resolved_verdict,
+            note,
+            forward_unknown: Vec::new(),
+        }
+    } else if let Some(grid_path) = from_grid {
+        let Some(kernel_name) = kernel else {
+            log_opt_usage_error("--from-grid requires --kernel (a HistoryEntryRecord carries no kernel name)".to_string());
+        };
+        let text: String = match std::fs::read_to_string(&grid_path) {
+            Ok(t) => t,
+            Err(e) => log_opt_usage_error(format!("io error reading {grid_path:?}: {e}")),
+        };
+        let record: axc_driver::mcp::HistoryEntryRecord = match serde_json::from_str(&text) {
+            Ok(r) => r,
+            Err(e) => log_opt_usage_error(format!("--from-grid: failed to parse {grid_path:?} as a HistoryEntryRecord: {e}")),
+        };
+        entry_from_grid_record(&record, kernel_name, baseline_median_ns, Some(resolved_ts), note)
+    } else {
+        let (Some(kernel_name), Some(metric_val), Some(unit_str), Some(verdict_str)) = (kernel, metric, unit, verdict) else {
+            log_opt_usage_error(
+                "raw mode requires --kernel, --metric, --unit, and --verdict (or use --from-verify / --from-grid)".to_string(),
+            );
+        };
+        let resolved_unit: OptLogUnit = match OptLogUnit::from_ident(&unit_str) {
+            Some(u) => u,
+            None => log_opt_usage_error(format!("invalid --unit `{unit_str}`; expected one of mtflops, pct_milli, ns, us, ms, bytes")),
+        };
+        let resolved_verdict: OptLogVerdict = match OptLogVerdict::from_ident(&verdict_str) {
+            Some(v) => v,
+            None => log_opt_usage_error(format!(
+                "invalid --verdict `{verdict_str}`; expected one of PASS, FAIL, REJECT, SKIPPED, NONDETERMINISTIC_ORACLE, ERROR, REGRESS"
+            )),
+        };
+        OptimizationLogEntry {
+            ts: resolved_ts,
+            kernel: kernel_name,
+            metric: metric_val,
+            unit: resolved_unit,
+            verdict: resolved_verdict,
+            note,
+            forward_unknown: Vec::new(),
+        }
+    };
+
+    match append_optimization_log(&source, entry) {
+        Ok(()) => {
+            println!("{}", serde_json::json!({ "status": "ok", "source": source.display().to_string() }));
+            std::process::exit(0);
+        }
+        Err(e) => {
+            let exit_code: i32 = e.exit_code();
+            println!("{}", serde_json::json!({ "status": "error", "detail": e.to_string() }));
+            std::process::exit(exit_code);
+        }
+    }
+}
+
+/// Emit a minimal usage-error JSON to stdout and exit 2 (CLI-layer failures
+/// that occur BEFORE an `OptimizationLogEntry` can even be built — mirrors
+/// `emit_usage_error`'s role for `rewrite-verify`).
+fn log_opt_usage_error(detail: String) -> ! {
+    println!("{}", serde_json::json!({ "status": "error", "detail": detail }));
+    std::process::exit(2);
 }
 
 /// M3.18 (FG.8): `axc verify` handler.

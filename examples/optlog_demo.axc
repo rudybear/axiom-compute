@@ -1,0 +1,44 @@
+// optlog_demo.axc — a kernel carrying a two-entry @optimization_log block.
+//
+// M3.19 (FG.3) fixture: demonstrates the rewrite-surviving, self-describing
+// history block. The block is codegen-inert (AT-2903 golden gate: this file
+// compiles to byte-identical SPIR-V whether or not the block is present) —
+// it exists purely so an agent reading this source sees prior optimization
+// attempts inline, without a side-channel JSONL lookup.
+//
+// The two entries below are a representative PASS-then-REGRESS pair, in the
+// shape `axc log-opt` (or the `append_optimization_log` MCP tool) produces.
+
+@kernel
+@workgroup(64, 1, 1)
+@intent("compute Y[i] = alpha * X[i] + Y[i] in parallel")
+@complexity(O(n))
+@optimization_log {
+  version: 1,
+  entry {
+    ts: "2026-07-14T12:00:00.000Z",
+    kernel: "optlog_demo",
+    metric: 42860,
+    unit: mtflops,
+    verdict: PASS,
+    note: "baseline register-blocked tile"
+  },
+  entry {
+    ts: "2026-07-14T12:05:00.000Z",
+    kernel: "optlog_demo",
+    metric: 41640,
+    unit: mtflops,
+    verdict: REGRESS,
+    note: "double-buffered variant; slower — reverted"
+  }
+}
+fn optlog_demo(n: u32, alpha: f32, x: readonly_buffer[f32], y: buffer[f32]) -> void {
+    let i: u32 = gid(0);
+    let limit: u32 = n;
+    let in_range: bool = i < limit;
+    let xi: f32 = x[i];
+    let yi: f32 = y[i];
+    let result: f32 = alpha * xi + yi;
+    y[i] = result;
+    return;
+}

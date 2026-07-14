@@ -29,6 +29,8 @@ pub mod q4_0;
 pub mod ext_inst;
 /// Workgroup-shared array HIR types (M3.2).
 pub mod shared;
+/// `@optimization_log { ... }` schema + validator (M3.19 / FG.3).
+pub mod opt_log;
 
 pub use hir::{
     Module as HirModule,
@@ -67,3 +69,8 @@ pub use coopmat::{CoopMatUse, CoopMatBuiltin, CoopMatrixShapeKind, CoopMatKey, C
 pub use q4_0::{Q4_0Builtin, RESERVED_Q4_0_BUILTIN_NAMES, is_reserved_q4_0_builtin};
 pub use ext_inst::{ExtInstBuiltin, RESERVED_EXT_INST_BUILTIN_NAMES, is_reserved_ext_inst_builtin};
 pub use shared::{SharedId, SharedTy, SharedDecl, MAX_SHARED_ELEMS, PORTABLE_MIN_SHARED_BYTES, is_allowed_shared_element};
+pub use opt_log::{
+    OptimizationLog, OptimizationLogEntry, OptLogUnit, OptLogVerdict,
+    MAX_OPT_LOG_ENTRIES, SUPPORTED_OPT_LOG_VERSION, validate_block as validate_opt_log_block,
+    validate_entry as validate_opt_log_entry,
+};

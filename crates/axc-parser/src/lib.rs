@@ -9,7 +9,7 @@ pub mod ast;
 pub mod parser;
 
 pub use ast::{Module, Item, KernelDecl, Annotation, AnnotationArg, Block, Stmt, Expr, TypeRef, Param,
-              BinOp, UnaryOp, ShortCircuitOp, ElseArm};
+              BinOp, UnaryOp, ShortCircuitOp, ElseArm, RecordField, RecordValue};
 pub use parser::{Parser, ParseError, M1_1_RESERVED_KEYWORDS, M1_3_RESERVED_KEYWORDS};
 
 use axc_lexer::LexError;

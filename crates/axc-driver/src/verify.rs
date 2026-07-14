@@ -147,6 +147,8 @@ fn hir_warning_span(w: &HirWarning) -> Option<axc_lexer::Span> {
         HirWarning::SharedMemoryExceedsPortableMinimum { span, .. } => Some(*span),
         HirWarning::SharedWriteWithoutBarrierBeforeRead { span, .. } => Some(*span),
         HirWarning::PostconditionNotLowerable { span, .. } => Some(*span),
+        HirWarning::EmptyOptimizationLog { span } => Some(*span),
+        HirWarning::UnknownOptimizationLogKeyForward { span, .. } => Some(*span),
     }
 }
 
