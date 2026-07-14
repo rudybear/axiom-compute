@@ -404,6 +404,8 @@ Currently one `@kernel` per file. DESIGN.md hints at multi-kernel modules with c
 | ~~No `CHANGELOG.md`~~ ✅ DONE (M3.15): milestone-level backfill M0→M3.15, AT-2839 | — | — |
 | ~~`strip_strategy_annotation_block` naive substring footgun~~ ✅ FIXED (M3.15): lexer-token anchor, comment/string-safe, AT-2830..2835 incl. examples-corpus regression anchor | — | — |
 | M3.14 golden fixtures are annotated hand-computed-from-formula (permitted §6 fallback); a real ggml-quantized byte-dump cross-check for Q6_K/Q5_K_M is still owed as a drop-in | low | 200 LOC |
+| `at_1115` (M2.4 bench_variant 4-ULP saxpy correctness) fails deterministically on Lavapipe/Mesa 25.2.8 (9/1024 elements) — pre-existing FP drift from a Mesa bump, NOT caused by M3.16 (stash-verified on unmodified HEAD); needs re-baseline or Lavapipe-only ULP-widening with rationale | medium | 100 LOC |
+| M3.16 W1/W2 (routed from pessimistic code review, both safe-direction): `rel:` comparator near-zero denominator (seed-pinned in AT-2855) + `within_ulp_f32` sign-boundary false-mismatch — candidates for a condition-aware tolerance follow-up | low | 300 LOC |
 
 ---
 
