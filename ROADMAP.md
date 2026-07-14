@@ -374,11 +374,9 @@ IMPLEMENTED. Full pipeline: lexer (token already existed) → parser (TypeRef::S
 
 **Effort:** ~600 LOC.
 
-### FG.8 — `axc verify` / `axc test --fuzz`
+### FG.8 — `axc verify` / `axc test --fuzz` ✅ IMPLEMENTED (M3.18, 2026-07-14)
 
-Parent AXIOM CLAUDE.md mentions these for `@strict` modules. AXIOM-Compute inherits the design but never built them. Verify checks annotation completeness; test --fuzz auto-generates inputs from `@precondition` constraints.
-
-**Effort:** ~1500 LOC.
+IMPLEMENTED as M3.18. `axc verify` = the @strict enforcement point (C1 completeness, C2 predicate-DSL well-formedness incl. the arity-drop diagnostic surfaced WITHOUT changing compile, C3 workgroup sanity, C4 inert-postcondition surfacing, C5 front-end errors). `axc test --fuzz` = precondition-constrained fuzzing with the honest oracle triad: device-fault, **M3.17 postcondition runtime flags as the correctness oracle**, twin-dispatch determinism; all-f32 interval satisfier with unsat detection (exit 3); total 4-quadrant CPU-vs-GPU discriminator (can surface an M3.17 check miscompile honestly); severity ordering ERROR>FAIL>UNSATISFIABLE>UNCONSTRAINED_PRECONDITION_FIRED>SKIPPED>PASS. Zero compiler changes. AT-2881..2899. Pipeline note: 3 design cycles + 1 documented orchestrator resolution (reviewer-specified severity clause), verified by the pessimistic code review as backstop.
 
 ### FG.9 — Multi-kernel modules
 
@@ -405,6 +403,7 @@ Currently one `@kernel` per file. DESIGN.md hints at multi-kernel modules with c
 | ~~`at_1115` Lavapipe failure~~ ✅ FIXED (M3.17): root cause was NOT Mesa drift — a device-independent CPU-oracle NaN bug (`0.0*x` shortcut), fixed at the root; measured genuine ULP delta 0; NVIDIA 4-ULP frozen; defensive llvmpipe→8 keying retained | — | — |
 | M3.17 LOW (pessimistic code review): `@precondition`/`@postcondition` with arity ≠ 1 (e.g. comma-conjunction) is SILENTLY dropped — compile-time fail-open for a verification tool; pre-existing M0 behavior mirrored; needs a v1.1 diagnostic | low | 50 LOC |
 | M3.17 deferred (§9): buffer `elem(buf)` postcondition lowering with the syntactic-dominance gate (design r2-approved, never built — v1 defers all to `PostconditionNotLowerable`) | low | 300 LOC |
+| M3.18 W1/W2 (pessimistic code review, both fail-loud): early-return SKIPPED paths discard accumulated `worst` (latent, unreachable today — fold into record_worst) + `negate_one` unsound for f32 ge/le at large magnitudes (unreachable by v1 alpha-pin) | low | 100 LOC |
 | M3.16 W1/W2 (routed from pessimistic code review, both safe-direction): `rel:` comparator near-zero denominator (seed-pinned in AT-2855) + `within_ulp_f32` sign-boundary false-mismatch — candidates for a condition-aware tolerance follow-up | low | 300 LOC |
 
 ---
