@@ -548,7 +548,15 @@ fn substitute_strategy_holes_boundary_safe(
             let mut matched: Option<(&str, i64)> = None;
             for &(name, value) in &names {
                 let end: usize = after_q + name.len();
-                if end <= bytes.len() && &source[after_q..end] == name {
+                // `source.get(..)` returns `None` on out-of-bounds AND on a
+                // non-char-boundary `end` — both cases panic a raw `&source[..]`
+                // slice. Using the Option form makes the scan panic-free: a
+                // candidate whose length reaches into a following multibyte
+                // UTF-8 char can never equal an ASCII hole `name` anyway (PCR-1,
+                // M3.21 pessimistic code review — the old direct-slice form
+                // panicked on `?W` immediately followed by `€`), so refusing to
+                // match there and falling through to verbatim-copy is correct.
+                if source.get(after_q..end) == Some(name) {
                     // Boundary check: the byte immediately after the matched
                     // name must NOT be an identifier-continuation char.
                     let boundary_ok: bool = match bytes.get(end) {
@@ -1670,6 +1678,63 @@ mod tests {
         // The comment's OWN ?WG2 occurrence is also substituted (harmless —
         // comments never reach the lexer/HIR); it must be 64, never 1282.
         assert!(result.contains("// note: 64 tile"), "comment substitution is harmless but still boundary-safe; got {result:?}");
+    }
+
+    /// AT-2968(c): char-boundary panic (PCR-1, M3.21 pessimistic code review).
+    ///
+    /// `substitute_strategy_holes_boundary_safe` used to slice
+    /// `&source[after_q..end]` directly. When a candidate hole name's byte
+    /// length reaches PAST the start of a following multibyte UTF-8
+    /// character, `end` lands mid-character (not a char boundary) and the
+    /// direct slice panics — a regression from the OLD `str::replace`
+    /// algorithm, which silently left such input untouched. Reproduces the
+    /// review's exact fixture: a `//` comment containing `?W` immediately
+    /// followed by `€` (a 3-byte char), with `WG` (len 2) a registered hole
+    /// name. `after_q` points at `W` (1 ASCII byte); `end = after_q + 2`
+    /// therefore lands 1 byte into `€`'s 3-byte encoding — the exact
+    /// panicking offset before the fix (`source.get(after_q..end) ==
+    /// Some(name)` now returns `None` there instead of panicking).
+    #[test]
+    fn at_2968c_multibyte_boundary_no_panic_comment_untouched() {
+        let src = "// tuned ?W\u{20AC} budget\n@kernel @workgroup(?WG, 1, 1)\n@strategy { WG: ?[32, 64, 128] }\nfn tune() -> void { return; }\n";
+        let mut assignments: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+        assignments.insert("WG".to_string(), 64);
+
+        // Low-level scan: must not panic, and the truncated comment
+        // candidate (`?W` immediately followed by `€`) must be left
+        // untouched verbatim since `WG` cannot match a boundary that falls
+        // mid-character.
+        let scanned = substitute_strategy_holes_boundary_safe(src, &assignments);
+        assert!(
+            scanned.contains("?W\u{20AC} budget"),
+            "the non-char-boundary candidate must be left verbatim, not substituted or corrupted; got {scanned:?}"
+        );
+
+        // End-to-end: the whole module must still compile clean (the hole
+        // in the comment is invisible to the lexer regardless; the LIVE
+        // `?WG` in `@workgroup` resolves normally).
+        let (bytes, meta) = compile_source_with_assignments(src, &assignments)
+            .expect("AT-2968c: multibyte-adjacent comment text must not panic and must compile clean");
+        assert_eq!(&bytes[0..4], &[0x03, 0x02, 0x23, 0x07], "SPIR-V magic must be correct");
+        assert_eq!(meta.workgroup_size, [64, 1, 1], "workgroup_size must reflect resolved WG=64");
+    }
+
+    /// AT-2968(c) variant: a REAL multibyte-adjacent hole still substitutes
+    /// correctly. `?WG` immediately followed by `€` (not a truncated
+    /// candidate — `WG` matches in full, and `end` lands exactly on the char
+    /// boundary right before `€`) must still resolve to its value; the fix
+    /// must not overcorrect into refusing valid matches merely because a
+    /// multibyte char follows.
+    #[test]
+    fn at_2968c_multibyte_adjacent_hole_substitutes_correctly() {
+        let src = "?WG\u{20AC}";
+        let mut assignments: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+        assignments.insert("WG".to_string(), 128);
+        let result = substitute_strategy_holes_boundary_safe(src, &assignments);
+        assert_eq!(
+            result, "128\u{20AC}",
+            "a full-length hole name immediately followed by a multibyte char must still substitute; got {result:?}"
+        );
     }
 
     /// AT-2969: the WRONG-METADATA GUARD. A 2-kernel source with DISTINCT
