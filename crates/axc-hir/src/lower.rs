@@ -334,6 +334,22 @@ pub fn lower_module(ast: &AstModule) -> (HirModule, Vec<HirError>, Vec<HirWarnin
         }
     }
 
+    // M3.21 (FG.9): a module with 2+ kernels sharing the same name would collide
+    // on both the emitted OpEntryPoint name and (for --all multi-emit) the output
+    // file path — fail closed rather than let codegen/driver silently alias them.
+    let mut seen_names: std::collections::BTreeMap<&str, Span> = std::collections::BTreeMap::new();
+    for k in &kernels {
+        if let Some(&original_span) = seen_names.get(k.name.as_str()) {
+            errors.push(HirError::DuplicateKernelName {
+                name: k.name.clone(),
+                span: k.span,
+                original_span,
+            });
+        } else {
+            seen_names.insert(k.name.as_str(), k.span);
+        }
+    }
+
     (HirModule { kernels }, errors, warnings)
 }
 

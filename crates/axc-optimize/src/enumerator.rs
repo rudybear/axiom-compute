@@ -35,7 +35,7 @@
 
 use std::collections::BTreeMap;
 use xxhash_rust::xxh3::xxh3_64;
-use axc_hir::hir::{Kernel, KernelAnnotations, StrategyHoles, WorkgroupDims};
+use axc_hir::hir::{Kernel, KernelAnnotations, Module as HirModule, StrategyHoles, WorkgroupDims};
 use crate::EnumerateError;
 
 /// Soft limit: warn (but don't fail) when the Cartesian product exceeds this.
@@ -210,6 +210,64 @@ fn resolve_wg_dim(
         return Ok(value as u32);
     }
     Ok(original)
+}
+
+/// M3.21 (FG.9): union the `@strategy` hole maps across ALL kernels of a module.
+///
+/// A hole name declared in one kernel's `@strategy` block is available
+/// module-wide (referenced-but-not-declared is valid — that's the sharing
+/// mechanism, §4 of the spec). Two rules enforced here, both fail-closed:
+///
+/// - The SAME hole name declared (with a candidate list) in >=2 kernels must
+///   have a byte-identical candidate list in every declaration, else
+///   `EnumerateError::ConflictingHoleCandidates`.
+/// - No hole name may be a byte-prefix of another hole name in the union
+///   (F1 defense-in-depth — the substitution itself is already
+///   prefix-collision-safe; this refuses the ambiguous authoring pattern at
+///   discovery time), else `EnumerateError::PrefixCollidingHoleNames`.
+///
+/// Kernels with no `@strategy` block contribute nothing. A module where NO
+/// kernel declares any hole produces an empty `StrategyHoles` (callers that
+/// require >=1 hole, e.g. the CLI `optimize` path, raise their own
+/// `NoStrategy`-shaped error on the empty result).
+pub fn union_module_holes(module: &HirModule) -> Result<StrategyHoles, EnumerateError> {
+    let mut union_map: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+
+    for kernel in &module.kernels {
+        let Some(ref strategy) = kernel.annotations.strategy else {
+            continue;
+        };
+        for (name, candidates) in &strategy.map {
+            match union_map.get(name) {
+                Some(existing) if existing != candidates => {
+                    return Err(EnumerateError::ConflictingHoleCandidates { name: name.clone() });
+                }
+                Some(_) => {}
+                None => {
+                    union_map.insert(name.clone(), candidates.clone());
+                }
+            }
+        }
+    }
+
+    // Prefix-collision guard (F1 defense-in-depth): BTreeMap iterates keys in
+    // sorted byte order, so any name that is a prefix of another is adjacent
+    // to it in iteration order — a single linear scan over consecutive pairs
+    // suffices (a prefix relation implies lexicographic adjacency for any
+    // strings that share that prefix, since nothing can sort strictly between
+    // a prefix and a string it prefixes).
+    let names: Vec<&String> = union_map.keys().collect();
+    for pair in names.windows(2) {
+        let (shorter, longer) = (pair[0], pair[1]);
+        if longer.starts_with(shorter.as_str()) {
+            return Err(EnumerateError::PrefixCollidingHoleNames {
+                shorter: shorter.clone(),
+                longer: longer.clone(),
+            });
+        }
+    }
+
+    Ok(StrategyHoles { map: union_map })
 }
 
 /// Compute the total Cartesian product size for a set of holes.
@@ -495,5 +553,132 @@ mod tests {
         assert_eq!(variants[11].assignments.values["a"], 2);
         assert_eq!(variants[11].assignments.values["b"], 30);
         assert_eq!(variants[11].assignments.values["c"], 200);
+    }
+
+    // ── M3.21 (FG.9): union_module_holes (AT-2953, AT-2954, AT-2972) ──────────
+
+    fn kernel_with_strategy(name: &str, holes_map: BTreeMap<String, Vec<i64>>) -> Kernel {
+        Kernel {
+            id: KernelId(0),
+            name: name.to_string(),
+            annotations: KernelAnnotations {
+                workgroup: WorkgroupDims { x: 1, y: 1, z: 1 },
+                intent: None,
+                complexity: None,
+                preconditions: Vec::new(),
+                subgroup_uniform: false,
+                cooperative_matrix: false,
+                coop_matrix: None,
+                strategy: if holes_map.is_empty() { None } else { Some(StrategyHoles { map: holes_map }) },
+                debug_checks: Vec::new(),
+                opt_log: None,
+            },
+            params: Vec::new(),
+            binding_plan: axc_hir::param::ParamBindingPlan {
+                buffers: Vec::new(),
+                scalars: Vec::new(),
+                push_constant_total_bytes: 0,
+            },
+            body: KernelBody::Empty,
+            span: Span::new(0, 1),
+        }
+    }
+
+    /// AT-2953: two kernels both declaring `?WG` with IDENTICAL candidates ->
+    /// one merged axis (union has exactly one entry, with that candidate list).
+    #[test]
+    fn at_2953_union_identical_candidates_merges_to_one_axis() {
+        let mut m1: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+        m1.insert("WG".to_string(), vec![64, 128, 256]);
+        let mut m2: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+        m2.insert("WG".to_string(), vec![64, 128, 256]);
+
+        let module = HirModule {
+            kernels: vec![
+                kernel_with_strategy("partial_reduce", m1),
+                kernel_with_strategy("final_reduce", m2),
+            ],
+        };
+
+        let union = union_module_holes(&module).expect("union must succeed for identical candidates");
+        assert_eq!(union.map.len(), 1, "expected exactly one merged hole axis");
+        assert_eq!(union.map["WG"], vec![64, 128, 256]);
+    }
+
+    /// AT-2954: same `?WG` name, DIFFERING candidate lists -> ConflictingHoleCandidates.
+    #[test]
+    fn at_2954_union_conflicting_candidates_fails_closed() {
+        let mut m1: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+        m1.insert("WG".to_string(), vec![64, 128]);
+        let mut m2: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+        m2.insert("WG".to_string(), vec![64, 256]);
+
+        let module = HirModule {
+            kernels: vec![
+                kernel_with_strategy("a", m1),
+                kernel_with_strategy("b", m2),
+            ],
+        };
+
+        let result = union_module_holes(&module);
+        assert!(
+            matches!(result, Err(EnumerateError::ConflictingHoleCandidates { ref name }) if name == "WG"),
+            "expected ConflictingHoleCandidates{{name:\"WG\"}}; got {result:?}"
+        );
+    }
+
+    /// AT-2972: a module declaring both `?WG` and `?WG2` (prefix collision)
+    /// fails closed at discovery, even though each individually is a valid hole.
+    #[test]
+    fn at_2972_union_prefix_colliding_names_fails_closed() {
+        let mut m: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+        m.insert("WG".to_string(), vec![64]);
+        m.insert("WG2".to_string(), vec![32]);
+
+        let module = HirModule {
+            kernels: vec![kernel_with_strategy("k", m)],
+        };
+
+        let result = union_module_holes(&module);
+        assert!(
+            matches!(
+                result,
+                Err(EnumerateError::PrefixCollidingHoleNames { ref shorter, ref longer })
+                    if shorter == "WG" && longer == "WG2"
+            ),
+            "expected PrefixCollidingHoleNames{{shorter:\"WG\",longer:\"WG2\"}}; got {result:?}"
+        );
+    }
+
+    /// Independent per-kernel holes with distinct names produce distinct axes
+    /// (no interference — sharing is opt-in via name-matching only).
+    #[test]
+    fn union_distinct_hole_names_produce_independent_axes() {
+        let mut m1: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+        m1.insert("A".to_string(), vec![1, 2]);
+        let mut m2: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+        m2.insert("B".to_string(), vec![10, 20, 30]);
+
+        let module = HirModule {
+            kernels: vec![
+                kernel_with_strategy("k1", m1),
+                kernel_with_strategy("k2", m2),
+            ],
+        };
+
+        let union = union_module_holes(&module).expect("union must succeed");
+        assert_eq!(union.map.len(), 2);
+        assert_eq!(union.map["A"], vec![1, 2]);
+        assert_eq!(union.map["B"], vec![10, 20, 30]);
+    }
+
+    /// A module with no @strategy anywhere produces an empty union (not an error).
+    #[test]
+    fn union_no_strategy_anywhere_is_empty_not_error() {
+        let module = HirModule {
+            kernels: vec![kernel_with_strategy("k", BTreeMap::new())],
+        };
+        let union = union_module_holes(&module).expect("empty union must be Ok, not Err");
+        assert!(union.map.is_empty());
     }
 }

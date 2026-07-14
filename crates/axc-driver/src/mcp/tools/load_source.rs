@@ -22,6 +22,14 @@ pub struct LoadSourceRequest {
     /// Path to an `.axc` source file. Mutually exclusive with `source`.
     #[serde(default)]
     pub path: Option<PathBuf>,
+    /// M3.21 (FG.9): the kernel to load. `None` on an ambiguous (2+ kernel)
+    /// source fails closed (`McpToolError::Compile(DriverError::AmbiguousKernel)`)
+    /// listing every kernel name — this tool was previously a SILENT-FIRST-PICK
+    /// of `kernels[0]` with no count check at all; that is the defect this
+    /// param closes (a distinct defect from `enumerate_variants`' lying
+    /// "exactly one @kernel" text — no such text lived here to correct).
+    #[serde(default)]
+    pub kernel: Option<String>,
 }
 
 /// Response from the `load_source` tool.
@@ -85,13 +93,13 @@ pub struct ScalarBindingSummary {
 /// Returns `McpToolError::Compile` if any pipeline phase fails.
 pub(crate) fn handle(req: LoadSourceRequest) -> Result<LoadSourceResponse, McpToolError> {
     let source: String = crate::mcp::dispatch::resolve_source(&req.source, &req.path)?;
-    load_source_str(&source)
+    load_source_str_kernel(&source, req.kernel.as_deref())
 }
 
-/// Shared helper: run the pipeline on a source string, return `LoadSourceResponse`.
-///
+/// Shared helper: run the pipeline on a source string, return `LoadSourceResponse`
+/// for the selected kernel (`None` = the sole kernel, fail-closed on 2+).
 /// Called directly by other tools that need kernel metadata before further processing.
-pub(crate) fn load_source_str(source: &str) -> Result<LoadSourceResponse, McpToolError> {
+pub(crate) fn load_source_str_kernel(source: &str, kernel: Option<&str>) -> Result<LoadSourceResponse, McpToolError> {
     use axc_lexer::tokenize;
     use axc_parser::Parser;
     use axc_hir::lower_module;
@@ -117,12 +125,16 @@ pub(crate) fn load_source_str(source: &str) -> Result<LoadSourceResponse, McpToo
         }));
     }
 
-    let kernel = hir.kernels.into_iter().next()
-        .ok_or_else(|| McpToolError::Compile(DriverError::Compile {
+    if hir.kernels.is_empty() {
+        return Err(McpToolError::Compile(DriverError::Compile {
             lex: Vec::new(),
             parse: Vec::new(),
             hir: Vec::new(),
-        }))?;
+        }));
+    }
+    let kernel = crate::select_kernel(&hir.kernels, kernel)
+        .map_err(McpToolError::Compile)?
+        .clone();
 
     let wg: [u32; 3] = [
         kernel.annotations.workgroup.x,
@@ -222,7 +234,7 @@ mod tests {
 
     #[test]
     fn load_saxpy_returns_correct_metadata() {
-        let resp: LoadSourceResponse = load_source_str(SAXPY_SRC)
+        let resp: LoadSourceResponse = load_source_str_kernel(SAXPY_SRC, None)
             .expect("load_source_str must succeed for saxpy");
 
         assert_eq!(resp.kernel_name, "saxpy");
@@ -257,14 +269,14 @@ mod tests {
             "@kernel @workgroup(64, 1, 1)\n",
             "fn k() -> void { return; }\n",
         );
-        let resp: LoadSourceResponse = load_source_str(src)
+        let resp: LoadSourceResponse = load_source_str_kernel(src, None)
             .expect("load_source_str must succeed");
         assert!(resp.strategy_holes.is_empty(), "no @strategy → empty map");
     }
 
     #[test]
     fn load_source_returns_compile_error_for_bad_source() {
-        let err = load_source_str("💥 this is invalid").unwrap_err();
+        let err = load_source_str_kernel("💥 this is invalid", None).unwrap_err();
         assert!(
             matches!(err, McpToolError::Compile(_)),
             "expected McpToolError::Compile, got {err:?}"
@@ -276,5 +288,36 @@ mod tests {
         assert_eq!(access_str(BufferAccess::ReadOnly), "readonly");
         assert_eq!(access_str(BufferAccess::WriteOnly), "writeonly");
         assert_eq!(access_str(BufferAccess::ReadWrite), "readwrite");
+    }
+
+    // ── AT-2961 (M3.21 / FG.9): load_source `kernel` param ─────────────────────
+
+    const MULTI_SRC: &str = concat!(
+        "@kernel @workgroup(64, 1, 1) @intent(\"a\") @complexity(O(n)) fn kernel_a(x: buffer[u32]) -> void {\n",
+        "    let i: u32 = gid(0u32);\n    x[i] = i;\n    return;\n}\n",
+        "@kernel @workgroup(32, 1, 1) @intent(\"b\") @complexity(O(n)) fn kernel_b(y: buffer[u32]) -> void {\n",
+        "    let i: u32 = gid(0u32);\n    y[i] = i;\n    return;\n}\n",
+    );
+
+    /// AT-2961: `kernel: Some(name)` selects the named kernel's holes/plan.
+    #[test]
+    fn at_2961_kernel_param_selects_named_kernel() {
+        let resp = load_source_str_kernel(MULTI_SRC, Some("kernel_b"))
+            .expect("must load kernel_b");
+        assert_eq!(resp.kernel_name, "kernel_b");
+        assert_eq!(resp.workgroup_size, [32, 1, 1]);
+    }
+
+    /// AT-2961: ambiguous (2+ kernel, no selector) -> fail closed listing
+    /// kernel names (`McpToolError::Compile(DriverError::AmbiguousKernel)`).
+    #[test]
+    fn at_2961_ambiguous_without_kernel_param_fails_closed() {
+        let err = load_source_str_kernel(MULTI_SRC, None).unwrap_err();
+        match err {
+            McpToolError::Compile(crate::DriverError::AmbiguousKernel { available }) => {
+                assert_eq!(available, vec!["kernel_a".to_string(), "kernel_b".to_string()]);
+            }
+            other => panic!("expected AmbiguousKernel; got {other:?}"),
+        }
     }
 }

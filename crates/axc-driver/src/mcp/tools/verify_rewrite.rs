@@ -70,6 +70,9 @@ pub struct VerifyRewriteRequest {
     /// Seed for deterministic input generation. Default `0`.
     #[serde(default)]
     pub seed: u64,
+    /// M3.21 (FG.9): the kernel to verify, applied to BOTH sources.
+    #[serde(default)]
+    pub kernel: Option<String>,
 }
 
 /// Handle a `verify_rewrite` request.
@@ -108,6 +111,7 @@ pub(crate) fn handle(req: VerifyRewriteRequest, ctx: &mut McpContext) -> Result<
         workgroups: req.workgroups,
         push_constants,
         seed: req.seed,
+        kernel: req.kernel,
     };
 
     // MCP callers want a hard error on Vulkan-unavailable (documented divergence

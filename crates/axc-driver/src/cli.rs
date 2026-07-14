@@ -107,6 +107,19 @@ pub enum Command {
         /// subcommand (`optimize`, `rewrite-verify`, `mcp`) exposes this flag.
         #[arg(long)]
         debug: bool,
+        /// M3.21 (FG.9): compile only the named kernel out of a multi-kernel
+        /// source. Required (or `--all`) when the source declares 2+ kernels —
+        /// omitting it on an ambiguous source is a fail-closed
+        /// `AmbiguousKernel` error, not a silent `kernels[0]` pick. Ignored
+        /// (a no-op) on a single-kernel source. Mutually exclusive with `--all`.
+        #[arg(long, conflicts_with = "all")]
+        kernel: Option<String>,
+        /// M3.21 (FG.9): compile EVERY kernel in the source, one `.spv` +
+        /// sidecar pair per kernel, named `<stem>.<kernel>.spv` (`.spv`
+        /// extension stripped from `--output` to form `<stem>`). Mutually
+        /// exclusive with `--kernel`.
+        #[arg(long, conflicts_with = "kernel")]
+        all: bool,
     },
     /// Dump the lexed token stream (debug / diagnostic use).
     Lex {
@@ -134,6 +147,14 @@ pub enum Command {
         /// Defaults to `none`.
         #[arg(long, default_value = "none")]
         correctness: String,
+        /// M3.21 (FG.9): the kernel to bench/tune when the source declares
+        /// 2+ kernels sharing a `@strategy` hole (e.g. `two_pass_reduce.axc`'s
+        /// `?WG`). The shared hole still binds module-wide; this only names
+        /// the ONE kernel grid-search dispatches+times. Required (fail-closed
+        /// `AmbiguousKernel`) on a multi-kernel source. Ignored on a
+        /// single-kernel source.
+        #[arg(long)]
+        kernel: Option<String>,
     },
     /// Start a JSON-RPC 2.0 stdio MCP server for LLM agent integration.
     ///
@@ -212,6 +233,11 @@ pub enum Command {
         /// Shared `@strategy` hole assignment applied to BOTH sources: `name=value`.
         #[arg(long = "strategy-value", value_name = "name=value")]
         strategy_values: Vec<StrategyValue>,
+        /// M3.21 (FG.9): the kernel to verify, applied to BOTH `original` and
+        /// `rewritten`. Required (fail-closed `AmbiguousKernel`) when either
+        /// source declares 2+ kernels. Ignored on single-kernel sources.
+        #[arg(long)]
+        kernel: Option<String>,
     },
     /// Static annotation/consistency checker (M3.18 / FG.8).
     ///
@@ -275,6 +301,11 @@ pub enum Command {
         /// Shared `@strategy` hole assignment: `name=value`.
         #[arg(long = "strategy-value", value_name = "name=value")]
         strategy_values: Vec<StrategyValue>,
+        /// M3.21 (FG.9): the kernel to fuzz. Required (fail-closed
+        /// `AmbiguousKernel`) when the source declares 2+ kernels. Ignored on
+        /// a single-kernel source.
+        #[arg(long)]
+        kernel: Option<String>,
     },
     /// Append one entry to a kernel source's `@optimization_log { ... }` block
     /// (M3.19 / FG.3 — the ONE writer). Creates the block if absent. LLM-free,
@@ -366,7 +397,11 @@ mod tests {
     fn at_2875b_compile_debug_flag_defaults_false() {
         let cli = Cli::parse_from(["axc", "compile", "a.axc", "-o", "b.spv"]);
         match cli.command {
-            Command::Compile { debug, .. } => assert!(!debug, "default must be release (debug: false)"),
+            Command::Compile { debug, kernel, all, .. } => {
+                assert!(!debug, "default must be release (debug: false)");
+                assert_eq!(kernel, None, "default --kernel must be None");
+                assert!(!all, "default --all must be false");
+            }
             other => panic!("expected Command::Compile, got: {:?}", std::mem::discriminant(&other)),
         }
     }
@@ -634,6 +669,81 @@ mod tests {
                 assert_eq!(baseline_median_ns, None);
             }
             other => panic!("expected Command::LogOpt, got: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    // ── M3.21 (FG.9): `--kernel`/`--all` CLI parsing ───────────────────────────
+
+    /// `axc compile a.axc -o b.spv --kernel foo` parses `kernel: Some("foo")`.
+    #[test]
+    fn m321_compile_kernel_flag_parses() {
+        let cli = Cli::parse_from(["axc", "compile", "a.axc", "-o", "b.spv", "--kernel", "foo"]);
+        match cli.command {
+            Command::Compile { kernel, all, .. } => {
+                assert_eq!(kernel, Some("foo".to_string()));
+                assert!(!all);
+            }
+            other => panic!("expected Command::Compile, got: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    /// `axc compile a.axc -o b.spv --all` parses `all: true`.
+    #[test]
+    fn m321_compile_all_flag_parses() {
+        let cli = Cli::parse_from(["axc", "compile", "a.axc", "-o", "b.spv", "--all"]);
+        match cli.command {
+            Command::Compile { kernel, all, .. } => {
+                assert_eq!(kernel, None);
+                assert!(all);
+            }
+            other => panic!("expected Command::Compile, got: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    /// `--kernel` and `--all` are mutually exclusive at the clap layer.
+    #[test]
+    fn m321_compile_kernel_and_all_are_mutually_exclusive() {
+        let result = Cli::try_parse_from(["axc", "compile", "a.axc", "-o", "b.spv", "--kernel", "foo", "--all"]);
+        assert!(result.is_err(), "--kernel and --all together must be a clap usage error");
+    }
+
+    /// `axc optimize a.axc -o b.spv --kernel foo` parses `kernel: Some("foo")`.
+    #[test]
+    fn m321_optimize_kernel_flag_parses() {
+        let cli = Cli::parse_from(["axc", "optimize", "a.axc", "-o", "b.spv", "--kernel", "foo"]);
+        match cli.command {
+            Command::Optimize { kernel, .. } => assert_eq!(kernel, Some("foo".to_string())),
+            other => panic!("expected Command::Optimize, got: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    /// `axc optimize a.axc -o b.spv` (no `--kernel`) defaults to `None`.
+    #[test]
+    fn m321_optimize_kernel_flag_defaults_none() {
+        let cli = Cli::parse_from(["axc", "optimize", "a.axc", "-o", "b.spv"]);
+        match cli.command {
+            Command::Optimize { kernel, .. } => assert_eq!(kernel, None),
+            other => panic!("expected Command::Optimize, got: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    /// `axc rewrite-verify a.axc b.axc --size 64 --kernel foo` parses `kernel: Some("foo")`.
+    #[test]
+    fn m321_rewrite_verify_kernel_flag_parses() {
+        let cli = Cli::parse_from(["axc", "rewrite-verify", "a.axc", "b.axc", "--size", "64", "--kernel", "foo"]);
+        match cli.command {
+            Command::RewriteVerify { kernel, .. } => assert_eq!(kernel, Some("foo".to_string())),
+            other => panic!("expected Command::RewriteVerify, got: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    /// `axc test --fuzz f.axc --kernel foo` parses `kernel: Some("foo")`.
+    #[test]
+    fn m321_test_fuzz_kernel_flag_parses() {
+        let cli = Cli::parse_from(["axc", "test", "--fuzz", "f.axc", "--kernel", "foo"]);
+        match cli.command {
+            Command::Test { kernel, .. } => assert_eq!(kernel, Some("foo".to_string())),
+            other => panic!("expected Command::Test, got: {:?}", std::mem::discriminant(&other)),
         }
     }
 }

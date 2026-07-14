@@ -84,7 +84,15 @@ pub struct VerifyReport {
     pub verdict: VerifyVerdict,
     pub milestone: &'static str,
     pub file: String,
+    /// The first declared kernel's name (back-compat; `None` on 0 kernels).
     pub kernel: Option<String>,
+    /// M3.21 (FG.9): every declared kernel's name, in source declaration
+    /// order. A 2+-kernel source is NOT an error here (unlike most other
+    /// tooling surfaces) — `verify` already ran C1-C5 over every kernel's
+    /// annotations (the per-kernel loop below was never single-kernel-only);
+    /// this field just makes that "all kernels" scope visible in the report
+    /// (AT-2965) rather than silently reporting only `kernel[0]`'s name.
+    pub kernels: Vec<String>,
     pub checks: Vec<VerifyCheckResult>,
     pub diagnostics: Vec<VerifyDiag>,
     pub summary: VerifySummary,
@@ -300,14 +308,14 @@ pub fn verify_source(source: &str, file: &str) -> VerifyReport {
     }
 
     let mut kernel_name: Option<String> = None;
-    let mut kernel_count: usize = 0;
+    let mut kernel_names: Vec<String> = Vec::new();
     for item in &ast.items {
         // M0-era grammar: `Item` has exactly one variant today (`Kernel`). Matched
         // exhaustively (anti-pattern #4 — no wildcard arm) so a future `Item`
         // variant forces this loop to be revisited rather than silently skipped.
         match &item.node {
             Item::Kernel(kd) => {
-                kernel_count += 1;
+                kernel_names.push(kd.name.node.clone());
                 if kernel_name.is_none() {
                     kernel_name = Some(kd.name.node.clone());
                 }
@@ -317,7 +325,7 @@ pub fn verify_source(source: &str, file: &str) -> VerifyReport {
         }
     }
 
-    if kernel_count == 0 && lex_errors.is_empty() && parse_errors.is_empty() {
+    if kernel_names.is_empty() && lex_errors.is_empty() && parse_errors.is_empty() {
         diags.push((
             Category::Other,
             VerifyDiag {
@@ -362,6 +370,7 @@ pub fn verify_source(source: &str, file: &str) -> VerifyReport {
         milestone: MILESTONE,
         file: file.to_string(),
         kernel: kernel_name,
+        kernels: kernel_names,
         checks,
         diagnostics: diags.into_iter().map(|(_, d)| d).collect(),
         summary: VerifySummary { errors: total_errors, warnings: total_warnings },
@@ -372,7 +381,9 @@ pub fn verify_source(source: &str, file: &str) -> VerifyReport {
 pub fn render_human(report: &VerifyReport) -> String {
     let mut out = String::new();
     out.push_str(&format!("axc verify: {} — {:?}\n", report.file, report.verdict));
-    if let Some(k) = &report.kernel {
+    if report.kernels.len() > 1 {
+        out.push_str(&format!("kernels: {}\n", report.kernels.join(", ")));
+    } else if let Some(k) = &report.kernel {
         out.push_str(&format!("kernel: {k}\n"));
     }
     for c in &report.checks {
@@ -556,6 +567,39 @@ mod tests {
         let report = verify_source("", "inline");
         assert_eq!(report.verdict, VerifyVerdict::Fail);
         assert!(report.diagnostics.iter().any(|d| d.code == "no_kernel"));
+    }
+
+    /// AT-2965 (M3.21 / FG.9): `verify` on a 2-kernel file reports ALL kernel
+    /// names (not just the first) and runs C1-C5 over EVERY kernel — no error
+    /// on >1 kernel (the pre-existing tolerance, which `verify_source`'s loop
+    /// already had; this pins the NEW `kernels: Vec<String>` field surfacing it).
+    #[test]
+    fn at_2965_multi_kernel_report_lists_all_kernel_names() {
+        let src = concat!(
+            "@kernel @workgroup(64,1,1) @strict @intent(\"a\") @complexity(O(n)) fn a(n: u32) -> void { return; }\n",
+            "@kernel @workgroup(32,1,1) @intent(\"b\") @complexity(O(n)) fn b() -> void { return; }\n",
+        );
+        let report = verify_source(src, "inline");
+        // No error solely from having 2 kernels (a's @strict is COMPLETE:
+        // intent+complexity+precondition/postcondition — wait, `a` has no
+        // pre/postcondition, so @strict SHOULD fail C1; use that to also
+        // confirm per-kernel checks run over BOTH kernels, not just kernels[0].
+        assert_eq!(report.kernels, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(report.kernel, Some("a".to_string()), "back-compat `kernel` field is the FIRST kernel");
+        assert!(
+            report.diagnostics.iter().any(|d| d.code == "strict_missing_precondition"),
+            "C1 must run over kernel `a` (2+ kernels present): {:?}", report.diagnostics
+        );
+    }
+
+    /// A single-kernel file's `kernels` field has exactly one entry (the
+    /// golden-identity-adjacent case: the new field doesn't change PASS/FAIL
+    /// behavior for the single-kernel corpus).
+    #[test]
+    fn single_kernel_report_kernels_field_has_one_entry() {
+        let report = verify_source(PRECONDITION_SAXPY_SRC, "inline");
+        assert_eq!(report.kernels.len(), 1);
+        assert_eq!(report.kernel, report.kernels.first().cloned());
     }
 
     #[test]

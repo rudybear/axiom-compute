@@ -218,6 +218,7 @@ fn at_2851_q4km_cached_vs_sr_accept_k512() {
         workgroups: Some(workgroups),
         push_constants: Some(pc),
         seed: 0,
+        kernel: None,
     };
     // NOTE: verify_rewrite generates its OWN deterministic inputs (§3.2), it
     // does not take the caller's q_bytes/x_bytes directly — buffer_sizes/pc
@@ -278,6 +279,7 @@ fn at_2852_matmul_rb_vs_pad_accept_768cube() {
         workgroups: Some(workgroups),
         push_constants: Some(pc),
         seed: 0,
+        kernel: None,
     };
     let report = verify_rewrite(&req, Some(&ctx));
     eprintln!("{at}: verdict={:?} stage={} reason={:?}", report.verdict, report.stage, report.reason);
@@ -308,6 +310,7 @@ fn at_2853_saxpy_vs_wrong_reject_output() {
         workgroups: None,
         push_constants: Some(pc),
         seed: 0,
+        kernel: None,
     };
     let report = verify_rewrite(&req, Some(&ctx));
     eprintln!("{at}: verdict={:?} stage={} reason={:?}", report.verdict, report.stage, report.reason);
@@ -342,6 +345,7 @@ fn at_2854_saxpy_vs_3buffer_reject_interface() {
         workgroups: None,
         push_constants: Some(vec![0_u8; 8]),
         seed: 0,
+        kernel: None,
     };
     // vk=None: proves the REJECT fires with NO GPU need whatsoever.
     let report = verify_rewrite(&req, None);
@@ -388,6 +392,7 @@ fn at_2855_saxpy_vs_perturbed_tolerance_and_negative_control() {
         workgroups: None,
         push_constants: Some(pc_alpha2.clone()),
         seed: 1,
+        kernel: None,
     };
     let report1 = verify_rewrite(&req_bitexact, Some(&ctx));
     assert_eq!(report1.verdict, Verdict::Fail, "{at} (bit-exact): report={report1:?}");
@@ -448,6 +453,7 @@ fn at_2856_reproducibility_same_seed_byte_identical_stats() {
         workgroups: None,
         push_constants: Some(pc),
         seed: 123,
+        kernel: None,
     };
     let r1 = verify_rewrite(&req, Some(&ctx));
     let r2 = verify_rewrite(&req, Some(&ctx));
@@ -499,6 +505,7 @@ fn at_2857_typed_skip_on_no_coopmat_device() {
         workgroups: Some(workgroups),
         push_constants: Some(pc),
         seed: 0,
+        kernel: None,
     };
     let report = verify_rewrite(&req, Some(&ctx));
     eprintln!("{at}: verdict={:?} stage={} reason={:?}", report.verdict, report.stage, report.reason);
@@ -566,6 +573,7 @@ fn at_2858_q4km_tail_k_accept() {
         workgroups: Some(workgroups),
         push_constants: Some(pc),
         seed: 0,
+        kernel: None,
     };
     let report = verify_rewrite(&req, Some(&ctx));
     eprintln!("{at}: verdict={:?} stage={} reason={:?}", report.verdict, report.stage, report.reason);
@@ -596,6 +604,7 @@ fn at_2859_saxpy_reassoc_accept_on_lavapipe() {
         workgroups: None,
         push_constants: Some(pc),
         seed: 0,
+        kernel: None,
     };
     let report = verify_rewrite(&req, Some(&ctx));
     eprintln!("{at}: verdict={:?} stage={} reason={:?} device={}", report.verdict, report.stage, report.reason, ctx.physical_device_name());
@@ -639,6 +648,7 @@ fn at_2860_deterministic_pair_never_trips_nondeterministic_oracle() {
         workgroups: None,
         push_constants: Some(pc),
         seed: 0,
+        kernel: None,
     };
     let report = verify_rewrite(&req, Some(&ctx));
     eprintln!("{at}: verdict={:?} stage={}", report.verdict, report.stage);

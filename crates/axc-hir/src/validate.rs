@@ -380,6 +380,22 @@ pub enum HirError {
         #[label("here")]
         span: Span,
     },
+
+    // ── M3.21 (FG.9): multi-kernel modules ───────────────────────────────────
+
+    /// Two `@kernel` items in the same module declare the same function name.
+    ///
+    /// This would collide on both the emitted `OpEntryPoint` name and (for
+    /// `axc compile --all`) the per-kernel output file path — fail closed
+    /// rather than let the driver silently alias two distinct kernels.
+    #[error("duplicate kernel name `{name}`; two @kernel items in this module share the same function name")]
+    DuplicateKernelName {
+        name: String,
+        #[label("duplicate declared here")]
+        span: Span,
+        #[label("original declaration here")]
+        original_span: Span,
+    },
 }
 
 /// Non-fatal diagnostic warning from HIR validation.
