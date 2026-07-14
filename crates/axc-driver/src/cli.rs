@@ -12,6 +12,10 @@
 //!
 //! M2.4 adds:
 //! - `axc mcp [--log stderr|null]`: start a JSON-RPC 2.0 stdio MCP server.
+//!
+//! M3.15 (EB.3) adds:
+//! - `axc bench [--filter NAME] [--bless]`: discoverable wrapper over
+//!   `cargo bench -p axc-driver`.
 
 use std::path::PathBuf;
 
@@ -132,4 +136,82 @@ pub enum Command {
         #[arg(long, default_value = "stderr")]
         log: String,
     },
+    /// Run the AXIOM-Compute benchmark suite (wrapper over `cargo bench -p axc-driver`).
+    ///
+    /// Examples:
+    ///   axc bench                       # run all bench groups
+    ///   axc bench --filter cpu_saxpy    # run only benches whose name matches `cpu_saxpy`
+    ///   axc bench --bless               # run all + promote candidate → baselines.json
+    ///
+    /// NOTE: run the INSTALLED/built `axc` binary, NOT `cargo run -p axc-driver -- bench`.
+    /// `axc bench` spawns an inner `cargo bench` that needs the workspace target-dir build
+    /// lock; launching it via `cargo run` (same target dir) makes the inner cargo block
+    /// forever on the lock the outer `cargo run` holds → a self-deadlock.
+    Bench {
+        /// Only run benches whose Criterion name contains this substring.
+        ///
+        /// Passed through to `cargo bench -p axc-driver -- <FILTER>` (Criterion's
+        /// positional name filter).
+        #[arg(long, value_name = "NAME")]
+        filter: Option<String>,
+
+        /// Promote the measured candidate to `.pipeline/benchmarks/baselines.json`
+        /// for THIS machine's key (sets `AXC_BLESS_BASELINES=1` for the child).
+        #[arg(long)]
+        bless: bool,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::{CommandFactory, Parser};
+
+    // ── AT-2826/2827: `axc bench` CLI parsing (EB.3, M3.15) ────────────────────
+
+    /// AT-2826: `axc bench` (no flags) parses to `Command::Bench { filter: None, bless: false }`.
+    #[test]
+    fn at_2826_bench_parse_default() {
+        let cli = Cli::parse_from(["axc", "bench"]);
+        match cli.command {
+            Command::Bench { filter, bless } => {
+                assert_eq!(filter, None, "default filter must be None");
+                assert!(!bless, "default bless must be false");
+            }
+            other => panic!("expected Command::Bench, got a different variant: {:?}",
+                std::mem::discriminant(&other)),
+        }
+    }
+
+    /// AT-2827: `axc bench --filter cpu_saxpy --bless` parses both flags correctly.
+    #[test]
+    fn at_2827_bench_parse_flags() {
+        let cli = Cli::parse_from(["axc", "bench", "--filter", "cpu_saxpy", "--bless"]);
+        match cli.command {
+            Command::Bench { filter, bless } => {
+                assert_eq!(filter, Some("cpu_saxpy".to_owned()));
+                assert!(bless);
+            }
+            other => panic!("expected Command::Bench, got a different variant: {:?}",
+                std::mem::discriminant(&other)),
+        }
+    }
+
+    /// AT-2829: the `bench` subcommand's rendered clap help mentions `--filter`,
+    /// `--bless`, and the word `baseline` — guards that help text stays useful
+    /// (discoverability was EB.3's whole point).
+    #[test]
+    fn at_2829_bench_help_mentions_flags_and_baseline() {
+        let mut cmd = Cli::command();
+        let bench_cmd = cmd
+            .find_subcommand_mut("bench")
+            .expect("Cli must have a `bench` subcommand");
+        let help: String = bench_cmd.render_long_help().to_string();
+        assert!(help.contains("--filter"), "help must mention --filter; got:\n{help}");
+        assert!(help.contains("--bless"), "help must mention --bless; got:\n{help}");
+        assert!(
+            help.to_lowercase().contains("baseline"),
+            "help must mention 'baseline'; got:\n{help}"
+        );
+    }
 }

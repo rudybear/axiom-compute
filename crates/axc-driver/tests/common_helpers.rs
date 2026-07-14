@@ -803,26 +803,32 @@ fn at_eb2_08_select_block_no_vulkan_fallback() {
 }
 
 // ── AT-EB2-05: NVIDIA baselines migrated value-exact (full-field, BLOCKER 3) ──
+//
+// M3.15 (EB.4) note: this frozen table is re-pinned to the M3.15 NVIDIA
+// re-bless (`AXC_ENABLE_GPU_BENCHES=1 AXC_BLESS_BASELINES=1 cargo bench -p
+// axc-driver`, git_sha 305cc24, generated 2026-07-14T02:53:54Z) — see the
+// M3.15 coder run JSON for the executed bless command. Re-pin here again on
+// any future intentional re-bless.
 
 #[test]
 fn at_eb2_05_nvidia_baselines_preserved_full_field() {
     // The frozen expected table: (group, bench, median_ns, low_ns, high_ns).
     let expected: Vec<(&str, &str, u64, u64, u64)> = vec![
-        ("compile_pipeline", "compile_saxpy", 11593, 11528, 11664),
-        ("compile_pipeline", "compile_vector_add", 9670, 9632, 9694),
-        ("cpu_reference", "cpu_saxpy_1024", 210, 194, 245),
-        ("cpu_reference", "cpu_saxpy_1m", 654714, 649807, 660390),
-        ("cpu_reference", "cpu_vector_add_1024", 64, 64, 64),
-        ("cpu_reference", "cpu_vector_add_1m", 151750, 150862, 153023),
-        ("dispatch_gpu", "dispatch_saxpy_1024", 31565, 31185, 31780),
-        ("dispatch_gpu", "dispatch_saxpy_1m", 3219017, 3203119, 3231790),
-        ("dispatch_gpu", "dispatch_vector_add_1024", 1133524, 1128837, 1143283),
-        ("dispatch_gpu", "dispatch_vector_add_1m", 9941574, 9904838, 9993295),
-        ("dispatch_gpu_amortized", "dispatch_handle_saxpy_1m", 3169279, 3150457, 3181693),
-        ("dispatch_gpu_q4_0", "dispatch_gpu_q4_0_1024", 1709351, 1701715, 1720783),
-        ("dispatch_gpu_q4_0", "dispatch_gpu_q4_0_128", 1209143, 1203519, 1216455),
-        ("dispatch_gpu_q4km", "dispatch_q4km_128", 1832268, 1824685, 1844525),
-        ("dispatch_gpu_q4km", "dispatch_q4km_512", 5322206, 5255519, 5407011),
+        ("compile_pipeline", "compile_saxpy", 11517, 11494, 11527),
+        ("compile_pipeline", "compile_vector_add", 8883, 8878, 8887),
+        ("cpu_reference", "cpu_saxpy_1024", 198, 184, 215),
+        ("cpu_reference", "cpu_saxpy_1m", 630652, 628594, 633250),
+        ("cpu_reference", "cpu_vector_add_1024", 65, 65, 66),
+        ("cpu_reference", "cpu_vector_add_1m", 146968, 146834, 147144),
+        ("dispatch_gpu", "dispatch_saxpy_1024", 31764, 31540, 32020),
+        ("dispatch_gpu", "dispatch_saxpy_1m", 1317450, 1314955, 1323652),
+        ("dispatch_gpu", "dispatch_vector_add_1024", 1101040, 1098271, 1105721),
+        ("dispatch_gpu", "dispatch_vector_add_1m", 5617811, 5597683, 5657890),
+        ("dispatch_gpu_amortized", "dispatch_handle_saxpy_1m", 1318100, 1312931, 1325734),
+        ("dispatch_gpu_q4_0", "dispatch_gpu_q4_0_1024", 1689799, 1686011, 1695719),
+        ("dispatch_gpu_q4_0", "dispatch_gpu_q4_0_128", 1168572, 1163189, 1175106),
+        ("dispatch_gpu_q4km", "dispatch_q4km_128", 1834472, 1830184, 1842921),
+        ("dispatch_gpu_q4km", "dispatch_q4km_512", 5615858, 5582354, 5644312),
     ];
 
     let file: BaselinesV2 = load_committed_baselines();

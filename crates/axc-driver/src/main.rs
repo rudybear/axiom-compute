@@ -4,9 +4,13 @@
 //! renders diagnostics via miette, and exits non-zero on error.
 //!
 //! M2.4 adds `axc mcp [--log stderr|null]` — a JSON-RPC 2.0 stdio MCP server.
+//!
+//! M3.15 (EB.3) adds `axc bench [--filter NAME] [--bless]` — a discoverable
+//! wrapper over `cargo bench -p axc-driver`. The argv/env mapping is the pure,
+//! unit-tested `build_bench_command` (lib.rs); this file only spawns it.
 
 use clap::Parser as ClapParser;
-use axc_driver::{Cli, Command, compile_file};
+use axc_driver::{Cli, Command, compile_file, build_bench_command};
 use axc_driver::optimize::run_optimize;
 use axc_driver::mcp::{run_mcp_server, LogTarget};
 
@@ -65,5 +69,35 @@ fn main() -> miette::Result<()> {
                 target,
             ).map_err(|e| miette::miette!("mcp server: {}", e))
         }
+        Command::Bench { filter, bless } => run_bench(filter.as_deref(), bless),
+    }
+}
+
+/// M3.15 (EB.3): spawn `cargo bench -p axc-driver` per `build_bench_command`'s
+/// pure argv/env mapping, with **inherited** stdio (child bench output streams
+/// straight to the user's terminal).
+///
+/// This function shells out, so it is intentionally NOT unit-tested — only
+/// `build_bench_command` (the argv/env mapping) is (AT-2828). See that
+/// function's doc-comment for the "installed binary, not `cargo run`"
+/// self-deadlock footgun this wrapper exists to sidestep for its own callers.
+fn run_bench(filter: Option<&str>, bless: bool) -> miette::Result<()> {
+    let (program, args, env_overrides) = build_bench_command(filter, bless);
+
+    let status = std::process::Command::new(&program)
+        .args(&args)
+        .envs(env_overrides)
+        .status();
+
+    match status {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(miette::miette!(
+            "axc bench: `{program} {}` exited with {status}",
+            args.join(" "),
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(miette::miette!(
+            "axc bench: `cargo` not found on PATH — install a Rust toolchain"
+        )),
+        Err(e) => Err(miette::miette!("axc bench: failed to spawn `{program}`: {e}")),
     }
 }
