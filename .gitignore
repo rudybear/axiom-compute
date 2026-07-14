@@ -15,6 +15,10 @@ Cargo.lock.bak
 /vendor/
 .pipeline/benchmarks/m34/llamacpp_raw.txt
 .pipeline/benchmarks/m34/axiom_bench_raw.txt
+.pipeline/benchmarks/m34/warptile_bench.txt
+.pipeline/benchmarks/m34/ablate_bench_q4km.txt
+# maturin-built PyO3 extension (build artifact)
+py/axiom_compute/*.so
 __pycache__/
 .pytest_cache/
 *.pyc
