@@ -492,7 +492,10 @@ fn bytes_to_f32_slice(bytes: &[u8]) -> Vec<f32> {
 }
 
 /// Check if two f32 values are within `ulp` ULPs of each other.
-fn within_ulp_f32(a: f32, b: f32, ulp: u32) -> bool {
+///
+/// `pub(crate)` (M3.16): reused verbatim by `rewrite_verify`'s differential
+/// comparator (§3.4 reuse map) — promoted from private, not duplicated.
+pub(crate) fn within_ulp_f32(a: f32, b: f32, ulp: u32) -> bool {
     if a.is_nan() || b.is_nan() {
         return false;
     }

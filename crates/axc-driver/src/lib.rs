@@ -16,6 +16,8 @@ pub mod mcp;
 pub mod q4km_oracle;
 pub mod q6k_oracle;
 pub mod q5k_oracle;
+/// M3.16 (FG.1): `verify_rewrite` — the LLM structural-rewrite verifier core.
+pub mod rewrite_verify;
 
 pub use cli::{Command, Cli};
 

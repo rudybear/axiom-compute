@@ -85,6 +85,15 @@ fn no_strat() -> void {
 }
 "#;
 
+/// AT-2849 fixtures: the SAME saxpy vs saxpy_reassoc pair used by
+/// `rewrite_verify_gpu.rs`'s AT-2859 (a single legal IEEE-754 commutation,
+/// `alpha*x+y` -> `y+alpha*x`; byte-identical interface, PASSes under
+/// bit-exact on Lavapipe). Reused here (rather than a fresh fixture) so a
+/// PASS verdict is expected on BOTH legs of the tolerance test below,
+/// isolating `tolerance_overridden` as the only varying assertion.
+const SAXPY_ORIGINAL_SRC: &str = include_str!("../../../examples/saxpy.axc");
+const SAXPY_REASSOC_SRC: &str = include_str!("../../../examples/saxpy_reassoc.axc");
+
 // ── Subprocess helpers ────────────────────────────────────────────────────────
 
 /// Build the `axc` binary if not already built, then return its path.
@@ -182,6 +191,7 @@ fn at_1101_initialize_returns_server_info() {
             "bench_variant",
             "grid_search",
             "optimization_history",
+            "verify_rewrite",
         ],
         "tool list mismatch"
     );
@@ -327,9 +337,9 @@ fn at_1106_unknown_method_returns_method_not_found_error() {
         .iter()
         .map(|v: &serde_json::Value| v.as_str().expect("method name is string"))
         .collect();
-    // Must include "initialize" plus the 6 tool methods.
+    // Must include "initialize" plus the 7 tool methods (M3.16 adds verify_rewrite).
     assert!(methods.contains(&"initialize"), "available must include 'initialize'");
-    assert_eq!(methods.len(), 7, "must list all 7 methods; got {methods:?}");
+    assert_eq!(methods.len(), 8, "must list all 8 methods; got {methods:?}");
 }
 
 // ── AT-1107: malformed JSON returns -32700 ────────────────────────────────────
@@ -1322,7 +1332,134 @@ fn at_1132_mcp_rejects_malformed_jsonrpc_field() {
     );
     assert_eq!(
         available_c.as_array().unwrap().len(),
-        7,
-        "(c) must list 7 methods"
+        8,
+        "(c) must list 8 methods (M3.16 adds verify_rewrite)"
     );
+}
+
+// ── AT-2849: verify_rewrite MCP call sets tolerance_overridden (GPU-gated) ────
+//
+// QA follow-up (M3.16-qa.json requirements_missing): the only prior AT-2849
+// coverage checked `TolerancePolicy` string-parsing in isolation and never
+// invoked the real `verify_rewrite` MCP handler. This drives the SAME
+// `axc mcp` subprocess dispatch path as AT-1114/AT-1115 (un-gated, typed-skip
+// via AXC_ENABLE_GPU_TESTS so it runs for real on Lavapipe in CI) and asserts
+// the r2/CRIT-2 governance stamp end-to-end: verdict PASS, a caller-supplied
+// `tolerance: "rel:1e-3"` sets `tolerance_overridden: true` plus a
+// `tolerance_loosened_by_caller` notes entry, and the converse (tolerance
+// omitted -> server-owned bit-exact default) leaves both unset.
+
+/// Assemble push-constant bytes for `saxpy(n: u32, alpha: f32, ...)`, keyed by
+/// parameter name via `ParamBindingPlan` (same idiom as `rewrite_verify_gpu.rs`'s
+/// `saxpy_pc` helper) so this test does not hardcode std430 offsets.
+fn saxpy_pc_base64(n: u32, alpha: f32) -> String {
+    let (_bytes, meta) = axc_driver::compile_source_with_meta(SAXPY_ORIGINAL_SRC)
+        .expect("compile saxpy.axc for push-constant offsets");
+    let plan = &meta.binding_plan;
+    let mut pc: Vec<u8> = vec![0_u8; plan.push_constant_total_bytes as usize];
+    for s in &plan.scalars {
+        let start = s.offset as usize;
+        match s.name.as_str() {
+            "n" => pc[start..start + 4].copy_from_slice(&n.to_le_bytes()),
+            "alpha" => pc[start..start + 4].copy_from_slice(&alpha.to_le_bytes()),
+            other => panic!("unexpected scalar `{other}` in saxpy.axc binding plan"),
+        }
+    }
+    axc_driver::mcp::base64_encode(&pc)
+}
+
+#[test]
+fn at_2849_verify_rewrite_tolerance_overridden_stamp_on_lavapipe() {
+    if std::env::var("AXC_ENABLE_GPU_TESTS").unwrap_or_default() != "1" {
+        eprintln!("AT-2849: skipped (AXC_ENABLE_GPU_TESTS != 1)");
+        return;
+    }
+    let n: u32 = 1024;
+    let pc_b64: String = saxpy_pc_base64(n, 2.0);
+    let buffer_bytes: usize = (n * 4) as usize;
+
+    // (1) tolerance: "rel:1e-3" -> loosened past the server-owned bit-exact
+    // default -> tolerance_overridden must be stamped true, with a matching
+    // notes entry, and the verdict itself must still be PASS.
+    let req_overridden: serde_json::Value = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2849,
+        "method": "verify_rewrite",
+        "params": {
+            "original_source": SAXPY_ORIGINAL_SRC,
+            "rewritten_source": SAXPY_REASSOC_SRC,
+            "tolerance": "rel:1e-3",
+            "buffer_sizes": [buffer_bytes, buffer_bytes],
+            "push_constants_base64": pc_b64,
+        }
+    });
+    let resp_overridden: serde_json::Value = rpc(&req_overridden.to_string());
+    assert!(
+        resp_overridden["error"].is_null(),
+        "AT-2849 (rel:1e-3): verify_rewrite error: {}",
+        resp_overridden["error"]
+    );
+    let report_overridden: &serde_json::Value = &resp_overridden["result"];
+    assert_eq!(
+        report_overridden["verdict"].as_str().unwrap_or(""),
+        "PASS",
+        "AT-2849 (rel:1e-3): expected PASS; report={report_overridden}"
+    );
+    assert_eq!(
+        report_overridden["tolerance_overridden"].as_bool(),
+        Some(true),
+        "AT-2849 (rel:1e-3): tolerance_overridden must be true; report={report_overridden}"
+    );
+    let notes_overridden: Vec<&str> = report_overridden["notes"]
+        .as_array()
+        .expect("notes must be array")
+        .iter()
+        .map(|v: &serde_json::Value| v.as_str().expect("note is string"))
+        .collect();
+    assert!(
+        notes_overridden.iter().any(|n: &&str| n.starts_with("tolerance_loosened_by_caller")),
+        "AT-2849 (rel:1e-3): expected a tolerance_loosened_by_caller note; got: {notes_overridden:?}"
+    );
+
+    // (2) Converse: `tolerance` omitted -> server-owned bit-exact default ->
+    // tolerance_overridden stays false and no loosening note is emitted (the
+    // verdict is still PASS: saxpy vs saxpy_reassoc is bit-identical, per
+    // AT-2859).
+    let req_default: serde_json::Value = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2850,
+        "method": "verify_rewrite",
+        "params": {
+            "original_source": SAXPY_ORIGINAL_SRC,
+            "rewritten_source": SAXPY_REASSOC_SRC,
+            "buffer_sizes": [buffer_bytes, buffer_bytes],
+            "push_constants_base64": pc_b64,
+        }
+    });
+    let resp_default: serde_json::Value = rpc(&req_default.to_string());
+    assert!(
+        resp_default["error"].is_null(),
+        "AT-2849 (default tolerance): verify_rewrite error: {}",
+        resp_default["error"]
+    );
+    let report_default: &serde_json::Value = &resp_default["result"];
+    assert_eq!(
+        report_default["verdict"].as_str().unwrap_or(""),
+        "PASS",
+        "AT-2849 (default tolerance): expected PASS; report={report_default}"
+    );
+    assert_eq!(
+        report_default["tolerance_overridden"].as_bool(),
+        Some(false),
+        "AT-2849 (default tolerance): tolerance_overridden must be false; report={report_default}"
+    );
+    let notes_default: &serde_json::Value = &report_default["notes"];
+    assert!(
+        notes_default.as_array().unwrap().iter().all(|n: &serde_json::Value| {
+            !n.as_str().unwrap_or("").starts_with("tolerance_loosened_by_caller")
+        }),
+        "AT-2849 (default tolerance): must not carry a tolerance_loosened_by_caller note; got: {notes_default}"
+    );
+
+    eprintln!("AT-2849: PASS — rel:1e-3 stamps tolerance_overridden=true+notes, default leaves it false");
 }
