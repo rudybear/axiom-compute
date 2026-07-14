@@ -1458,6 +1458,28 @@ IF PRONG A shows no PORTABLE register win (the likely base case — naive codege
 
 ---
 
+## 3.1.44 M3.20 — sized local arrays `array[T, N]` (ROADMAP FG.7)
+
+**`array[T, N]` is the per-invocation (thread-private) sibling of `shared[T, N]` (M3.2, §3.1).** Declared in a kernel body as `array name: array[elem, N];` — an exact 1:1 structural mirror of `shared`'s grammar — and allocated as a **Function-storage** `OpVariable` of `OpTypeArray %elem %N`, read/written via a single-index `OpAccessChain` + `OpLoad`/`OpStore`. Two deliberate divergences from `shared`: **(a)** `Function` storage class instead of `Workgroup`, so the `OpVariable` is emitted in the function's **entry-block prelude** (the M3.11 carry pattern, alongside `let`-scalar `OpVariable`s) rather than the module globals section; **(b)** **no runtime metadata / preflight** — private memory is not a Vulkan-limited device resource, so the metadata schema stays at its current version (v4) unchanged, and `axc-runtime`/`axc-driver` are untouched. Unlocks per-thread accumulator arrays, small LUTs, and scratch buffers.
+
+**Size cap — the M3.12 register-pressure lesson, 16x tighter than shared.** A `Function`-storage array the driver cannot keep in registers spills to off-chip "local memory" per-thread; because private arrays are replicated PER-THREAD (not per-workgroup), a large local array is far more dangerous to occupancy than an equivalently-sized `shared` array. Aggregate `sum(bytes) <= 4096` is a hard error (`LocalArrayTooLarge`, vs shared's 65536); `> 1024` is a non-blocking spill advisory (`LocalArrayMaySpill`). `N` is a compile-time literal only (no `@strategy` holes — mirrors `shared`'s literal-only size; the enumerator does not re-key `OpTypeArray` per candidate).
+
+**Two hazard classes, both cheap-and-sound (mirrors `shared`'s missing-barrier philosophy — hard error on the decidable subset, advisory otherwise):**
+- **Uninitialized read.** `Function`-storage `OpVariable`s have no initializer (same as `let` scalars). A `LocalArrayRead` reached while the array's write-set is EMPTY fires `HirWarning::LocalArrayReadBeforeAnyWrite` — decidable, zero-false-positive, but path-INSENSITIVE (a write nested inside an `if` populates the write-set unconditionally, so a later read on an uncovered `else` path is not flagged; uninitialized-read remains UB-by-design on any path).
+- **Out-of-bounds index.** Symbolic indices stay UB-by-design (no bounds check, mirrors `shared`). A **constant** index `>= N` is decidable and provably wrong at compile time — hard error `LocalArrayConstIndexOutOfBounds`, not a warning.
+
+**Nested-scope restriction (the one real semantic divergence from `let`).** Every `Function`-storage `OpVariable` is hoisted to the entry-block prelude with NO per-iteration reset — so `array name: array[T,N];` declared inside `if`/`for`/`while` would silently diverge from `let`-inside-a-loop intuition (allocated once, never reset, unlike a `let` which re-runs its `OpStore` every iteration). Rather than document a surprising hoist-once semantics, M3.20 REJECTS nested decls outright: `HirError::LocalArrayDeclNotAtBlockScope`, enforced in HIR (the parser still accepts and recovers, per anti-pattern #6). A rejected nested decl still poison-registers the name so in-block uses resolve as local-array references instead of cascading into unrelated `UnknownBinding` noise. The array is still fully usable inside loops — declare once at the kernel-body top level, index freely inside any loop (the `OpVariable` persists across iterations; no `OpPhi` is needed — arrays are memory, not SSA — proven by AT-2938).
+
+**Name-collision safety (bidirectional).** A `shared`/`array` name collision is caught regardless of declaration order: `register_local_array` rejects a name already in `shared`'s name map, AND `register_shared` is symmetrically extended to reject a name already in the local-array name map. Without both directions, `shared foo: shared[u32,8]; array foo: array[u32,8];` would silently resolve every `foo[i]` to the (wrong) local array.
+
+**Files:** `crates/axc-lexer/src/token.rs` (`TokenKind::Array` keyword); `crates/axc-parser/src/{ast.rs,parser.rs}` (`TypeRef::LocalArray`, `Stmt::LocalArrayDecl`, report-ALL recovery); `crates/axc-hir/src/local.rs` (new — mirrors `shared.rs`); `crates/axc-hir/src/{expr.rs,typecheck.rs,validate.rs,lower.rs}` (`LocalArrayRead`/`LocalArrayWrite`/`LocalArrayDeclMarker` HIR nodes, the two hazard checks, the bidirectional collision guard, the nested-scope restriction); `crates/axc-codegen/src/local.rs` (new — mirrors `shared.rs`'s codegen, minus the `OpVariable` itself); `crates/axc-codegen/src/{body.rs,emit.rs}` (entry-block prelude emission, the four gid/local-invocation-id/subgroup/coopmat recursion scanners); `examples/local_histogram.axc` (new — GPU-proven per-invocation 8-bin histogram).
+
+**Tests (AT-2927..AT-2944).** Lexer keyword + collision guard (AT-2927); parser decl/type shape + report-ALL malformed-decl recovery + param/return-type parse acceptance (AT-2928..2930); HIR validate (zero-length, bool-element, duplicate-name, param/binding collision — AT-2931); aggregate cap hard-error + spill advisory (AT-2932); init-hazard advisory with a zero-false-positive write-then-read fixture (AT-2933); index/value typing (AT-2934); codegen structural shape — `OpTypeArray`, 2x `OpTypePointer Function`, `OpVariable` precedes all non-var instructions, single-index access chains, zero `OpPhi`, capability set byte-identical to a plain-`let`-scalar equivalent (AT-2935); element-type capability flags with no spurious `StorageBuffer8/16BitAccess` (AT-2936); **local_histogram.axc bit-exact on NVIDIA RTX PRO 6000 AND Lavapipe (AT-2937, measured)**; RMW-in-a-loop bit-exact proving zero `OpPhi` needed for array carry (AT-2938, measured on both platforms); metadata schema v4 unchanged, `shared_memory_bytes == 0` (AT-2939); corpus-wide golden-identity — every `examples/*.axc` that declares no `array` compiles byte-identical branch-vs-main (AT-2940); compile + spirv-val CI anchor (AT-2941); bidirectional name-collision, both declaration orders (AT-2942, r2); nested-decl rejection with cascade-suppression proof + top-level-decl-used-inside-loop clean compile (AT-2943, r2); const-index-OOB boundary-exact + symbolic-index-exempt (AT-2944, r2).
+
+*(Design status: **IMPLEMENTED (Coder).** Full lex-through-codegen pipeline, GPU-proven bit-exact on NVIDIA RTX PRO 6000 AND Lavapipe (AT-2937/2938, measured, non-simulated). `axc-runtime`/`axc-driver` dispatch geometry untouched — private arrays set neither `shared_memory_bytes` nor `coopmat`, so `derive_workgroups` stays elementwise-1-D derivable. Deferred: hole-sized arrays, per-index definite-assignment, multi-dimensional arrays, array-valued `let`/params/return, automatic bounds checking, zero-initialization sugar — see the milestone spec §13.)*
+
+---
+
 ### 3.1 Types
 
 ```
@@ -1468,6 +1490,7 @@ Buffers:        buffer[T]              // SSBO on Vulkan, cl_mem on OpenCL
                 writeonly_buffer[T]    // writeonly decoration
 Images:         image2d[T] image3d[T]  // opaque image handles
 Shared:         shared[T, N]           // workgroup-local memory (SLM)
+Local arrays:   array[T, N]            // per-invocation (thread-private) sized memory (M3.20)
 Matrices:       matrix[T, M, N]        // cooperative_matrix
 Subgroup:       subgroup[T]            // subgroup-uniform values
 ```
@@ -1497,6 +1520,7 @@ Subgroup:       subgroup[T]            // subgroup-uniform values
 | `@target(vendor, caps)` | Target capability set | Guards codegen paths |
 | `@optimization_log { version: N, entry {...}, ... }` | Embedded, rewrite-surviving optimization history (M3.19 / FG.3) | HIR-only, codegen-inert (never lowered) |
 | `@transfer { ... }` | Agent handoff protocol (M3.19 / FG.2) | **NOT BUILT** — `HirError::UnknownAnnotationInM0` (see §3.1.43) |
+| `array name: array[T, N];` | Per-invocation sized local array (M3.20 / FG.7) | `OpTypeArray` + `OpVariable Function` in the entry-block prelude (see §3.1.44) |
 
 ### 3.3 SPIR-V extensions in scope
 

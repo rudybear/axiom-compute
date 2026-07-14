@@ -316,6 +316,23 @@ pub fn emit_module(hir: &HirModule, opts: &CodegenOptions) -> Result<Vec<u32>, C
                 None
             };
 
+            // (a6) M3.20: Local-array (Function-storage) TYPES ONLY — the OpVariable
+            // itself is created later, in emit_kernel_body's entry-block prelude
+            // (SPIR-V S2.16.1: Function OpVariables must live inside the first block,
+            // unlike shared's Workgroup-class GLOBAL OpVariable). Emitted before
+            // begin_block, symmetric with the shared-array pre-scan above — type
+            // instructions land in the module's types/globals section regardless of
+            // block state.
+            let mut local_array_pre_caps = CapabilitiesRequired::default();
+            let local_array_types: Option<crate::local::LocalArrayBindings> =
+                if !typed_body.local_arrays.is_empty() {
+                    Some(crate::local::emit_local_array_types(
+                        &mut b, &mut type_cache, &mut local_array_pre_caps, &typed_body.local_arrays,
+                    ))
+                } else {
+                    None
+                };
+
             let first_block_id = b.id();
             b.begin_block(Some(first_block_id))
                 .expect("rspirv: begin_block should not fail after begin_function");
@@ -325,12 +342,13 @@ pub fn emit_module(hir: &HirModule, opts: &CodegenOptions) -> Result<Vec<u32>, C
                 storage_16bit: uses_f16_ssbo,
                 // M2.5: Set storage_8bit / int8 flags from binding plan (U8 SSBO buffers).
                 storage_8bit: uses_u8_ssbo,
-                // M3.2: Merge shared-array capability pre-scan flags with binding-plan flags.
-                int8: uses_u8_ssbo || shared_pre_caps.int8,
-                float16: shared_pre_caps.float16,
-                int16: shared_pre_caps.int16,
-                int64: shared_pre_caps.int64,
-                float64: shared_pre_caps.float64,
+                // M3.2 / M3.20: Merge shared-array AND local-array capability pre-scan
+                // flags with binding-plan flags.
+                int8: uses_u8_ssbo || shared_pre_caps.int8 || local_array_pre_caps.int8,
+                float16: shared_pre_caps.float16 || local_array_pre_caps.float16,
+                int16: shared_pre_caps.int16 || local_array_pre_caps.int16,
+                int64: shared_pre_caps.int64 || local_array_pre_caps.int64,
+                float64: shared_pre_caps.float64 || local_array_pre_caps.float64,
                 ..Default::default()
             };
 
@@ -349,7 +367,7 @@ pub fn emit_module(hir: &HirModule, opts: &CodegenOptions) -> Result<Vec<u32>, C
                 debug: debug_ctx.as_ref(),
             };
 
-            emit_kernel_body(&mut b, typed_body, &mut type_cache, &mut caps, &res)
+            emit_kernel_body(&mut b, typed_body, &mut type_cache, &mut caps, &res, local_array_types)
                 .map_err(|e| CodegenError::Rspirv(e.to_string()))?;
 
             // `b.capability()` pushes directly to `module.capabilities` — safe to call
@@ -549,6 +567,12 @@ fn stmt_uses_gid(stmt: &HirStmt) -> bool {
         }
         // SharedDeclMarker is a no-op with no expressions.
         HirStmt::SharedDeclMarker { .. } => false,
+        // M3.20: LocalArrayWrite may have gid-using index/value expressions.
+        HirStmt::LocalArrayWrite { index, value, .. } => {
+            expr_uses_gid(index) || expr_uses_gid(value)
+        }
+        // LocalArrayDeclMarker is a no-op with no expressions.
+        HirStmt::LocalArrayDeclMarker { .. } => false,
     }
 }
 
@@ -585,6 +609,8 @@ fn expr_uses_gid(expr: &axc_hir::expr::HirExpr) -> bool {
         | HirExprKind::LocalInvocationIdBuiltin { .. } => false,
         // M3.2: SharedRead's index expression may use gid.
         HirExprKind::SharedRead { index, .. } => expr_uses_gid(index),
+        // M3.20: LocalArrayRead's index expression may use gid.
+        HirExprKind::LocalArrayRead { index, .. } => expr_uses_gid(index),
     }
 }
 
@@ -640,6 +666,12 @@ fn stmt_uses_local_invocation_id(stmt: &HirStmt) -> bool {
         }
         // SharedDeclMarker is a no-op with no expressions.
         HirStmt::SharedDeclMarker { .. } => false,
+        // M3.20: LocalArrayWrite index/value may use local_invocation_id.
+        HirStmt::LocalArrayWrite { index, value, .. } => {
+            expr_uses_local_invocation_id(index) || expr_uses_local_invocation_id(value)
+        }
+        // LocalArrayDeclMarker is a no-op with no expressions.
+        HirStmt::LocalArrayDeclMarker { .. } => false,
     }
 }
 
@@ -690,6 +722,8 @@ fn expr_uses_local_invocation_id(expr: &axc_hir::expr::HirExpr) -> bool {
         | HirExprKind::LocalRead(_) => false,
         // M3.2: SharedRead index expression may use local_invocation_id.
         HirExprKind::SharedRead { index, .. } => expr_uses_local_invocation_id(index),
+        // M3.20: LocalArrayRead index expression may use local_invocation_id.
+        HirExprKind::LocalArrayRead { index, .. } => expr_uses_local_invocation_id(index),
     }
 }
 
@@ -741,6 +775,11 @@ fn stmt_uses_subgroup_op(stmt: &HirStmt, target: SubgroupOp) -> bool {
             expr_uses_subgroup_op(index, target) || expr_uses_subgroup_op(value, target)
         }
         HirStmt::SharedDeclMarker { .. } => false,
+        // M3.20: LocalArrayWrite may contain subgroup-op using expressions.
+        HirStmt::LocalArrayWrite { index, value, .. } => {
+            expr_uses_subgroup_op(index, target) || expr_uses_subgroup_op(value, target)
+        }
+        HirStmt::LocalArrayDeclMarker { .. } => false,
     }
 }
 
@@ -795,6 +834,8 @@ fn expr_uses_subgroup_op(expr: &axc_hir::expr::HirExpr, target: SubgroupOp) -> b
         | HirExprKind::LocalRead(_) => false,
         // M3.2: SharedRead index may use subgroup ops.
         HirExprKind::SharedRead { index, .. } => expr_uses_subgroup_op(index, target),
+        // M3.20: LocalArrayRead index may use subgroup ops.
+        HirExprKind::LocalArrayRead { index, .. } => expr_uses_subgroup_op(index, target),
     }
 }
 
@@ -835,6 +876,9 @@ fn stmt_uses_coopmat(stmt: &HirStmt) -> bool {
         }
         // M3.2: SharedWrite does not involve coopmat ops directly.
         HirStmt::SharedWrite { .. } | HirStmt::SharedDeclMarker { .. } => false,
+        // M3.20: LocalArrayWrite/LocalArrayDeclMarker do not involve coopmat ops
+        // (local arrays never interact with cooperative-matrix ops).
+        HirStmt::LocalArrayWrite { .. } | HirStmt::LocalArrayDeclMarker { .. } => false,
     }
 }
 
@@ -879,6 +923,8 @@ fn expr_uses_coopmat(expr: &axc_hir::expr::HirExpr) -> bool {
         | HirExprKind::LocalRead(_) => false,
         // M3.2: SharedRead index may theoretically contain coopmat-using exprs; recurse.
         HirExprKind::SharedRead { index, .. } => expr_uses_coopmat(index),
+        // M3.20: LocalArrayRead index may theoretically contain coopmat-using exprs; recurse.
+        HirExprKind::LocalArrayRead { index, .. } => expr_uses_coopmat(index),
     }
 }
 

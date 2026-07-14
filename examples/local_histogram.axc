@@ -1,0 +1,65 @@
+// examples/local_histogram.axc — per-invocation 8-bin histogram over array[u32,8].
+//
+// M3.20 (FG.7) GPU proof: sized per-invocation local arrays.
+//
+// Each invocation owns a PRIVATE `array hist: array[u32, 8];` (Function-storage,
+// thread-private — NOT shared across the workgroup, unlike `shared[T,N]`). It
+// zeroes its 8 bins, scans its own contiguous 16-element slice of the input
+// buffer, buckets each value by `v % 8u32`, and writes its 8 counts to the
+// output buffer at `gid*8 + bin`.
+//
+// This exercises every new M3.20 surface in one small, obviously-correct
+// kernel: declaration, zero-init write loop, indexed READ-MODIFY-WRITE
+// (`hist[b] = hist[b] + 1u32`), indexed read, `u32` index typing, and the
+// aggregate cap (8 * 4 = 32 bytes, far under the 4096-byte hard cap and the
+// 1024-byte spill advisory).
+//
+// Correctness oracle: bit-exact (`max_diff == 0`) against a trivial CPU
+// histogram reference — `u32` counts are exact, so no `@equiv_fp_tol` is
+// needed (private-array semantics carry no float-reassociation risk).
+//
+// HONEST PERF NOTE (M3.20 spec §6 — the M3.12 register-pressure lesson): a
+// `Function`-storage array the driver cannot keep in registers spills to
+// off-chip "local memory" per-thread. Because private arrays are replicated
+// PER-THREAD (not per-workgroup, unlike `shared[T,N]`), a large local array is
+// STRICTLY MORE DANGEROUS to occupancy than an equivalently-sized `shared`
+// array — this 32-byte histogram is comfortably below the spill cliff on
+// mainstream GPUs, but a naive `array[f32, 4096]` per thread would obliterate
+// occupancy. Prefer `shared[T,N]` for workgroup-cooperative data; reach for
+// `array[T,N]` for small per-thread accumulators, LUTs, or scratch (this
+// kernel's use case) — see DESIGN.md S3.1.44.
+//
+// Anti-pattern #2: explicit `return;`.
+// Anti-pattern #9: real GPU execution required for the full correctness proof
+//                  (runs on Lavapipe in CI and on NVIDIA RTX PRO 6000).
+
+@kernel
+@workgroup(64, 1, 1)
+@intent("per-invocation 8-bin histogram over a private array[u32,8]; M3.20 GPU proof")
+@complexity(O(n))
+fn local_histogram(input: readonly_buffer[u32], output: buffer[u32]) -> void {
+    array hist: array[u32, 8];
+
+    let gid0: u32 = gid(0u32);
+    let base: u32 = gid0 * 16u32;
+
+    // Zero-init all 8 bins (write-before-read — clears the LocalArrayReadBeforeAnyWrite advisory).
+    for i in range(0u32, 8u32) {
+        hist[i] = 0u32;
+    }
+
+    // Scan this invocation's own contiguous 16-element slice and bucket by v % 8.
+    for i in range(0u32, 16u32) {
+        let idx: u32 = base + i;
+        let v: u32 = input[idx];
+        let b: u32 = v % 8u32;
+        hist[b] = hist[b] + 1u32;
+    }
+
+    // Write this invocation's 8 counts out at gid*8 + bin.
+    for i in range(0u32, 8u32) {
+        output[gid0 * 8u32 + i] = hist[i];
+    }
+
+    return;
+}

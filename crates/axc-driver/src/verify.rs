@@ -149,6 +149,8 @@ fn hir_warning_span(w: &HirWarning) -> Option<axc_lexer::Span> {
         HirWarning::PostconditionNotLowerable { span, .. } => Some(*span),
         HirWarning::EmptyOptimizationLog { span } => Some(*span),
         HirWarning::UnknownOptimizationLogKeyForward { span, .. } => Some(*span),
+        HirWarning::LocalArrayMaySpill { span, .. } => Some(*span),
+        HirWarning::LocalArrayReadBeforeAnyWrite { span, .. } => Some(*span),
     }
 }
 

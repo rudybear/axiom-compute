@@ -191,6 +191,27 @@ pub enum ParseError {
         span: Span,
     },
 
+    // ── M3.20 local-array parse errors ───────────────────────────────────────
+
+    /// `array a: array[f32];` — missing N in `array[elem, N]`.
+    /// `array b: array[f32, 3.0];` — N must be an unsuffixed positive integer literal.
+    #[error("local-array size N must be an unsuffixed positive integer literal (1..=65536); got {found_kind}")]
+    LocalArraySizeMustBeUnsuffixedPositiveIntegerLiteral {
+        found_kind: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    /// N > 65536 — checked at parse time for a direct literal (mirrors shared's ceiling;
+    /// the tighter 4096-byte aggregate cap is enforced later at HIR time).
+    #[error("local-array size {got} exceeds maximum {max}; reduce N or split into multiple arrays")]
+    LocalArraySizeTooLarge {
+        got: u32,
+        max: u32,
+        #[label("here")]
+        span: Span,
+    },
+
     // ── M3.19 (FG.3): @optimization_log block parse errors ──────────────────
 
     /// Any malformed `@optimization_log { ... }` construct: an unrecognized
@@ -1089,9 +1110,19 @@ impl<'tok> Parser<'tok> {
                 }
                 return None;
             }
+            // M3.20: `array[elem, N]` — per-invocation local array type.
+            // `array` IS a keyword (TokenKind::Array); parse `array[elem, N]`.
+            TokenKind::Array => {
+                self.advance();
+                if let Some(local_array_ty) = self.parse_local_array_type_args() {
+                    let end_span: Span = self.last_span();
+                    return Some(Spanned::new(local_array_ty, span.merge(end_span)));
+                }
+                return None;
+            }
             other => {
                 self.errors.push(ParseError::Unexpected {
-                    expected: "type (void, bool, i32, u32, i64, u64, f16, f32, f64, buffer[T], readonly_buffer[T], writeonly_buffer[T], matrix[T, M, N, use], shared[T, N])".into(),
+                    expected: "type (void, bool, i32, u32, i64, u64, f16, f32, f64, buffer[T], readonly_buffer[T], writeonly_buffer[T], matrix[T, M, N, use], shared[T, N], array[T, N])".into(),
                     found: format!("{:?}", other),
                     span,
                 });
@@ -1455,6 +1486,216 @@ impl<'tok> Parser<'tok> {
         ))
     }
 
+    // ── Local array type and declaration (M3.20) ────────────────────────────
+
+    /// Parse `[elem, N]` after `array` keyword in a type context.
+    ///
+    /// Called after `array` has been consumed. Produces `TypeRef::LocalArray { elem, len }`.
+    /// On error, pushes an error and returns `None`; parser can still continue.
+    fn parse_local_array_type_args(&mut self) -> Option<TypeRef> {
+        if !self.expect_token(TokenKind::LBracket, "[") {
+            return None;
+        }
+        // Parse element type from the allowed local-array elem set.
+        let elem: ScalarTypeRef = self.parse_local_array_elem_type()?;
+        if !self.expect_token(TokenKind::Comma, ",") {
+            return None;
+        }
+        // Parse N — unsuffixed positive integer literal.
+        let len: u32 = self.parse_local_array_len()?;
+        if !self.expect_token(TokenKind::RBracket, "]") {
+            return None;
+        }
+        Some(TypeRef::LocalArray { elem, len })
+    }
+
+    /// Parse an element type token from the local-array allowed set (all scalars).
+    fn parse_local_array_elem_type(&mut self) -> Option<ScalarTypeRef> {
+        match self.peek_kind().clone() {
+            TokenKind::I8  => { self.advance(); Some(ScalarTypeRef::I8) }
+            TokenKind::U8  => { self.advance(); Some(ScalarTypeRef::U8) }
+            TokenKind::I32 => { self.advance(); Some(ScalarTypeRef::I32) }
+            TokenKind::U32 => { self.advance(); Some(ScalarTypeRef::U32) }
+            TokenKind::I64 => { self.advance(); Some(ScalarTypeRef::I64) }
+            TokenKind::U64 => { self.advance(); Some(ScalarTypeRef::U64) }
+            TokenKind::F16 => { self.advance(); Some(ScalarTypeRef::F16) }
+            TokenKind::F32 => { self.advance(); Some(ScalarTypeRef::F32) }
+            TokenKind::F64 => { self.advance(); Some(ScalarTypeRef::F64) }
+            other => {
+                self.errors.push(ParseError::Unexpected {
+                    expected: "local-array element type (i8, u8, i32, u32, i64, u64, f16, f32, f64)".into(),
+                    found: format!("{:?}", other),
+                    span: self.peek_span(),
+                });
+                None
+            }
+        }
+    }
+
+    /// Parse an unsuffixed positive integer literal N for `array[elem, N]`.
+    ///
+    /// Validates: N >= 1 (zero rejected); N <= MAX_N (65536, the parser-level ceiling;
+    /// the tighter 4096-byte aggregate cap is enforced at HIR time — §6 of the M3.20 spec).
+    /// Suffix -> error. Non-integer -> error.
+    fn parse_local_array_len(&mut self) -> Option<u32> {
+        let len_span: Span = self.peek_span();
+        match self.peek_kind().clone() {
+            TokenKind::IntLiteral { value, suffix: None, .. } => {
+                self.advance();
+                if value <= 0 {
+                    self.errors.push(ParseError::LocalArraySizeMustBeUnsuffixedPositiveIntegerLiteral {
+                        found_kind: format!("{value} (must be >= 1)"),
+                        span: len_span,
+                    });
+                    return None;
+                }
+                // MAX_N mirrors shared's parser-level ceiling (MAX_SHARED_ELEMS = 65536);
+                // the binding local-array cap is the tighter 4096-byte aggregate check at HIR time.
+                const MAX_N: u32 = 65536;
+                let n: u32 = if value > i128::from(MAX_N) { MAX_N + 1 } else { value as u32 };
+                if n > MAX_N {
+                    self.errors.push(ParseError::LocalArraySizeTooLarge {
+                        got: n,
+                        max: MAX_N,
+                        span: len_span,
+                    });
+                    return None;
+                }
+                Some(n)
+            }
+            TokenKind::IntLiteral { suffix: Some(_), .. } => {
+                self.advance();
+                self.errors.push(ParseError::LocalArraySizeMustBeUnsuffixedPositiveIntegerLiteral {
+                    found_kind: "suffixed integer literal (remove the suffix, e.g. 8 not 8u32)".into(),
+                    span: len_span,
+                });
+                None
+            }
+            TokenKind::FloatLiteral { .. } => {
+                self.advance();
+                self.errors.push(ParseError::LocalArraySizeMustBeUnsuffixedPositiveIntegerLiteral {
+                    found_kind: "float literal (N must be an integer, e.g. 8)".into(),
+                    span: len_span,
+                });
+                None
+            }
+            other => {
+                self.errors.push(ParseError::LocalArraySizeMustBeUnsuffixedPositiveIntegerLiteral {
+                    found_kind: format!("{:?}", other),
+                    span: len_span,
+                });
+                None
+            }
+        }
+    }
+
+    /// Parse `array name: array[elem, N];` — a per-invocation local array declaration.
+    ///
+    /// Called when `TokenKind::Array` is the leading token. Consumes the leading
+    /// `array` keyword, then parses: `name : array [ elem , N ] ;`.
+    ///
+    /// Recovers to `;` or `}` on malformed input (anti-pattern #6 — reports ALL errors).
+    fn parse_local_array_decl_stmt(&mut self) -> Option<Spanned<Stmt>> {
+        let stmt_start: Span = self.peek_span();
+        self.advance(); // consume `array`
+
+        // Parse name
+        let name_span: Span = self.peek_span();
+        let name: String = match self.peek_kind().clone() {
+            TokenKind::Ident(n) => { self.advance(); n }
+            other => {
+                self.errors.push(ParseError::Unexpected {
+                    expected: "identifier for local array name".into(),
+                    found: format!("{:?}", other),
+                    span: name_span,
+                });
+                self.recover_to_semicolon_or_brace();
+                return None;
+            }
+        };
+
+        // Expect ':'
+        if !self.expect_token(TokenKind::Colon, ":") {
+            self.recover_to_semicolon_or_brace();
+            return None;
+        }
+
+        // Expect 'array' keyword again for the type
+        let type_array_span: Span = self.peek_span();
+        if self.peek_kind() != &TokenKind::Array {
+            self.errors.push(ParseError::Unexpected {
+                expected: "array[elem, N] type annotation".into(),
+                found: format!("{:?}", self.peek_kind()),
+                span: type_array_span,
+            });
+            self.recover_to_semicolon_or_brace();
+            return None;
+        }
+        self.advance(); // consume `array` in the type position
+
+        // Parse the `[elem, N]` part.
+        let type_start: Span = self.peek_span();
+        if self.peek_kind() != &TokenKind::LBracket {
+            self.errors.push(ParseError::Unexpected {
+                expected: "[elem, N] after array type keyword".into(),
+                found: format!("{:?}", self.peek_kind()),
+                span: type_start,
+            });
+            self.recover_to_semicolon_or_brace();
+            return None;
+        }
+        // Consume `[`
+        self.advance();
+
+        // Elem type — parse carefully so we can recover on error.
+        let elem_opt: Option<ScalarTypeRef> = self.parse_local_array_elem_type();
+        let elem: ScalarTypeRef = match elem_opt {
+            Some(e) => e,
+            None => {
+                self.recover_to_semicolon_or_brace();
+                return None;
+            }
+        };
+
+        if !self.expect_token(TokenKind::Comma, ",") {
+            self.recover_to_semicolon_or_brace();
+            return None;
+        }
+
+        // N — length
+        let len_span: Span = self.peek_span();
+        let len_opt: Option<u32> = self.parse_local_array_len();
+        let len: u32 = match len_opt {
+            Some(n) => n,
+            None => {
+                self.recover_to_semicolon_or_brace();
+                return None;
+            }
+        };
+
+        if !self.expect_token(TokenKind::RBracket, "]") {
+            self.recover_to_semicolon_or_brace();
+            return None;
+        }
+
+        let semi_span: Span = self.peek_span();
+        if !self.expect_token(TokenKind::Semicolon, ";") {
+            self.recover_to_semicolon_or_brace();
+            return None;
+        }
+
+        let stmt_end: Span = semi_span;
+        let full_span: Span = stmt_start.merge(stmt_end);
+        Some(Spanned::new(
+            Stmt::LocalArrayDecl {
+                name: Spanned::new(name, name_span),
+                elem,
+                len: Spanned::new(len, len_span),
+            },
+            full_span,
+        ))
+    }
+
     // ── Block ────────────────────────────────────────────────────────────────
 
     fn parse_block(&mut self) -> Option<Spanned<Block>> {
@@ -1526,6 +1767,8 @@ impl<'tok> Parser<'tok> {
             TokenKind::Return => self.parse_return_stmt(),
             // M3.2: `shared name: shared[elem, N];` workgroup-shared array declaration.
             TokenKind::Shared => self.parse_shared_decl_stmt(),
+            // M3.20: `array name: array[elem, N];` per-invocation local array declaration.
+            TokenKind::Array => self.parse_local_array_decl_stmt(),
             TokenKind::If     => self.parse_if_stmt(),
             TokenKind::For    => self.parse_for_stmt(),
             TokenKind::While  => self.parse_while_stmt(),
@@ -3581,5 +3824,117 @@ mod tests {
         );
         let (_ast, errors) = parse_src(src);
         assert!(errors.is_empty(), "entry/version must remain ordinary idents outside @optimization_log: {errors:?}");
+    }
+
+    // ── M3.20: local arrays `array[T, N]` ─────────────────────────────────────
+
+    /// AT-2928: `array h: array[u32, 8];` parses to `Stmt::LocalArrayDecl` with the
+    /// type parsed as `TypeRef::LocalArray { elem, len }`; `h[i]` / `h[i] = v` parse
+    /// as ordinary index read/write (the same `Expr::Index` / `Stmt::IndexAssign`
+    /// nodes buffers and shared arrays use — disambiguation happens at HIR time).
+    #[test]
+    fn at_2928_local_array_decl_and_index_read_write_parse() {
+        let src = concat!(
+            "@kernel @workgroup(1,1,1) fn k() -> void { ",
+            "array h: array[u32, 8]; ",
+            "h[0u32] = h[0u32] + 1u32; ",
+            "let c: u32 = h[0u32]; ",
+            "return; }",
+        );
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        assert_eq!(kd.body.node.stmts.len(), 4, "decl + index-write + let + return");
+
+        match &kd.body.node.stmts[0].node {
+            Stmt::LocalArrayDecl { name, elem, len } => {
+                assert_eq!(name.node, "h");
+                assert_eq!(*elem, crate::ast::ScalarTypeRef::U32);
+                assert_eq!(len.node, 8);
+            }
+            other => panic!("expected Stmt::LocalArrayDecl, got {other:?}"),
+        }
+        assert!(matches!(kd.body.node.stmts[1].node, Stmt::IndexAssign { .. }));
+        assert!(matches!(kd.body.node.stmts[2].node, Stmt::Let { .. }));
+    }
+
+    /// AT-2928 (type-position half): `array[f32, 4]` parses as
+    /// `TypeRef::LocalArray { elem: F32, len: 4 }` — exercised via a decl statement
+    /// since local-array types are only valid there (not let-binding position).
+    #[test]
+    fn at_2928_local_array_type_ref_shape() {
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { array a: array[f32, 4]; return; }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        match &kd.body.node.stmts[0].node {
+            Stmt::LocalArrayDecl { elem, len, .. } => {
+                assert_eq!(*elem, crate::ast::ScalarTypeRef::F32);
+                assert_eq!(len.node, 4);
+            }
+            other => panic!("expected Stmt::LocalArrayDecl, got {other:?}"),
+        }
+    }
+
+    /// AT-2929 (report-ALL): a source with multiple malformed local-array decls in
+    /// separate kernels recovers and reports ALL errors in one pass (anti-pattern #6)
+    /// — missing N, a non-integer N, and an over-ceiling N.
+    #[test]
+    fn at_2929_report_all_malformed_local_array_decls() {
+        let src = concat!(
+            "@kernel @workgroup(1,1,1) fn ka() -> void { array a: array[f32]; return; } ",
+            "@kernel @workgroup(1,1,1) fn kb() -> void { array b: array[f32, 3.0]; return; } ",
+            "@kernel @workgroup(1,1,1) fn kc() -> void { array c: array[f32, 99999999]; return; }",
+        );
+        let (_module, errors) = parse_src(src);
+        assert_eq!(
+            errors.len(), 3,
+            "expected exactly 3 recovered errors (one per malformed decl), got {}: {errors:?}",
+            errors.len()
+        );
+        assert!(
+            matches!(errors[0], ParseError::Unexpected { .. }),
+            "missing-N decl should report an Unexpected (found `]` where N was expected): {:?}", errors[0]
+        );
+        assert!(
+            matches!(errors[1], ParseError::LocalArraySizeMustBeUnsuffixedPositiveIntegerLiteral { .. }),
+            "non-integer N should report LocalArraySizeMustBeUnsuffixedPositiveIntegerLiteral: {:?}", errors[1]
+        );
+        assert!(
+            matches!(errors[2], ParseError::LocalArraySizeTooLarge { .. }),
+            "over-ceiling N should report LocalArraySizeTooLarge: {:?}", errors[2]
+        );
+    }
+
+    /// AT-2930 (parser half): `array[T,N]` in parameter position is accepted
+    /// syntactically (the parser accepts any type token in param position; the HIR
+    /// rejects it with `LocalArrayAsParameter`) — this test only pins the parse shape.
+    #[test]
+    fn at_2930_local_array_type_parses_in_param_position() {
+        let src = "@kernel @workgroup(1,1,1) fn k(a: array[u32, 4]) -> void { return; }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "unexpected parse errors: {errors:?}");
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        assert_eq!(kd.params.len(), 1);
+        assert!(
+            matches!(kd.params[0].node.ty.node, TypeRef::LocalArray { .. }),
+            "param type should parse as TypeRef::LocalArray (HIR rejects it later): {:?}",
+            kd.params[0].node.ty.node
+        );
+    }
+
+    /// AT-2930 (parser half): `array[T,N]` as a return type is accepted syntactically
+    /// (the HIR rejects any non-void return type with `BadKernelReturnType`).
+    #[test]
+    fn at_2930_local_array_type_parses_as_return_type() {
+        let src = "@kernel @workgroup(1,1,1) fn k() -> array[u32, 4] { return; }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "unexpected parse errors: {errors:?}");
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        assert!(
+            matches!(kd.return_type.node, TypeRef::LocalArray { .. }),
+            "return type should parse as TypeRef::LocalArray (HIR rejects it later): {:?}",
+            kd.return_type.node
+        );
     }
 }

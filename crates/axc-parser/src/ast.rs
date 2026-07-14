@@ -122,6 +122,16 @@ pub enum TypeRef {
         /// Number of elements (validated N > 0, N <= MAX_SHARED_ELEMS at HIR lower time).
         len: u32,
     },
+    /// `array[elem, N]` — per-invocation (thread-private) sized local array type (M3.20+).
+    ///
+    /// `elem` is a scalar element type (Bool not allowed).
+    /// `N` is a compile-time unsuffixed positive integer literal (1..=MAX_LOCAL_ARRAY_ELEMS).
+    /// Only valid as the type in a `Stmt::LocalArrayDecl`; rejected in parameter position.
+    LocalArray {
+        elem: ScalarTypeRef,
+        /// Number of elements (validated N > 0, N <= MAX_LOCAL_ARRAY_ELEMS at HIR lower time).
+        len: u32,
+    },
 }
 
 /// An annotation on a kernel: `@name` or `@name(arg, …)`.
@@ -309,6 +319,24 @@ pub enum Stmt {
     /// (consumes no descriptor), and may NOT be used as return types or let-binding types.
     SharedDecl {
         /// Source-level name of the shared array.
+        name: axc_lexer::Spanned<String>,
+        /// Element type scalar reference.
+        elem: ScalarTypeRef,
+        /// Length (number of elements), as a spanned u32 for error messages.
+        len: axc_lexer::Spanned<u32>,
+    },
+    /// `array name: array[elem, N];` — per-invocation local array declaration (M3.20+).
+    ///
+    /// The leading `array` keyword introduces the declaration. The type is
+    /// `array[elem, N]` where `elem` is a scalar type and `N` is a compile-time
+    /// unsuffixed positive integer literal.
+    ///
+    /// Local arrays are per-invocation (Function-storage) — NOT parameters
+    /// (consume no descriptor), and may NOT be used as return types or let-binding
+    /// types. Only valid at the top level of a kernel body (nested decls are a HIR
+    /// hard error — `HirError::LocalArrayDeclNotAtBlockScope`, see M3.20 spec §5.1).
+    LocalArrayDecl {
+        /// Source-level name of the local array.
         name: axc_lexer::Spanned<String>,
         /// Element type scalar reference.
         elem: ScalarTypeRef,

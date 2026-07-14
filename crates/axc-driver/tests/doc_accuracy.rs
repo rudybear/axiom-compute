@@ -138,35 +138,54 @@ fn at_2917_transfer_revisit_trigger_recorded_verbatim() {
     );
 }
 
-/// AT-2918: whole-milestone codegen invariance. `crates/axc-codegen/src` has
-/// an EMPTY diff against the pre-M3.19 tree, with ONE documented mechanical
-/// exception: the single `opt_log: None,` line forced into a `#[cfg(test)]`
-/// `KernelAnnotations` literal by the new field on the shared HIR struct
-/// (test-only, non-behavioral). Complements — does NOT substitute for — the
-/// real binding proof, AT-2903's byte-identical golden SPIR-V gate.
+/// AT-2918: whole-milestone codegen invariance — SCOPED TO M3.19's OWN COMMITS.
+/// `crates/axc-codegen/src` had an EMPTY diff between the pre-M3.19 tree and the
+/// M3.19 feat commit, with ONE documented mechanical exception: the single
+/// `opt_log: None,` line forced into a `#[cfg(test)]` `KernelAnnotations` literal
+/// by the new field on the shared HIR struct (test-only, non-behavioral).
+/// Complements — does NOT substitute for — the real binding proof, AT-2903's
+/// byte-identical golden SPIR-V gate.
 ///
-/// NOTE (mirrors AT-2607's own documented caveat): this diffs the CURRENT
-/// working tree against `HEAD` (the commit this milestone branched from,
-/// since the Coder does not commit). Once this milestone is committed, a
-/// later reviewer should consider re-pinning this to fixed base/head SHAs
-/// the way AT-2607 does for M3.11a, so the fence keeps working after `HEAD`
-/// moves.
+/// RE-PINNED (M3.20 coder): this test originally diffed the then-CURRENT working
+/// tree against `HEAD` (a live, branch-relative check valid only during M3.19's
+/// own uncommitted dev window — its own prior doc comment flagged this and asked
+/// for re-pinning "once this milestone is committed"). M3.19 is now merged, and
+/// M3.20 legitimately adds a NEW codegen module (`local.rs`) plus `body.rs`/
+/// `emit.rs` changes per its own architect spec — a live `HEAD`-relative "empty
+/// diff" gate would incorrectly fail on EVERY future milestone that touches
+/// codegen, forever, regardless of correctness. Re-pinned to the FIXED
+/// pre-M3.19/post-M3.19 commit SHAs so the assertion permanently documents ONLY
+/// M3.19's own historical diff and no longer polls the mutable branch tip
+/// (mirrors AT-2607's fixed-ref pattern for M3.11a, including its graceful skip
+/// when the pinned SHAs are unavailable, e.g. a shallow clone).
 #[test]
 fn at_2918_codegen_empty_diff_except_one_mechanical_test_line() {
     let root: PathBuf = repo_root();
+    // Pre-M3.19 (M3.17 feat commit) .. M3.19 feat commit (AT-2900..2925).
+    const PRE_M3_19_SHA: &str = "cb750ec";
+    const POST_M3_19_SHA: &str = "6c7732d";
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(&root)
-        .args(["diff", "-U0", "--", "crates/axc-codegen/src"])
+        .args(["diff", "-U0", &format!("{PRE_M3_19_SHA}..{POST_M3_19_SHA}"), "--", "crates/axc-codegen/src"])
         .output()
         .expect("AT-2918: failed to run git diff");
-    assert!(output.status.success(), "AT-2918: git diff failed: {:?}", output.status);
+    if !output.status.success() {
+        eprintln!(
+            "AT-2918 SKIP: `git diff {PRE_M3_19_SHA}..{POST_M3_19_SHA}` unavailable (status {:?}, \
+             stderr: {}). Pinned-SHA history may be unreachable (e.g. a shallow clone); the \
+             historical M3.19 invariance is enforced at review, not by this fence.",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
 
     let diff_text: String = String::from_utf8_lossy(&output.stdout).to_string();
     // Every ADDED line (starting with a single `+`, not `+++`) must be
     // exactly the one mechanical field addition; every REMOVED line
-    // (starting with a single `-`, not `---`) must not exist at all (this
-    // milestone only ADDS the new field, never removes codegen lines).
+    // (starting with a single `-`, not `---`) must not exist at all (M3.19
+    // only ADDED the new field, never removed codegen lines).
     for line in diff_text.lines() {
         if line.starts_with("+++") || line.starts_with("---") {
             continue;
@@ -175,11 +194,11 @@ fn at_2918_codegen_empty_diff_except_one_mechanical_test_line() {
             assert_eq!(
                 added.trim(),
                 "opt_log: None,",
-                "AT-2918: crates/axc-codegen/src must have an EMPTY diff except the one \
+                "AT-2918: crates/axc-codegen/src's M3.19 diff must be EMPTY except the one \
                  mechanical `opt_log: None,` test-fixture line; found an unexpected addition: {added:?}"
             );
         } else if line.starts_with('-') {
-            panic!("AT-2918: crates/axc-codegen/src must have ZERO removed lines; found: {line:?}");
+            panic!("AT-2918: crates/axc-codegen/src's M3.19 diff must have ZERO removed lines; found: {line:?}");
         }
     }
 }
