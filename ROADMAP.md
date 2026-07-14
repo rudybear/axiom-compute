@@ -370,11 +370,9 @@ IMPLEMENTED. Full pipeline: lexer (token already existed) → parser (TypeRef::S
 
 **Effort:** ~5800 LOC across 19+ files. Landed as part of M3.2.
 
-### FG.7 — Sized arrays as locals
+### FG.7 — Sized arrays as locals ✅ IMPLEMENTED (M3.20, 2026-07-14)
 
-`array[T, N]` per DESIGN.md §3.1. Currently only buffer types are supported.
-
-**Effort:** ~600 LOC.
+IMPLEMENTED as M3.20: `array name: array[elem, N];` kernel-local Function-storage arrays mirroring the shared[T,N] pipeline (entry-block-prelude OpVariable, single-index OpAccessChain, zero OpPhi interaction). Bidirectional shared/local/let/param name-collision guard; nested decls rejected (hoist-no-reset foot-gun); const-index OOB hard error (==N); aggregate 4096-byte cap + 1024-byte spill advisory (M3.12 register-pressure rationale); read-before-write advisory (path-insensitive, disclosed); dynamic OOB = documented UB (no silent clamp — disasm-verified). Corpus golden 33/33 byte-identical. `local_histogram.axc` bit-exact NVIDIA + Lavapipe. AT-2927..2944. Backlog note: `validate()` has NO caller anywhere (pre-existing — the reachable checks live in typecheck; SharedMemoryTooLarge affected too).
 
 ### FG.8 — `axc verify` / `axc test --fuzz` ✅ IMPLEMENTED (M3.18, 2026-07-14)
 
@@ -408,6 +406,8 @@ Currently one `@kernel` per file. DESIGN.md hints at multi-kernel modules with c
 | M3.18 W1/W2 (pessimistic code review, both fail-loud): early-return SKIPPED paths discard accumulated `worst` (latent, unreachable today — fold into record_worst) + `negate_one` unsound for f32 ge/le at large magnitudes (unreachable by v1 alpha-pin) | low | 100 LOC |
 | M3.16 W1/W2 (routed from pessimistic code review, both safe-direction): `rel:` comparator near-zero denominator (seed-pinned in AT-2855) + `within_ulp_f32` sign-boundary false-mismatch — candidates for a condition-aware tolerance follow-up | low | 300 LOC |
 | M3.19 low warts (pessimistic code review, none gate): out-of-i64-range int literals in annotation args silently clamp to i64::MAX/MIN with no diagnostic (parser.rs — reject instead); log-opt inserts LF separator into CRLF files; no per-note length cap on MCP append_optimization_log | low | 100 LOC |
+| `validate()` in axc-hir has ZERO callers workspace-wide (discovered M3.20) — HirError::SharedMemoryTooLarge/LocalArrayTooLarge there are dead code; the reachable checks live in typecheck. Either wire validate() into the pipeline or fold its checks into typecheck and delete | medium | 200 LOC |
+| M3.20 nit: identical same-shape local arrays emit redundant duplicate OpTypeArray ids (valid SPIR-V, minor size waste) | low | 50 LOC |
 
 ---
 
