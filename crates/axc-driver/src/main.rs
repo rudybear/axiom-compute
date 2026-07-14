@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 
 use clap::Parser as ClapParser;
-use axc_driver::{Cli, Command, compile_file, build_bench_command};
+use axc_driver::{Cli, Command, compile_file_debug, build_bench_command};
 use axc_driver::optimize::run_optimize;
 use axc_driver::mcp::{run_mcp_server, LogTarget};
 
@@ -20,9 +20,9 @@ fn main() -> miette::Result<()> {
     let cli: Cli = Cli::parse();
 
     match cli.command {
-        Command::Compile { input, output, strategy_values } => {
+        Command::Compile { input, output, strategy_values, debug } => {
             if strategy_values.is_empty() {
-                compile_file(&input, &output).map_err(|e| {
+                compile_file_debug(&input, &output, debug).map_err(|e| {
                     miette::miette!("{}", e)
                 })
             } else {

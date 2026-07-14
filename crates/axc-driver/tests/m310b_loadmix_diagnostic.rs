@@ -812,9 +812,15 @@ fn test_at2504_plain_f32_core_staging_is_f16_vectorization_target() {
 
 #[test]
 fn test_at2505_no_codegen_change_suite_green() {
-    // The empty-codegen-diff anchor: `git diff main` must touch NO file under the codegen /
-    // HIR / typecheck / parser / lexer source trees. This milestone is a diagnostic + a
-    // documented conclusion — it adds ZERO codegen (same discipline as M3.10a).
+    // The empty-codegen-diff anchor is a HISTORICAL fact about the M3.10b commit itself,
+    // not a perpetual gate on all future work: M3.10b's own patch (between the M3.10 merge
+    // and the commit that added this test) touched NO file under the codegen / HIR /
+    // typecheck / parser / lexer source trees. Pinned to fixed SHAs (not `main`, which
+    // moves) so later milestones that DO legitimately touch codegen (e.g. M3.17's
+    // @precondition/@postcondition runtime checks, explicitly in-spec) do not spuriously
+    // fail this M3.10b-specific anchor.
+    const M310_MERGE_BASE: &str = "284b3d84c60e3535f4742be26bff0c07e69ab3a4";
+    const M310B_TEST_COMMIT: &str = "a4e36f622de8c23412f7d417df2aa74d278a9b3e";
     let manifest_dir =
         std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let repo_root = manifest_dir.join("..").join("..");
@@ -822,7 +828,7 @@ fn test_at2505_no_codegen_change_suite_green() {
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(&repo_root)
-        .args(["diff", "--name-only", "main", "--"])
+        .args(["diff", "--name-only", M310_MERGE_BASE, M310B_TEST_COMMIT, "--"])
         .args([
             "crates/axc-codegen/src",
             "crates/axc-hir/src",

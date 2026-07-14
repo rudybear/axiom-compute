@@ -27,6 +27,7 @@ use axc_parser::{Parser, ParseError};
 use axc_hir::{lower_module, HirError};
 use axc_codegen::{emit_module_bytes, CodegenOptions, extract_workgroup_dims};
 use axc_runtime::{KernelMetadata, CoopMatShapeMeta, CoopMatScalarMeta, CoopMatScopeMeta};
+use axc_runtime::{DebugChecksMeta, DebugConditionMeta, DebugCheckKind as DebugMetaCheckKind};
 use axc_hir::coopmat::{CoopMatrixShape, CoopMatScopeHir};
 use axc_hir::ty::ScalarTy;
 
@@ -89,7 +90,20 @@ impl DriverError {
 /// Steps 1-3: Lex, parse, HIR all run to completion even on errors.
 /// Step 4: Codegen runs only if all three error lists are empty.
 /// Step 5: Build KernelMetadata from HIR module.
+///
+/// Compiles in RELEASE mode (`--debug` OFF). Forwards to `compile_source_with_meta_debug`.
 pub fn compile_source_with_meta(source: &str) -> Result<(Vec<u8>, KernelMetadata), DriverError> {
+    compile_source_with_meta_debug(source, false)
+}
+
+/// M3.17 (FG.4): full pipeline with an explicit `--debug` flag. Identical to
+/// `compile_source_with_meta` except `debug_checks` threads to `CodegenOptions` and
+/// the metadata sidecar; `debug_checks == false` is byte-identical to release
+/// (golden-identity gate, §6 of the spec).
+pub fn compile_source_with_meta_debug(
+    source: &str,
+    debug_checks: bool,
+) -> Result<(Vec<u8>, KernelMetadata), DriverError> {
     // ── Step 0: BOM rejection (anti-pattern #1) ─────────────────────────────
     // UTF-8 BOM is EF BB BF. We check raw bytes, not the char value, to keep
     // the logic portable across platforms and consistent with the span semantics
@@ -125,7 +139,7 @@ pub fn compile_source_with_meta(source: &str) -> Result<(Vec<u8>, KernelMetadata
     }
 
     // ── Phase 4: Codegen (only when all phases are clean) ────────────────────
-    let bytes: Vec<u8> = emit_module_bytes(&hir, &CodegenOptions::default())?;
+    let bytes: Vec<u8> = emit_module_bytes(&hir, &CodegenOptions { debug_checks, ..CodegenOptions::default() })?;
 
     // ── Phase 5: Build metadata from HIR ─────────────────────────────────────
     let workgroup_size: [u32; 3] = extract_workgroup_dims(&hir);
@@ -157,15 +171,50 @@ pub fn compile_source_with_meta(source: &str) -> Result<(Vec<u8>, KernelMetadata
         axc_hir::KernelBody::Empty => 0,
     };
 
+    // M3.17 (FG.4): debug-check metadata, present only under `--debug` (§7/§6 —
+    // `skip_serializing_if` on the field keeps a release sidecar unperturbed).
+    let debug_checks_meta: Option<DebugChecksMeta> = if debug_checks {
+        Some(build_debug_checks_meta(kernel, source))
+    } else {
+        None
+    };
+
     let metadata: KernelMetadata = KernelMetadata::new(
         kernel.name.clone(),
         workgroup_size,
         kernel.binding_plan.clone(),
         kernel.name.clone(),
     ).with_coopmat(coopmat_meta)
-     .with_shared_memory_bytes(shared_memory_bytes);
+     .with_shared_memory_bytes(shared_memory_bytes)
+     .with_debug_checks(debug_checks_meta);
 
     Ok((bytes, metadata))
+}
+
+/// M3.17 (FG.4): build the sidecar's `DebugChecksMeta` from a compiled kernel's
+/// lowered `debug_checks` (§7 of the spec — the flag binding is one past the last
+/// user buffer; `text`/`line` are for host-side violation messages).
+fn build_debug_checks_meta(kernel: &axc_hir::Kernel, source: &str) -> DebugChecksMeta {
+    DebugChecksMeta {
+        flag_binding: kernel.binding_plan.buffers.len() as u32,
+        flag_len_words: 2,
+        conditions: kernel.annotations.debug_checks.iter().map(|c| DebugConditionMeta {
+            kind: match c.kind {
+                axc_hir::DebugCheckKind::Pre => DebugMetaCheckKind::Pre,
+                axc_hir::DebugCheckKind::Post => DebugMetaCheckKind::Post,
+            },
+            bit: c.bit,
+            text: c.text.clone(),
+            line: source_line_of(source, c.span.start),
+        }).collect(),
+    }
+}
+
+/// 1-based source line number for a byte offset (best-effort; used only for the
+/// human-readable `DebugConditionMeta.line`, not for correctness).
+fn source_line_of(source: &str, byte_offset: u32) -> u32 {
+    let off: usize = (byte_offset as usize).min(source.len());
+    1 + source.as_bytes()[..off].iter().filter(|&&b| b == b'\n').count() as u32
 }
 
 /// Full pipeline: source string → SPIR-V bytes.
@@ -399,9 +448,17 @@ pub(crate) fn metadata_sidecar_path(output: &Path) -> PathBuf {
 /// Writes two files:
 /// - `output`: SPIR-V binary
 /// - `output.axc.meta.json`: JSON metadata sidecar
+///
+/// Compiles in RELEASE mode (`--debug` OFF). Forwards to `compile_file_debug`.
 pub fn compile_file(input: &Path, output: &Path) -> Result<(), DriverError> {
+    compile_file_debug(input, output, false)
+}
+
+/// M3.17 (FG.4): `compile_file` with an explicit `--debug` flag. See
+/// `compile_source_with_meta_debug` for the behavioral contract.
+pub fn compile_file_debug(input: &Path, output: &Path, debug_checks: bool) -> Result<(), DriverError> {
     let source: String = std::fs::read_to_string(input)?;
-    let (bytes, metadata) = compile_source_with_meta(&source)?;
+    let (bytes, metadata) = compile_source_with_meta_debug(&source, debug_checks)?;
     std::fs::write(output, &bytes)?;
     let sidecar_path: PathBuf = metadata_sidecar_path(output);
     metadata.save(&sidecar_path)
@@ -1038,5 +1095,50 @@ mod tests {
             ),
             "filter + bless: filter appended after `--`, AXC_BLESS_BASELINES=1 set"
         );
+    }
+
+    // ── AT-2874: @strict + a REAL precondition interaction (M3.17 FG.4) ────────
+
+    /// AT-2874: a `@strict` kernel (`@intent`+`@complexity`+`@precondition`) with a
+    /// REAL (non-`true`) precondition compiles; `--debug` lowers the precondition;
+    /// the M2.5 strict-discipline path is unaffected; and the RELEASE artifact is
+    /// byte-unchanged by the presence of `@precondition` (ties to AT-2866).
+    #[test]
+    fn at_2874_strict_kernel_with_real_precondition() {
+        const STRICT_SRC: &str = concat!(
+            "@kernel\n",
+            "@workgroup(64, 1, 1)\n",
+            "@intent(\"strict kernel with a real precondition\")\n",
+            "@complexity(O(n))\n",
+            "@precondition(gt(n, 0))\n",
+            "@strict\n",
+            "fn strict_k(n: u32) -> void { return; }\n",
+        );
+        const STRICT_SRC_NO_PRECONDITION: &str = concat!(
+            "@kernel\n",
+            "@workgroup(64, 1, 1)\n",
+            "@intent(\"strict kernel with a real precondition\")\n",
+            "@complexity(O(n))\n",
+            "@strict\n",
+            "fn strict_k(n: u32) -> void { return; }\n",
+        );
+
+        // Release: compiles clean, no debug_checks in metadata.
+        let (release_bytes, release_meta) = compile_source_with_meta_debug(STRICT_SRC, false)
+            .expect("release compile must succeed for a @strict kernel with a real precondition");
+        assert!(release_meta.debug_checks.is_none(), "release metadata must have no debug_checks");
+
+        // Release artifact is byte-unchanged by the presence of @precondition (AT-2866 tie-in).
+        let (release_bytes_no_pc, _) = compile_source_with_meta_debug(STRICT_SRC_NO_PRECONDITION, false)
+            .expect("release compile (no precondition) must succeed");
+        assert_eq!(release_bytes, release_bytes_no_pc,
+            "release SPIR-V for a @strict kernel must be byte-unchanged by @precondition's presence");
+
+        // --debug: lowers the precondition into metadata.
+        let (_debug_bytes, debug_meta) = compile_source_with_meta_debug(STRICT_SRC, true)
+            .expect("--debug compile must succeed for a @strict kernel");
+        let dbg = debug_meta.debug_checks.expect("--debug metadata must carry debug_checks");
+        assert_eq!(dbg.conditions.len(), 1, "exactly the one real precondition must be lowered");
+        assert_eq!(dbg.conditions[0].text, "gt(n, 0)");
     }
 }

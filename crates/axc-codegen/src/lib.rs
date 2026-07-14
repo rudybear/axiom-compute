@@ -13,9 +13,11 @@ pub mod q4_0;
 pub mod ext_inst;
 /// Workgroup-shared array SPIR-V emission (M3.2).
 pub mod shared;
+/// Runtime `@precondition`/`@postcondition` debug-check SPIR-V support (M3.17).
+pub mod debug_checks;
 
 pub use emit::{emit_module, emit_module_bytes, CodegenError, CodegenOptions};
-pub use body::{ScalarTypeCache, CapabilitiesRequired, BodyCodegenError, KernelResources, emit_kernel_body};
+pub use body::{ScalarTypeCache, CapabilitiesRequired, BodyCodegenError, KernelResources, emit_kernel_body, DebugCodegenCtx};
 pub use buffers::{
     emit_buffer_globals, emit_push_constant_block, emit_gid_variable,
     BufferBindings, PushConstantBlock, GlobalInvocationIdVar,

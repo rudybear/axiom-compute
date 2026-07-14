@@ -86,9 +86,11 @@ pub mod device_uuid;
 
 pub use error::{DispatchError, DispatchResult, CopyDirection};
 pub use context::{VulkanContext, VulkanContextOptions};
-pub use dispatch::DispatchRequest;
+pub use dispatch::{DispatchRequest, DebugDispatchOutcome};
 pub use metadata::{KernelMetadata, load_kernel_metadata, CURRENT_SCHEMA_VERSION,
-                   CoopMatShapeMeta, CoopMatScalarMeta, CoopMatScopeMeta};
+                   CoopMatShapeMeta, CoopMatScalarMeta, CoopMatScopeMeta,
+                   DebugChecksMeta, DebugConditionMeta, DebugCheckKind,
+                   debug_augmented_binding_plan, decode_debug_flags};
 pub use icd::{probe_vulkan_available, gpu_tests_enabled, captured_icd_path};
 pub use kernel_handle::{KernelHandle, KernelCacheKey};
 pub use coopmat::{

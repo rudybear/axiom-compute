@@ -21,6 +21,7 @@
 use axc_hir::ParamBindingPlan;
 use crate::context::VulkanContext;
 use crate::error::DispatchError;
+use crate::metadata::{debug_augmented_binding_plan, decode_debug_flags, KernelMetadata};
 
 /// Default fence timeout in milliseconds (10 seconds).
 pub(crate) const DEFAULT_FENCE_TIMEOUT_MS: u64 = 10_000;
@@ -129,6 +130,86 @@ impl VulkanContext {
 
         // handle dropped here → pipeline + DSL + PL + fence + buffers destroyed
         Ok(out)
+    }
+
+    /// M3.17 (FG.4): dispatch a `--debug`-compiled kernel, transparently handling the
+    /// injected flag binding. Reuses `prepare_kernel_checked` + `dispatch_handle`
+    /// UNMODIFIED — the flag buffer is appended as just another SSBO (via
+    /// `debug_augmented_binding_plan`) plus one zero-init input / 8-byte output, so
+    /// the DSL/pool/bind-loop/NonCoherent-readback path treats it like a user buffer.
+    ///
+    /// Returns `Ok(DebugDispatchOutcome)` for ANY completed dispatch (violation or
+    /// not) — call `.into_result()` for the typed `DebugCheckViolation` error, or
+    /// inspect `flag_words` directly for exact-bitmask assertions.
+    pub fn dispatch_debug_checked(
+        &self,
+        spirv: &[u32],
+        meta: &KernelMetadata,
+        workgroups: (u32, u32, u32),
+        inputs: &[&[u8]],
+        output_sizes: &[usize],
+        push_constants: &[u8],
+    ) -> Result<DebugDispatchOutcome, DispatchError> {
+        let dbg = meta.debug_checks.as_ref().ok_or_else(|| {
+            DispatchError::CommandBufferRecordFailed(
+                "dispatch_debug_checked called with metadata that has no debug_checks (compile with --debug)".to_owned(),
+            )
+        })?;
+
+        let plan: ParamBindingPlan = debug_augmented_binding_plan(meta);
+        let handle = self.prepare_kernel_checked(
+            spirv,
+            &plan,
+            plan.push_constant_total_bytes,
+            &meta.entry_point,
+            meta.coopmat.as_ref(),
+            &meta.kernel_name,
+            meta.shared_memory_bytes,
+        )?;
+
+        // Zero-init the flag buffer's upload (spec §2 "the runtime zero-inits flag").
+        let zero_flag = [0u8; 8];
+        let mut all_inputs: Vec<&[u8]> = inputs.to_vec();
+        all_inputs.push(&zero_flag);
+        let mut all_output_sizes: Vec<usize> = output_sizes.to_vec();
+        all_output_sizes.push(8);
+
+        let mut outputs = self.dispatch_handle(&handle, workgroups, &all_inputs, &all_output_sizes, push_constants)?;
+        let flag_bytes: Vec<u8> = outputs.pop()
+            .expect("all_output_sizes always has one more entry than output_sizes; dispatch_handle returns one Vec<u8> per entry");
+        if flag_bytes.len() != 8 {
+            return Err(DispatchError::CommandBufferRecordFailed(format!(
+                "debug flag buffer readback returned {} bytes, expected 8", flag_bytes.len()
+            )));
+        }
+        let flag_words: [u32; 2] = [
+            u32::from_le_bytes([flag_bytes[0], flag_bytes[1], flag_bytes[2], flag_bytes[3]]),
+            u32::from_le_bytes([flag_bytes[4], flag_bytes[5], flag_bytes[6], flag_bytes[7]]),
+        ];
+
+        Ok(DebugDispatchOutcome { outputs, flag_words, conditions: dbg.conditions.clone() })
+    }
+}
+
+/// Result of `VulkanContext::dispatch_debug_checked` (M3.17 FG.4).
+///
+/// `outputs` excludes the injected flag buffer (same shape as a release dispatch's
+/// return value). `flag_words` is the raw `[precondition_bits, postcondition_bits]`
+/// readback — exposed directly so callers can assert an exact expected bitmask
+/// without going through the typed-error path.
+pub struct DebugDispatchOutcome {
+    pub outputs: Vec<Vec<u8>>,
+    pub flag_words: [u32; 2],
+    conditions: Vec<crate::metadata::DebugConditionMeta>,
+}
+
+impl DebugDispatchOutcome {
+    /// Decode `flag_words` against the recorded conditions: `Ok(outputs)` when clean
+    /// (`flag_words == [0, 0]`), or `Err(DispatchError::DebugCheckViolation{..})`
+    /// naming every failing condition.
+    pub fn into_result(self) -> Result<Vec<Vec<u8>>, DispatchError> {
+        decode_debug_flags(self.flag_words, &self.conditions)?;
+        Ok(self.outputs)
     }
 }
 

@@ -9,6 +9,7 @@ use axc_parser::ast::{Module as AstModule, Item, AnnotationArg, Stmt, TypeRef, S
 use crate::hir::{
     Module as HirModule, Kernel, KernelId, KernelAnnotations, WorkgroupDims,
     KernelBody, ComplexityForm, ComplexityVar, PreconditionTrivial, StrategyHoles,
+    DebugCheck, DebugCheckKind, DebugCompareOp, DebugOperand,
 };
 use crate::validate::{HirError, HirWarning};
 use crate::typecheck::typecheck_kernel_body;
@@ -43,6 +44,11 @@ pub fn lower_module(ast: &AstModule) -> (HirModule, Vec<HirError>, Vec<HirWarnin
                 let mut seen_kernel: bool = false;
                 // M2.3: strategy holes
                 let mut strategy_holes_opt: Option<StrategyHoles> = None;
+                // M3.17 (FG.4): raw Call-form @precondition/@postcondition bodies.
+                // Resolution is deferred until after `lower_params` (below) because
+                // operand resolution needs the kernel's scalar parameter table.
+                let mut precondition_calls: Vec<(String, Vec<axc_lexer::Spanned<AnnotationArg>>, Span)> = Vec::new();
+                let mut postcondition_calls: Vec<(String, Vec<axc_lexer::Spanned<AnnotationArg>>, Span)> = Vec::new();
 
                 for ann in &kd.annotations {
                     let name: &str = &ann.node.name.node;
@@ -114,9 +120,34 @@ pub fn lower_module(ast: &AstModule) -> (HirModule, Vec<HirError>, Vec<HirWarnin
                                     AnnotationArg::Bool(true) => {
                                         preconditions.push(PreconditionTrivial { span: ann.span });
                                     }
+                                    // M3.17 (FG.4): a whitelisted Call-form predicate
+                                    // (`gt(n, 0)`, etc.) — resolution deferred until params
+                                    // are known (see `lower_debug_checks` below).
+                                    AnnotationArg::Call { name: call_name, args: call_args } => {
+                                        precondition_calls.push((call_name.clone(), call_args.clone(), ann.span));
+                                    }
                                     other => {
                                         errors.push(HirError::UnsupportedPrecondition {
                                             detail: format!("{other:?}"),
+                                            span: ann.span,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        // M3.17 (FG.4): @postcondition follows the same Call-form DSL as
+                        // @precondition, plus `is_finite`. `true` is accepted for symmetry
+                        // (back-compat parity) and lowers to nothing, like @precondition(true).
+                        "postcondition" => {
+                            if ann.node.args.len() == 1 {
+                                match &ann.node.args[0].node {
+                                    AnnotationArg::Bool(true) => {}
+                                    AnnotationArg::Call { name: call_name, args: call_args } => {
+                                        postcondition_calls.push((call_name.clone(), call_args.clone(), ann.span));
+                                    }
+                                    other => {
+                                        errors.push(HirError::UnsupportedDebugPredicate {
+                                            name: format!("{other:?}"),
                                             span: ann.span,
                                         });
                                     }
@@ -212,6 +243,16 @@ pub fn lower_module(ast: &AstModule) -> (HirModule, Vec<HirError>, Vec<HirWarnin
                     &mut errors,
                 );
 
+                // M3.17 (FG.4): resolve the raw @precondition/@postcondition Call bodies
+                // now that the kernel's scalar parameter table is known.
+                let debug_checks: Vec<DebugCheck> = lower_debug_checks(
+                    &precondition_calls,
+                    &postcondition_calls,
+                    &params,
+                    &mut errors,
+                    &mut warnings,
+                );
+
                 // Determine body: Empty if trivial (only void return), Typed otherwise.
                 let body = lower_kernel_body(&kd.body.node, &params, &mut errors, &mut warnings);
 
@@ -248,6 +289,7 @@ pub fn lower_module(ast: &AstModule) -> (HirModule, Vec<HirError>, Vec<HirWarnin
                     cooperative_matrix,
                     coop_matrix,
                     strategy: strategy_holes_opt,
+                    debug_checks,
                 };
 
                 kernels.push(Kernel {
@@ -347,6 +389,233 @@ fn lower_params(
             })
         }
     }
+}
+
+// ── M3.17 (FG.4): @precondition/@postcondition Call-form predicate DSL ─────────
+
+/// Classification of one annotation-arg operand inside a debug-check Call.
+enum RawDebugOperand {
+    Lit(i64),
+    ScalarRef(String),
+    /// `elem(buf)` — buffer-element operand. Hard-rejected in a precondition,
+    /// deferred (`PostconditionNotLowerable`) in a postcondition (defer-list §9.1).
+    BufElem(String),
+    Invalid,
+}
+
+/// Classify a single annotation-arg node as a debug-check operand shape.
+fn classify_debug_operand(arg: &AnnotationArg) -> RawDebugOperand {
+    match arg {
+        AnnotationArg::Int(v) => RawDebugOperand::Lit(*v),
+        AnnotationArg::Ident(name) => RawDebugOperand::ScalarRef(name.clone()),
+        AnnotationArg::Call { name, args } if name == "elem" && args.len() == 1 => {
+            match &args[0].node {
+                AnnotationArg::Ident(buf) => RawDebugOperand::BufElem(buf.clone()),
+                _ => RawDebugOperand::Invalid,
+            }
+        }
+        _ => RawDebugOperand::Invalid,
+    }
+}
+
+/// Resolve a scalar param reference to its `ScalarTy`, restricted to u32/i32/f32
+/// (§3 of the spec). `None` if not a scalar param, or an out-of-set type.
+fn resolve_scalar_param_ty(params: &[KernelParam], name: &str) -> Option<ScalarTy> {
+    params.iter().find(|p| p.name == name).and_then(|p| match &p.ty {
+        ParamTy::Scalar(t @ (ScalarTy::U32 | ScalarTy::I32 | ScalarTy::F32)) => Some(*t),
+        _ => None,
+    })
+}
+
+/// Lower a classified operand to the codegen-ready `DebugOperand`. `None` for
+/// `BufElem`/`Invalid` (callers must reject/defer those before calling this).
+fn to_debug_operand(raw: &RawDebugOperand, params: &[KernelParam]) -> Option<DebugOperand> {
+    match raw {
+        RawDebugOperand::Lit(v) => Some(DebugOperand::Lit(*v)),
+        RawDebugOperand::ScalarRef(name) => {
+            let position = params.iter().find(|p| p.name == *name)?.position;
+            Some(DebugOperand::ScalarRef { name: name.clone(), position })
+        }
+        RawDebugOperand::BufElem(_) | RawDebugOperand::Invalid => None,
+    }
+}
+
+/// Human-readable rendering of a raw operand for `DebugCheck::text`.
+fn render_debug_operand(raw: &RawDebugOperand) -> String {
+    match raw {
+        RawDebugOperand::Lit(v) => v.to_string(),
+        RawDebugOperand::ScalarRef(n) => n.clone(),
+        RawDebugOperand::BufElem(b) => format!("elem({b})"),
+        RawDebugOperand::Invalid => "?".to_string(),
+    }
+}
+
+/// Lower every collected raw `@precondition`/`@postcondition` Call body into
+/// fully-resolved `DebugCheck`s (dense 0-based bit index per kind). Deferred until
+/// after `lower_params` — operand resolution needs the scalar parameter table.
+fn lower_debug_checks(
+    precondition_calls: &[(String, Vec<axc_lexer::Spanned<AnnotationArg>>, Span)],
+    postcondition_calls: &[(String, Vec<axc_lexer::Spanned<AnnotationArg>>, Span)],
+    params: &[KernelParam],
+    errors: &mut Vec<HirError>,
+    warnings: &mut Vec<HirWarning>,
+) -> Vec<DebugCheck> {
+    let mut out: Vec<DebugCheck> = Vec::new();
+
+    if precondition_calls.len() > 32 {
+        errors.push(HirError::TooManyDebugConditions {
+            kind: DebugCheckKind::Pre,
+            got: precondition_calls.len(),
+            span: precondition_calls.first().map(|c| c.2).unwrap_or_default(),
+        });
+    } else {
+        let mut bit: u32 = 0;
+        for (name, args, span) in precondition_calls {
+            if let Some(check) = lower_one_debug_predicate(
+                DebugCheckKind::Pre, name, args, *span, params, bit, errors, warnings,
+            ) {
+                bit += 1;
+                out.push(check);
+            }
+        }
+    }
+
+    if postcondition_calls.len() > 32 {
+        errors.push(HirError::TooManyDebugConditions {
+            kind: DebugCheckKind::Post,
+            got: postcondition_calls.len(),
+            span: postcondition_calls.first().map(|c| c.2).unwrap_or_default(),
+        });
+    } else {
+        let mut bit: u32 = 0;
+        for (name, args, span) in postcondition_calls {
+            if let Some(check) = lower_one_debug_predicate(
+                DebugCheckKind::Post, name, args, *span, params, bit, errors, warnings,
+            ) {
+                bit += 1;
+                out.push(check);
+            }
+        }
+    }
+
+    out
+}
+
+/// Lower one `@precondition`/`@postcondition` Call body to a `DebugCheck`.
+///
+/// Returns `None` when the predicate was rejected (an `HirError` was pushed) or is
+/// a not-lowerable buffer-operand postcondition (an `HirWarning` was pushed) — in
+/// neither case does the caller advance its bit counter.
+#[allow(clippy::too_many_arguments)]
+fn lower_one_debug_predicate(
+    kind: DebugCheckKind,
+    name: &str,
+    args: &[axc_lexer::Spanned<AnnotationArg>],
+    span: Span,
+    params: &[KernelParam],
+    bit: u32,
+    errors: &mut Vec<HirError>,
+    warnings: &mut Vec<HirWarning>,
+) -> Option<DebugCheck> {
+    let op: DebugCompareOp = match name {
+        "gt" => DebugCompareOp::Gt,
+        "ge" => DebugCompareOp::Ge,
+        "lt" => DebugCompareOp::Lt,
+        "le" => DebugCompareOp::Le,
+        "eq" => DebugCompareOp::Eq,
+        "ne" => DebugCompareOp::Ne,
+        "is_finite" if kind == DebugCheckKind::Post => {
+            // is_finite is buffer-only in v1 (§3 DSL table) — always deferred, never
+            // hard-rejected, as long as its one argument is a well-formed elem(buf).
+            if args.len() == 1 {
+                if let RawDebugOperand::BufElem(buf) = classify_debug_operand(&args[0].node) {
+                    warnings.push(HirWarning::PostconditionNotLowerable {
+                        buf,
+                        reason: "is_finite(elem(buf)) buffer postconditions are deferred in M3.17 v1 (defer-list §9.1)".to_owned(),
+                        span,
+                    });
+                    return None;
+                }
+            }
+            errors.push(HirError::UnsupportedDebugPredicate { name: name.to_owned(), span });
+            return None;
+        }
+        _ => {
+            errors.push(HirError::UnsupportedDebugPredicate { name: name.to_owned(), span });
+            return None;
+        }
+    };
+
+    if args.len() != 2 {
+        errors.push(HirError::UnsupportedDebugPredicate { name: name.to_owned(), span });
+        return None;
+    }
+
+    let lhs_raw = classify_debug_operand(&args[0].node);
+    let rhs_raw = classify_debug_operand(&args[1].node);
+
+    // A buffer-element operand: hard error in a precondition (thread-uniform-only),
+    // deferred warning in a postcondition (v1 never lowers buffer postconditions).
+    for raw in [&lhs_raw, &rhs_raw] {
+        if let RawDebugOperand::BufElem(buf) = raw {
+            return match kind {
+                DebugCheckKind::Pre => {
+                    errors.push(HirError::PreconditionOperandNotScalar { span });
+                    None
+                }
+                DebugCheckKind::Post => {
+                    warnings.push(HirWarning::PostconditionNotLowerable {
+                        buf: buf.clone(),
+                        reason: "elem(buf) buffer postconditions are deferred in M3.17 v1 (defer-list §9.1)".to_owned(),
+                        span,
+                    });
+                    None
+                }
+            };
+        }
+    }
+
+    if matches!(lhs_raw, RawDebugOperand::Invalid) || matches!(rhs_raw, RawDebugOperand::Invalid) {
+        errors.push(HirError::UnsupportedDebugPredicate { name: name.to_owned(), span });
+        return None;
+    }
+
+    // Resolve the shared comparison type: at least one operand must be a ScalarRef
+    // naming a u32/i32/f32 param. Two ScalarRefs must agree; two Lits are ambiguous
+    // (v1 infers no default numeric type) and rejected.
+    let resolved_ty: Option<ScalarTy> = match (&lhs_raw, &rhs_raw) {
+        (RawDebugOperand::ScalarRef(n), RawDebugOperand::ScalarRef(m)) => {
+            match (resolve_scalar_param_ty(params, n), resolve_scalar_param_ty(params, m)) {
+                (Some(a), Some(b)) if a == b => Some(a),
+                _ => None,
+            }
+        }
+        (RawDebugOperand::ScalarRef(n), RawDebugOperand::Lit(_))
+        | (RawDebugOperand::Lit(_), RawDebugOperand::ScalarRef(n)) => resolve_scalar_param_ty(params, n),
+        _ => None,
+    };
+
+    let ty = match resolved_ty {
+        Some(t) => t,
+        None => {
+            errors.push(HirError::UnsupportedDebugPredicate { name: name.to_owned(), span });
+            return None;
+        }
+    };
+
+    let (Some(lhs), Some(rhs)) = (to_debug_operand(&lhs_raw, params), to_debug_operand(&rhs_raw, params)) else {
+        errors.push(HirError::UnsupportedDebugPredicate { name: name.to_owned(), span });
+        return None;
+    };
+
+    if bit >= 32 {
+        errors.push(HirError::TooManyDebugConditions { kind, got: bit as usize + 1, span });
+        return None;
+    }
+
+    let text = format!("{name}({}, {})", render_debug_operand(&lhs_raw), render_debug_operand(&rhs_raw));
+
+    Some(DebugCheck { kind, op, ty, lhs, rhs, bit, text, span })
 }
 
 /// Convert an AST `TypeRef` to a HIR `ParamTy`.
@@ -1626,5 +1895,141 @@ mod tests {
             warns.iter().any(|w| matches!(w, HirWarning::EmptyStrategyBlock { .. })),
             "expected EmptyStrategyBlock warning: {warns:?}"
         );
+    }
+
+    // ── M3.17 (FG.4): @precondition/@postcondition debug-check tests ────────────
+
+    /// AT-2861 (parser no-change anchor): `@precondition(gt(n,0))` parses to
+    /// `Call{gt,[Ident(n),Int(0)]}` with EXISTING tokens (no new AnnotationArg
+    /// variant, no new token kind); `@precondition(true)` still parses.
+    #[test]
+    fn at_2861_precondition_call_form_parses_with_existing_grammar() {
+        let src = "@kernel @workgroup(1,1,1) @precondition(gt(n, 0)) fn k(n: u32) -> void { return; }";
+        let (ast, lex_errs, parse_errs) = axc_parser::parse(src);
+        assert!(lex_errs.is_empty(), "lex errors: {lex_errs:?}");
+        assert!(parse_errs.is_empty(), "parse errors: {parse_errs:?}");
+        let axc_parser::ast::Item::Kernel(kd) = &ast.items[0].node;
+        let ann = kd.annotations.iter().find(|a| a.node.name.node == "precondition").expect("precondition annotation");
+        match &ann.node.args[0].node {
+            AnnotationArg::Call { name, args } => {
+                assert_eq!(name, "gt");
+                assert_eq!(args.len(), 2);
+                assert!(matches!(&args[0].node, AnnotationArg::Ident(n) if n == "n"));
+                assert!(matches!(&args[1].node, AnnotationArg::Int(0)));
+            }
+            other => panic!("expected Call{{gt,[Ident(n),Int(0)]}}; got {other:?}"),
+        }
+
+        // @precondition(true) still parses via the existing Bool variant.
+        let src2 = "@kernel @workgroup(1,1,1) @precondition(true) fn k() -> void { return; }";
+        let (_, lex_errs2, parse_errs2) = axc_parser::parse(src2);
+        assert!(lex_errs2.is_empty() && parse_errs2.is_empty(), "@precondition(true) must still parse");
+    }
+
+    /// AT-2862 (HIR lower): the comparison whitelist lowers pre + post to structured
+    /// `DebugCheck` nodes with distinct bits; `@postcondition(...)` is recognized (no
+    /// longer `UnknownAnnotationInM0`).
+    #[test]
+    fn at_2862_precondition_postcondition_lower_with_distinct_bits() {
+        let src = concat!(
+            "@kernel @workgroup(1,1,1) @intent(\"t\") @complexity(O(n)) ",
+            "@precondition(gt(n, 0)) @postcondition(lt(n, 1000)) ",
+            "fn k(n: u32) -> void { return; }",
+        );
+        let (hir, errors, _warns) = lower_src(src);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        let checks = &hir.kernels[0].annotations.debug_checks;
+        assert_eq!(checks.len(), 2, "expected 1 pre + 1 post: {checks:?}");
+        let pre = checks.iter().find(|c| c.kind == DebugCheckKind::Pre).expect("pre check");
+        let post = checks.iter().find(|c| c.kind == DebugCheckKind::Post).expect("post check");
+        assert_eq!(pre.bit, 0);
+        assert_eq!(post.bit, 0, "pre and post bits are counted independently per flag word");
+        assert_eq!(pre.op, DebugCompareOp::Gt);
+        assert_eq!(post.op, DebugCompareOp::Lt);
+    }
+
+    /// AT-2863 (HIR reject): buffer operand in a precondition →
+    /// `PreconditionOperandNotScalar`; a non-whitelisted call → `UnsupportedDebugPredicate`;
+    /// 33 conditions of one kind → `TooManyDebugConditions`.
+    #[test]
+    fn at_2863_debug_predicate_rejections() {
+        // Buffer operand in a precondition.
+        let src1 = "@kernel @workgroup(1,1,1) @precondition(gt(elem(buf), 0)) fn k(buf: buffer[u32]) -> void { return; }";
+        let (_, errors1, _) = lower_src(src1);
+        assert!(
+            errors1.iter().any(|e| matches!(e, HirError::PreconditionOperandNotScalar { .. })),
+            "expected PreconditionOperandNotScalar: {errors1:?}"
+        );
+
+        // Non-whitelisted call.
+        let src2 = "@kernel @workgroup(1,1,1) @precondition(foo(n)) fn k(n: u32) -> void { return; }";
+        let (_, errors2, _) = lower_src(src2);
+        assert!(
+            errors2.iter().any(|e| matches!(e, HirError::UnsupportedDebugPredicate { name, .. } if name == "foo")),
+            "expected UnsupportedDebugPredicate{{name:\"foo\"}}: {errors2:?}"
+        );
+
+        // 33 preconditions of one kind.
+        let anns: String = (0..33).map(|_| "@precondition(gt(n, 0)) ".to_string()).collect();
+        let src3 = format!("@kernel @workgroup(1,1,1) {anns}fn k(n: u32) -> void {{ return; }}");
+        let (_, errors3, _) = lower_src(&src3);
+        assert!(
+            errors3.iter().any(|e| matches!(e, HirError::TooManyDebugConditions { kind: DebugCheckKind::Pre, got: 33, .. })),
+            "expected TooManyDebugConditions{{kind:Pre,got:33}}: {errors3:?}"
+        );
+    }
+
+    /// AT-2864 (HIR warn): `@postcondition(ge(elem(out),0))` → `PostconditionNotLowerable`,
+    /// compile succeeds, no check emitted (v1 never lowers buffer postconditions —
+    /// defer-list §9.1, which also removes AT-2877's dominance-analysis surface).
+    #[test]
+    fn at_2864_buffer_postcondition_not_lowerable() {
+        let src = "@kernel @workgroup(1,1,1) @postcondition(ge(elem(out), 0)) fn k(out: buffer[u32]) -> void { out[gid(0)] = 1u32; return; }";
+        let (hir, errors, warns) = lower_src(src);
+        assert!(errors.is_empty(), "compilation must succeed: {errors:?}");
+        assert!(
+            warns.iter().any(|w| matches!(w, HirWarning::PostconditionNotLowerable { buf, .. } if buf == "out")),
+            "expected PostconditionNotLowerable{{buf:\"out\"}}: {warns:?}"
+        );
+        assert!(hir.kernels[0].annotations.debug_checks.is_empty(), "no check must be emitted for the deferred postcondition");
+    }
+
+    /// AT-2865 (back-compat): `@precondition(true)` is accepted and emits no
+    /// runtime check (empty `debug_checks`, non-empty legacy `preconditions`).
+    #[test]
+    fn at_2865_precondition_true_back_compat_emits_no_check() {
+        let src = "@kernel @workgroup(1,1,1) @precondition(true) fn k() -> void { return; }";
+        let (hir, errors, _warns) = lower_src(src);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        assert!(hir.kernels[0].annotations.debug_checks.is_empty(), "true precondition must emit no DebugCheck");
+        assert_eq!(hir.kernels[0].annotations.preconditions.len(), 1, "legacy PreconditionTrivial marker must still be recorded");
+    }
+
+    /// AT-2877 shed (defer-list §9.1): buffer postconditions are ALWAYS deferred in
+    /// v1 (never lowered), regardless of whether the write is guarded or
+    /// unconditional — this is a stricter, simpler, and still-sound superset of the
+    /// r2 spec's conditional-dominance gate (shedding it removes the CRITICAL-2
+    /// surface entirely, as the spec's own defer-list explicitly sanctions).
+    #[test]
+    fn at_2877_shed_guarded_and_unconditional_buffer_postconditions_both_deferred() {
+        let guarded = concat!(
+            "@kernel @workgroup(1,1,1) @postcondition(is_finite(elem(buf))) ",
+            "fn k(n: u32, buf: buffer[f32]) -> void { ",
+            "let i: u32 = gid(0); if i < n { buf[i] = 1.0f32; } return; }",
+        );
+        let (hir_g, errors_g, warns_g) = lower_src(guarded);
+        assert!(errors_g.is_empty(), "errors: {errors_g:?}");
+        assert!(warns_g.iter().any(|w| matches!(w, HirWarning::PostconditionNotLowerable { .. })));
+        assert!(hir_g.kernels[0].annotations.debug_checks.is_empty());
+
+        let unconditional = concat!(
+            "@kernel @workgroup(1,1,1) @postcondition(is_finite(elem(buf))) ",
+            "fn k(buf: buffer[f32]) -> void { buf[gid(0)] = 1.0f32; return; }",
+        );
+        let (hir_u, errors_u, warns_u) = lower_src(unconditional);
+        assert!(errors_u.is_empty(), "errors: {errors_u:?}");
+        assert!(warns_u.iter().any(|w| matches!(w, HirWarning::PostconditionNotLowerable { .. })));
+        assert!(hir_u.kernels[0].annotations.debug_checks.is_empty(),
+            "v1 shed scope: even an UNCONDITIONAL buffer-element postcondition is never lowered (defer-list §9.1)");
     }
 }

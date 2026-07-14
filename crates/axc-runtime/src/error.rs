@@ -302,6 +302,21 @@ pub enum DispatchError {
         kernel: String,
     },
 
+    /// M3.17 (FG.4): a `--debug`-compiled kernel's injected flag buffer had at least
+    /// one bit set after dispatch — naming every violated `@precondition`/
+    /// `@postcondition` by its human-readable predicate text (`DebugConditionMeta.text`).
+    ///
+    /// Returned by `crate::metadata::decode_debug_flags`. `flag == {0,0}` never
+    /// produces this variant (`Ok(())` instead) — fail-CLOSED: any real violation is
+    /// always observed via the NonCoherent-invalidate readback path.
+    #[error("debug check violation: preconditions failed: {preconditions:?}; postconditions failed: {postconditions:?}")]
+    DebugCheckViolation {
+        /// Human-readable text of every violated `@precondition`.
+        preconditions: Vec<String>,
+        /// Human-readable text of every violated `@postcondition`.
+        postconditions: Vec<String>,
+    },
+
     // ── M4.1 CUDA↔Vulkan external-memory interop errors ───────────────────────
     /// No enumerated Vulkan physical device's `VkPhysicalDeviceIDProperties.deviceUUID`
     /// byte-matched the CUDA target UUID — M4.1 (FAIL-CLOSED, R-3).
@@ -349,14 +364,14 @@ pub type DispatchResult<T> = Result<T, DispatchError>;
 mod tests {
     use super::*;
 
-    /// AT-801: DispatchError has exactly 30 variants, all Display and Diagnostic.
+    /// AT-801: DispatchError has exactly 37 variants, all Display and Diagnostic.
     ///
-    /// Supersedes AT-502 (23 variants), M2.3a at_801 (25 variants), M3.0 at_801 (28 variants).
-    /// M3.1 adds 2: `CoopMatUnsupported`, `DeviceFeatureUnsupported`.
+    /// Supersedes AT-502 (23 variants), M2.3a at_801 (25 variants), M3.0 at_801 (28 variants),
+    /// M4.1 at_801 (36 variants). M3.17 adds 1: `DebugCheckViolation`.
     /// The exhaustive match below ensures the compiler reminds us to update this test
     /// whenever a variant is added or removed.
     #[test]
-    fn at_801_dispatch_error_variants_count_is_36() {
+    fn at_801_dispatch_error_variants_count_is_37() {
         // Construct one instance of each variant and verify non-empty Display.
         let variants: Vec<DispatchError> = vec![
             DispatchError::VulkanEntryFailed("test".to_owned()),
@@ -424,10 +439,15 @@ mod tests {
             DispatchError::ExternalSemaphoreUnsupported("no OPAQUE_FD".to_owned()),
             DispatchError::ExternalExportFailed { kind: "memory", reason: "test".to_owned() },
             DispatchError::MemoryNotExportable,
+            // M3.17 addition (variant 37):
+            DispatchError::DebugCheckViolation {
+                preconditions: vec!["gt(n, 0)".to_owned()],
+                postconditions: Vec::new(),
+            },
         ];
 
-        // Verify exactly 36 variants are covered (M4.1 adds 5 external-interop variants).
-        assert_eq!(variants.len(), 36, "expected exactly 36 DispatchError variants");
+        // Verify exactly 37 variants are covered (M3.17 adds 1: DebugCheckViolation).
+        assert_eq!(variants.len(), 37, "expected exactly 37 DispatchError variants");
 
         for variant in &variants {
             let msg = variant.to_string();
@@ -505,11 +525,11 @@ mod tests {
         assert!(e3.to_string().contains("Invalidate"), "MappedRangeOpFailed must include op name");
     }
 
-    /// AT-502 (legacy test preserved as alias): verifies the new 31-count.
+    /// AT-502 (legacy test preserved as alias): verifies the new 37-count.
     #[test]
     fn at_502_dispatch_error_variants_are_display_miette() {
         // This test delegates to the more complete at_801 test above.
         // Preserved for backward-compatibility with any test-name grepping.
-        at_801_dispatch_error_variants_count_is_36();
+        at_801_dispatch_error_variants_count_is_37();
     }
 }

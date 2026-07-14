@@ -10,6 +10,7 @@
 use axc_lexer::Span;
 use std::collections::BTreeMap;
 use crate::param::{KernelParam, ParamBindingPlan};
+use crate::ty::ScalarTy;
 
 /// Vulkan 1.1 guaranteed minimum `maxComputeWorkGroupInvocations`.
 ///
@@ -120,6 +121,49 @@ pub struct KernelAnnotations {
     /// a kernel with unresolved `HoleRef`s that reaches codegen triggers
     /// `CodegenError::UnresolvedStrategyHole` as a backstop.
     pub strategy: Option<StrategyHoles>,
+    /// M3.17 (FG.4): fully-lowered, codegen-ready `@precondition`/`@postcondition`
+    /// runtime debug checks. Empty when no real predicate was declared, or every
+    /// one was rejected/deferred (see `HirError`/`HirWarning::PostconditionNotLowerable`).
+    pub debug_checks: Vec<DebugCheck>,
+}
+
+/// M3.17 (FG.4): which flag word a debug check targets. `Pre` = entry, word 0;
+/// `Post` = before the trailing `return`, word 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DebugCheckKind { Pre, Post }
+
+/// Comparison predicate for a lowered debug check (v1 whitelist, §3 of the spec).
+/// `is_finite` is buffer-only and never reaches this enum (always deferred —
+/// `HirWarning::PostconditionNotLowerable`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DebugCompareOp { Gt, Ge, Lt, Le, Eq, Ne }
+
+/// One operand of a lowered debug-check comparison. `elem(buf)` operands never
+/// reach this type in v1 (always deferred, see `DebugCompareOp` doc).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DebugOperand {
+    /// A scalar push-constant param, pre-resolved to its 0-based position in the
+    /// kernel's full parameter list (matches codegen's `scalar_params` table).
+    ScalarRef { name: String, position: u32 },
+    /// A bare integer literal; `DebugCheck::ty` supplies its type.
+    Lit(i64),
+}
+
+/// A fully-lowered, codegen-ready runtime debug check (M3.17 FG.4).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DebugCheck {
+    pub kind: DebugCheckKind,
+    pub op: DebugCompareOp,
+    /// Resolved scalar type shared by both operands (`U32`, `I32`, or `F32` only).
+    pub ty: ScalarTy,
+    pub lhs: DebugOperand,
+    pub rhs: DebugOperand,
+    /// 0-based bit index within the kind's flag word (< 32, enforced at lowering).
+    pub bit: u32,
+    /// Human-readable predicate rendering (e.g. `"gt(n, 0)"`), for host error
+    /// messages and the metadata sidecar's `DebugConditionMeta.text`.
+    pub text: String,
+    pub span: Span,
 }
 
 /// Complexity form: the outer function (`O`, `Theta`, `Omega`).

@@ -33,6 +33,97 @@ use serde::{Deserialize, Serialize};
 use axc_hir::ParamBindingPlan;
 use crate::error::DispatchError;
 
+// ── M3.17 (FG.4): runtime debug-check metadata ───────────────────────────────
+
+/// Serializable mirror of `axc_hir::DebugCheckKind` — which flag word a condition
+/// targets (`Pre` → word 0, `Post` → word 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DebugCheckKind {
+    Pre,
+    Post,
+}
+
+/// One lowered `@precondition`/`@postcondition` condition, as recorded in the
+/// sidecar for host-side violation decoding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DebugConditionMeta {
+    pub kind: DebugCheckKind,
+    /// 0-based bit index within `kind`'s flag word.
+    pub bit: u32,
+    /// Human-readable predicate rendering (e.g. `"gt(n, 0)"`), used to name the
+    /// violated condition in `DispatchError::DebugCheckViolation`.
+    pub text: String,
+    /// 1-based source line number (best-effort; computed from the annotation's
+    /// byte span against the original source text at compile time).
+    pub line: u32,
+}
+
+/// Runtime debug-check metadata (M3.17 FG.4, schema v4). Present in the sidecar
+/// ONLY under `--debug` (`None` for a release compile — §6/§7 of the spec).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DebugChecksMeta {
+    /// Descriptor binding of the injected flag SSBO (`== num_user_buffers`).
+    pub flag_binding: u32,
+    /// Length of the flag buffer in `u32` words (always 2: `[pre_bits, post_bits]`).
+    pub flag_len_words: u32,
+    /// Every lowered condition, in declaration order.
+    pub conditions: Vec<DebugConditionMeta>,
+}
+
+/// Mirrors `axc_codegen::debug_checks::DEBUG_FLAG_BUFFER_NAME` (duplicated so
+/// `axc-runtime` needs no dependency on `axc-codegen`).
+const DEBUG_FLAG_BUFFER_NAME: &str = "__axc_debug_flags";
+
+/// M3.17 (FG.4), reviewer nit (b): materialize the injected debug-flag descriptor
+/// slot into a `ParamBindingPlan`. ANY consumer dispatching a `--debug` kernel —
+/// in-process OR a sidecar-reconstructed path (e.g. an MCP tool that only reads
+/// JSON) — MUST call this instead of `meta.binding_plan` directly, so the
+/// DSL/pool/bind-loop (keyed on `binding_plan.buffers`) see the flag binding
+/// uniformly. Returns `meta.binding_plan` unchanged when `debug_checks` is `None`.
+pub fn debug_augmented_binding_plan(meta: &KernelMetadata) -> ParamBindingPlan {
+    let mut plan = meta.binding_plan.clone();
+    if let Some(dbg) = &meta.debug_checks {
+        plan.buffers.push(axc_hir::BufferBindingSlot {
+            name: DEBUG_FLAG_BUFFER_NAME.to_owned(),
+            ty: axc_hir::BufferTy { elem: axc_hir::ScalarTy::U32, access: axc_hir::BufferAccess::ReadWrite },
+            position: dbg.flag_binding,
+            buffer_position: dbg.flag_binding,
+            span: Default::default(),
+        });
+    }
+    plan
+}
+
+/// Decode the injected debug-flag words against `conditions`.
+///
+/// `flag_words == [0, 0]` ⇒ `Ok(())` (no violation). Otherwise every set bit is
+/// matched against `conditions` and returns a typed
+/// `DispatchError::DebugCheckViolation` naming every failing condition's `text`
+/// (split by `kind` — preconditions vs postconditions).
+pub fn decode_debug_flags(
+    flag_words: [u32; 2],
+    conditions: &[DebugConditionMeta],
+) -> Result<(), DispatchError> {
+    if flag_words == [0, 0] {
+        return Ok(());
+    }
+    let mut preconditions: Vec<String> = Vec::new();
+    let mut postconditions: Vec<String> = Vec::new();
+    for c in conditions {
+        let word = match c.kind {
+            DebugCheckKind::Pre => flag_words[0],
+            DebugCheckKind::Post => flag_words[1],
+        };
+        if word & (1u32 << c.bit) != 0 {
+            match c.kind {
+                DebugCheckKind::Pre => preconditions.push(c.text.clone()),
+                DebugCheckKind::Post => postconditions.push(c.text.clone()),
+            }
+        }
+    }
+    Err(DispatchError::DebugCheckViolation { preconditions, postconditions })
+}
+
 // ── CoopMat metadata types ────────────────────────────────────────────────────
 
 /// Serializable scalar element type for a cooperative-matrix operand.
@@ -96,20 +187,22 @@ pub struct CoopMatShapeMeta {
 ///
 /// M3.1 bumped this from 1 to 2 to add `coopmat: Option<CoopMatShapeMeta>`.
 /// M3.2 bumps this from 2 to 3 to add `shared_memory_bytes: u32`.
+/// M3.17 bumps this from 3 to 4 to add `debug_checks: Option<DebugChecksMeta>`.
 ///
-/// `load_kernel_metadata` accepts versions 1, 2, and 3 via the `SUPPORTED_SCHEMA_VERSIONS`
-/// allowed-set guard (CRITICAL-1 fix). Version 4+ is rejected.
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+/// `load_kernel_metadata` accepts versions 1, 2, 3, and 4 via the
+/// `SUPPORTED_SCHEMA_VERSIONS` allowed-set guard (CRITICAL-1 fix). Version 5+ is rejected.
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 
 /// All schema versions accepted by this runtime (CRITICAL-1 back-compat guard).
 ///
 /// - v1: pre-M3.1 (no coopmat, no shared_memory_bytes). Deserializes with both
 ///   `coopmat=None` and `shared_memory_bytes=0` via `#[serde(default)]`.
 /// - v2: M3.1 coopmat. Deserializes with `shared_memory_bytes=0` via default.
-/// - v3: M3.2 shared memory. New; all fields present.
+/// - v3: M3.2 shared memory. Deserializes with `debug_checks=None` via default.
+/// - v4: M3.17 debug checks. New; all fields present when `--debug` was used.
 ///
-/// v4+ (or 0) are rejected with `MetadataSchemaMismatch`.
-pub const SUPPORTED_SCHEMA_VERSIONS: [u32; 3] = [1, 2, 3];
+/// v5+ (or 0) are rejected with `MetadataSchemaMismatch`.
+pub const SUPPORTED_SCHEMA_VERSIONS: [u32; 4] = [1, 2, 3, 4];
 
 /// Metadata sidecar for a compiled AXIOM-Compute kernel.
 ///
@@ -175,6 +268,14 @@ pub struct KernelMetadata {
     /// `maxComputeSharedMemorySize` limit (CRITICAL-4 wiring).
     #[serde(default)]
     pub shared_memory_bytes: u32,
+
+    /// Runtime debug-check metadata — M3.17 (schema v4).
+    ///
+    /// `Some` only when compiled with `--debug`. `skip_serializing_if` is REQUIRED so
+    /// a release sidecar emits NO `debug_checks` key at all (not `"debug_checks":null`),
+    /// keeping "release metadata unchanged from today" literally true (§7/§6 of the spec).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debug_checks: Option<DebugChecksMeta>,
 }
 
 impl KernelMetadata {
@@ -199,6 +300,7 @@ impl KernelMetadata {
             entry_point,
             coopmat: None,
             shared_memory_bytes: 0,
+            debug_checks: None,
         }
     }
 
@@ -225,6 +327,15 @@ impl KernelMetadata {
     /// ```
     pub fn with_shared_memory_bytes(mut self, bytes: u32) -> Self {
         self.shared_memory_bytes = bytes;
+        self
+    }
+
+    /// Builder: set the optional runtime debug-check metadata (M3.17).
+    ///
+    /// Pass `None` for a release compile (the default) — `debug_checks` is then
+    /// omitted from the serialized JSON entirely (`skip_serializing_if`).
+    pub fn with_debug_checks(mut self, debug_checks: Option<DebugChecksMeta>) -> Self {
+        self.debug_checks = debug_checks;
         self
     }
 
@@ -313,13 +424,14 @@ mod tests {
         }
     }
 
-    /// AT-503: CURRENT_SCHEMA_VERSION equals 3 (M3.2 bump), and KernelMetadata::new sets it.
+    /// AT-503: CURRENT_SCHEMA_VERSION equals 4 (M3.17 bump), and KernelMetadata::new sets it.
     ///
-    /// Updated from "version 2" in M3.1 to "version 3" in M3.2.
-    /// Non-coopmat kernels have coopmat==None; non-shared kernels have shared_memory_bytes==0.
+    /// Updated from "version 3" in M3.2 to "version 4" in M3.17.
+    /// Non-coopmat kernels have coopmat==None; non-shared kernels have shared_memory_bytes==0;
+    /// non-debug kernels have debug_checks==None.
     #[test]
-    fn at_503_metadata_current_schema_is_3_and_new_sets_it() {
-        assert_eq!(CURRENT_SCHEMA_VERSION, 3, "CURRENT_SCHEMA_VERSION must be 3 for M3.2");
+    fn at_503_metadata_current_schema_is_4_and_new_sets_it() {
+        assert_eq!(CURRENT_SCHEMA_VERSION, 4, "CURRENT_SCHEMA_VERSION must be 4 for M3.17");
 
         // AT-503a: entry_point is set to the kernel name (matches OpEntryPoint
         // emitted by axc-codegen), not a hard-coded `"main"`. See the fix for
@@ -331,7 +443,7 @@ mod tests {
             "saxpy".to_owned(),
         );
 
-        assert_eq!(meta.schema_version, 3);
+        assert_eq!(meta.schema_version, 4);
         assert_eq!(meta.kernel_name, "saxpy");
         assert_eq!(meta.workgroup_size, [64, 1, 1]);
         assert_eq!(meta.entry_point, "saxpy");
@@ -340,17 +452,101 @@ mod tests {
         assert!(meta.coopmat.is_none(), "non-coopmat kernel must have coopmat=None");
         // Non-shared kernel has 0 shared_memory_bytes.
         assert_eq!(meta.shared_memory_bytes, 0, "non-shared kernel must have shared_memory_bytes=0");
+        // Non-debug kernel has None.
+        assert!(meta.debug_checks.is_none(), "non-debug kernel must have debug_checks=None");
     }
 
-    /// AT-1553 (restructured for M3.2): Metadata schema back-compat.
+    /// AT-2868: release metadata (debug_checks=None) serializes with NO `debug_checks`
+    /// key at all — not `"debug_checks":null` — asserting the `skip_serializing_if`.
+    #[test]
+    fn at_2868_release_metadata_omits_debug_checks_key() {
+        let meta: KernelMetadata = KernelMetadata::new(
+            "saxpy".to_owned(), [64, 1, 1], saxpy_plan(), "saxpy".to_owned(),
+        );
+        let json: String = serde_json::to_string(&meta).expect("serialize");
+        assert!(!json.contains("debug_checks"), "release JSON must omit debug_checks entirely: {json}");
+    }
+
+    /// AT-2868: a `--debug` sidecar carries `debug_checks{flag_binding, conditions[]}`,
+    /// `CURRENT_SCHEMA_VERSION == 4`, and round-trips through JSON.
+    #[test]
+    fn at_2868_debug_metadata_round_trips() {
+        let dbg = DebugChecksMeta {
+            flag_binding: 2,
+            flag_len_words: 2,
+            conditions: vec![DebugConditionMeta {
+                kind: DebugCheckKind::Pre,
+                bit: 0,
+                text: "gt(n, 0)".to_owned(),
+                line: 1,
+            }],
+        };
+        let meta: KernelMetadata = KernelMetadata::new(
+            "saxpy".to_owned(), [64, 1, 1], saxpy_plan(), "saxpy".to_owned(),
+        ).with_debug_checks(Some(dbg.clone()));
+        let json: String = serde_json::to_string(&meta).expect("serialize");
+        assert!(json.contains("debug_checks"), "debug JSON must carry debug_checks: {json}");
+        let roundtripped: KernelMetadata = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(roundtripped.debug_checks, Some(dbg));
+        assert_eq!(roundtripped.schema_version, 4);
+    }
+
+    /// M3.17: `debug_augmented_binding_plan` appends the flag slot at
+    /// `buffer_position == flag_binding` only when `debug_checks` is `Some`; returns
+    /// the plan unchanged (buffer count-wise) otherwise.
+    #[test]
+    fn debug_augmented_binding_plan_appends_flag_slot_only_when_present() {
+        let plan_without_debug = saxpy_plan();
+        let meta_release: KernelMetadata = KernelMetadata::new(
+            "saxpy".to_owned(), [64, 1, 1], plan_without_debug.clone(), "saxpy".to_owned(),
+        );
+        let augmented_release = debug_augmented_binding_plan(&meta_release);
+        assert_eq!(augmented_release.buffers.len(), plan_without_debug.buffers.len(),
+            "release metadata: augmented plan must be unchanged");
+
+        let dbg = DebugChecksMeta {
+            flag_binding: plan_without_debug.buffers.len() as u32,
+            flag_len_words: 2,
+            conditions: Vec::new(),
+        };
+        let meta_debug: KernelMetadata = KernelMetadata::new(
+            "saxpy".to_owned(), [64, 1, 1], plan_without_debug.clone(), "saxpy".to_owned(),
+        ).with_debug_checks(Some(dbg.clone()));
+        let augmented_debug = debug_augmented_binding_plan(&meta_debug);
+        assert_eq!(augmented_debug.buffers.len(), plan_without_debug.buffers.len() + 1,
+            "debug metadata: augmented plan must append exactly one flag slot");
+        assert_eq!(augmented_debug.buffers.last().unwrap().buffer_position, dbg.flag_binding);
+    }
+
+    /// M3.17: `decode_debug_flags` returns `Ok(())` for `[0,0]`, and a typed
+    /// violation naming the exact failing condition text for a nonzero word.
+    #[test]
+    fn decode_debug_flags_ok_and_violation() {
+        let conditions = vec![
+            DebugConditionMeta { kind: DebugCheckKind::Pre, bit: 0, text: "gt(n, 0)".to_owned(), line: 1 },
+            DebugConditionMeta { kind: DebugCheckKind::Post, bit: 0, text: "is_finite(elem(y))".to_owned(), line: 2 },
+        ];
+        assert!(decode_debug_flags([0, 0], &conditions).is_ok());
+
+        let err = decode_debug_flags([1, 0], &conditions).unwrap_err();
+        match err {
+            DispatchError::DebugCheckViolation { preconditions, postconditions } => {
+                assert_eq!(preconditions, vec!["gt(n, 0)".to_owned()]);
+                assert!(postconditions.is_empty());
+            }
+            other => panic!("expected DebugCheckViolation, got {other:?}"),
+        }
+    }
+
+    /// AT-1553 (restructured for M3.17): Metadata schema back-compat.
     ///
     /// Tests that:
-    /// (a) v1 sidecar (no coopmat/shared fields) deserializes with coopmat=None, shared=0.
+    /// (a) v1 sidecar (no coopmat/shared/debug_checks fields) deserializes with
+    ///     coopmat=None, shared=0, debug_checks=None.
     /// (b) v2 sidecar (hand-written literal with schema_version=2, coopmat field) loads correctly.
-    ///     NOTE: KernelMetadata::new now stamps version 3 — we use a hand-written v2 JSON literal
-    ///     to avoid testing serialization from a v2 instance (which would now produce v3).
-    /// (c) v3 sidecar with shared_memory_bytes ACCEPTED (INVERTED from old reject-v3 assertion).
-    /// (d) v4 sidecar REJECTED with MetadataSchemaMismatch { supported: 3 }.
+    /// (c) v3 sidecar with shared_memory_bytes ACCEPTED, debug_checks defaults to None.
+    /// (d) v4 sidecar (with debug_checks) ACCEPTED (M3.17: v4 is now CURRENT).
+    /// (e) v5 sidecar REJECTED with MetadataSchemaMismatch { supported: 4 }.
     #[test]
     fn at_1553_metadata_schema_v1_v2_back_compat() {
         // (a) V1 sidecar: no coopmat field — must deserialize with coopmat=None, shared=0.
@@ -406,10 +602,33 @@ mod tests {
         assert_eq!(v3_meta.schema_version, 3);
         assert_eq!(v3_meta.shared_memory_bytes, 1024, "v3 sidecar shared_memory_bytes must be 1024");
         assert!(v3_meta.coopmat.is_none(), "v3 sidecar without coopmat field must have coopmat=None");
+        assert!(v3_meta.debug_checks.is_none(), "v3 sidecar without debug_checks field must default to None");
 
-        // (d) V4 sidecar — REJECTED (supported: 3 is the new CURRENT).
+        // (d) V4 sidecar (with debug_checks) — ACCEPTED (M3.17: v4 is now CURRENT).
         let v4_json = r#"{
             "schema_version": 4,
+            "kernel_name": "precondition_saxpy",
+            "workgroup_size": [64, 1, 1],
+            "binding_plan": {"buffers": [], "scalars": [], "push_constant_total_bytes": 0},
+            "push_constant_total_bytes": 0,
+            "entry_point": "precondition_saxpy",
+            "debug_checks": {
+                "flag_binding": 2,
+                "flag_len_words": 2,
+                "conditions": [
+                    {"kind": "Pre", "bit": 0, "text": "gt(n, 0)", "line": 3}
+                ]
+            }
+        }"#;
+        let v4_meta: KernelMetadata = serde_json::from_str(v4_json)
+            .expect("v4 sidecar must deserialize");
+        assert_eq!(v4_meta.schema_version, 4);
+        assert!(v4_meta.debug_checks.is_some(), "v4 sidecar must carry debug_checks");
+        assert_eq!(v4_meta.debug_checks.as_ref().unwrap().flag_binding, 2);
+
+        // (e) V5 sidecar — REJECTED (supported: 4 is the new CURRENT).
+        let v5_json = r#"{
+            "schema_version": 5,
             "kernel_name": "test",
             "workgroup_size": [1, 1, 1],
             "binding_plan": {"buffers": [], "scalars": [], "push_constant_total_bytes": 0},
@@ -417,11 +636,11 @@ mod tests {
             "entry_point": "test"
         }"#;
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(tmp.path(), v4_json).unwrap();
+        std::fs::write(tmp.path(), v5_json).unwrap();
         let result = load_kernel_metadata(tmp.path());
         assert!(
-            matches!(result, Err(DispatchError::MetadataSchemaMismatch { got: 4, supported: 3 })),
-            "version 4 must be rejected with supported: 3; got: {result:?}"
+            matches!(result, Err(DispatchError::MetadataSchemaMismatch { got: 5, supported: 4 })),
+            "version 5 must be rejected with supported: 4; got: {result:?}"
         );
     }
 
