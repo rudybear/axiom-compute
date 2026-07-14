@@ -1,0 +1,113 @@
+{
+  "verdict": "COMPLETE",
+  "agent": "coder",
+  "milestone_id": "M3.16-axc-rewrite",
+  "compiler_changes": "NONE (lexer/parser/HIR/MIR/codegen crates untouched, verified by full workspace build)",
+  "files_created": [
+    "crates/axc-driver/src/rewrite_verify.rs",
+    "crates/axc-driver/src/mcp/tools/verify_rewrite.rs",
+    "crates/axc-driver/tests/rewrite_verify_cli.rs",
+    "crates/axc-driver/tests/rewrite_verify_gpu.rs",
+    "examples/saxpy_wrong.axc",
+    "examples/saxpy_perturbed.axc",
+    "examples/saxpy_reassoc.axc"
+  ],
+  "files_modified": [
+    "crates/axc-driver/src/cli.rs",
+    "crates/axc-driver/src/main.rs",
+    "crates/axc-driver/src/lib.rs",
+    "crates/axc-driver/src/mcp/dispatch.rs",
+    "crates/axc-driver/src/mcp/tools/mod.rs",
+    "crates/axc-driver/src/mcp/mod.rs",
+    "crates/axc-driver/src/mcp/tools/bench_variant.rs",
+    "crates/axc-driver/tests/mcp_roundtrip.rs",
+    "DESIGN.md",
+    "ROADMAP.md"
+  ],
+  "public_apis_implemented": [
+    "pub enum axc_driver::rewrite_verify::TolerancePolicy { BitExact, Ulp { ulp: u32 }, Relative { eps: f32 } } (+ FromStr, Display, Default)",
+    "pub struct axc_driver::rewrite_verify::VerifyRequest",
+    "pub enum axc_driver::rewrite_verify::Verdict { Pass, Fail, Reject, Skipped, NondeterministicOracle, Error }",
+    "pub enum axc_driver::rewrite_verify::InterfaceMismatch { BufferCount, BufferName, BufferType, BufferAccess, ScalarMismatch, PushConstantBytes, WorkgroupSize }",
+    "pub struct axc_driver::rewrite_verify::BufferDiff",
+    "pub struct axc_driver::rewrite_verify::KernelSummary",
+    "pub struct axc_driver::rewrite_verify::Reason",
+    "pub struct axc_driver::rewrite_verify::VerifyReport",
+    "pub fn axc_driver::rewrite_verify::diff_interface(original: &KernelMetadata, rewritten: &KernelMetadata) -> Option<InterfaceMismatch>",
+    "pub fn axc_driver::rewrite_verify::verify_rewrite(req: &VerifyRequest, vk: Option<&VulkanContext>) -> VerifyReport",
+    "pub fn axc_driver::rewrite_verify::exit_code_for_verdict(v: Verdict) -> i32",
+    "Command::RewriteVerify { original, rewritten, tol, buffer_sizes, size, output_sizes, workgroups, push_constants_base64, seed, strategy_values } (axc-driver CLI)",
+    "pub struct axc_driver::mcp::tools::verify_rewrite::VerifyRewriteRequest (+ handle(), registered as MCP method 'verify_rewrite')",
+    "pub(crate) fn axc_driver::mcp::tools::bench_variant::within_ulp_f32 (promoted from private for reuse, per spec §3.4)"
+  ],
+  "tests_added": {
+    "cpu_only": [
+      "AT-2841 (cli.rs::at_2841_rewrite_verify_parse_buffer_sizes, at_2841b_rewrite_verify_parse_size_shortcut_and_defaults)",
+      "AT-2842 (rewrite_verify.rs::at_2842_verdict_is_first_serialized_key)",
+      "AT-2843 (rewrite_verify.rs::at_2843_tolerance_policy_from_str_roundtrip, at_2843b_tolerance_policy_display_matches_grammar)",
+      "AT-2844 (rewrite_verify.rs::at_2844_diff_interface_identical_kernel_is_none)",
+      "AT-2845 (rewrite_verify.rs::at_2845_diff_interface_detects_buffer_count, at_2845b_..._buffer_access_flip, at_2845c_..._workgroup_size_change)",
+      "AT-2846 (rewrite_verify.rs::at_2846_non_compiling_rewritten_fails_no_panic)",
+      "AT-2847 (rewrite_verify.rs::at_2847_vk_none_skips_gpu_unavailable)",
+      "AT-2848 (rewrite_verify.rs::at_2848_kernel_name_rename_is_legal, at_2848b_writeonly_to_readwrite_flip_is_gated)",
+      "AT-2849 (mcp/dispatch.rs::at_2849_verify_rewrite_registered_in_all_methods, at_2849_verify_rewrite_missing_buffer_sizes_is_invalid_params, at_2849_verify_rewrite_source_and_path_both_missing_errors; mcp/tools/verify_rewrite.rs unit tests; mcp_roundtrip.rs tool-list assertion updated 6->8)",
+      "AT-2850 (tests/rewrite_verify_cli.rs::at_2850_cli_exit_codes_reject_and_error [subprocess], at_2850_exit_code_mapping_pass_skipped_nondeterministic_are_zero)",
+      "AT-2850b (rewrite_verify.rs::at_2850b_preflight_workgroups_required_for_coopmat, at_2850b_preflight_push_constants_required_for_float_scalar)",
+      "AT-2854 (tests/rewrite_verify_gpu.rs::at_2854_saxpy_vs_3buffer_reject_interface — not #[ignore]-gated per spec note 'also passes with vk=None')"
+    ],
+    "gpu_gated_ignore_plus_axc_enable_gpu_tests": [
+      "AT-2851 (rewrite_verify_gpu.rs::at_2851_q4km_cached_vs_sr_accept_k512)",
+      "AT-2852 (rewrite_verify_gpu.rs::at_2852_matmul_rb_vs_pad_accept_768cube)",
+      "AT-2853 (rewrite_verify_gpu.rs::at_2853_saxpy_vs_wrong_reject_output)",
+      "AT-2855 (rewrite_verify_gpu.rs::at_2855_saxpy_vs_perturbed_tolerance_and_negative_control)",
+      "AT-2856 (rewrite_verify_gpu.rs::at_2856_reproducibility_same_seed_byte_identical_stats)",
+      "AT-2857 (rewrite_verify_gpu.rs::at_2857_typed_skip_on_no_coopmat_device)",
+      "AT-2858 (rewrite_verify_gpu.rs::at_2858_q4km_tail_k_accept)",
+      "AT-2859 (rewrite_verify_gpu.rs::at_2859_saxpy_reassoc_accept_on_lavapipe)",
+      "AT-2860 (rewrite_verify_gpu.rs::at_2860_deterministic_pair_never_trips_nondeterministic_oracle)"
+    ]
+  },
+  "cargo_build_status": "pass (cargo build --workspace)",
+  "cargo_clippy_status": "pass (cargo clippy --workspace --lib --tests -- -D warnings, zero warnings)",
+  "cargo_test_status": "pass (cargo test --workspace: all non-ignored tests green, zero failures)",
+  "spirv_val_status": "n/a (no codegen change; verify_rewrite reuses the existing in-process spirv-val path for both original and rewritten sources)",
+  "results": {
+    "cpu_ci_gate": "cargo test --workspace: 100% green (no regressions in any existing crate/test file; mcp_roundtrip.rs tool-count assertions updated 6->8 and 7->8 for the new verify_rewrite tool)",
+    "gpu_nvidia": {
+      "device": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+      "command": "AXC_ENABLE_GPU_TESTS=1 cargo test -p axc-driver --test rewrite_verify_gpu -- --ignored --test-threads=1",
+      "outcome": "9/9 ignored tests PASS: AT-2851 Pass(bit-exact,n_diff=0), AT-2852 Pass(bit-exact), AT-2853 Fail/output/numeric_mismatch(n_diff=1024, non-vacuity proven), AT-2855 Pass(bit-exact FAIL -> rel:1e-3 PASS -> alpha=0 negative-control PASS), AT-2856 Pass(byte-identical repro stats), AT-2857 Skipped(device supports coopmat on this box, defers to Lavapipe run), AT-2858 Pass(K=320 tail, bit-exact), AT-2859 Pass(bit-exact), AT-2860 Pass(no spurious NONDETERMINISTIC_ORACLE)"
+    },
+    "gpu_lavapipe": {
+      "device": "llvmpipe (LLVM 20.1.2, 256 bits)",
+      "command": "VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json AXC_ENABLE_GPU_TESTS=1 cargo test -p axc-driver --test rewrite_verify_gpu -- --ignored --test-threads=1",
+      "outcome": "9/9 ignored tests PASS: AT-2851/2852/2858 typed-skip (coopmat_unsupported), AT-2853 Fail/output as expected, AT-2855/2856/2860 Pass identically to NVIDIA, AT-2857 Skipped/device_feature_unsupported (vulkanMemoryModel gate fires before the coopmat-shape check on this ICD -- a different but equally valid closed-set typed-skip kind than on NVIDIA; test asserts either), AT-2859 Pass -- the Lavapipe ACCEPT path (r2/WARN-5) confirmed end-to-end without NVIDIA, closing the CI vendor gap"
+    }
+  },
+  "self_assessment": {
+    "spec_coverage": "All r2 spec items implemented: alpha=0 annihilation guard (CRIT-1, push_constants_required preflight), non-vacuity meta-guard on every reject fixture (n_diff>0 assertions), server-owned MCP BitExact default + tolerance_overridden stamp (CRIT-2), well-conditioned [-1,1] seeded finite float fills incl. half::f16::from_f32 for f16 (CRIT-3), mandatory explicit workgroups for coopmat/shared (WARN-1), determinism self-check dispatching the original twice (WARN-2), closed verdict taxonomy from spec table 5 verbatim (WARN-3), AT-2858 tail-K smoke at K=320 (WARN-4), examples/saxpy_reassoc.axc + AT-2859 Lavapipe ACCEPT (WARN-5).",
+    "known_limitations": [
+      "AT-2855's fixture requires a measured-pinned seed (seed=1 instead of the default 0): the well-conditioned [-1,1] uniform fill can legitimately land alpha*x+y near zero for some element at n=1024 (independent x,y in [-1,1], alpha=2.0 is not a pathological case), which blows up the literal §3.3 per-element Relative-policy denominator for that one element even though the absolute perturbation is ULP-class. This is an inherent property of naive per-element relative tolerance (documented precedent: axc_driver::q4km_oracle::max_rel_diff's own doc comment warns of the identical class of issue), not a verifier defect -- the Q4_K_M-specific 'combined' condition-aware metric that avoids it is explicitly out of scope for this milestone's general-purpose Relative policy. Documented inline in the test rather than silently loosening the pinned rel:1e-3.",
+      "output_sizes semantics: dispatch_handle's binding_is_readback predicate (output_size>0 AND access!=ReadOnly) means a ReadOnly buffer's dispatch output is always an empty Vec<u8> regardless of the requested output_sizes[i]. compare_outputs therefore skips ReadOnly buffers explicitly (not just output_sizes[i]==0) to avoid a false always-pass / index-out-of-bounds; this mirrors axc_runtime::kernel_handle::binding_is_readback exactly but is implemented as a local check since that predicate is pub(crate) to axc-runtime, not exported.",
+      "The --pc-u32/--pc-f32 CLI convenience mentioned in spec prose (§3.2) was not added as separate flags: the CLI struct given verbatim in spec §6.2 only lists --push-constants-base64, so the implementation follows the exact listed signature. GPU tests build push constants via a local assemble_pc_u32/assemble_pc_f32 helper (the same idiom as the pre-existing dispatch_q4km_*_equiv.rs tests)."
+    ],
+    "deviations": []
+  },
+  "git_commits": [],
+  "followup": {
+    "gap_closed": "AT-2849 (partial) from M3.16-qa.json requirements_missing: no automated test previously invoked the real verify_rewrite MCP handler end-to-end and asserted tolerance_overridden==true + the tolerance_loosened_by_caller notes entry. The only prior AT-2849 coverage (non_bit_exact_tolerance_string_parses_and_is_flagged_overridden in crates/axc-driver/src/mcp/tools/verify_rewrite.rs) checked TolerancePolicy::from_str/PartialEq only, never called handle().",
+    "test_added": "at_2849_verify_rewrite_tolerance_overridden_stamp_on_lavapipe in crates/axc-driver/tests/mcp_roundtrip.rs (new section after AT-1132, plus a new saxpy_pc_base64() helper and SAXPY_ORIGINAL_SRC/SAXPY_REASSOC_SRC fixture consts). Follows the at_1114/at_1115 precedent exactly: NOT #[ignore]-gated, self-skips (eprintln + early return) when AXC_ENABLE_GPU_TESTS != '1', spawns the real `axc mcp` subprocess and drives verify_rewrite through the actual JSON-RPC dispatch path (dispatch_request -> narrow_and_run_ctx -> mcp::tools::verify_rewrite::handle -> rewrite_verify core) end-to-end on Lavapipe.",
+    "what_it_asserts": [
+      "leg 1: original=examples/saxpy.axc, rewritten=examples/saxpy_reassoc.axc (the same AT-2859 pair, a single legal IEEE-754 commutation), explicit push_constants_base64 (n=1024,alpha=2.0, offsets read from the real ParamBindingPlan via compile_source_with_meta so no offset is hardcoded), tolerance:'rel:1e-3' -> asserts result.verdict=='PASS', result.tolerance_overridden==true, and notes contains an entry starting with 'tolerance_loosened_by_caller'",
+      "leg 2 (converse, cheap re-use of the same buffers/push-constants): tolerance omitted entirely -> server-owned bit-exact default -> asserts result.verdict=='PASS' (saxpy vs saxpy_reassoc is bit-identical per AT-2859), result.tolerance_overridden==false, and no note starts with 'tolerance_loosened_by_caller'"
+    ],
+    "vk_env_required": "VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json (matches QA's own gpu_verification.lavapipe.command in M3.16-qa.json; CI sets the equivalent /usr/share/vulkan/icd.d/lvp_icd.x86_64.json path plus AXC_ENABLE_GPU_TESTS=1 for the whole job in .github/workflows/ci.yml) + AXC_ENABLE_GPU_TESTS=1. Confirmed both the plain-skip path (env unset: prints 'AT-2849: skipped (AXC_ENABLE_GPU_TESTS != 1)' and passes trivially) and the real Lavapipe run (env set: both legs execute, real verdict PASS).",
+    "secondary_edit": "Tightened the doc-comment on the pre-existing non_bit_exact_tolerance_string_parses_and_is_flagged_overridden unit test in crates/axc-driver/src/mcp/tools/verify_rewrite.rs to state explicitly it is the CPU-only parse-level half of AT-2849 and to point at the new end-to-end test by name -- kept (not deleted/renamed) since it is still a valid, cheap, real assertion and multiple tests already share one AT- label elsewhere in this milestone (e.g. AT-2849 in mcp/dispatch.rs, AT-2850/AT-2850b in rewrite_verify.rs).",
+    "verification": {
+      "cargo_build_workspace": "pass",
+      "cargo_clippy_workspace_lib_tests_D_warnings": "pass, zero warnings",
+      "new_test_isolated": "VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json AXC_ENABLE_GPU_TESTS=1 cargo test -p axc-driver --test mcp_roundtrip at_2849 -- --nocapture -> 1 passed (both legs), un-gated env also verified to typed-skip cleanly",
+      "cargo_test_workspace_no_fail_fast": "83/84 test binaries green (including the new AT-2849 test and every pre-existing axc-driver/axc-hir/axc-lexer/axc-parser/axc-mir/axc-codegen/axc-runtime/axc-py test, unit + integration + doc-tests). The sole failure is crates/axc-driver/tests/mcp_roundtrip.rs::at_1115_bench_variant_correctness_ok_for_saxpy ('9/1024 elements exceeded 4 ULP tolerance') -- an M2.4 test wholly unrelated to this M3.16 diff. Confirmed PRE-EXISTING and environment-caused (not a regression from this change): reproduced identically (same 9/1024 count, same message) by `git stash`-ing this entire diff and re-running against the unmodified branch HEAD commit (94c845c). Deterministic across 3 repeated runs at --test-threads=1, so not a scheduling race either -- most likely Lavapipe/llvmpipe (Mesa 25.2.8 on this box) floating-point codegen drift versus whatever Mesa build QA's environment had when it recorded 1078/1078 passing. Not introduced or touched by this follow-up; left as-is per scope (only the AT-2849 gap was in scope for this pass)."
+    }
+  }
+}

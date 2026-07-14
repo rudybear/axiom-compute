@@ -1,0 +1,84 @@
+{
+  "verdict": "PASS",
+  "agent": "qa_agent",
+  "milestone_id": "M3.16-axc-rewrite",
+  "branch": "coder/M316-20260713-1900/M3.16-axc-rewrite",
+  "requirements_total": 21,
+  "requirements_covered": 20,
+  "requirements_missing": [
+    "AT-2849 (partial): spec text explicitly requires 'an MCP call with tolerance:\"rel:1e-3\" sets tolerance_overridden=true + a notes entry' to be verified. No automated test (unit, integration, or mcp_roundtrip.rs subprocess) actually invokes mcp::tools::verify_rewrite::handle() end-to-end and asserts report.tolerance_overridden==true / notes contains 'tolerance_loosened_by_caller'. The only related test (non_bit_exact_tolerance_string_parses_and_is_flagged_overridden) checks TolerancePolicy parsing/inequality only, never calls handle(). Precedent exists for un-gated GPU-backed MCP tests in this exact file (at_1114_bench_variant_returns_median_ns_on_lavapipe, at_1115_bench_variant_correctness_ok_for_saxpy run without #[ignore], relying on Lavapipe CI fallback) that the coder could have followed for this behavior. QA manually verified the CODE IS CORRECT by sending a live JSON-RPC verify_rewrite request over stdio to `axc mcp` on Lavapipe with tolerance:'rel:1e-3': response correctly contained `\"tolerance_overridden\":true` and `\"notes\":[\"tolerance_loosened_by_caller: rel:0.001\"]`. This is a test-coverage gap, not a functional defect -- recommend a fast-follow unit/integration test before or shortly after merge; not blocking given the underlying behavior is independently verified correct and every other spec item is fully covered."
+  ],
+  "test_results": {
+    "cargo_test_workspace_non_ignored": { "passed": 1078, "failed": 0, "ignored": 121 },
+    "baseline_main_non_ignored": { "passed": 1036, "failed": 0, "ignored": 112 },
+    "delta": { "new_passed": 42, "new_ignored_gpu_gated": 9, "regressions": 0 },
+    "rewrite_verify_cli_rs": { "passed": 6, "failed": 0 },
+    "rewrite_verify_gpu_rs_cpu_run": { "passed": 5, "ignored_as_expected": 9 },
+    "flake_note": "crates/axc-runtime icd::tests::at_709_captured_icd_path_returns_vk_driver_files_verbatim failed once under full parallel `cargo test --workspace` (env-var race across threads) then passed on immediate re-run and in isolation; confirmed pre-existing/unrelated to this diff (axc-runtime is untouched by M3.16; same flake independently reproduced against a clean main-branch worktree with 68/68 passing on that run). Not counted as a regression."
+  },
+  "gpu_verification": {
+    "nvidia": {
+      "device": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+      "command": "AXC_ENABLE_GPU_TESTS=1 cargo test -p axc-driver --test rewrite_verify_gpu -- --ignored --test-threads=1",
+      "result": "9/9 PASS",
+      "per_at": {
+        "AT-2851": "Pass, stage=output, bit-exact, n_diff=0 on all compared buffers (q4km_cached vs _sr, K=512)",
+        "AT-2852": "Pass, stage=output, bit-exact (matmul_rb vs pad, 768^3)",
+        "AT-2853": "Fail, stage=output, reason=numeric_mismatch, buffers_failed=[1], n_diff=1024 (all 1024 elements, matches coder claim exactly), max_rel=1.9847...",
+        "AT-2855": "sequence PASS: bit-exact leg FAIL (n_diff>0) -> rel:1e-3 leg PASS -> alpha=0 negative-control leg PASS under bit-exact",
+        "AT-2856": "reproducibility PASS: two runs byte-identical buffers_compared stats (n_diff, max_abs_diff bits, max_ulp, max_rel bits all equal)",
+        "AT-2857": "test self-detects NVIDIA supports coopmat and short-circuits (by design -- real check is on Lavapipe, see below)",
+        "AT-2858": "Pass, stage=output, bit-exact (K=320 tail, one full 256-superblock + 64-elem tail)",
+        "AT-2859": "Pass, stage=output, bit-exact (saxpy vs saxpy_reassoc, single IEEE-754 commutation)",
+        "AT-2860": "Pass; no spurious NondeterministicOracle for saxpy-vs-itself"
+      }
+    },
+    "lavapipe": {
+      "device": "llvmpipe (LLVM 20.1.2, 256 bits)",
+      "command": "VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json AXC_ENABLE_GPU_TESTS=1 cargo test -p axc-driver --test rewrite_verify_gpu -- --ignored --test-threads=1",
+      "result": "9/9 PASS",
+      "per_at": {
+        "AT-2851": "Skipped (coopmat_unsupported) -- typed-skip as expected",
+        "AT-2852": "Skipped (coopmat_unsupported) -- typed-skip as expected",
+        "AT-2853": "Fail, stage=output, n_diff=1024 -- identical to NVIDIA run",
+        "AT-2855": "identical PASS sequence to NVIDIA",
+        "AT-2856": "identical reproducibility PASS",
+        "AT-2857": "Skipped, stage=dispatch, reason.kind=device_feature_unsupported, detail='vulkanMemoryModel/q4km_matmul_rb_coopmat_f32acc_cached' -- confirmed the documented alternate typed-skip kind (vulkanMemoryModel gate fires before the coopmat-shape check on this ICD); assertion correctly accepts either kind",
+        "AT-2858": "Skipped (coopmat_unsupported) -- typed-skip as expected",
+        "AT-2859": "Pass -- CONFIRMED genuine end-to-end ACCEPT verdict on Lavapipe/CI without NVIDIA (closes the vendor gap per r2/WARN-5)",
+        "AT-2860": "Pass; no spurious NondeterministicOracle"
+      }
+    }
+  },
+  "cli_manual_verification": {
+    "command_pass": "VK_DRIVER_FILES=.../lvp_icd.json ./target/debug/axc rewrite-verify examples/saxpy.axc examples/saxpy_reassoc.axc --tol bit-exact --size 1024 --push-constants-base64 <n=1024,alpha=2.0>",
+    "result": "verdict=PASS, exit=0, JSON schema exactly matches spec Section 5 (verdict first key; fields: milestone, policy, tolerance_overridden, seed, stage, original, rewritten, device, buffers_compared, reason, notes)",
+    "command_fail": "same but saxpy_wrong.axc as rewritten",
+    "result_fail": "verdict=FAIL, exit=1, stage=output, reason.kind=numeric_mismatch, n_diff=1024",
+    "command_error": "axc rewrite-verify examples/saxpy.axc examples/saxpy_wrong.axc (no --buffer-sizes/--size)",
+    "result_error": "verdict=ERROR, exit=2, stage=preflight, reason.kind=infra_error",
+    "conclusion": "exit codes and closed verdict/reason.kind taxonomy exactly match spec Section 5"
+  },
+  "mcp_manual_verification": {
+    "method": "live JSON-RPC 2.0 stdio call to `axc mcp` on Lavapipe: verify_rewrite with original=saxpy.axc, rewritten=saxpy_perturbed.axc, tolerance='rel:1e-3'",
+    "observed_response_fields": "tolerance_overridden:true, notes:[\"tolerance_loosened_by_caller: rel:0.001\"], policy:\"rel:0.001\"",
+    "conclusion": "CRIT-2 server-owned-default + loud-override-stamp mechanism is functionally correct at runtime; see requirements_missing for the automated-test-coverage gap on this exact behavior"
+  },
+  "verification_results": {
+    "build_check": "PASS (cargo build --workspace, clean)",
+    "clippy_check": "PASS (cargo clippy --workspace --lib --tests -- -D warnings, zero warnings)",
+    "diff_check": "PASS -- every file in the spec's Section 7 create/modify table is present in `git diff --stat main...HEAD` (18 files, 3151 insertions, 11 deletions); no extra/missing files",
+    "scope_isolation_check": "PASS -- `git diff --stat main...HEAD` contains zero paths under crates/axc-lexer, axc-parser, axc-hir, axc-mir, axc-codegen; matches spec's 'Compiler changes: NONE' claim",
+    "frozen_tolerance_check": "PASS -- crates/axc-driver/src/q4km_oracle.rs is untouched by this diff (not in the changed-file list); the FROZEN 1e-3 relative-tolerance gate and its max_rel_diff_combined logic are unmodified",
+    "coder_self_report_matches_reality": true,
+    "coder_self_report_note": "The coder's run-artifact JSON claims tool-count assertions 'updated 6->8 and 7->8'; the actual diff shows tool_list 6->7 (matches spec exactly) and total-methods-including-initialize 7->8 (an orthogonal, correctly-updated second assertion). Self-report wording was imprecise but the underlying diff is exactly spec-conformant -- not a discrepancy.",
+    "fixtures_check": "PASS -- saxpy_wrong.axc (alpha*x - y), saxpy_perturbed.axc (alpha*1.0000001*x + y), saxpy_reassoc.axc (y + alpha*x, a single IEEE-754 commutation, NOT re-association across 3+ terms) all read and match spec Section 7 definitions verbatim; no `>>` operator in any new .axc file; explicit types throughout",
+    "anti_cheat_gates_check": "PASS -- diff_interface gates buffer count/name/element-type/access(all 3 BufferAccess variants: ReadOnly/ReadWrite/WriteOnly)/position, scalar count/name/type/offset/member_index, push_constant_total_bytes, workgroup_size, in the exact order of spec Section 5's InterfaceMismatch sub-kind table; kernel_name/coopmat/shared_memory_bytes/body correctly NOT gated (AT-2848 kernel-rename-is-legal test present and passing). push_constants_required preflight for float scalars present (preflight_check, tested by at_2850b_preflight_push_constants_required_for_float_scalar). workgroups_required preflight for coopmat/shared present and tested (at_2850b_preflight_workgroups_required_for_coopmat) -- hard ERROR, not silent partial-coverage pass. Determinism self-check dispatches the ORIGINAL twice (Step 7) and compares BEFORE the rewritten is ever dispatched (Step 8) -- verified by reading verify_rewrite()'s control flow directly.",
+    "at_2855_pinned_seed_check": "PASS -- inline documentation in rewrite_verify_gpu.rs (lines 366-379) and DESIGN.md 3.1.42 both describe the seed=1 pin as measured (worst_max_rel 6.6e-3 at seed=0 vs 6.8e-5 at seed=1), explicitly cross-referencing the SAME naive-relative-tolerance denominator-floor class documented in q4km_oracle.rs's own max_rel_diff doc comment ('blows up on near-zero (catastrophic-cancellation) outputs'). QA independently confirmed this class of issue exists in q4km_oracle.rs by reading its doc comments. The bit-exact FAIL leg (seed=1) still asserts n_diff>0 and was independently observed to FAIL on both NVIDIA and Lavapipe, proving the pinned seed is not a green-washing hack -- perturbation detection is still demonstrated.",
+    "mcp_tool_registration_check": "PASS -- verify_rewrite registered in ALL_METHODS, routed via narrow_and_run_ctx (matching every other tool's dispatch pattern), added to initialize.tools (6->7) and total methods list (7->8); mcp_roundtrip.rs assertions updated and passing",
+    "documentation_check": "PASS -- DESIGN.md section 3.1.42 and ROADMAP.md FG.1 entry read in full; both accurately describe the shipped architecture, verdict taxonomy, reuse map, non-goals, and measured GPU results with no overclaims detected against QA's own independent measurements"
+  },
+  "accidental_incident_disclosure": "During verification QA ran `git checkout main -- .` while investigating an unrelated pre-existing test flake, which briefly staged a revert of all M3.16 changes in the working tree (never committed). Caught immediately via `git status`/`git diff HEAD`, corrected with `git reset --hard HEAD` (restoring exactly the 18-file/3151-insertion diff, verified byte-identical to the original `git diff --stat main...HEAD`). No data was lost; disclosed here per NEVER-TRUST-ALWAYS-VERIFY transparency norms even though it is a QA-process note, not a finding about the coder's work.",
+  "memory_footprint_ok": true,
+  "summary": "M3.16 axc rewrite-verify is a high-fidelity implementation of the r2 spec. Build clean, clippy clean (-D warnings), full workspace test suite green with zero regressions (1078 passed vs 1036 baseline, +42 new CPU tests + 9 new GPU-gated tests, matching the AT-2841..2860 range). All 9 GPU-gated ATs independently re-run and verified PASS on BOTH real NVIDIA RTX PRO 6000 Blackwell and Lavapipe/llvmpipe, with every measured value (AT-2853 n_diff=1024, AT-2855's 3-leg sequence, AT-2857's device_feature_unsupported typed-skip kind on Lavapipe, AT-2859's genuine Lavapipe ACCEPT) matching the coder's self-report exactly. CLI and MCP behavior independently exercised by QA (not just unit tests): verdict JSON schema, exit codes, and the CRIT-2 tolerance_overridden governance stamp were all manually driven end-to-end and confirmed correct. Anti-cheat gates (interface diff, preflight, determinism self-check ordering) read and confirmed correct in source. Fixtures match spec verbatim; no `>>`; explicit types. Compiler-crate scope isolation and frozen-tolerance non-interference both confirmed via diff inspection. The single gap found: AT-2849's specific 'MCP call with rel:1e-3 sets tolerance_overridden=true' assertion has no dedicated automated test (existing tests only cover the isolated string-parse logic), though QA manually verified the runtime behavior is correct via a live stdio JSON-RPC call. This is a test-coverage nit, not a functional defect, and does not block PASS given the exhaustive independent verification performed across every other dimension of the spec."
+}

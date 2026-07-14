@@ -1,0 +1,93 @@
+{
+  "verdict": "REVISED",
+  "agent": "architect",
+  "milestone_id": "M3.16-axc-rewrite",
+  "revision": "r2",
+  "supersedes": "r1",
+  "architecture_unchanged": true,
+  "architecture_invariants_preserved": [
+    "verify-not-generate (no in-compiler LLM; the agent is the generator, the tool is the independent oracle)",
+    "3-layer structure (Layer-0 pure core / Layer-1 CLI primitive / Layer-2 MCP wrapper over one shared core)",
+    "interface immutability gate runs CPU-only, before any GPU dispatch",
+    "tolerance is verifier-owned (never read from kernel source; no HIR channel from @equiv_fp_tol)",
+    "differential A-vs-B: the original kernel IS the oracle; no per-kernel CPU reference; NONE of the compiler crates change",
+    "AT range AT-2841..AT-2860 unchanged; ~2000 LOC estimate unchanged"
+  ],
+  "summary": "Surgical r2 pass. Pessimistic NEEDS_REVISION carried 3 criticals + 5 warnings, all policy/fixture/verdict-taxonomy defects, none touching the architecture. All 8 fixes folded into .pipeline/milestones/M3.16-axc-rewrite.md (marked r2, r2-changelog appended). Optimistic APPROVE minors (tuple/array + slice glue, WriteOnly third BufferAccess variant, --size non-uniform detection, coopmat-shape ungated) folded cheaply. Architecture is unchanged; these were closing silent-blessing holes in an anti-reward-hacking gate.",
+  "fixes_applied": [
+    {
+      "id": "CRIT-1",
+      "issue": "alpha=0 annihilation: default zero-fill push-constant makes saxpy compute y-passthrough, so saxpy vs saxpy_perturbed both return y -> AT-2855/2853 falsely PASS.",
+      "r1": "Push-constants: 'must match push_constant_total_bytes when present, else zero-filled.' No non-vacuity requirement on reject fixtures.",
+      "r2": "Silent all-zero default FORBIDDEN for any kernel whose binding_plan.scalars has a float scalar -> ERROR/preflight/push_constants_required (metadata-only, CPU-reachable). saxpy-family ATs pin n=elem_count, alpha=2.0 (0x40000000). Added a non-vacuity meta-guard: every reject-fixture AT asserts n_diff>0 under bit-exact (self-proving), and AT-2855 carries an explicit alpha=0 negative control that PASSes bit-exact (proves the pinned alpha is load-bearing). §3.2, §3.1-step4, §8.",
+      "location": "§3.2 push-constants + non-vacuity meta-guard; §3.1 step 4 preflight; AT-2853/2855/2850b"
+    },
+    {
+      "id": "CRIT-2",
+      "issue": "MCP tolerance front door: on the MCP/self-optimize path the agent is the caller and picks its own tolerance; the 'structurally defeats weaken-@equiv_fp_tol' claim overclaims on the exact path the thesis targets.",
+      "r1": "'This structurally defeats the weaken-@equiv_fp_tol attack ... no channel to loosen the bar.' tolerance a request field defaulting to bit-exact.",
+      "r2": "(a) MCP tool default is SERVER-owned BitExact (default_bit_exact), never caller-set; (b) a looser-than-default MCP tolerance is accepted only with tolerance_overridden:true + notes 'tolerance_loosened_by_caller:<policy>' -- accept-with-loud-stamp chosen over hard-reject because the verdict consumer is the outer supervisor agent (pipeline rule #3, machine-parsed and merge-gating), so the stamp is guaranteed-audited and silent loosening is impossible; hard-reject floor deferred as a config knob; (c) §4.2 re-worded to honest scope: source-annotation weakening is STRUCTURALLY DEFEATED, the request-level knob is GOVERNED (server default + non-silent override), NOT eliminated. New field tolerance_overridden in schema; AT-2849 asserts the stamp; AT-2860 slot references governance.",
+      "location": "§4.2 (rewritten), §6.3 (server-owned default + stamping), §5 (tolerance_overridden field), §9 non-goal #10"
+    },
+    {
+      "id": "CRIT-3",
+      "issue": "Raw random bytes reinterpreted as f32/f16 are majority NaN/Inf/denormal; can false-FAIL the flagship accept fixtures (two NaN payloads at same position differ under to_bits) and weaken every reject.",
+      "r1": "'Buffer inputs: seeded_inputs(&buffer_sizes, seed)' -- raw StdRng byte fill for all buffers.",
+      "r2": "Element-type-dispatched fill: FLOAT buffers (f32/f16) get a well-conditioned finite seeded fill, uniform in [-1,1] with an exact formula (rng_b=StdRng::seed_from_u64(seed^b); u=next_u32(); v=(u/u32::MAX)*2-1; store as f32, or round to f16) -- denormal/NaN/Inf-free by construction, so NaN-payload comparison is avoided for v1. INTEGER/packed-quant buffers keep raw-byte seeded_inputs (correct there -- realistic Q4_K data). Edge-value probes (NaN/Inf/-0) documented as follow-up (§9 non-goal #9). New fill code noted in §3.4.",
+      "location": "§3.2 buffer-inputs, §3.4 reuse map + new-code list, §9 non-goal #9"
+    },
+    {
+      "id": "WARN-1",
+      "issue": "derive_workgroups is elementwise-1D-only; a coopmat/matmul fixture with no explicit grid gets a meaningless 1-D grid, both sides share the same wrong grid -> trivial partial-coverage PASS.",
+      "r1": "workgroups: when absent, derive_workgroups(...) for all kernels.",
+      "r2": "Explicit workgroups MANDATORY whenever coopmat.is_some() OR shared_memory_bytes>0; missing -> Verdict::Error/preflight/workgroups_required (metadata-only, CPU-reachable). Elementwise kernels still fall back to derive_workgroups. A wrong shared/coopmat grid is now a hard ERROR, never a silent pass. Matmul/coopmat ATs pin explicit workgroups.",
+      "location": "§3.1 step 4, §3.2 workgroups, §8 AT-2851/2852/2858/2850b"
+    },
+    {
+      "id": "WARN-2",
+      "issue": "No determinism self-check; harness cannot tell 'rewrite wrong' from 'original nondeterministic' -> flaky false-FAIL or masking false-PASS.",
+      "r1": "'Determinism -- fixed seed + fixed grid; the verdict is reproducible.' original dispatched once.",
+      "r2": "Added §3.1 step 7: dispatch the ORIGINAL TWICE with identical inputs FIRST; self-disagreement -> distinct verdict NONDETERMINISTIC_ORACLE/stage=self_check/original_nondeterministic (neither PASS nor FAIL for the candidate). Compare uses the first original run vs the rewritten run. §4.4 determinism bullet softened accordingly. AT-2860 exercises it. One extra dispatch.",
+      "location": "§3.1 step 7, §4.4, §5 (new verdict), §6.1 (Verdict enum), §8 AT-2860, §10 limitation #2"
+    },
+    {
+      "id": "WARN-3",
+      "issue": "Verdict taxonomy incomplete: prepare_kernel_checked/preflight_kernel_support rejects shared-over-limit and other bindings with DispatchError variants the spec never maps.",
+      "r1": "5 verdicts (PASS/FAIL/REJECT/SKIPPED/ERROR); only CoopMatUnsupported/DeviceFeatureUnsupported mapped.",
+      "r2": "Full closed set enumerated in §5: verdicts PASS|FAIL|REJECT|SKIPPED|NONDETERMINISTIC_ORACLE|ERROR; stages compile|spirv_val|interface|preflight|self_check|dispatch|output; reason.kind closed table incl. compile_fail_{original,rewritten}, val_fail_{original,rewritten}, interface_mismatch(+sub), workgroups_required, push_constants_required, preflight_fail_rewritten, preflight_fail_original, original_nondeterministic, gpu_unavailable, coopmat_unsupported, device_feature_unsupported, numeric_mismatch, infra_error. Mapping: rewritten prepare/dispatch DispatchError (e.g. shared over maxComputeSharedMemorySize) -> FAIL/preflight_fail_rewritten; original -> SKIPPED/infra by class; never panic, never lump into coopmat_unsupported.",
+      "location": "§5 (closed verdict set + closed reason.kind table), §3.1 step 8, §6.1 Verdict enum"
+    },
+    {
+      "id": "WARN-4",
+      "issue": "Flagship Q4_K_M accept fixture uses tail-free K=512 (2x256 superblocks); a rewrite mishandling a partial final superblock PASSes.",
+      "r1": "AT-2851 at K=512 only; AT-2858..2860 reserved/unspecified.",
+      "r2": "AT-2858 added: Q4_K_M pair at K%256!=0 (e.g. K=320 = 256 + 64-tail) -> Pass bit-exact, exercising the partial-superblock decode path. Explicit deferral clause: if the coopmat kernels structurally require K a multiple of the coopmat-K tile, the coder documents it loudly and pins the smallest tail-bearing admissible K or records the limitation -- never a silent skip.",
+      "location": "§8 AT-2858"
+    },
+    {
+      "id": "WARN-5",
+      "issue": "All ACCEPT fixtures are coopmat -> typed-skip on Lavapipe; CI never asserts a PASS verdict end-to-end (PASS path only ever runs on NVIDIA).",
+      "r1": "AT-2851/2852 coopmat only; no subgroup-agnostic accept fixture.",
+      "r2": "New fixture examples/saxpy_reassoc.axc (body reordered to y+alpha*x, commutative IEEE-754 add -> bit-identical for finite inputs, @workgroup(64,1,1), no coopmat/shared). AT-2859 runs it on Lavapipe/CI -> Verdict::Pass bit-exact, exercising the ACCEPT path without NVIDIA. coopmat pairs kept NVIDIA-tier.",
+      "location": "§7 files (new fixture), §8 AT-2859"
+    }
+  ],
+  "optimistic_minors_folded": [
+    "tuple-vs-array workgroups + slice-of-slices dispatch_handle glue noted in §3.4 implementation-glue callout (headroom on the ~450 LOC core).",
+    "BufferAccess has THREE variants (ReadOnly/ReadWrite/WriteOnly, axc-hir/src/buffer.rs) -- §4.1 now gates all three; AT-2848 asserts a WriteOnly<->ReadWrite flip is caught (output-aliasing cheat).",
+    "--size restricted to same-ScalarTy elementwise kernels (coopmat.is_none() && shared==0) and ERRORs otherwise, dropping the unimplementable 'errors if non-uniform' heuristic for multi-f32-buffer matmul (§3.2).",
+    "coopmat-shape stays ungated (defensible -- output interface identical keeps the differential compare valid); the sibling ungated field shared_memory_bytes now has the over-limit error mapping it lacked (WARN-3).",
+    "accept-pairs must share @strategy hole names or supply per-side assignments -- noted in §3.1 step 1 assignments handling (AT-2851 verified identical hole names)."
+  ],
+  "at_range_note": "AT-2841..AT-2860 unchanged. Reserved slots consumed: AT-2858 (tail-K), AT-2859 (Lavapipe accept), AT-2860 (nondeterministic-oracle). One CPU sub-slot AT-2850b (request-completeness preflight) added within range.",
+  "outputs_written": [
+    ".pipeline/milestones/M3.16-axc-rewrite.md (revised in place; Status -> r2; r2-changelog appended)",
+    ".pipeline/runs/M3.16-architect.json (this file)"
+  ],
+  "ready_for": "re-review (pessimistic) then Coder",
+  "residual_open_questions_for_coder": [
+    "Empirically confirm AT-2851/2852 remain bit-identical under the well-conditioned finite fill (should hold -- cached vs cached_sr differ only in integer index-decode, not float math) and record the measured n_diff==0.",
+    "AT-2860: if a reliably-nondeterministic portable fixture kernel cannot be authored, assert the self-check via a synthetic disagreeing-buffer unit test on the comparator (documented fallback in the AT).",
+    "AT-2858: confirm whether the coopmat fixture kernels admit K%256!=0; apply the deferral clause if not."
+  ]
+}
