@@ -1,0 +1,76 @@
+{
+  "verdict": "APPROVE",
+  "agent": "pessimistic_code_reviewer",
+  "milestone_id": "M3.17-runtime-checks",
+  "branch": "coder/M317-20260714-0000/M3.17-runtime-checks",
+  "review_method": "Adversarial. Read git diff main...HEAD for every touched crate; DISASSEMBLED the emitted --debug SPIR-V (both GLSL450 and coopmat legs) via an independent word-stream parser and hand-decoded every injected instruction; probed HIR validation with 11 malformed throwaway fixtures; independently reproduced the golden-identity gate (fresh axc compile + cmp) and the metadata/scope tests; ran the codegen (spirv-val), HIR, metadata, and bench test suites.",
+
+  "critical_bugs": [],
+
+  "spirv_level_verification": {
+    "atomic_operands": "CORRECT. Disassembled precondition_saxpy --debug (GLSL450). OpAtomicOr [u32, res, ptr, scope=id20, sem=id19, val]: ptr = OpAccessChain into flag var 18 with indices [const0(struct member 0), const_word] — flag[0] for preconditions, flag[1] for the postcondition (verified array index const1 at word 461); scope const id20 == 1 (Device) under MemoryModel GLSL450; semantics const id19 == 0 (Relaxed); mask == 1<<bit (1 for bit0, 2 for bit1). All exact.",
+    "critical_1_scope_vs_memory_model": "CORRECT AND INDEPENDENTLY CONFIRMED. Compiled a coopmat precondition kernel --debug: OpMemoryModel == Vulkan(3), atomic scope const == 5 (QueueFamily); no VulkanMemoryModelDeviceScope capability emitted (which Device-scope-under-Vulkan would have required). Non-coopmat kernel: GLSL450 + Device(1). Scope is keyed on the same uses_coopmat predicate as the memory-model branch. Capability set is byte-equal between release and debug on BOTH legs (verified by at_2867 codegen tests, which run the spirv-tools-crate validator in-process — a non-ignored CI test, so spirv-val genuinely runs in CI).",
+    "nan_fail_loud_form": "CORRECT. Both f32 checks use the pinned form: OpFOrdGreaterThan(186)/OpFOrdLessThan then OpLogicalNot(168) of the RESULT — NOT an unordered FUnord* compare, NOT an inverted comparison operator. A NaN operand makes the ordered compare false -> LogicalNot -> %bad true -> violation flagged. u32 uses OpUGreaterThan(172), i32 would use OpSGreaterThan — signedness picked from the resolved ScalarTy (verified in emit_debug_compare match).",
+    "selection_merge_and_observational_only": "CORRECT. Each check is a self-contained OpSelectionMerge + OpBranchConditional %bad -> then(OpAccessChain+OpAtomicOr+OpBranch) -> merge. NO OpReturn/OpBranch early-exit anywhere; the atomic is the ONLY side effect of a failure; the body runs unchanged with bad inputs. The happy path issues zero atomics. Confirmed no OpReturnValue/early OpReturn injected in the check blocks.",
+    "sequencing": "CORRECT. Preconditions are emitted after the OpVariable prelude and before the first body statement, chained through dominating merge blocks (entry -> merge43 -> merge53 -> body load-gid at word 341). The check blocks provably dominate the body in the structured CFG, so they execute before it. Relaxed atomics have no intra-invocation ordering guarantee vs body stores, but that is immaterial: the host reads the flag only after the fence (whole dispatch complete), so observational semantics hold.",
+    "injected_binding_decorations": "CORRECT. Flag var 18 decorated DescriptorSet(34)=0, Binding(33)=2 == num_user_buffers (x=0, y=1, flag=2). Appended to the same buffer list via emit_buffer_globals so DSL/pool/bind-loop all agree (N+1). Postcondition writes flag[1], preconditions flag[0] — verified by the distinct access-chain array indices.",
+    "postcondition_placement": "CORRECT. Emitted immediately before OpReturn (word 476 -> 478). Guards every top-level return (a conservative superset of the spec's single-trailing-return assumption); sound because v1 postconditions are uniform scalar-param predicates and atomicOr is idempotent. Returns-inside-loops are hard-rejected upstream (ReturnInsideLoopDeferred), so all guarded returns are top-level."
+  },
+
+  "codegen_perturbation_hunt": {
+    "result": "PASS - no drift path when debug_checks==false.",
+    "detail": "The only unconditional new code in emit.rs when debug is OFF is building the pre_checks/post_checks Vecs (pure HIR clone, allocates NO SPIR-V ids, touches the Builder zero times). The buffer-emission else-if branch is byte-identical to the pre-M3.17 path; scope/semantics constants and the DebugCodegenCtx are built only inside `if opts.debug_checks`. body.rs calls the check emitters only when res.debug.is_some(). Golden-identity independently reproduced: freshly compiled precondition_saxpy.axc (no --debug) is BYTE-IDENTICAL (cmp) to the committed golden AND its release metadata omits the debug_checks key entirely. Shared-only (non-coopmat) kernels correctly get GLSL450 + Device scope, which is valid with Shader alone."
+  },
+
+  "hir_validation_holes": {
+    "result": "PASS - no codegen panic reachable from malformed DSL.",
+    "detail": "Compiled 11 throwaway malformed fixtures --debug: nested gt(gt(a,b),c) -> UnsupportedDebugPredicate (Invalid operand); gt(buffer_name,0) -> UnsupportedDebugPredicate (buffer name resolves to no scalar ty); gt(elem(buf),0) in a precondition -> PreconditionOperandNotScalar; gt(n) 1-arg -> reject; mod(n,2) unknown fn -> reject; gt(1,0) two-literal -> reject (ambiguous, no type-bearing operand); gt(zzz,0) unknown ident -> reject; scalar postcondition lt(n,5) -> lowered with correct metadata (bit0/word1/line1). @precondition() empty args does NOT panic on args[0] (guarded by args.len()==1). All exit with a clean HirError; zero panics/aborts."
+  },
+
+  "runtime_checks": {
+    "flag_zero_init_every_dispatch": "PASS. dispatch_debug_checked pushes a fresh [0u8;8] as the flag buffer's upload input on EVERY call (not first-only); dispatch_handle re-uploads per dispatch.",
+    "bitmask_bounds": "PASS. HIR caps at <=32 conditions/kind (TooManyDebugConditions on 33); 1u32<<bit with bit<32 cannot wrap; decode_debug_flags matches per-kind word. No silent wrap.",
+    "violation_index_determinism": "PASS. Bits are assigned densely in source declaration order per kind during lowering; DebugConditionMeta.{kind,bit,text} carries them to the sidecar; decode maps set bits back to text deterministically. AT-2871/2872/2873 assert exact bitmasks.",
+    "metadata_v4_fail_closed": "PASS. A v4-debug sidecar routed through the RELEASE dispatch path (which reads meta.binding_plan directly, without debug_augmented_binding_plan) would build a DSL of N bindings while the SPIR-V references binding N -> Vulkan pipeline-create/descriptor VUID failure -> DispatchError. Fail-CLOSED, not silent misbind. The only entry to debug dispatch (dispatch_debug_checked) always calls debug_augmented_binding_plan. v1/v2/v3 sidecars still load (debug_checks defaults None); v5 rejected with supported:4."
+  },
+
+  "at_1115_review": {
+    "nan_fix_ieee_correct": "CONFIRMED CORRECT. The oracle now computes expected = 0.0*x[i] + y_in[i] (was the y_in[i] shortcut). For finite x -> 0.0*x==0(or -0) -> expected==y_in[i]; for x==Inf/NaN -> 0.0*x==NaN -> expected NaN, matching the GPU's alpha*x+y (alpha=0) under IEEE invalid-op (and FMA-contracted, since FMA(0,x,y) is likewise NaN for non-finite x). The both-NaN==match rule in correctness_match is IEEE-justified (NaN payload is implementation-defined). One-sided NaN still fails. within_ulp_f32 body/signature are UNTOUCHED (only a per-call tolerance arg added); M3.16 rewrite_verify.rs has zero diff -> its fixed-4-ULP reuse is unweakened. NVIDIA stays at 4 ULP (guard leg in AT-2876).",
+    "llvmpipe_widening_is_dead_code": "DISCLOSED DEVIATION, ACCEPTED. The coder's honest re-diagnosis found the root cause was a device-INDEPENDENT oracle bug, not Mesa FP drift; genuine measured ULP delta == 0 on both Lavapipe and NVIDIA, so even 4 ULP now passes at_1115. LLVMPIPE_ULP_TOLERANCE==8 and AT-2876's `widened>4` therefore exercise a non-load-bearing branch. This deviates from spec §10's next_pow2(measured_max) formula (max=0 would not yield 8) but is documented in the fn doc comment + coder report as a defensive 2x margin, is <=64 (ceiling rule honored), and is harmless. Accept as documented, not silent."
+  },
+
+  "anchor_repoint_review": "PASS. m310b/m311 diagnostics repoint their empty-codegen-diff assertion from `git diff main` (which now legitimately shows M3.17 codegen changes) to fixed historical SHA pairs. The assertion LOGIC (empty diff over codegen/hir/typecheck/parser/lexer trees) is untouched; the SHAs pin a HISTORICAL fact (those diagnostic commits were pure-source) rather than a moving branch relationship. Not vacuous - it still guards against history rewrite of those commits. Independently: both tests pass; the repoint was necessary (this branch's own diff touches axc-codegen/src + axc-hir/src). Minor robustness note: the tests now hard-depend on those SHAs existing in local history (would error under shallow clone / history rewrite) - non-blocking.",
+
+  "warnings": [
+    {
+      "id": "silent-drop-malformed-arity",
+      "severity": "low",
+      "description": "@precondition / @postcondition with args.len() != 1 (e.g. `@postcondition(gt(n,0), lt(n,9))` attempting comma-conjunction, or `@postcondition()`) is SILENTLY dropped: the arm guards `if ann.node.args.len() == 1` with no else, so no HirError/HirWarning is raised and no check is emitted. Independently reproduced: t_post_2arg.axc and t_pre_2arg.axc both compile --debug with exit 0 and zero diagnostics. This is a compile-time fail-OPEN for a verification tool - a user's intended check silently does not run under --debug, contrary to the design's fail-CLOSED ethos. Mitigating: (1) it requires syntax outside the documented DSL (conjunction is 'multiple annotations', §3); (2) @complexity already errors here (UnsupportedComplexityInM0) so the inconsistency is visible; (3) it is the PRE-EXISTING M0 behavior for @precondition, merely mirrored to @postcondition - not a regression introduced by this diff. Not a codegen/UB/correctness defect.",
+      "file": "crates/axc-hir/src/lower.rs",
+      "line": "117-156",
+      "recommended_followup": "Add an else-branch pushing an HirError (arity) for @precondition/@postcondition, matching @complexity. Routes to Architect as a v1.1 diagnostic-completeness item; NOT a blocker for M3.17."
+    },
+    {
+      "id": "decode-unmatched-bit-empty-vecs",
+      "severity": "info",
+      "description": "decode_debug_flags returns DebugCheckViolation with possibly-empty preconditions/postconditions vecs if a flag word is nonzero but no condition matches a set bit. Cannot occur in practice (every emitted bit has a corresponding DebugConditionMeta). Defensive-only observation.",
+      "file": "crates/axc-runtime/src/metadata.rs",
+      "line": "499-521"
+    }
+  ],
+
+  "spirv_val_check": "PASS",
+  "ub_check": "PASS",
+  "race_condition_check": "PASS",
+  "vendor_divergence_check": "PASS",
+
+  "tests_run_independently": {
+    "axc-codegen debug_checks_codegen": "5/5 pass (incl. spirv-val on GLSL450 + coopmat legs, golden identity)",
+    "axc-hir --lib": "276/276 pass",
+    "axc-runtime --lib metadata": "7/7 pass",
+    "axc-driver --lib bench_variant": "10/10 pass",
+    "manual": "release compile inert (no debug_checks key, byte-identical golden via cmp); --debug rejected on `optimize`; --debug SPIR-V disassembled and hand-verified on both memory-model legs"
+  },
+
+  "summary": "APPROVE. This first codegen-touching diff since M3.3d is sound. I disassembled the emitted --debug SPIR-V on BOTH memory-model legs and hand-verified every adversarial concern: OpAtomicOr operands (pointer/scope/semantics/mask) are exact; CRITICAL-1 is correctly implemented (QueueFamily=5 under MemoryModel::Vulkan for coopmat, Device=1 under GLSL450, no new capability on either leg - independently confirmed); the NaN-fail-loud form is the pinned OpFOrd*+OpLogicalNot(RESULT), never FUnord and never operand-swap, on both an f32 precondition and an f32 postcondition; the check is observational-only (OpSelectionMerge, no early return, atomic is the sole side effect); preconditions dominate the body and the postcondition precedes OpReturn writing flag[1]; the injected binding is decorated DescriptorSet0/Binding==num_user_buffers and appended uniformly to the buffer list. Golden-identity holds byte-for-byte (independent axc compile + cmp) and release metadata omits the debug_checks key. No HIR panic is reachable from 11 malformed DSL fixtures - all yield clean errors. Metadata v4 is back-compat and fail-CLOSED (a debug sidecar on the release path errors at pipeline creation). The at_1115 fix is IEEE-correct and leaves within_ulp_f32 / M3.16 rewrite-verify provably untouched with NVIDIA frozen at 4 ULP; its device-keyed llvmpipe widening is now honestly-disclosed dead code (defensive), not a defect. The anchor repoint preserves assertion semantics against fixed historical SHAs. ONE low-severity finding: malformed-arity @precondition/@postcondition (0 or >=2 args) is silently dropped with no diagnostic - a compile-time fail-open, but pre-existing M0 behavior for @precondition, requires out-of-DSL syntax to trigger, and produces no UB/miscodegen. Recommended as a v1.1 diagnostic follow-up to the Architect, not a blocker."
+}

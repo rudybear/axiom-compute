@@ -1,0 +1,61 @@
+{
+  "verdict": "APPROVE",
+  "agent": "optimistic_code_reviewer",
+  "milestone_id": "M3.17-runtime-checks",
+  "branch": "coder/M317-20260714-0000/M3.17-runtime-checks",
+  "spec_compliance": true,
+  "positive_feedback": [
+    "debug_checks.rs (crates/axc-codegen/src/debug_checks.rs) is a clean, well-scoped module: DEBUG_FLAG_BUFFER_NAME/DEBUG_FLAG_LEN_WORDS constants, emit_debug_flag_binding reuses emit_buffer_globals on an EXTENDED slot list (not a bespoke emission path) so DSL/pool/bind-loop agree by construction, and debug_atomic_scope_value keys the CRITICAL-1 scope constant on the same uses_coopmat predicate emit.rs already uses for the memory-model branch. Doc comments explain WHY (raw numeric Scope value, no rspirv::spirv::Scope dependency) not just what.",
+    "body.rs's emit_one_debug_check / emit_debug_compare / emit_debug_violation_atomic decomposition is textbook: the NaN-fail-loud pin (ORDERED FOrd* compare + OpLogicalNot of the RESULT, never FUnord* and never an inverted operator) is implemented exactly as spec'd in the comparison match table, and the OpSelectionMerge/OpBranchConditional/atomicOr/OpBranch merge shape matches the spec's observational-only (no early return) contract verbatim.",
+    "The Call-form DSL lowering in lower.rs (classify_debug_operand / lower_one_debug_predicate) is a faithful, zero-parser-change implementation of spec section 3/4: buffer operands hard-reject in preconditions (PreconditionOperandNotScalar) and defer with a warning in postconditions (PostconditionNotLowerable), ambiguous literal-only comparisons are rejected, and per-kind bit counters are independent (pre bit 0 / post bit 0 verified by AT-2862's own test).",
+    "The buffer-postcondition shed (defer-list section 9 item 1) is TOTAL, not partial: grep confirms zero stmt_reassigns_binding_unconditionally-style dominance-gate code was added to lower.rs. AT-2877 was honestly repurposed into a unit test proving BOTH guarded and unconditional buffer writes are deferred, which is a strictly conservative superset of the spec's original dominance gate and removes the entire CRITICAL-2 surface as the spec's own pressure valve explicitly sanctions. No half-built dead code found anywhere in the postcondition-over-buffer path.",
+    "metadata.rs schema v4 follows the v2/v3 precedent exactly: CURRENT_SCHEMA_VERSION/SUPPORTED_SCHEMA_VERSIONS bump pattern, #[serde(default)] on the new field for old-sidecar back-compat, and skip_serializing_if = \"Option::is_none\" is correctly used (and tested at_2868_release_metadata_omits_debug_checks_key asserts the JSON string literally excludes the substring, not just checking for null) so release metadata is provably unperturbed.",
+    "DispatchError::DebugCheckViolation follows the existing thiserror/#[error(...)] taxonomy precisely, and the AT-801 exhaustive-variant-count test was correctly bumped (36->37) with the new variant added to the covering match, preserving the 'compiler reminds us to update this test' discipline.",
+    "CLI surface is idiomatic clap: --debug is a plain bool flag on Command::Compile only, with AT-2875c asserting (via render_long_help on every other subcommand) that no other subcommand exposes it -- a real behavioral check, not just an eyeball read of cli.rs.",
+    "The at_1115 fix is high quality and unusually honest: the coder discovered the ROOT CAUSE was NOT Mesa FP drift (the spec's working hypothesis) but a device-independent CPU-oracle bug (expected = y_in[i] silently ignored 0.0 * NaN/Inf == NaN, plus NaN-payload non-determinism), fixed the actual oracle (expected = ALPHA * x[i] + y_in[i], both-NaN-matches via correctness_match), implemented ulp_tolerance_for_device exactly as spec'd anyway (llvmpipe-substring-keyed, never lavapipe, frozen 4 ULP guard leg verified for NVIDIA/AMD/Intel), and documented the still-open NVIDIA-side ROADMAP.md W2 defect as explicitly out of scope rather than quietly special-casing it away. within_ulp_f32 is untouched (grep-confirmed zero diff hunk touching its body).",
+    "dispatch.rs's dispatch_debug_checked/DebugDispatchOutcome is a clean, additive API: reuses prepare_kernel_checked/dispatch_handle UNMODIFIED (the flag buffer rides along as an ordinary SSBO input/output pair), and .into_result() cleanly separates the raw-bitmask-assertion use case (flag_words field) from the typed-error use case."
+  ],
+  "minor_issues": [
+    {
+      "file": "DESIGN.md / ROADMAP.md",
+      "line": null,
+      "description": "Neither file was touched by this diff (git diff main...HEAD -- DESIGN.md ROADMAP.md is empty). ROADMAP.md FG.4 (line 357-361) still reads 'Currently parsed and HIR-validated, but never lowered... Effort: ~600 LOC' -- stale now that M3.17 lowers it. The polish/bug-backlog row for at_1115 (ROADMAP.md line 407) still describes it as an open bug needing 'a re-baseline or Lavapipe-only ULP-widening with rationale' -- also stale. Every prior milestone in this repo's history (M3.9, M3.10, M3.13, M3.14, M3.15, M3.16) landed a companion 'docs(M3.x): ROADMAP ...' commit marking the FG item done / backlog row resolved (see e.g. 305cc24, d967222, 2d37250). This milestone's single commit (cb750ec) has no such companion. Flagging for merge close-out: a docs(M3.17) commit updating ROADMAP.md's FG.4 entry to a done-marker and resolving/updating the at_1115 backlog row (with the corrected oracle-bug root cause, not the originally-assumed Mesa-drift one) should land before/at merge, matching established project convention. Not a code-quality defect and does not block APPROVE on the diff itself."
+    },
+    {
+      "file": "crates/axc-hir/src/lower.rs",
+      "line": 553,
+      "description": "In lower_one_debug_predicate, the `if bit >= 32 { ... }` guard inside the per-predicate loop is unreachable dead code: the caller (lower_debug_checks) already gates the whole loop behind `if precondition_calls.len() > 32 { error } else { ...bit only ever reaches len-1 <= 31... }`, so bit can never be >= 32 when this line executes. Harmless (defensive-in-depth, correctly worded), but worth a `// unreachable in practice, kept defensive` comment or removing in a follow-up; not spec-violating."
+    },
+    {
+      "file": "crates/axc-runtime/src/dispatch.rs",
+      "line": 162,
+      "description": "DebugDispatchOutcome::conditions is populated via dbg.conditions.clone() on every dispatch call; fine at v1 scale (<=64 conditions) but a micro-nit if this path is ever called in a hot loop -- not worth blocking on."
+    }
+  ],
+  "spec_deviations_reviewed": [
+    {
+      "id": "buffer_postcondition_shed",
+      "assessment": "Matches defer-list section 9 item 1 verbatim; independently re-verified no dead dominance-gate code exists (grep confirms)."
+    },
+    {
+      "id": "at_1115_root_cause_correction",
+      "assessment": "Honest, well-documented deviation from the spec's Mesa-FP-drift hypothesis to the actual CPU-oracle bug; within_ulp_f32 and M3.16's rewrite_verify.rs remain untouched (grep-confirmed); NVIDIA's frozen 4-ULP bar is unweakened (guard-leg test + observed failure-reason string both confirm)."
+    },
+    {
+      "id": "context_rs_not_touched",
+      "assessment": "Spec section 11 lists context.rs under Modify for the flag-buffer wiring; the coder achieved the same effect generically via dispatch.rs's dispatch_debug_checked riding the existing prepare_kernel_checked/dispatch_handle NonCoherent-invalidate path. This is a legitimate simplification (AT-2879 passes on both Lavapipe and NVIDIA, proving the reused path works), not a missed requirement."
+    }
+  ],
+  "quality_notes": {
+    "debug_checks_rs_module_structure": "clean single-responsibility module; doc comments explain the CRITICAL-1 rationale inline rather than just pointing at the spec",
+    "dsl_lowering_table": "implemented as spec'd; NaN-fail-loud form pinned exactly (FOrd* + OpLogicalNot of result)",
+    "hir_validation_messages": "actionable: UnsupportedDebugPredicate's #[error] message enumerates the full v1 whitelist inline so a user sees the fix without consulting docs",
+    "metadata_v4": "follows v2/v3 precedent exactly, including the #[serde(default)]/skip_serializing_if discipline and the incremental back-compat test additions",
+    "cli_debug_surface": "idiomatic clap bool flag, negative-surface behaviorally tested (not just inspected)",
+    "error_taxonomy": "DebugCheckViolation matches existing DispatchError style; AT-801 exhaustive count test correctly maintained",
+    "deferred_buffer_postcondition_path": "no dead half-built code; shed is total and grep-verified",
+    "design_roadmap_docs": "NOT updated in this diff -- flagged above for merge close-out",
+    "at_1115_fix_quality": "high; root-cause-corrected rather than papered over, with the correction transparently documented in-code and cross-referenced to the ROADMAP.md W2 backlog item"
+  },
+  "summary": "APPROVE. The diff is a faithful, well-documented implementation of the M3.17 r2 spec: Call-form DSL lowering with zero parser changes, CRITICAL-1's memory-model-keyed atomic scope, the golden-identity gate (byte-for-byte verified), schema-v4 metadata following the v2/v3 precedent exactly (including the skip_serializing_if discipline), an idiomatic --debug CLI surface, and a DispatchError variant consistent with the existing taxonomy. The buffer-postcondition defer-list shed is total with no dead scaffolding. The at_1115 fix goes beyond the spec's assumption by finding and fixing the true root cause (a CPU-oracle bug, not Mesa FP drift) while still implementing the spec's device-keyed tolerance mechanism and leaving within_ulp_f32/rewrite_verify.rs untouched. Two trivial code-quality nits (unreachable defensive bit>=32 check, a clone() in a non-hot path) do not warrant blocking. One real gap: DESIGN.md and ROADMAP.md were not updated in this diff (unlike every prior milestone's companion docs commit) -- flagged for merge close-out, not a reason to withhold APPROVE on the code diff itself."
+}

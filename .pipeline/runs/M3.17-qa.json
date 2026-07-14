@@ -1,0 +1,83 @@
+{
+  "verdict": "PASS",
+  "agent": "qa_agent",
+  "milestone_id": "M3.17-runtime-checks",
+  "branch": "coder/M317-20260714-0000/M3.17-runtime-checks",
+  "requirements_total": 19,
+  "requirements_covered": 19,
+  "requirements_missing": [],
+  "test_results": {
+    "cargo_test_workspace_total_passed": 1102,
+    "cargo_test_workspace_total_failed": 0,
+    "cargo_test_workspace_total_ignored": 128,
+    "baseline_passed": 1078,
+    "baseline_ignored": 121,
+    "delta_passed": 24,
+    "delta_ignored": 7,
+    "delta_ignored_explained": "exactly matches the 7 #[ignore]-gated GPU tests added in crates/axc-runtime/tests/dispatch_debug_checks.rs",
+    "no_regressions": true,
+    "note": "0 flakes observed this run (the coder's own report listed at_709 icd env-race and dispatch_shared_m32 at1707 as known pre-existing parallel-run flakes; neither reproduced during QA's full-suite run)"
+  },
+  "verification_results": {
+    "cargo_build_check": "PASS",
+    "clippy_check": "PASS (cargo clippy --workspace --all-targets -- -D warnings, 0 warnings, ran after touching 4 touched source files to force a non-cached recheck)",
+    "diff_check": "PASS - all 20 files_modified + 5 files_created from coder's report appear in git diff main...HEAD; zero unexplained extra files besides the two disclosed test-anchor repoints",
+    "spirv_val_check": "PASS - spirv-tools crate-based validator (Vulkan_1_1 target) invoked in crates/axc-codegen/tests/debug_checks_codegen.rs for BOTH the GLSL450 leg and the coopmat leg; both green; re-ran independently, 5/5 tests pass",
+    "coder_self_report_matches_reality": true
+  },
+  "golden_identity_gate": {
+    "method": "independently compiled examples/precondition_saxpy.axc via `cargo run -p axc-driver --bin axc -- compile` (no --debug) and byte-compared with `cmp`",
+    "vs_committed_golden": "MATCH (byte-identical) - crates/axc-codegen/tests/golden/precondition_saxpy_release.spv",
+    "vs_annotation_stripped_source": "MATCH (byte-identical) - hand-stripped @precondition/@postcondition lines, recompiled, cmp identical",
+    "golden_spv_committed": "verified tracked in commit cb750ec (git ls-files + git show --stat); the coder's flagged .gitignore risk did not materialize",
+    "AT_2838_empty_kernel_golden": "green (crates/axc-codegen/tests/debug_checks_codegen.rs::at_2838_empty_kernel_golden_unaffected passes)",
+    "existing_examples_drift_check": "N/A beyond precondition_saxpy/saxpy pair - no other example source or golden was touched by this diff (git diff --stat confirms only 1 new golden .spv, 1 new example); zero drift"
+  },
+  "gpu_legs": {
+    "dispatch_debug_checks_lavapipe": "7/7 pass (--ignored, AXC_ENABLE_GPU_TESTS=1, VK_DRIVER_FILES=lvp_icd.json) - AT-2870/2871/2872/2873/2878/2879 + AT-2867c (coopmat leg typed-skips as expected: DeviceFeatureUnsupported)",
+    "dispatch_debug_checks_nvidia": "7/7 pass (RTX PRO 6000 Blackwell, VK_DRIVER_FILES=nvidia_icd.json) - same suite; AT-2867c coopmat leg ACTUALLY DISPATCHES on NVIDIA (confirms reviewer nit c)",
+    "at_2867_capset_differential": "confirmed via crates/axc-codegen/tests/debug_checks_codegen.rs (spirv-tools-crate-based spirv-val, no external binary needed - Vulkan_1_1 target): GLSL450 leg debug_caps==release_caps=={Shader}; coopmat leg debug_caps==release_caps=={Shader,VulkanMemoryModel,CooperativeMatrixKHR}; both spirv-val clean; binding index pinned == num_user_buffers on both legs",
+    "exact_bitmask_assertions": "confirmed present and passing for AT-2870 ({0,0}), AT-2871 (1<<0), AT-2872 (1<<0 in word 1), AT-2873 (composite OR across both words), AT-2878 (bit 1), AT-2879 (1<<0 under forced NonCoherent)"
+  },
+  "deviation_audit": [
+    {
+      "id": "a_buffer_postcondition_shed",
+      "claim": "AT-2877 shed + all elem(buf) postconditions deferred, per spec defer-list §9 item 1",
+      "assessment": "JUSTIFIED. Spec §9 defer-list item 1 verbatim: 'First shed: postcondition-over-buffer (elem(buf) + is_finite) ... Note: shedding this ALSO removes CRITICAL-2's entire surface' - matches exactly. Ran at_2864_buffer_postcondition_not_lowerable and at_2877_shed_guarded_and_unconditional_buffer_postconditions_both_deferred directly: both green, both confirm HirWarning::PostconditionNotLowerable is raised (not silently dropped), compilation still succeeds, and debug_checks stays empty for BOTH a guarded and an unconditional buffer write (a conservative superset of the spec's dominance gate, itself sound and explicitly spec-sanctioned). No half-alive partial lowering: grep of lower.rs shows the dominance-gate code (stmt_reassigns_binding_unconditionally-style analysis) was never added at all - the shed is total, matching the coder's claim precisely.",
+      "verdict": "PASS"
+    },
+    {
+      "id": "b_at1115_root_cause",
+      "claim": "at_1115 fails on main's check_saxpy on Lavapipe; root cause is a CPU-oracle bug (not Mesa FP drift as spec assumed); fix touches only check_saxpy/correctness_match; within_ulp_f32 and rewrite_verify.rs untouched; passes 5+ consecutive on Lavapipe; NVIDIA stays at frozen 4 ULP",
+      "assessment": "REPRODUCED AND CONFIRMED INDEPENDENTLY. Checked out main into a scratch git worktree: at_1115 fails deterministically on Lavapipe with 'reason: 9/1024 elements exceeded 4 ULP tolerance' (5/5 runs). On the M3.17 branch, at_1115 passes 5/5 consecutive runs on Lavapipe. git diff confirms crates/axc-driver/src/mcp/tools/rewrite_verify.rs has ZERO diff (untouched), and within_ulp_f32's function body (bench_variant.rs:579-589) has zero diff hunk touching it - only its call sites gained a per-call ulp_tolerance parameter. Ran the NVIDIA leg directly (RTX PRO 6000): at_1115 STILL FAILS on NVIDIA on this branch, with the failure reason explicitly showing 'device=\"NVIDIA...\", max observed ULP=5863519' at the frozen 4-ULP bound - proving ulp_tolerance_for_device is NOT widened for NVIDIA. Reproduced the SAME NVIDIA failure on unmodified main (also 3/1024 fails) - confirms this is genuinely pre-existing and not introduced/worsened by M3.17. Verified ROADMAP.md:408 does carry the 'M3.16 W1/W2 ... within_ulp_f32 sign-boundary false-mismatch' backlog entry the coder cited as the real cause, corroborating the deviation's honesty.",
+      "verdict": "PASS (deviation is honestly disclosed and independently verified true)"
+    },
+    {
+      "id": "c_test_anchor_repointing",
+      "claim": "m310b_loadmix_diagnostic.rs and m311_strength_reduction_diagnostic.rs anchors repointed from `git diff main` to fixed historical SHA pairs, no assertion weakening",
+      "assessment": "CONFIRMED. Both diffs are minimal - only the git diff base/target arguments change (main -> two pinned SHAs); the assertion logic (must be empty diff over codegen/hir/parser/lexer paths) is untouched. Verified all 4 cited SHAs exist in-repo (git cat-file -e) and that `git diff <base> <commit> -- <paths>` is genuinely empty for both pairs (independently reproduces the historical fact being pinned). Ran both tests directly on this branch: both green. Sanity-confirmed the repoint was NECESSARY (not just convenient): this branch's own diff against main clearly touches axc-codegen/src and axc-hir/src, which would have failed the old main-relative anchor.",
+      "verdict": "PASS"
+    },
+    {
+      "id": "d_metadata_v4",
+      "claim": "schema v4, round-trips v1/v2/v3, skip_serializing_if omits debug_checks key in release, CURRENT/SUPPORTED bumped correctly",
+      "assessment": "CONFIRMED. Ran crates/axc-runtime metadata unit tests directly: at_503 (CURRENT_SCHEMA_VERSION==4), at_1553_metadata_schema_v1_v2_back_compat (v1/v2/v3 sidecars still load with correct defaults), at_2868_release_metadata_omits_debug_checks_key (asserts the serialized JSON string literally does not contain the substring 'debug_checks'), at_2868_debug_metadata_round_trips (Some(DebugChecksMeta) round-trips exactly) - all green. Did not find any non-debug dispatch path that consumes v4-debug metadata unsafely; debug_augmented_binding_plan is a no-op passthrough when debug_checks is None, so a v4-debug artifact fed to a release-only consumer (e.g. M3.16 rewrite-verify) is caught by the EXISTING binding-count interface gate (AT-2869), not new code - consistent with §7.1's stated design.",
+      "verdict": "PASS"
+    }
+  ],
+  "scope_check": {
+    "axc_lexer_axc_parser_untouched": "CONFIRMED - git diff --stat main...HEAD -- crates/axc-lexer crates/axc-parser is empty",
+    "equiv_fp_tol_1e-3_untouched": "CONFIRMED - only appears in the new milestone spec doc text, zero code diff references it",
+    "no_new_opcapability": "CONFIRMED - grepped every b.capability(...) call site added/changed in the diff; the only capability-adjacent additions are debug_checks.rs's TEST-SCOPE builder helper (used only inside its own unit test, mirrors an existing baseline) and debug_checks_codegen.rs's numeric capability constant used purely for assertions. emit.rs's actual capability-emission list (Shader/VulkanMemoryModel/Int64/Float64/GroupNonUniform*/CooperativeMatrixKHR/Float16/StorageBuffer*BitAccess/Int8/Int16) is completely unchanged by this diff.",
+    "context_rs_note": "MINOR SCOPE NOTE (not a defect): spec §11 lists crates/axc-runtime/src/context.rs under 'Modify' for the flag-buffer alloc/zero/bind/readback wiring, but the actual diff shows ZERO changes to context.rs - the coder achieved the same NonCoherent-invalidate readback reuse generically via dispatch.rs's new dispatch_debug_checked() calling the EXISTING prepare_kernel_checked/dispatch_handle unmodified (flag buffer riding along as just another SSBO). AT-2879 (GPU, forced NonCoherent staging) passes on both Lavapipe and NVIDIA, proving the reused path works correctly. This is a legitimate simplification, not a missed requirement."
+  },
+  "loc_check": {
+    "coder_claimed_product_sloc": 862,
+    "coder_claimed_cap": 950,
+    "qa_independent_estimate": 840,
+    "qa_estimate_method": "parsed git diff -U0 per touched product file, excluded lines whose new-file line number falls inside a top-level #[cfg(test)] mod {...} block, excluded blank and brace/punctuation-only lines; counted only the 18 previously-existing files that were modified (the 3 new files created - debug_checks_codegen.rs, dispatch_debug_checks.rs, and the golden .spv/example - are test/fixture artifacts, correctly excluded from 'product' either way)",
+    "verdict": "CONSISTENT - independent estimate (840) and coder's claim (862) agree within ~2.5% (methodology-level rounding, e.g. multi-line match-arm formatting); both are comfortably under the 950 hard cap with margin to spare"
+  },
+  "memory_footprint_ok": true,
+  "summary": "PASS. All independently-reproduced evidence corroborates the coder's report: golden-identity gate holds byte-for-byte (verified via a fresh `axc compile` + `cmp`, not just re-running the coder's own test); the full GPU acceptance suite (7 tests) passes 7/7 on BOTH real NVIDIA (RTX PRO 6000 Blackwell) and Lavapipe, including the coopmat leg actually dispatching on NVIDIA; the at_1115 fix was reproduced end-to-end - failure confirmed on main (9/1024 @ Lavapipe, matching reproduced on NVIDIA too as a documented pre-existing defect), fix confirmed passing 5/5 on Lavapipe with within_ulp_f32 and M3.16's rewrite_verify.rs provably untouched, and NVIDIA's 4-ULP bar provably still enforced (observed directly in the failure-reason string). All 4 disclosed deviations were independently investigated against the spec text and the actual code/tests, not taken on faith, and all check out as honestly and accurately reported. Scope is clean: zero axc-lexer/axc-parser diff, zero new OpCapability, 1e-3 invariant untouched, LOC well under cap by two independent counts. cargo test --workspace: 1102 passed / 0 failed / 128 ignored (delta vs baseline exactly explained by new GPU-gated tests). clippy: 0 warnings on a forced (non-cached) run. No blocking issues found; one cosmetic scope note (context.rs listed in spec but not touched, due to a legitimate reuse-based simplification, functionally verified via AT-2879)."
+}

@@ -1,0 +1,117 @@
+{
+  "verdict": "REVISED",
+  "agent": "architect",
+  "revision": "r2",
+  "milestone_id": "M3.17-runtime-checks",
+  "responds_to": [
+    ".pipeline/runs/M3.17-pessimistic-design-review.json (NEEDS_REVISION: 2 CRITICAL + 2 NEEDS_REVISION + mandates)",
+    ".pipeline/runs/M3.17-optimistic-design-review.json (APPROVE + minors)"
+  ],
+  "core_design_unchanged": true,
+  "core_design_summary": "Call-form predicate DSL (zero parser change) + host-observed debug-flag SSBO injected only under --debug + atomicOr idempotent bitmask + golden-identity byte-identity gate (AT-2838/2866) + at_1115 device-keyed ULP widening. All four pillars STAND; the r2 changes are surgical.",
+  "fixes": [
+    {
+      "id": "CRITICAL-1",
+      "title": "OpAtomicOr scope vs emitted memory model",
+      "r1_state": "spec said scope Device unconditionally + 'no new OpCapability'; INVALID on coopmat kernels (emit.rs:152-162 emits MemoryModel::Vulkan, where Device scope requires VulkanMemoryModelDeviceScope). Preconditions ARE lowered on coopmat kernels, so the bad leg is real.",
+      "r2_resolution": "§2 + §4 + §11(emit.rs): scope keyed on the emitted memory model via the SAME uses_coopmat predicate — Scope::QueueFamily under MemoryModel::Vulkan (coopmat; needs nothing beyond the already-present VulkanMemoryModel), Scope::Device under GLSL450 (non-coopmat; valid with Shader alone). Net capability set == baseline on BOTH legs. AT-2867 now spirv-vals a GLSL450 AND a coopmat precondition kernel and asserts caps gain nothing.",
+      "sections": ["2", "4", "11"],
+      "ats": ["AT-2867"]
+    },
+    {
+      "id": "CRITICAL-2",
+      "title": "Postcondition gate unsound for guarded/conditional writes",
+      "r1_state": "§5 required only that a BufferWrite{buf,gid(0)} EXISTS; body.rs:579/850 support guarded `if(i<n){buf[i]=…}`, so a guarded write passed the gate but the exit read `buf[gid(0)]` on padding threads is OOB / reads-unwritten ⇒ spurious violation or device fault.",
+      "r2_resolution": "§5 condition 3 now requires the HirStmt::BufferWrite{buffer_binding==buf, index==gid(0)} to UNCONDITIONALLY DOMINATE exit, defined as a CONSERVATIVE SYNTACTIC check: the write appears at the kernel body top level, NOT nested inside any HirStmt::If/ForRange/While — explicitly NO dataflow analysis in v1. Reuses the proven body.rs:836 stmt_reassigns_binding_unconditionally discipline. Guarded/loop-nested writes ⇒ HirWarning::PostconditionNotLowerable, compile succeeds, no unguarded exit read emitted. (r1 also mislabeled the node 'IndexAssign'; corrected to the actual HirStmt::BufferWrite.)",
+      "sections": ["5", "9", "11"],
+      "ats": ["AT-2877"]
+    },
+    {
+      "id": "PLUMBING",
+      "title": "Descriptor plumbing for the injected binding",
+      "r1_state": "under-specified against how the runtime sizes DSL/pool.",
+      "r2_resolution": "§7 states explicitly the flag binding is APPENDED to binding_plan.buffers under --debug, so all four derivations agree: SPIR-V decoration (set0/binding=num_user_buffers), DSL build, pool sizing (context.rs:1636 uses .len()), bind loop (context.rs:1628). Not a detached metadata field. AT-2867 asserts pool==layout==bind==N+1.",
+      "sections": ["7", "11"],
+      "ats": ["AT-2867"]
+    },
+    {
+      "id": "COHERENCY",
+      "title": "Host-readback NonCoherent invalidate (fail-closed)",
+      "r1_state": "§2 said fence makes writes host-visible; OMITTED vkInvalidateMappedMemoryRanges — fail-OPEN on non-HOST_COHERENT devices (silently misses violations).",
+      "r2_resolution": "§2 + §7 route the flag readback through the existing NonCoherent invalidate path (buffers.rs Coherency::NonCoherent), honoring context.rs force_noncoherent_staging / AXC_FORCE_NONCOHERENT_STAGING — same path as user outputs; fails CLOSED. New AT-2879 exercises AXC_FORCE_NONCOHERENT_STAGING=1 and asserts a real violation is still observed.",
+      "sections": ["2", "7", "11"],
+      "ats": ["AT-2879"]
+    },
+    {
+      "id": "MANDATE-NaN",
+      "title": "Pin %bad = OpLogicalNot(OpFOrd*) NaN-fail-loud form",
+      "r2_resolution": "§4 pins the exact form: FOrd-family compare + OpLogicalNot of the RESULT (never FUnord*, never inverting the operator) so a NaN operand ⇒ compare false ⇒ %bad true ⇒ violation FLAGGED. New AT-2878: a NaN scalar precondition operand sets the violation bit.",
+      "sections": ["4"],
+      "ats": ["AT-2878"]
+    },
+    {
+      "id": "MANDATE-observational",
+      "title": "Observational-only (NO early return) as an explicit design rule",
+      "r2_resolution": "§2 states: violated condition does NOT short-circuit (body runs with offending inputs); each check emits its own OpSelectionMerge (structured CF); postcondition insertion assumes a SINGLE trailing OpReturn (deferred multi-return). Sidesteps BarrierInDivergentContext by construction.",
+      "sections": ["2"],
+      "ats": []
+    },
+    {
+      "id": "MANDATE-at1115",
+      "title": "at_1115 keys on 'llvmpipe' substring; within_ulp_f32 untouched; no >64 clamp",
+      "r2_resolution": "§10: device match = name.to_ascii_lowercase().contains(\"llvmpipe\") (never 'lavapipe', which never appears). within_ulp_f32 is NOT modified (M3.16 reuses it at fixed 4 ULP at bench_variant.rs:496-498); tolerance threaded only through check_saxpy/check_vector_add. Ceiling rule: measured_max forcing >64 ⇒ milestone FAILS/re-measures, no silent clamp. AT-2876 adds a guard leg proving a non-llvmpipe name stays 4 ULP.",
+      "sections": ["10"],
+      "ats": ["AT-2876"]
+    },
+    {
+      "id": "MANDATE-metadata-null",
+      "title": "skip_serializing_if so release metadata has no debug_checks key",
+      "r2_resolution": "§7 + §11: field is #[serde(default, skip_serializing_if = \"Option::is_none\")]; release JSON omits the key entirely (not \"debug_checks\":null). AT-2868 asserts absence under release.",
+      "sections": ["7", "11"],
+      "ats": ["AT-2868"]
+    },
+    {
+      "id": "OPTIMISTIC-minors",
+      "title": "Pin injected binding index; assert flag bytes directly; @strict release cross-check",
+      "r2_resolution": "AT-2867 pins injected index == num_user_buffers; AT-2870..2873 assert flag-buffer words == exact expected bitmask (not only the typed error); AT-2874 adds the @strict-release-byte-unchanged cross-check.",
+      "sections": ["12"],
+      "ats": ["AT-2867", "AT-2870", "AT-2871", "AT-2872", "AT-2873", "AT-2874"]
+    }
+  ],
+  "at_range": {
+    "start": "AT-2861",
+    "end": "AT-2879",
+    "r1_end": "AT-2876",
+    "added": ["AT-2877 (guarded-write PostconditionNotLowerable)", "AT-2878 (NaN fail-loud)", "AT-2879 (NonCoherent fail-closed)"],
+    "ceiling_honored": "<= AT-2880",
+    "collision_free": "M3.16 owns 2850..2860; M3.17 2861..2879 confirmed non-overlapping by pessimistic reviewer"
+  },
+  "loc_ceiling": {
+    "target": 650,
+    "cap": 950,
+    "r1_target": 600,
+    "r1_cap": 900,
+    "delta_rationale": "+~50 LOC for the memory-model-keyed scope constant (CRITICAL-1) and the conservative top-level-dominance scan (CRITICAL-2). Defer-list §9 item 1 (shed buffer postconditions first) removes CRITICAL-2's entire surface if the cap is threatened."
+  },
+  "verified_in_tree": [
+    "emit.rs:152-162 — uses_coopmat drives MemoryModel::Vulkan + Capability::VulkanMemoryModel (grounds CRITICAL-1 scope split)",
+    "HirStmt::BufferWrite is the actual buffer-write node (expr.rs:291); r1's 'IndexAssign' was loose terminology — corrected",
+    "body.rs:836 stmt_reassigns_binding_unconditionally — the existing conservative top-level (no If/ForRange/While descent) precedent reused for the §5 dominance gate",
+    "body.rs:579 HirStmt::If + body.rs:850 CONDITIONAL reassignment — grounds the guarded-write hazard",
+    "context.rs force_noncoherent_staging + AXC_FORCE_NONCOHERENT_STAGING env — grounds the coherency AT-2879",
+    "context.rs:1636 pool sizing = binding_plan.buffers.len() — grounds the append-plumbing rule"
+  ],
+  "unchanged_from_r1": [
+    "Call-form predicate DSL (§3) — zero parser change, AT-2861 no-change anchor",
+    "Injected 2-word flag SSBO mechanism + idempotent atomicOr bitmask (§2)",
+    "Golden-identity byte-identity gate: AT-2838 + AT-2866 (§6)",
+    "Schema v4 #[serde(default)] pattern (now + skip_serializing_if) (§7)",
+    "at_1115 device-keyed Lavapipe-only widening, NVIDIA path frozen (§10)",
+    "Defer-list ordering with buffer-postconditions shed first (§9)"
+  ],
+  "outputs_written": [
+    ".pipeline/milestones/M3.17-runtime-checks.md (updated in place, marked REVISED r2, §14 r2-changelog appended)",
+    ".pipeline/runs/M3.17-architect.json (this file, r2)"
+  ],
+  "ready_for": "re-review by pessimistic design reviewer (all 2 CRITICAL + 2 NEEDS_REVISION + mandates addressed); optimistic minors folded"
+}
