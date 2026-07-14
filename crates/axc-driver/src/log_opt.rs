@@ -20,6 +20,15 @@
 //!   FG.9 territory, not built.
 //! - A source that fails to parse, or whose EXISTING `@optimization_log` block
 //!   is itself malformed, is refused rather than spliced blind.
+//! - A source whose EXISTING `@optimization_log` block declares
+//!   `version != SUPPORTED_OPT_LOG_VERSION` is refused
+//!   (`LogOptError::UnsupportedVersion`) BEFORE any write — this writer only
+//!   ever emits/splices `version == SUPPORTED_OPT_LOG_VERSION`-shaped entries,
+//!   so splicing one into a block of any other declared version would
+//!   silently mix schema versions inside one block (QA-caught gap, AT-2926:
+//!   a `version: 2` block parses and compiles cleanly on its own, so the
+//!   writer cannot rely on "this can't happen via the parser" — it must
+//!   check explicitly).
 //!
 //! # Concurrency
 //!
@@ -56,6 +65,17 @@ pub enum LogOptError {
     /// already would not compile.
     #[error("existing @optimization_log block is malformed: {detail}")]
     MalformedExistingBlock { detail: String },
+    /// The EXISTING `@optimization_log` block declares a `version` this
+    /// writer does not support (only `SUPPORTED_OPT_LOG_VERSION` is
+    /// splice-able). A `version != SUPPORTED_OPT_LOG_VERSION` block is a
+    /// REAL, parseable, HIR-valid block (§1.4a forward-compat preserves
+    /// unknown keys instead of rejecting it) — it is NOT unreachable, so this
+    /// writer must check explicitly rather than assume the parser rules it
+    /// out. Refusing here, BEFORE any write, avoids silently splicing a
+    /// `SUPPORTED_OPT_LOG_VERSION`-shaped entry into a block of a different
+    /// declared schema version (AT-2926).
+    #[error("existing @optimization_log block has version {found}; this writer only supports version {supported} (refusing to splice a mismatched-schema-version entry into it)")]
+    UnsupportedVersion { found: i64, supported: i64 },
     /// The kernel has no leading annotations to anchor a freshly-inserted
     /// block before (should not happen for any source that passed HIR
     /// validation, since `@kernel` itself is always a leading annotation).
@@ -68,14 +88,16 @@ pub enum LogOptError {
 
 impl LogOptError {
     /// Distinct machine-readable exit codes (§1.5: "distinct... exit-coded
-    /// LogOptError::Full"). `Full` and `Multikernel` get their OWN codes (not
-    /// the generic usage-error `2`) so a calling script can distinguish
-    /// "capacity reached" / "multi-kernel not supported" from a plain usage
-    /// mistake without parsing the JSON error body.
+    /// LogOptError::Full"). `Full`, `Multikernel`, and `UnsupportedVersion`
+    /// get their OWN codes (not the generic usage-error `2`) so a calling
+    /// script can distinguish "capacity reached" / "multi-kernel not
+    /// supported" / "unsupported block version" from a plain usage mistake
+    /// without parsing the JSON error body.
     pub fn exit_code(&self) -> i32 {
         match self {
             LogOptError::Full { .. } => 3,
             LogOptError::Multikernel(_) => 4,
+            LogOptError::UnsupportedVersion { .. } => 5,
             LogOptError::Parse { .. }
             | LogOptError::MalformedExistingBlock { .. }
             | LogOptError::NoAnchor
@@ -286,8 +308,26 @@ pub fn splice_optimization_log_entry(source: &str, new_entry: &OptimizationLogEn
             if let Some(detail) = malformed_detail {
                 return Err(LogOptError::MalformedExistingBlock { detail });
             }
-            let current_entries: usize = hir.kernels.first()
-                .and_then(|k| k.annotations.opt_log.as_ref())
+            let existing_log: Option<&OptimizationLog> = hir.kernels.first()
+                .and_then(|k| k.annotations.opt_log.as_ref());
+
+            // Fail-closed BEFORE any write: this writer only ever produces
+            // `SUPPORTED_OPT_LOG_VERSION`-shaped entries, so it must refuse to
+            // splice into a block declaring any other version rather than
+            // silently mixing schema versions inside one block. A
+            // `version != SUPPORTED_OPT_LOG_VERSION` block is real,
+            // parseable, and HIR-valid (§1.4a forward-compat), so this check
+            // cannot be skipped as "unreachable" (AT-2926).
+            if let Some(log) = existing_log {
+                if log.version != axc_hir::opt_log::SUPPORTED_OPT_LOG_VERSION {
+                    return Err(LogOptError::UnsupportedVersion {
+                        found: log.version,
+                        supported: axc_hir::opt_log::SUPPORTED_OPT_LOG_VERSION,
+                    });
+                }
+            }
+
+            let current_entries: usize = existing_log
                 .map(|log| log.entries.len())
                 .unwrap_or(0);
             if current_entries >= MAX_OPT_LOG_ENTRIES {
@@ -455,6 +495,76 @@ mod tests {
         // the file-level `append_optimization_log` wrapper never calls
         // `std::fs::write` in this path (verified structurally: it always
         // calls `splice_optimization_log_entry` first via `?`).
+    }
+
+    // ── AT-2926 (QA-fix extension, one past the M3.19 spec's AT-2925 ceiling):
+    //    the writer REFUSES to splice into an existing `version != 1` block,
+    //    fail-closed BEFORE any write, source byte-unchanged. This is the fix
+    //    for the QA-blocking finding in M3.19-qa.json: a `version: 2` block
+    //    parses and compiles cleanly (proven below), and the coder's original
+    //    "no real source can carry a block-level version>1 today via this
+    //    parser's own grammar" justification for skipping this check was
+    //    factually wrong — it conflated "an unknown BLOCK-LEVEL KEY is
+    //    unreachable" (true, EBNF-closed) with "a block-level VERSION NUMBER
+    //    greater than 1 is unreachable" (false — `version` is itself always a
+    //    parseable, HIR-valid field, per §1.4a forward-compat). ─────────────
+
+    #[test]
+    fn at_2926_version2_block_refused_source_byte_unchanged() {
+        let src = "@kernel @workgroup(1,1,1) @optimization_log { version: 2, entry { ts: \"2026-07-14T12:00:00.000Z\", kernel: \"k\", metric: 1, unit: ns, verdict: PASS } } fn k() -> void { return; }";
+
+        // Sanity, matching the QA finding: this version:2 block is REAL —
+        // it parses and lowers with zero errors (not a malformed/rejected
+        // block), so `LogOptError::MalformedExistingBlock` must NOT be what
+        // fires here; only the dedicated `UnsupportedVersion` check may.
+        let (ast, lex, parse) = axc_parser::parse(src);
+        assert!(lex.is_empty() && parse.is_empty(), "fixture must parse clean: {lex:?} {parse:?}");
+        let (hir, errors, _warnings) = axc_hir::lower_module(&ast);
+        assert!(errors.is_empty(), "fixture must lower clean (this is the exact QA-reproduced end-to-end scenario): {errors:?}");
+        assert_eq!(hir.kernels[0].annotations.opt_log.as_ref().unwrap().version, 2);
+
+        let result = splice_optimization_log_entry(src, &sample_entry());
+        match result {
+            Err(LogOptError::UnsupportedVersion { found, supported }) => {
+                assert_eq!(found, 2);
+                assert_eq!(supported, axc_hir::opt_log::SUPPORTED_OPT_LOG_VERSION);
+                assert_eq!(supported, 1);
+                assert_eq!(LogOptError::UnsupportedVersion { found, supported }.exit_code(), 5);
+            }
+            other => panic!("expected LogOptError::UnsupportedVersion: {other:?}"),
+        }
+        // The pure splice function is Err-only on failure — nothing written;
+        // exercised at the file level too, below, for the actual byte-unchanged
+        // guarantee on disk (mirrors AT-2922's own pattern).
+    }
+
+    #[test]
+    fn at_2926_version2_block_refused_file_byte_unchanged_on_disk() {
+        use std::io::Write;
+        let src = "@kernel @workgroup(1,1,1) @optimization_log { version: 2, entry { ts: \"2026-07-14T12:00:00.000Z\", kernel: \"k\", metric: 1, unit: ns, verdict: PASS } } fn k() -> void { return; }";
+        let mut f = tempfile::NamedTempFile::new().expect("tempfile");
+        f.write_all(src.as_bytes()).expect("write fixture");
+
+        let before = std::fs::read(f.path()).expect("read before");
+        let err = append_optimization_log(f.path(), sample_entry()).expect_err("must refuse to append");
+        assert!(matches!(err, LogOptError::UnsupportedVersion { found: 2, supported: 1 }), "expected UnsupportedVersion{{found:2,supported:1}}: {err:?}");
+        assert_eq!(err.exit_code(), 5);
+        let after = std::fs::read(f.path()).expect("read after");
+        assert_eq!(before, after, "source file must be byte-for-byte unchanged after a refused append");
+    }
+
+    #[test]
+    fn at_2926_version1_block_append_still_works() {
+        // No-regression companion: a version:1 block (the only version this
+        // writer supports) must continue to splice successfully — the new
+        // check must not be over-broad.
+        let src = "@kernel @workgroup(1,1,1) @optimization_log { version: 1, entry { ts: \"2026-07-14T12:00:00.000Z\", kernel: \"k\", metric: 1, unit: ns, verdict: PASS } } fn k() -> void { return; }";
+        let spliced = splice_optimization_log_entry(src, &sample_entry()).expect("version:1 block must still splice");
+        let (ast, lex, parse) = axc_parser::parse(&spliced);
+        assert!(lex.is_empty() && parse.is_empty(), "spliced source must re-parse clean: {lex:?} {parse:?}");
+        let (hir, errors, _) = axc_hir::lower_module(&ast);
+        assert!(errors.is_empty(), "spliced source must lower clean: {errors:?}");
+        assert_eq!(hir.kernels[0].annotations.opt_log.as_ref().unwrap().entries.len(), 2);
     }
 
     // ── Multikernel fail-closed ────────────────────────────────────────────────

@@ -296,8 +296,10 @@ pub enum Command {
     ///    name).
     ///
     /// Fails closed (exit 3 = `LogOptError::Full`, exit 4 =
-    /// `LogOptError::Multikernel`, exit 2 = any other usage/parse/malformed
-    /// error) and NEVER partially writes `source`.
+    /// `LogOptError::Multikernel`, exit 5 = `LogOptError::UnsupportedVersion`
+    /// (existing block's `version != SUPPORTED_OPT_LOG_VERSION` — AT-2926),
+    /// exit 2 = any other usage/parse/malformed error) and NEVER partially
+    /// writes `source`.
     LogOpt {
         /// Kernel source file (`.axc`) to append to.
         source: PathBuf,

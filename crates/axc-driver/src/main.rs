@@ -106,9 +106,9 @@ fn main() -> miette::Result<()> {
 /// comment for the exact three-way grammar), calls the fail-closed writer,
 /// prints a small JSON status to stdout, and exits: `0` on success,
 /// `LogOptError::exit_code()` on a writer failure (`3` = Full, `4` =
-/// Multikernel, `2` = any other writer error), `2` on a CLI-layer usage
-/// error (bad flag combination, unreadable/malformed `--from-*` JSON, bad
-/// `--unit`/`--verdict` string). Never returns.
+/// Multikernel, `5` = UnsupportedVersion, `2` = any other writer error), `2`
+/// on a CLI-layer usage error (bad flag combination, unreadable/malformed
+/// `--from-*` JSON, bad `--unit`/`--verdict` string). Never returns.
 #[allow(clippy::too_many_arguments)]
 fn run_log_opt(
     source: PathBuf,
