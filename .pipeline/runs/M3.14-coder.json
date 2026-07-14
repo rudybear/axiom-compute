@@ -1,0 +1,78 @@
+{
+  "verdict": "COMPLETE",
+  "agent": "coder",
+  "milestone_id": "M3.14-quant-variants",
+  "design_revision": "r2",
+  "branch": "coder/M314-20260713-1200/M3.14-quant-variants",
+  "compiler_change_flag": "NONE (as required by spec §7) — zero codegen/HIR/typecheck/parser/lexer changes. Both new formats are fully expressible pure-source with the existing Q4_0-path builtin set (ptr_read_u8_zext, ptr_read_u16_zext, f16_bits_to_f32, f32_from_u32, f32_to_f16, band/bor/shl/shr/lshr) plus f32 arithmetic + branches.",
+  "files_created": [
+    "crates/axc-driver/src/q6k_oracle.rs",
+    "crates/axc-driver/src/q5k_oracle.rs",
+    "examples/q6k_dequant_matmul.axc",
+    "examples/q5k_dequant_matmul.axc",
+    "examples/q5km_matmul_rb_coopmat_f32acc_cached.axc",
+    "crates/axc-driver/tests/dispatch_q6k_matmul.rs",
+    "crates/axc-driver/tests/dispatch_q5k_matmul.rs",
+    "crates/axc-driver/tests/dispatch_q5km_matmul_rb_f32acc_cached.rs"
+  ],
+  "files_modified": [
+    "crates/axc-driver/src/lib.rs",
+    "crates/axc-driver/tests/compile_shared_examples.rs"
+  ],
+  "public_apis_implemented": [
+    "pub const Q6K_SUPERBLOCK_BYTES: usize = 210 (q6k_oracle)",
+    "pub const Q6K_SUPERBLOCK_ELEMS: usize = 256 (q6k_oracle)",
+    "pub fn q6k_dequant_matmul_f32accum_cpu(q: &[u8], x_f16: &[u16], n_rows, n_cols, n_blocks_per_row) -> Vec<f32>",
+    "pub fn q6k_dequant_matmul_f32_cpu(q: &[u8], x_f32: &[f32], n_rows, n_cols, n_blocks_per_row) -> Vec<f32>  # bit-exact template mirroring common_matmul.rs::q4km_dequant_matmul_cpu",
+    "pub fn q6k_abs_dot_scale(q: &[u8], x_f16: &[u16], n_rows, n_cols, n_blocks_per_row) -> Vec<f32>",
+    "pub const Q5K_SUPERBLOCK_BYTES: usize = 176 (q5k_oracle)",
+    "pub const Q5K_SUPERBLOCK_ELEMS: usize = 256 (q5k_oracle)",
+    "pub fn q5k_dequant_matmul_f32accum_cpu(q: &[u8], x_f16: &[u16], n_rows, n_cols, n_blocks_per_row) -> Vec<f32>",
+    "pub fn q5k_dequant_matmul_f32_cpu(q: &[u8], x_f32: &[f32], n_rows, n_cols, n_blocks_per_row) -> Vec<f32>",
+    "pub fn q5k_abs_dot_scale(q: &[u8], x_f16: &[u16], n_rows, n_cols, n_blocks_per_row) -> Vec<f32>",
+    "fn q6k_dequant_matmul(q,x,y,n_rows,n_cols,n_blocks_per_row) -> void  (examples/q6k_dequant_matmul.axc, portable, Lavapipe-runnable)",
+    "fn q5k_dequant_matmul(q,x,y,n_rows,n_cols,n_blocks_per_row) -> void  (examples/q5k_dequant_matmul.axc, portable, Lavapipe-runnable)",
+    "fn q5km_matmul_rb_coopmat_f32acc_cached(q,x,C,M,N,K,n_blocks_per_row) -> void  (examples/q5km_matmul_rb_coopmat_f32acc_cached.axc, NVIDIA coopmat, M3.6-leader-derived)"
+  ],
+  "metric_reuse": "max_rel_diff / max_rel_diff_combined / round_f32_to_f16_to_f32 re-exported from axc_driver::q4km_oracle in both new oracle modules — NOT re-implemented, per spec §5. The frozen 1e-3 gate is never re-defined or loosened.",
+  "tests_added": [
+    "AT-2811 (CPU, q6k_oracle::tests::at_2811_dequant_q6k_row_full_256_golden) — full 256-element Q6_K golden: all 4 quant-groups, both h halves, is=l/16 boundary, negative scale, both quant extremes",
+    "AT-2812 (CPU, q6k_oracle::tests::at_2812_signed_scale_and_metric_sanity) — sc={-128,-1,127} sign-reconstruction + abs_dot_scale dominance + 1% mutant caught",
+    "AT-2813 (CI/no-GPU, compile_shared_examples.rs::at_2813_q6k_dequant_matmul_compiles_capset_and_builtinset) — compiles + spirv-val, cap set == q4km_dequant_matmul.axc, referenced-builtin set ⊆ baseline",
+    "AT-2814 (GPU Lavapipe+NVIDIA, NOT ignored, dispatch_q6k_matmul.rs::at_2814_q6k_matmul_k256_bit_exact) — K=256 bit-exact (max_diff==0) via an exact-integer fixture",
+    "AT-2815 (GPU NVIDIA #[ignore], dispatch_q6k_matmul.rs::at_2815_q6k_matmul_k2048_combined_within_tol) — K=2048, random signed scales, combined ≤ 1e-3",
+    "AT-2816 (CPU, q5k_oracle::tests::at_2816_dequant_q5k_row_golden) — Q5_K_M golden, qh bit set/clear across all 8 positions",
+    "AT-2817 (CPU, q5k_oracle::tests::at_2817_five_bit_range_and_metric_sanity) — 5-bit range (nib5 in {15,31}) + metric sanity",
+    "AT-2818 (CI/no-GPU, compile_shared_examples.rs::at_2818_q5k_dequant_matmul_compiles_capset_and_builtinset)",
+    "AT-2819 (GPU Lavapipe+NVIDIA, NOT ignored, dispatch_q5k_matmul.rs::at_2819_q5k_matmul_k256_bit_exact)",
+    "AT-2820 (GPU NVIDIA #[ignore], dispatch_q5k_matmul.rs::at_2820_q5k_matmul_k2048_combined_within_tol)",
+    "AT-2821 (CI/no-GPU, compile_shared_examples.rs::at_2821_q5km_coopmat_cached_compiles_capset_and_builtinset) — cap set BYTE-IDENTICAL to M3.6 leader, shared_memory_bytes==4096, builtin set ⊆ leader",
+    "AT-2822 (GPU NVIDIA #[ignore], dispatch_q5km_matmul_rb_f32acc_cached.rs, 3 tests: k256/k512/k14336) — combined ≤ 1e-3 vs q5k_dequant_matmul_f32accum_cpu",
+    "AT-2823 (GPU NVIDIA #[ignore], dispatch_q5km_matmul_rb_f32acc_cached.rs::at_2823_q5km_rb_coopmat_f32acc_cached_apples_to_apples_k256) — apples-to-apples vs the f16-weight-rounded oracle, per r2 FIX-2 (NOT vs the portable kernel)"
+  ],
+  "golden_fixture_provenance": {
+    "AT-2811": "hand-computed-from-formula fallback (§6) — no live ggml byte dump was available in this environment; annotated in the test doc comment as required",
+    "AT-2816": "hand-computed-from-formula fallback (§6), same reason; annotated in the test doc comment"
+  },
+  "test_run_results": {
+    "cargo_build_workspace": "pass",
+    "cargo_test_workspace_cpu_only": "pass, 0 failed (full suite, no regressions)",
+    "cargo_clippy_workspace_lib_tests_D_warnings": "pass, 0 warnings",
+    "cpu_oracle_tests_q6k_q5k": "4/4 pass (AT-2811, AT-2812, AT-2816, AT-2817)",
+    "compile_anchor_tests": "3/3 pass (AT-2813, AT-2818, AT-2821) — spirv-val clean, capability sets verified, referenced-builtin-set ⊆ baseline verified",
+    "gpu_tests_not_ignored_on_real_nvidia": "2/2 pass (AT-2814 max_diff=0, AT-2819 max_diff=0) — AXC_ENABLE_GPU_TESTS=1 on NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+    "gpu_tests_ignored_on_real_nvidia": "6/6 pass (AT-2815 combined=2.473e-5, AT-2820 combined=2.801e-5, AT-2822 x3: k256 combined=5.095e-7 / k512 combined=5.379e-7 / k14336 combined=1.703e-6, AT-2823 combined=5.095e-7) — all comfortably within the frozen 1e-3 gate",
+    "gpu_device": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition (real hardware, not Lavapipe)"
+  },
+  "deviations_from_spec": [
+    "NONE in design/layout/algorithm. One SELF-INFLICTED authoring fix (not a spec deviation): the q5km_matmul_rb_coopmat_f32acc_cached.axc header comment originally mentioned the literal substring '@strategy' inside a prose comment BEFORE the real @strategy annotation; the driver's strip_strategy_annotation_block does a naive source.find(\"@strategy\") for the FIRST occurrence and bailed on the comment instead of the real annotation, leaving all 5 holes unresolved at codegen. Fixed by rewording the comment to avoid the literal substring before the real annotation — a documentation-only change, not a compiler change (this quirk pre-exists in axc-driver::strip_strategy_annotation_block and was not touched)."
+  ],
+  "self_assessment": {
+    "spec_coverage": "All M3.14 r2 spec deliverables implemented: Q6_K oracle+kernel (M3.14a), Q5_K_M oracle+kernel+coopmat-leader-extension (M3.14b), AT-2811..2823 all implemented and passing (CPU + CI compile-anchor + real-GPU Lavapipe/NVIDIA paths verified where hardware-gated tests could be run locally).",
+    "known_limitations": [
+      "Golden fixtures for AT-2811/AT-2816 use the hand-computed-from-formula fallback (no live ggml byte dump cross-check was available in this environment) — explicitly permitted by spec §6 as an annotated fallback; QA should note this and a future milestone could add a real ggml dump cross-check as a drop-in.",
+      "AT-2814/AT-2815/AT-2819/AT-2820/AT-2822/AT-2823 were run and verified passing on real NVIDIA hardware in this environment; Lavapipe CI execution of the NOT-#[ignore] tests (AT-2814, AT-2819) was not separately re-verified here (only the driver-level spirv-val + capability-set anchors were checked without Lavapipe) since this box's default Vulkan ICD routed to the real NVIDIA GPU — the kernels are pure f32 buffer I/O with no coopmat/f16-storage requirement so Lavapipe compatibility follows the same pattern as the already-Lavapipe-proven q4km_dequant_matmul.axc (AT-1520 class)."
+    ],
+    "deviations": []
+  }
+}

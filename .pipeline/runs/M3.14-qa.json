@@ -1,0 +1,61 @@
+{
+  "verdict": "PASS",
+  "agent": "qa_agent",
+  "milestone_id": "M3.14-quant-variants",
+  "design_revision": "r2",
+  "branch": "coder/M314-20260713-1200/M3.14-quant-variants",
+  "requirements_total": 13,
+  "requirements_covered": 13,
+  "requirements_missing": [],
+  "test_results": {
+    "cpu_workspace_total": "all crates pass, 0 failed (full `cargo test --workspace` run reproduced independently)",
+    "q6k_q5k_cpu_oracle_tests": {
+      "AT-2811": "PASS (full 256-element golden, byte-exact)",
+      "AT-2812": "PASS (signed-scale sanity + 1% mutant caught, combined=1.678e-3)",
+      "AT-2816": "PASS (qh set/clear golden, byte-exact)",
+      "AT-2817": "PASS (5-bit range + 1% mutant caught, combined=3.644e-3)"
+    },
+    "compile_anchor_tests": {
+      "AT-2813": "PASS (q6k cap set == q4km baseline {1,9,22,39,4448}; builtin set ⊆ baseline)",
+      "AT-2818": "PASS (q5k cap set == q4km baseline; builtin set ⊆ baseline)",
+      "AT-2821": "PASS (q5km coopmat cap set BYTE-IDENTICAL to M3.6 leader {1,9,22,39,61,4433,4448,5345,6022}; shared_memory_bytes==4096; builtin set ⊆ leader)"
+    },
+    "gpu_tests_not_ignored_real_nvidia": {
+      "AT-2814": "PASS, max_diff=0.0 (bit-exact), gpu=-725.5 ref=-725.5",
+      "AT-2819": "PASS, max_diff=0.0 (bit-exact), gpu=-351.75 ref=-351.75"
+    },
+    "gpu_tests_ignored_real_nvidia": {
+      "AT-2815": "PASS, combined=2.473e-5 (raw=6.181e-1)",
+      "AT-2820": "PASS, combined=2.801e-5 (raw=5.748e-2)",
+      "AT-2822_k256": "PASS, combined=5.095e-7 (raw=3.133e-4)",
+      "AT-2822_k512": "PASS, combined=5.379e-7 (raw=1.900e-2)",
+      "AT-2822_k14336": "PASS, combined=1.703e-6 (raw=7.990e-3)",
+      "AT-2823_k256": "PASS, combined=5.095e-7 (raw=3.133e-4)"
+    },
+    "gpu_device": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition (real hardware, independently confirmed present via nvidia-smi)"
+  },
+  "verification_results": {
+    "cargo_build_workspace": "PASS (clean)",
+    "clippy_check": "PASS (0 warnings, `cargo clippy --workspace --lib --tests -- -D warnings`)",
+    "diff_check": "PASS — all 9 files from the Coder's self-report present with matching line counts (q6k_oracle.rs 475, q5k_oracle.rs 417, 3 .axc kernels, 3 dispatch test files, compile_shared_examples.rs +244); lib.rs diff is EXACTLY the 2 `pub mod` lines claimed",
+    "zero_compiler_change_check": "PASS — `git diff main...HEAD -- crates/axc-lexer crates/axc-parser crates/axc-hir crates/axc-mir crates/axc-codegen crates/axc-runtime` is empty (0 lines); all additions confined to axc-driver + examples/ + milestone doc",
+    "spirv_val_check": "PASS — all three new kernels (q6k_dequant_matmul.axc, q5k_dequant_matmul.axc, q5km_matmul_rb_coopmat_f32acc_cached.axc) compile and pass spirv-val via compile_shared_examples.rs (AT-2813/2818/2821), independently re-run",
+    "capset_and_builtinset_anchors": "PASS — AT-2813/2818 assert cap-set EQUAL to q4km_dequant_matmul.axc baseline and builtin-set ⊆ baseline; AT-2821 asserts cap-set BYTE-IDENTICAL to the M3.6 leader plus shared_memory_bytes==4096 and builtin-set ⊆ leader — all three independently re-run and pass",
+    "no_shr_operator_check": "PASS — grep for `>>` in the three new .axc files finds occurrences ONLY inside `//` comment lines (formula documentation), never in executable code; all shifts use shl/lshr/shr builtins",
+    "explicit_types_check": "PASS — spot-checked; all `let`/`let mut` bindings in the new .axc kernels carry explicit type annotations",
+    "metric_reuse_check": "PASS — both q6k_oracle.rs and q5k_oracle.rs `use crate::q4km_oracle::{round_f32_to_f16_to_f32, max_rel_diff_combined}` (and dispatch tests call `axc_driver::q4km_oracle::max_rel_diff`/`max_rel_diff_combined` directly); the metric functions are NOT re-implemented anywhere in the new files",
+    "bit_exact_oracle_template_check": "PASS — q6k_dequant_matmul_f32_cpu / q5k_dequant_matmul_f32_cpu use the SAME per-superblock loop nest, `(d*sc_f)*q_f` / `(d*sc)*nib5-(dmin*m)` associativity, and left-to-right `sum = sum + ...` accumulation order as the .axc kernels (verified by reading both side by side) — matches the common_matmul.rs bit-exact template the spec requires, not q4km_oracle.rs",
+    "layout_offset_check": "PASS — Q6_K ql@0/qh@128/scales@192/d@208 (210 bytes, d LAST, no dmin) and Q5_K_M d@0/dmin@2/scales@4/qh@16/qs@48 (176 bytes) match spec §3.1/§3.2 exactly in both the oracle and kernel source",
+    "q6k_inline_comment_check": "PASS — q6k_dequant_matmul.axc carries the mandated line-by-line `sc[8h+is+{0,2,4,6}]` → q1..q4 mapping comment (lines 25-28, 109-111), auditable against §3.1",
+    "strategy_workaround_check": "PASS — verified crates/axc-driver/src/lib.rs's `strip_strategy_annotation_block` (UNCHANGED by this diff — lib.rs diff is only the 2 `pub mod` lines) does a naive `source.find(\"@strategy\")` for the first occurrence; the q5km kernel's header comment (lines 1-44) mentions 'the strategy holes' (no literal `@strategy` substring) while the ONLY literal `@strategy` in the file is the real annotation at line 48 — confirmed via grep. AT-2821 compiles with all 5 holes (rb_m, rb_n, tile_k, a_block_size, b_block_size) resolved via rb2x2_assignments() and passes, proving the holes actually resolve",
+    "anti_pattern_9_check": "PASS — all GPU dispatch tests use real `VulkanContext`/`ctx.dispatch_handle`/`ctx.prepare_kernel(_checked)` against the physical NVIDIA device (device name printed and confirmed: 'NVIDIA RTX PRO 6000 Blackwell Workstation Edition'), no mocking",
+    "coder_self_report_matches_reality": true
+  },
+  "golden_fixture_provenance": {
+    "AT-2811": "hand-computed-from-formula fallback (annotated in q6k_oracle.rs test doc comment per §6 rule) — no live ggml byte dump was available; acceptable per spec §6 fallback clause",
+    "AT-2816": "hand-computed-from-formula fallback (annotated in q5k_oracle.rs test doc comment per §6 rule) — same reason; acceptable per spec §6 fallback clause"
+  },
+  "memory_footprint_ok": true,
+  "discrepancies": [],
+  "summary": "M3.14 (Q6_K + Q5_K_M quantization variants) independently reproduced and PASSES. Every AT-2811..2823 acceptance test was re-run from scratch (not trusted from the Coder's report) and passed, including all 6 NVIDIA-#[ignore]-gated GPU tests and the 2 non-ignored GPU tests, on the same real NVIDIA RTX PRO 6000 Blackwell hardware. All measured GPU metric values (bit-exact max_diff==0 for AT-2814/AT-2819; combined values for AT-2815/2820/2822×3/2823) match the Coder's self-report exactly. `cargo build --workspace` and `cargo clippy --workspace --lib --tests -- -D warnings` are clean; `cargo test --workspace` has 0 failures. Zero compiler-crate changes confirmed via empty diff on axc-lexer/parser/hir/mir/codegen/runtime. Cap-set and referenced-builtin-set zero-new-builtin anchors (AT-2813/2818/2821) independently re-verified. No `>>` operator in executable kernel code, explicit types throughout, frozen 1e-3 tolerance never loosened, metric functions reused (not reimplemented) from q4km_oracle. Both golden fixtures use the annotated hand-computed-from-formula fallback (no live ggml dump was available), which is an explicitly permitted spec §6 option. No discrepancies found."
+}

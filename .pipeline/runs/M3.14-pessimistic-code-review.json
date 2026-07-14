@@ -1,0 +1,46 @@
+{
+  "verdict": "APPROVE",
+  "agent": "pessimistic_code_reviewer",
+  "milestone_id": "M3.14-quant-variants",
+  "design_revision": "r2",
+  "branch": "coder/M314-20260713-1200/M3.14-quant-variants",
+  "adversarial_focus": "oracle-vs-kernel co-derivation, ggml ground-truth re-derivation, signed-path UB, 12-byte packed-scale decode, GPU OOB, coopmat verbatim-reuse, test vacuity",
+  "critical_bugs": [],
+  "warnings": [
+    {
+      "id": "W1",
+      "severity": "low",
+      "route_to": "architect",
+      "description": "AT-2811 / AT-2816 goldens are CO-DERIVED, not independent ground truth. The `expected[256]` array in golden_q6k_superblock()/golden_q5k_superblock() is computed inline from the SAME §3.1/§3.2 formula that dequant_q6k_row_f32/dequant_q5k_row_f32 implement, so the byte-exact assertion is a self-consistency check (Rust-inline vs Rust-fn), NOT a guard against a transcription error in the frozen layout tables themselves. The spec §6 EXPLICITLY permits this hand-computed-from-formula fallback (annotated; QA recorded it), and the residual risk is mitigated by my independent re-derivation of BOTH decodes against canonical ggml dequantize_row_q6_K / dequantize_row_q5_K + get_scale_min_k4 (both MATCH exactly). A real-ggml byte-dump cross-check remains owed as a future drop-in, per the spec's stronger-option preference.",
+      "file": "crates/axc-driver/src/q6k_oracle.rs:341-377, crates/axc-driver/src/q5k_oracle.rs:288-317"
+    },
+    {
+      "id": "W2",
+      "severity": "low",
+      "route_to": "architect",
+      "description": "The @strategy naive-substring quirk is a latent footgun for the next kernel author but is NOT documented as a durable warning. strip_strategy_annotation_block (lib.rs:297-309) does source.find(\"@strategy\") on the FIRST occurrence; if that first hit is NOT followed by whitespace+`{` (e.g. a header comment containing a literal `@strategy`), it returns the source UNCHANGED, leaving the REAL @strategy block un-stripped and breaking compilation. The q5km kernel correctly dodges this (its header says 'the strategy holes', no literal `@strategy`; grep confirms the ONLY literal is the real annotation at line 48). This quirk is PRE-EXISTING (M3.6 leader has the same shape), not introduced by M3.14, and no comment/DESIGN note warns future authors. Consider a durable note near the function or in DESIGN.",
+      "file": "crates/axc-driver/src/lib.rs:297-309, examples/q5km_matmul_rb_coopmat_f32acc_cached.axc:15,48"
+    },
+    {
+      "id": "W3",
+      "severity": "informational",
+      "description": "AT-2823 uses the identical fixture and comparison path as AT-2822_k256 (run_cached_q5k('...', 64, 64, 1) vs the same q5k_dequant_matmul_f32accum_cpu oracle), so it is effectively a duplicate of AT-2822_k256 rather than an additional independent check. This is by design after r2 FIX-2 (the coopmat-vs-portable cross-precision comparison was correctly removed) and cross-decode consistency is proven transitively by AT-2819+AT-2822; no action needed, noted for completeness.",
+      "file": "crates/axc-driver/tests/dispatch_q5km_matmul_rb_f32acc_cached.rs:243-257"
+    }
+  ],
+  "ground_truth_rederivation": {
+    "q6k": "PASS — re-derived vs canonical ggml dequantize_row_q6_K: ql[64h+l]/ql[64h+l+32], qh[32h+l], sc[8h+is+{0,2,4,6}], y[128h+l+{0,32,64,96}], q=(nibble|(qhbits<<4))-32, d*sc(int8)*q with (d*sc)*q associativity — MATCHES kernel + both oracles + golden exactly.",
+    "q5k": "PASS — re-derived vs canonical ggml dequantize_row_q5_K + get_scale_min_k4: u1=1<<2c / u2=1<<(2c+1) equals hi-bit shift is0=chunk*2 / is1=chunk*2+1; ql pointer advances 32/chunk (qs[chunk*32+l]); lo nibble->y[l], hi nibble->y[l+32]; d1*(nib+16?)-m1; j<4 (q[j]&63, q[j+4]&63) and j>=4 ((q[j+4]&0xF)|((q[j-4]>>6)<<4), (q[j+4]>>4)|((q[j]>>6)<<4)) byte indexing — MATCHES kernel + both oracles + golden exactly.",
+    "get_scale_min_k4": "PASS — masking with 0x03 on the hi2 nibble is equivalent to ggml's unmasked (q>>6)<<4 since the shift already isolates 2 bits."
+  },
+  "signed_path_ub_check": "PASS — Q6_K (q_u-32) and (sc_u-256) are BOTH performed in f32 after f32_from_u32 conversion (kernel lines 104-107, 117-124); no u32 subtraction that could wrap. Verified boundary reconstruction sc_u=128->-128, sc_u=255->-1 (AT-2812 asserts directly). q_u in [0,63] and sc_u in [0,255] are f32-exact. Q5_K/coopmat nib5=nib+hi*16 is addition-only (no underflow).",
+  "oob_check": "PASS — all reads stay within the 210 B (Q6_K: ql<128, qh<192, sc max base+207<208, d base+208..209) and 176 B (Q5_K: scales max base+15<16, qh max base+47<48, qs max base+175<176) superblocks. Portable dispatch guard `if i>=n_rows*n_cols return` with div_ceil(_,64) workgroups is exact; coopmat dispatch (n/32,m/32,1) matches M=N multiples of 32.",
+  "coopmat_verbatim_check": "PASS — `diff` vs q4km_matmul_rb_coopmat_f32acc_cached.axc confirms ONLY the §4.3 deltas: comments, two 144u32->176u32, qs_base base+16->base+48, NEW qh_base=base+16, and the nib5 = nib + hi_bit*16 promotion (nib->nib5 in the dequant). The 3-barrier structure, single-level OpPhi K-carry, 4 f32 accumulators, coopmat_load/mul_add/store, and a_block_size=512 cache-bound pin are byte-for-byte unchanged.",
+  "spirv_val_check": "PASS — AT-2813/2818/2821 compile + spirv-val clean; independently re-run (34 passed, 0 failed).",
+  "capability_creep_check": "PASS — AT-2813/2818 assert cap-set EQUAL to q4km_dequant_matmul.axc; AT-2821 asserts cap-set BYTE-IDENTICAL to the M3.6 leader + shared_memory_bytes==4096; referenced-builtin set ⊆ baseline in all three. No Int8 or other capability creep beyond baseline. Independently re-run and pass.",
+  "race_condition_check": "PASS — coopmat kernel barrier/uniformity structure is verbatim M3.6 (RAW-hoisted / post-staging / WAR, all conditional_depth==0, workgroup-uniform k_block%16 fill). The new qh read is a plain per-element readonly_buffer[u8] load in A-staging, adds no shared state and no barrier requirement.",
+  "test_vacuity_check": "PASS — AT-2814/2819 assert max_diff==0 (not >=), on exact-integer fixtures that include negative scales (Q6_K) and set qh bits (Q5_K), so a broken unsigned/no-qh path would fail. AT-2812/2817 mutation-guard the combined gate against a 1% systematic error. Golden loops cover all 256 elements, all 4 quant-groups, both halves, is-boundary, negatives, and extremes. No empty loop bounds, no golden generated by calling the fn under test.",
+  "zero_compiler_change_check": "PASS — verified via QA and diff-stat: additions confined to axc-driver + examples/ + milestone doc; lib.rs diff is only the 2 `pub mod` lines.",
+  "independent_reproduction": "CPU oracle tests (AT-2811/2812/2816/2817) and compile anchors (AT-2813/2818/2821) independently re-run from this branch: 4/4 lib tests pass, 34/34 compile_shared_examples tests pass. GPU tests (AT-2814/2815/2819/2820/2822x3/2823) not re-run here (hardware-gated) but QA reproduced them on real NVIDIA RTX PRO 6000 Blackwell with max_diff==0 for the bit-exact gates.",
+  "summary": "APPROVE. The #1 residual risk (oracle-vs-kernel co-derived layout misunderstanding) is retired: I independently re-derived both the Q6_K and Q5_K decodes — including the tricky get_scale_min_k4 12-byte packed 6-bit scale/min j<4/j>=4 byte indexing and the qh bit-overlay shift — against canonical ggml dequantize_row_q6_K / dequantize_row_q5_K, and they MATCH the kernels, both oracles, and the goldens exactly. The pure-source signed path is UB-free (all sign/bias arithmetic in f32, no u32 underflow, boundaries 128/255 verified). The Q5_K_M coopmat kernel is a byte-verified verbatim M3.6 reuse with only the four documented deltas; caps/barriers/OpPhi/shared-mem are unchanged and anchored by AT-2821. No OOB, no races, no capability creep, no vacuous tests. Independently re-ran all non-GPU tests (4 oracle + 3 compile anchors): all pass. Three low/informational warnings routed to the Architect (co-derived goldens pending a real-ggml cross-check per spec §6; the pre-existing @strategy naive-substring footgun lacks a durable warning; AT-2823 duplicates AT-2822_k256 by design) — none rise to REJECT/NEEDS_REVISION."
+}

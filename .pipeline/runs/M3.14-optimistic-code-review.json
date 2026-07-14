@@ -1,0 +1,42 @@
+{
+  "verdict": "APPROVE",
+  "agent": "optimistic_code_reviewer",
+  "milestone_id": "M3.14-quant-variants",
+  "design_revision": "r2",
+  "branch": "coder/M314-20260713-1200/M3.14-quant-variants",
+  "spec_compliance": true,
+  "positive_feedback": [
+    "All 4 in-scope deliverables present and none exceed scope: crates/axc-driver/src/q6k_oracle.rs, crates/axc-driver/src/q5k_oracle.rs, examples/q6k_dequant_matmul.axc, examples/q5k_dequant_matmul.axc, examples/q5km_matmul_rb_coopmat_f32acc_cached.axc, plus dispatch_q6k_matmul.rs / dispatch_q5k_matmul.rs / dispatch_q5km_matmul_rb_f32acc_cached.rs and the compile_shared_examples.rs additions. No fused Q6_K coopmat kernel was added (correctly deferred per spec §4.3/out-of-scope), and no perf/TFLOPS gate was asserted anywhere (correctly a coverage-only milestone).",
+    "AT numbering is exact: AT-2811..AT-2823 all present and correctly mapped 1:1 to the spec's table (verified via grep across q6k_oracle.rs, q5k_oracle.rs, dispatch_q6k_matmul.rs, dispatch_q5k_matmul.rs, dispatch_q5km_matmul_rb_f32acc_cached.rs, compile_shared_examples.rs). AT-2824/2825 correctly left unused/reserved, no renumbering games.",
+    "lib.rs diff is exactly the two `pub mod q6k_oracle;` / `pub mod q5k_oracle;` lines next to `pub mod q4km_oracle;` -- matches spec §5.3 verbatim, same style/ordering as the existing module.",
+    "q6k_oracle.rs / q5k_oracle.rs doc comments explicitly distinguish the two templates per spec §5 FIX-4 (f32accum/f16-staged mirrors q4km_oracle.rs; bit-exact mirrors tests/common_matmul.rs::q4km_dequant_matmul_cpu, NOT q4km_oracle.rs) -- this is the exact distinction the r2 spec called out as the most likely place for a Coder to conflate templates, and it is handled correctly with an explicit disclaimer in both files.",
+    "Metric-fn reuse is real, not just claimed: both oracle modules `use crate::q4km_oracle::round_f32_to_f16_to_f32` and tests import `max_rel_diff` / `max_rel_diff_combined` from q4km_oracle -- no reimplementation anywhere, matching the spec's single-source-of-truth mandate for the frozen 1e-3 gate.",
+    "Kernel-matching associativity (spec's bit-exactness-by-construction requirement) is honored precisely: q6k oracle uses `(d * sc_f) * q_f` and q6k_dequant_matmul.axc's kernel source uses the identical `(d * sc_f1) * q1_f` grouping and the identical left-to-right `sum = sum + w1*x1 + w2*x2 + w3*x3 + w4*x4` accumulation order; same verified for Q5_K_M's `d1*nib5_lo - m1f` / `sum = sum + lo_f*x_lo + hi_f*x_hi`.",
+    "The MANDATORY Q6_K inline comment (spec §4.1, the most transcription-error-prone part) is present and does exactly what was asked: `sc[8h+is+{0,2,4,6}]` is mapped line-by-line to q1..q4 with inline `<- sc index for q1 (§3.1 line 1)` style annotations, auditable against the spec without re-deriving it.",
+    "q5km_matmul_rb_coopmat_f32acc_cached.axc diffed directly against the M3.6 leader (q4km_matmul_rb_coopmat_f32acc_cached.axc): the only structural deltas are the 144->176 stride, qs_base 16->48, new qh_base=+16, and the nib->nib5 promotion inserted at exactly the point M3.6 reads `nib` -- this is a genuinely 'verbatim plus minimal delta' implementation, not a rewrite dressed up as one, matching spec §4.3's explicit delta list item-for-item.",
+    "AT-2813/2818/2821 zero-new-builtin anchors implement the exact r2 FIX-3 semantics (set-subset-of-baseline, not 'only reserved builtins'), including a non-trivial helper (`referenced_call_names`) that strips comments and string-literal contents so `@intent(\"...dequant_q6k(...)...\")` free text doesn't produce false positives, and excludes each kernel's own `fn` declaration name. AT-2821 additionally hand-verifies shared_memory_bytes == 4096 with the exact (512+512)*2 + 2*256*4 arithmetic the spec asked for.",
+    "Golden fixtures (AT-2811, AT-2816) are properly annotated per the §6 provenance rule as the hand-computed-from-formula fallback (doc comments state this explicitly and note no live ggml dump was available), and both fixtures independently re-derive the expected array from the documented formula rather than calling into the function under test -- a genuine cross-check, not a tautology. AT-2811's fixture additionally has explicit sanity assertions (negative scale present, both quant extremes reachable) verified directly from raw bytes, matching r2 FIX-1's coverage requirement (all 4 quant-groups, both halves, the is-boundary, a negative scale, both extremes).",
+    "AT-2823's doc comment correctly implements r2 FIX-2: it compares against q5k_dequant_matmul_f32accum_cpu (the f16-staged oracle) rather than the portable f32 kernel, and explicitly disclaims the old 'mirror AT-1803 bit-identity' framing while noting the transitive proof via AT-2819+AT-2822 -- this is a subtle correctness point in the spec that the Coder got exactly right rather than glossing over.",
+    "No `>>` operator anywhere in kernel-executable code (only inside `//` comments documenting the formula); anti-pattern #2 (explicit `return;`) and #1 (explicit types on every let) followed throughout all three new .axc files, consistent with q4km_dequant_matmul.axc and the M3.6 leader.",
+    "Test file structure (fixture builders, DeviceFeatureUnsupported handling, xorshift PRNG, assemble_pc by name) is idiomatic and closely mirrors the existing dispatch_q4km_matmul.rs / dispatch_q4km_matmul_rb_f32acc_cached.rs patterns -- a future maintainer familiar with the Q4_K_M tests will find these immediately legible."
+  ],
+  "minor_issues": [
+    {
+      "file": "crates/axc-driver/src/q6k_oracle.rs",
+      "line": "54-58",
+      "description": "`#![allow(clippy::identity_op)]` is a module-wide (not scoped-to-block) lint suppression, which technically also silences identity-op warnings in any future code added to this file outside the golden-fixture formula-mirroring blocks. Low risk given the module is small and single-purpose, but a `#[allow(clippy::identity_op)]` scoped to just the `dequant_q6k_row_f32`/`q6k_dequant_matmul_f32_cpu` fn bodies (or the golden-fixture test fn) would be tighter. Not a blocker -- QA's clippy run was clean and the comment explaining WHY is good practice already followed."
+    },
+    {
+      "file": "crates/axc-driver/tests/compile_shared_examples.rs",
+      "line": "2265-2312",
+      "description": "`referenced_call_names` is a hand-rolled tokenizer (comment-strip + naive string-blanking + identifier-scan) duplicated with only cosmetic differences across three new test functions' worth of usage. It works and is well-commented, but if a 4th quant-variant milestone needs the same anchor, consider whether this belongs as a shared `#[path]`-included test-helper module rather than being copy-adjacent to more AT-2xxx anchors over time. Purely a maintainability note, not a defect -- QA independently re-ran and confirmed it produces correct results on all three anchors."
+    },
+    {
+      "file": "examples/q6k_dequant_matmul.axc",
+      "line": "50",
+      "description": "The line-49/50 comment defending `l / 16u32` as 'not anti-pattern #8' (which bans `>>`, not `/`) is a good defensive note for a future reviewer who might mis-flag integer division as a disguised shift, but it's slightly verbose for something anti-pattern #8's own wording already makes clear. Cosmetic only."
+    }
+  ],
+  "design_level_concerns_for_architect": [],
+  "summary": "Implementation matches the r2 spec exactly: all in-scope deliverables present, all AT-2811..2823 correctly numbered and mapped, the explicit out-of-scope items (fused Q6_K coopmat, new perf campaign, tolerance loosening, new SPIR-V capabilities) are honestly absent rather than snuck in. Code quality is high and idiomatic for this repo -- oracle modules mirror q4km_oracle.rs's structure and doc-comment conventions, the .axc kernels mirror q4km_dequant_matmul.axc down to comment style, and the q5km coopmat kernel is a genuinely verbatim M3.6 reuse with only the spec-mandated minimal deltas (confirmed by direct diff). The two hardest correctness traps in the r2 spec -- kernel-matching associativity for bit-exactness-by-construction, and the AT-2823 precision-gate distinction (f16-staged oracle vs full-f32 portable kernel) -- are both handled correctly with explicit reasoning in comments, not just by accident. QA's independent GPU reproduction (real NVIDIA hardware) already confirms correctness; this review found no spec-compliance gaps and only cosmetic/maintainability notes. APPROVE."
+}

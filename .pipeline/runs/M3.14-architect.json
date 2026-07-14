@@ -1,0 +1,167 @@
+{
+  "verdict": "PROPOSED",
+  "agent": "architect",
+  "revision": "r2",
+  "milestone_id": "M3.14-quant-variants",
+  "milestone_title": "Q6_K + Q5_K_M quantization variants (ROADMAP FG.5)",
+  "spec_document": ".pipeline/milestones/M3.14-quant-variants.md",
+  "revision_summary": "Surgical r2 pass. Pessimistic design review = NEEDS_REVISION (4 test-guard fixes); optimistic = APPROVE (2 non-blocking folds). The design CORE was independently verified correct by BOTH reviewers and is UNCHANGED: Q6_K (210 B, d LAST @208, no dmin, signed int8 scales @192) + Q5_K_M (176 B, d@0/dmin@2/scales12@4/qh32@16/qs128@48) layouts; the pure-source signed technique (f32_from_u32(sc_u); if>=128 -=256.0) with zero new builtins; Q6_K-first phasing; the Q6_K non-fusion decision. No perf question re-opened; no TFLOPS gate. All r2 edits are to test-guard STRENGTH and Coder-facing references only — NOT to layouts, signedness, kernels, or the AT range.",
+  "fixes_applied": [
+    {"fix": 1, "id": "AT-2811 golden coverage", "source": "pessimistic (primary, blocks)", "change": "AT-2811 now REQUIRES the golden to be the FULL 256-element expected f32 array and to explicitly assert coverage of all four quant-groups q1..q4 (two ql slices x lo/hi nibble x qh bit-pairs 0-1/2-3/4-5/6-7), BOTH 128-halves h=0/h=1, the is=l/16 boundary (l=15 vs l=16), a negative int8 scale, and q extremes — matching AT-2816's rigor so a group-3/half-1/is-boundary decode bug cannot pass a partial golden."},
+    {"fix": 2, "id": "AT-2823 precision gate", "source": "pessimistic (blocks)", "change": "AT-2823 now gates the coopmat Q5 kernel against the q5k_dequant_matmul_f32accum_cpu ORACLE (f16-weight-rounded, apples-to-apples with the coopmat f32_to_f16 staging) at combined <= 1e-3, and REMOVES the false 'mirror AT-1803 bit-identity' framing (that cited a ~1e-6 floor for what is a ~5e-4 cross-precision comparison). Cross-decode consistency is already proven transitively by AT-2819 + AT-2822."},
+    {"fix": 3, "id": "builtin-set wording (AT-2813/2818/2821)", "source": "pessimistic (clarity, blocks QA)", "change": "Reworded 'source references only reserved Q4_0 builtins' (literally false — kernels call band/bor/shl/lshr/gid/coopmat_*/workgroup_barrier) to 'referenced-builtin set SUBSET-OF the corresponding Q4_K_M baseline kernel's builtin set — no addition', a mechanically checkable zero-NEW-builtin anchor. AT-2821 documents the 4096-byte arithmetic ((512+512)*2 f16 + (256+256)*4 f32)."},
+    {"fix": 4, "id": "oracle pointer (section 5)", "source": "pessimistic (question #3)", "change": "Section 5 points the Coder at crates/axc-driver/tests/common_matmul.rs::q4km_dequant_matmul_cpu as the bit-exact (native-f32) template (was incorrectly 'mirror q4km_oracle.rs'), while still reusing the metric fns from q4km_oracle.rs. Added a kernel-matching-associativity requirement ((d*sc_f)*q_f / (d*sc)*nib5-(dmin*m)) so max_diff==0 holds BY CONSTRUCTION per the review's bit-exact-safety proof; section 5.1 inline comment updated."}
+  ],
+  "optimistic_folds": [
+    {"fold": "a", "change": "Section 4.1 now MANDATES a line-by-line inline comment in the Q6_K kernel mapping sc[8h+is+{0,2,4,6}] and the q1..q4 reassembly to section 3.1's formula lines (the most transcription-error-prone part)."},
+    {"fold": "b", "change": "Section 6 adds a golden-fixture-provenance rule for AT-2811/AT-2816: PREFER a real ggml byte-dump cross-check; hand-computed-from-formula accepted as an annotated fallback documented per-ggml-field; QA MUST record which was used."}
+  ],
+  "at_range_allocated": "AT-2811..AT-2823 (2824/2825 reserved slack; M3.13 ended at AT-2810)",
+  "phasing": {
+    "M3.14a": "Q6_K (highest beachhead value + the only novel risk: signed int8 scales and (q-32)-biased quants, done risk-first)",
+    "M3.14b": "Q5_K_M (low-risk clean Q4_K_M extension; ALSO extends the M3.6 coopmat leader near-verbatim)"
+  },
+  "compiler_change_flag": "NONE — zero codegen/HIR/typecheck/parser/lexer change expected; both formats are pure-source over the existing Q4_0 builtin set. Q6_K signedness done in f32 (f32_from_u32(q)-32.0; sc: if sc_u>=128 { -=256.0 }) with a branch — no signed-int builtin exists or is added. AT-2813/2818/2821 mechanically anchor cap-set-identity + builtin-set-subset-of-baseline (no new builtin).",
+  "files_to_create": [
+    {
+      "path": "crates/axc-driver/src/q6k_oracle.rs",
+      "purpose": "Q6_K CPU reference: byte-exact ggml dequant (signed int8 scales, q-32 bias, 210-byte block, d as last 2 bytes, no dmin) + f32-accumulator matmul ref + bit-exact f32 matmul ref + abs_dot_scale. Reuses q4km_oracle metric fns; the bit-exact f32 ref mirrors tests/common_matmul.rs::q4km_dequant_matmul_cpu (NOT q4km_oracle.rs) with kernel-matching (d*sc_f)*q_f associativity.",
+      "public_api": [
+        "pub const Q6K_SUPERBLOCK_BYTES: usize = 210",
+        "pub const Q6K_SUPERBLOCK_ELEMS: usize = 256",
+        "pub fn q6k_dequant_matmul_f32accum_cpu(q: &[u8], x_f16: &[u16], n_rows: usize, n_cols: usize, n_blocks_per_row: usize) -> Vec<f32>",
+        "pub fn q6k_dequant_matmul_f32_cpu(q: &[u8], x_f32: &[f32], n_rows: usize, n_cols: usize, n_blocks_per_row: usize) -> Vec<f32>",
+        "pub fn q6k_abs_dot_scale(q: &[u8], x_f16: &[u16], n_rows: usize, n_cols: usize, n_blocks_per_row: usize) -> Vec<f32>"
+      ]
+    },
+    {
+      "path": "crates/axc-driver/src/q5k_oracle.rs",
+      "purpose": "Q5_K_M CPU reference: Q4_K_M dequant + 5-bit nib5=nib+hi*16 promotion (176-byte block, qh @16, qs @48); same fn shape as q6k_oracle. Reuses q4km_oracle metric fns; the bit-exact f32 ref mirrors tests/common_matmul.rs::q4km_dequant_matmul_cpu with kernel-matching (d*sc)*nib5-(dmin*m) associativity.",
+      "public_api": [
+        "pub const Q5K_SUPERBLOCK_BYTES: usize = 176",
+        "pub const Q5K_SUPERBLOCK_ELEMS: usize = 256",
+        "pub fn q5k_dequant_matmul_f32accum_cpu(q: &[u8], x_f16: &[u16], n_rows: usize, n_cols: usize, n_blocks_per_row: usize) -> Vec<f32>",
+        "pub fn q5k_dequant_matmul_f32_cpu(q: &[u8], x_f32: &[f32], n_rows: usize, n_cols: usize, n_blocks_per_row: usize) -> Vec<f32>",
+        "pub fn q5k_abs_dot_scale(q: &[u8], x_f16: &[u16], n_rows: usize, n_cols: usize, n_blocks_per_row: usize) -> Vec<f32>"
+      ]
+    },
+    {
+      "path": "examples/q6k_dequant_matmul.axc",
+      "purpose": "Portable (non-coopmat, Lavapipe-runnable) multi-output Q6_K dequant+matmul; mirrors q4km_dequant_matmul.axc; signed handling pure-source in f32. MUST carry line-by-line comments mapping sc[8h+is+{0,2,4,6}] / q1..q4 to spec section 3.1.",
+      "public_api": ["fn q6k_dequant_matmul(q: readonly_buffer[u8], x: readonly_buffer[f32], y: buffer[f32], n_rows: u32, n_cols: u32, n_blocks_per_row: u32) -> void"]
+    },
+    {
+      "path": "examples/q5k_dequant_matmul.axc",
+      "purpose": "Portable multi-output Q5_K_M dequant+matmul; q4km_dequant_matmul.axc verbatim except 176-byte stride, qs@48, qh@16, and nib5=nib+hi*16.",
+      "public_api": ["fn q5k_dequant_matmul(q: readonly_buffer[u8], x: readonly_buffer[f32], y: buffer[f32], n_rows: u32, n_cols: u32, n_blocks_per_row: u32) -> void"]
+    },
+    {
+      "path": "examples/q5km_matmul_rb_coopmat_f32acc_cached.axc",
+      "purpose": "M3.6 scale-cached coopmat leader reused VERBATIM for Q5_K_M: only deltas are 176-byte offsets (qs@48, qh@16) + qh high-bit read adding 16 to the nibble; cache fill/barriers/OpPhi/coopmat unchanged. NVIDIA tensor-core path.",
+      "public_api": ["fn q5km_matmul_rb_coopmat_f32acc_cached(q: readonly_buffer[u8], x: readonly_buffer[f16], C: buffer[f32], M: u32, N: u32, K: u32, n_blocks_per_row: u32) -> void"]
+    },
+    {
+      "path": "crates/axc-driver/tests/dispatch_q6k_matmul.rs",
+      "purpose": "AT-2814 (Lavapipe+NVIDIA bit-exact max_diff==0, K=256, negative scales) + AT-2815 (NVIDIA combined <=1e-3, large-K).",
+      "public_api": []
+    },
+    {
+      "path": "crates/axc-driver/tests/dispatch_q5k_matmul.rs",
+      "purpose": "AT-2819 (Lavapipe+NVIDIA bit-exact K=256, qh bits set) + AT-2820 (NVIDIA combined <=1e-3, large-K).",
+      "public_api": []
+    },
+    {
+      "path": "crates/axc-driver/tests/dispatch_q5km_matmul_rb_f32acc_cached.rs",
+      "purpose": "AT-2822 (NVIDIA combined <=1e-3 at K=256/512/14336, mirror AT-1800..1802) + AT-2823 (apples-to-apples vs q5k_dequant_matmul_f32accum_cpu oracle). Typed-skip Lavapipe + sg!=32.",
+      "public_api": []
+    }
+  ],
+  "files_to_modify": [
+    {
+      "path": "crates/axc-driver/src/lib.rs",
+      "changes": "Add `pub mod q6k_oracle;` and `pub mod q5k_oracle;` beside `pub mod q4km_oracle;`."
+    },
+    {
+      "path": "crates/axc-driver/tests/compile_shared_examples.rs",
+      "changes": "Add AT-2813/2818 (portable Q6/Q5 compile+spirv-val, cap-set == q4km_dequant_matmul, builtin-set SUBSET-OF q4km_dequant_matmul baseline) and AT-2821 (Q5 coopmat compile+spirv-val, cap-set BYTE-IDENTICAL to the M3.6 leader, shared_memory_bytes==4096, builtin-set SUBSET-OF q4km_matmul_rb_coopmat_f32acc_cached baseline). CPU/CI, no GPU."
+    }
+  ],
+  "dependency_graph": {
+    "q6k_oracle": ["q4km_oracle", "tests/common_matmul.rs (bit-exact template)"],
+    "q5k_oracle": ["q4km_oracle", "tests/common_matmul.rs (bit-exact template)"],
+    "dispatch_q6k_matmul": ["q6k_oracle", "axc-runtime"],
+    "dispatch_q5k_matmul": ["q5k_oracle", "axc-runtime"],
+    "dispatch_q5km_matmul_rb_f32acc_cached": ["q5k_oracle", "axc-runtime"],
+    "q5km_coopmat_kernel": ["existing M3.6/M3.3c coopmat codegen (UNCHANGED)"]
+  },
+  "spirv_capabilities_required": ["Shader", "Int8", "Int16", "Float16", "StorageBuffer8BitAccess"],
+  "spirv_capabilities_added_vs_q4km": [],
+  "spirv_extensions_required": ["SPV_KHR_8bit_storage"],
+  "spirv_extensions_added_vs_q4km": [],
+  "correctness_oracle": "Per format: (1) CPU dequant oracle byte-exact vs a golden superblock — PREFERABLY a real ggml byte dump, hand-computed-from-formula as an annotated fallback; the Q6_K golden is the FULL 256-element array covering all four quant-groups x both halves x the is=l/16 boundary + a negative scale (AT-2811/2816); (2) portable GPU kernel BIT-EXACT (max_diff==0) vs the native-f32 CPU matmul ref (mirroring common_matmul.rs::q4km_dequant_matmul_cpu with kernel-matching FP associativity) at K=256 with order-matched f32 accumulation (AT-2814/2819, mirror M3.1 AT-1520); (3) large-K + coopmat paths gated by max_rel_diff_combined <= FROZEN 1e-3 (condition-aware, mirror AT-1780/1800..1802). 1e-3 NEVER loosened. The Q5 coopmat kernel is cross-checked APPLES-TO-APPLES against the f16-rounded q5k_dequant_matmul_f32accum_cpu oracle (AT-2823), NOT against the full-f32 portable kernel (that would carry a ~5e-4 f16-weight-rounding gap).",
+  "acceptance_tests": [
+    {"id": "AT-2811", "description": "Q6_K CPU dequant byte-exact vs a FULL-256-element ggml golden covering all four quant-groups q1..q4, both 128-halves, the is=l/16 boundary (l=15 vs l=16), a negative int8 scale, and q extremes (q=0->-32, q=63->+31)", "test_name": "q6k_dequant_byte_exact_vs_ggml_golden_full256", "expected_behavior": "max_diff==0 vs the full 256-element hardcoded expected f32 array; every enumerated case asserted", "verified_via": "cargo test -p axc-driver (no GPU)"},
+    {"id": "AT-2812", "description": "Q6_K signed-scale reconstruction (sc_u>=128 -> -256) + metric sanity (abs_dot_scale>=|y|, 1% mutant caught)", "test_name": "q6k_signed_scale_and_combined_metric", "expected_behavior": "signed path correct; combined metric > 1e-3 on a 1% systematic mutant", "verified_via": "cargo test -p axc-driver (no GPU)"},
+    {"id": "AT-2813", "description": "q6k_dequant_matmul.axc compile+spirv-val clean; cap-set == q4km_dequant_matmul; referenced-builtin set SUBSET-OF examples/q4km_dequant_matmul.axc's builtin set (no addition)", "test_name": "compile_q6k_dequant_matmul_capset_and_builtin_subset", "expected_behavior": "spirv-val exit 0; capability set identical to q4km baseline; builtin set is a subset of the q4km portable baseline (zero new builtin)", "verified_via": "compile_shared_examples.rs (CI, no GPU)"},
+    {"id": "AT-2814", "description": "q6k_dequant_matmul.axc BIT-EXACT (max_diff==0) vs q6k_dequant_matmul_f32_cpu, K=256, negative scales; Lavapipe+NVIDIA, NOT #[ignore]", "test_name": "dispatch_q6k_matmul_bitexact_k256", "expected_behavior": "max_diff==0.0 on a non-symmetric f16-exact fixture (kernel-matching FP associativity makes this hold by construction)", "verified_via": "dispatch_q6k_matmul.rs (Lavapipe in CI + NVIDIA)"},
+    {"id": "AT-2815", "description": "q6k_dequant_matmul.axc combined <=1e-3 vs f32-accum oracle, large-K (K~2048) random signed scales; NVIDIA #[ignore]", "test_name": "dispatch_q6k_matmul_combined_largek", "expected_behavior": "max_rel_diff_combined <= 1e-3; both metrics reported", "verified_via": "dispatch_q6k_matmul.rs (AXC_ENABLE_GPU_TESTS=1)"},
+    {"id": "AT-2816", "description": "Q5_K_M CPU dequant byte-exact vs a ggml golden, qh high bit set+clear across all 8 positions", "test_name": "q5k_dequant_byte_exact_vs_ggml_golden", "expected_behavior": "max_diff==0 vs hardcoded expected (nibble->nibble+16 when qh bit set)", "verified_via": "cargo test -p axc-driver (no GPU)"},
+    {"id": "AT-2817", "description": "Q5_K_M 5-bit range (0..31, +16 exactly on qh set) + metric sanity", "test_name": "q5k_range_and_combined_metric", "expected_behavior": "values reach 31; combined>1e-3 on 1% mutant", "verified_via": "cargo test -p axc-driver (no GPU)"},
+    {"id": "AT-2818", "description": "q5k_dequant_matmul.axc compile+spirv-val clean; cap-set == q4km_dequant_matmul; referenced-builtin set SUBSET-OF examples/q4km_dequant_matmul.axc's builtin set (no addition)", "test_name": "compile_q5k_dequant_matmul_capset_and_builtin_subset", "expected_behavior": "spirv-val exit 0; capability set identical; builtin set subset of baseline", "verified_via": "compile_shared_examples.rs (CI, no GPU)"},
+    {"id": "AT-2819", "description": "q5k_dequant_matmul.axc BIT-EXACT (max_diff==0) vs q5k_dequant_matmul_f32_cpu, K=256, qh bits set; Lavapipe+NVIDIA, NOT #[ignore]", "test_name": "dispatch_q5k_matmul_bitexact_k256", "expected_behavior": "max_diff==0.0", "verified_via": "dispatch_q5k_matmul.rs (Lavapipe in CI + NVIDIA)"},
+    {"id": "AT-2820", "description": "q5k_dequant_matmul.axc combined <=1e-3 vs f32-accum oracle, large-K; NVIDIA #[ignore]", "test_name": "dispatch_q5k_matmul_combined_largek", "expected_behavior": "max_rel_diff_combined <= 1e-3", "verified_via": "dispatch_q5k_matmul.rs (AXC_ENABLE_GPU_TESTS=1)"},
+    {"id": "AT-2821", "description": "q5km_matmul_rb_coopmat_f32acc_cached.axc compile+spirv-val; cap-set BYTE-IDENTICAL to M3.6 leader; shared_memory_bytes==4096 ((512+512)*2 f16 + (256+256)*4 f32); referenced-builtin set SUBSET-OF examples/q4km_matmul_rb_coopmat_f32acc_cached.axc's builtin set (no addition)", "test_name": "compile_q5km_coopmat_capset_identical_to_m36", "expected_behavior": "spirv-val exit 0; caps == q4km_matmul_rb_coopmat_f32acc_cached; shared==4096; builtin set subset of the M3.6 coopmat baseline", "verified_via": "compile_shared_examples.rs (CI, no GPU)"},
+    {"id": "AT-2822", "description": "q5km coopmat kernel combined <=1e-3 vs q5k_dequant_matmul_f32accum_cpu at K=256/512/14336 (mirror AT-1800..1802); NVIDIA #[ignore], typed-skip Lavapipe + sg!=32", "test_name": "dispatch_q5km_coopmat_combined_k256_512_14336", "expected_behavior": "max_rel_diff_combined <= 1e-3 at all three K (catches cross-superblock WAR + accumulator reset)", "verified_via": "dispatch_q5km_matmul_rb_f32acc_cached.rs (AXC_ENABLE_GPU_TESTS=1)"},
+    {"id": "AT-2823", "description": "Apples-to-apples cross-check: Q5 coopmat kernel vs the f16-rounded q5k_dequant_matmul_f32accum_cpu ORACLE within combined <=1e-3 on a shared K=256 fixture. NOT vs the full-f32 portable kernel (avoids the ~5e-4 f16-weight-rounding gap); NOT an AT-1803 bit-identity check (cross-precision). Cross-decode consistency already proven by AT-2819 + AT-2822.", "test_name": "dispatch_q5km_coopmat_agrees_with_f32accum_oracle", "expected_behavior": "max_rel_diff_combined <= 1e-3; both metrics reported", "verified_via": "dispatch_q5km_matmul_rb_f32acc_cached.rs (AXC_ENABLE_GPU_TESTS=1)"}
+  ],
+  "edge_cases": [
+    "Q6_K field order: d is the LAST 2 bytes (offset 208) and there is NO dmin — do not copy the Q4_K_M (d,dmin-first) header.",
+    "Q6_K signed int8 scales in [-128,127] and quants (q-32) in [-32,31] — fixtures MUST include negatives (an all-positive fixture passes a broken unsigned kernel).",
+    "Bit-exactness by construction: for all u in [128,255], f32_from_u32(u)-256.0 == (i8)u as f32 exactly, and q_u in [0,63]/sc_u in [0,255] convert exactly — so the pure-source sign path yields IDENTICAL f32 to a signed reference PROVIDED the CPU oracle uses the same (d*sc_f)*q_f associativity as the kernel (section 5 requirement).",
+    "Q5_K_M qh bit index = 2*chunk + is_hi (0..7) into qh[(k%64)%32]; a wrong index passes chunk 0 but fails chunks 1..3 (AT-2816 covers all 8).",
+    "Block-stride constants 210 (Q6_K) / 176 (Q5_K_M) must not be copied as 144; runtime multi-superblock fixtures (AT-2814/2819) catch a wrong stride.",
+    "AT-2814/2819 fixtures should keep every product w*x AND every partial sum exactly f32-representable (integer-valued, |partial| < 2^24) so max_diff==0 is order-independent-safe (mirror AT-1520); fixture builders should assert it.",
+    "Portable kernels use f32 x/y (no coopmat) -> run on Lavapipe; the Q5 coopmat kernel typed-skips on Lavapipe (CoopMatUnsupported) like M3.6.",
+    "50 GB test-executable limit respected: portable K<=2048, single coopmat A/B correctness test at M=N=64 up to K=14336 — far under the limit."
+  ],
+  "out_of_scope": [
+    "No fused coopmat Q6_K matmul — Q6_K's 16 signed int8 scales + no-dmin + 210-byte layout are NOT a clean drop-in for the M3.6 (row x 8-sub-block) cache; the portable kernel proves Q6_K dequant; a fused Q6_K tensor-core kernel is a distinct deferred design.",
+    "No new leader-tuning / TFLOPS campaign (M3.13 closed it); NO perf gate asserted.",
+    "No loosening of the FROZEN 1e-3 tolerance.",
+    "No new SPIR-V capability/extension beyond the Q4_K_M set.",
+    "No i-quant/imatrix formats (IQ4_XS, Q3_K, etc.)."
+  ],
+  "open_questions": [
+    "Q6_K portable kernel structure: mirror ggml's explicit 2-half loop, or a flat-k decode? Either is acceptable if it reproduces section 3.1 byte-for-byte (Coder's call; the full-256 byte-exact AT-2811 golden + the mandated sc-index comment are the guards).",
+    "Whether to add an optional resident bench for the Q5 coopmat kernel — NOT required (coverage milestone, no perf gate); may be added for reporting only if trivial.",
+    "AT-2811/2816 golden provenance: real ggml byte dump (preferred) vs hand-computed-from-formula fallback — QA records which was used."
+  ],
+  "unchanged_verified_correct": [
+    "Canonical layouts (section 3.1/3.2) — both verified byte-for-byte against ggml k_quants by BOTH reviewers.",
+    "Pure-source signed technique + zero-compiler-change claim (section 4.1/7).",
+    "Phasing (section 2): Q6_K first, Q5_K_M second.",
+    "Q6_K non-fusion decision (section 4.3).",
+    "AT range AT-2811..2823 (2824/2825 slack) — no collision (last prior AT = AT-2810).",
+    "No TFLOPS/leader gate — coverage-only, honoring the M3.13 campaign conclusion.",
+    "File list, dependency graph, capability/extension set (unchanged from Q4_K_M), and all other ATs (AT-2812/2814/2815/2816/2817/2819/2820/2822)."
+  ],
+  "self_check": {
+    "read_r1_spec": true,
+    "read_pessimistic_review": true,
+    "read_optimistic_review": true,
+    "read_architect_template": true,
+    "all_four_required_fixes_applied": true,
+    "both_optimistic_folds_applied": true,
+    "design_core_unchanged": true,
+    "no_implementation_code": true,
+    "no_git_run": true,
+    "at_numbering_continues_from_2810": true,
+    "compiler_change_expected": false,
+    "compiler_change_anchored_by_tests": true,
+    "frozen_tolerance_not_loosened": true,
+    "no_new_spirv_capability": true,
+    "gpu_correctness_test_present_per_format": true,
+    "layouts_verified_against_ggml_and_repo_conventions": true,
+    "r2_changelog_present_in_spec": true
+  }
+}
