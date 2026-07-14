@@ -169,3 +169,4 @@ GPU-dispatch integration tests are `#[ignore]`-gated and require `AXC_ENABLE_GPU
 CI runs `cargo test --workspace && cargo test --workspace -- --ignored`.
 
 For Lavapipe: `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json`
+_ICD filename is environment-dependent: Ubuntu/CI (`mesa-vulkan-drivers`) installs the arch-suffixed `lvp_icd.x86_64.json` (used above and throughout `ci.yml`); some local Mesa builds name it `lvp_icd.json` (no suffix). Run `ls /usr/share/vulkan/icd.d/` to confirm which is present._

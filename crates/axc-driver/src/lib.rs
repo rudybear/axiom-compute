@@ -289,16 +289,47 @@ pub(crate) fn substitute_strategy_holes(
 
 /// Strip the first `@strategy { ... }` annotation block from source text.
 ///
-/// Finds `@strategy` followed by optional whitespace and `{`, then removes
-/// the entire span including the closing `}`.  Content between the braces is
-/// discarded.  Only single-level brace nesting is handled (sufficient for M2.3).
+/// Anchored on the **lexer token stream**, not a raw-text `find` (M3.15 EB.3
+/// footgun fix). The lexer already skips `//` comments and string-literal
+/// contents, so a `@strategy` occurring inside a comment or inside an
+/// `@intent("...")` string produces no `Annotation` token — it can no longer
+/// be mistaken for the real block. The anchor is the first
+/// `TokenKind::Annotation("strategy")` token's span.
 ///
-/// If no `@strategy {` is found, the source is returned unchanged.
+/// From that anchor, skips optional whitespace and looks for `{`, then
+/// removes the entire span including the closing `}`.  Content between the
+/// braces is discarded, with depth-tracked brace matching (handles nested
+/// `{ }` inside the block, e.g. a value list containing braces).
+///
+/// If no `@strategy {` is found (either no `Annotation("strategy")` token at
+/// all, or it's not followed by `{` — e.g. the `@strategy(...)` call form),
+/// the source is returned unchanged.
 pub(crate) fn strip_strategy_annotation_block(source: &str) -> String {
-    // Find `@strategy` in the text.
-    let Some(at_pos) = source.find("@strategy") else {
+    // Find the first `Annotation("strategy")` token via the real lexer — this
+    // is comment/string-literal safe (M3.14 footgun: a naive `source.find`
+    // would latch onto a decoy inside a `//` comment or `@intent(...)` prose).
+    let (tokens, _errs) = axc_lexer::tokenize(source);
+    let Some(strategy_tok) = tokens.iter().find(|t| {
+        matches!(&t.kind, axc_lexer::TokenKind::Annotation(name) if name == "strategy")
+    }) else {
         return source.to_string();
     };
+
+    // The Annotation token's span starts at the `@` sigil itself (verified
+    // against the lexer: `lex_annotation` is called with `start` = the
+    // position BEFORE the `@` byte is consumed). Guard this with a
+    // debug_assert (AT-2832 pins the byte-offset behavior in release too via
+    // the assertion on stripped output) rather than assuming silently.
+    let mut at_pos: usize = strategy_tok.span.start as usize;
+    if !source[at_pos..].starts_with("@strategy") {
+        // Defensive fallback in case a future lexer change moves the span to
+        // start at the name instead of the sigil — back up one byte to `@`.
+        at_pos = at_pos.saturating_sub(1);
+    }
+    debug_assert!(
+        source[at_pos..].starts_with("@strategy"),
+        "strip_strategy_annotation_block: computed at_pos {at_pos} does not point at `@strategy`"
+    );
 
     // After `@strategy`, skip whitespace and look for `{`.
     let after_keyword: &str = &source[at_pos + "@strategy".len()..];
@@ -374,6 +405,39 @@ pub fn compile_file(input: &Path, output: &Path) -> Result<(), DriverError> {
     metadata.save(&sidecar_path)
         .map_err(DriverError::MetadataEmitFailed)?;
     Ok(())
+}
+
+/// M3.15 (EB.3): Build the child-process invocation for `axc bench`.
+///
+/// Returns `(program, args, env_overrides)`.  Pure — does NOT spawn.  This is the
+/// unit-test seam (AT-2828) so the argv/env mapping is verified without running cargo.
+///
+/// Mapping (exact, test-pinned):
+/// - `program = "cargo"`.
+/// - base `args = ["bench", "-p", "axc-driver"]`.
+/// - if `filter = Some(f)`: append `["--", f]` (Criterion positional filter after the `--`).
+/// - if `bless`: `env_overrides = [("AXC_BLESS_BASELINES".into(), "1".into())]`; else `[]`.
+///
+/// NOTE (self-deadlock footgun): the caller MUST invoke this via the
+/// installed/built `axc` binary, NOT `cargo run -p axc-driver -- bench` — the
+/// spawned `cargo bench` needs the workspace target-dir build lock, and an outer
+/// `cargo run` already holds it, so the inner cargo would block forever.
+pub fn build_bench_command(
+    filter: Option<&str>,
+    bless: bool,
+) -> (String, Vec<String>, Vec<(String, String)>) {
+    let program: String = "cargo".to_owned();
+    let mut args: Vec<String> = vec!["bench".to_owned(), "-p".to_owned(), "axc-driver".to_owned()];
+    if let Some(f) = filter {
+        args.push("--".to_owned());
+        args.push(f.to_owned());
+    }
+    let env_overrides: Vec<(String, String)> = if bless {
+        vec![("AXC_BLESS_BASELINES".to_owned(), "1".to_owned())]
+    } else {
+        Vec::new()
+    };
+    (program, args, env_overrides)
 }
 
 #[cfg(test)]
@@ -675,6 +739,196 @@ mod tests {
         );
     }
 
+    // ── AT-2830..2835: strip_strategy_annotation_block robust fix (M3.15) ──────
+    //
+    // These live here (not in a `tests/` integration file) because
+    // `strip_strategy_annotation_block` is `pub(crate)` — the M3.15 spec's
+    // suggested integration-test location (`tests/strategy_saxpy_autotune.rs`
+    // or a new `tests/strip_strategy_robust.rs`) is not reachable from an
+    // external test binary; unit tests here follow the same convention as the
+    // pre-existing AT-1043/AT-1044 tests for the same function.
+
+    /// AT-2830: line-comment decoy — the real M3.14 footgun. A `@strategy`
+    /// inside a `//` comment must not be mistaken for the real block. The OLD
+    /// `source.find("@strategy")` algorithm would latch onto the comment
+    /// occurrence, see it isn't followed by `{`, and return the source
+    /// UNCHANGED — leaving the real block's `?[...]` candidates unresolved
+    /// (bug reproduced by AT-2835's `naive_strip_reference`; fixed here by
+    /// anchoring on the lexer's `Annotation` token stream, which emits no
+    /// token for text inside a comment).
+    #[test]
+    fn at_2830_line_comment_decoy_does_not_block_real_strip() {
+        let src = "// tune @strategy here\n@strategy { x: ?[1] }\n@kernel fn k() -> void { return; }\n";
+        let result = strip_strategy_annotation_block(src);
+        assert!(
+            !result.contains("@strategy {"),
+            "the real @strategy block must be stripped; got {result:?}"
+        );
+        assert!(
+            !result.contains("?["),
+            "the ?[...] candidate list must be gone after stripping; got {result:?}"
+        );
+        assert!(
+            result.contains("// tune @strategy here"),
+            "the comment line must survive verbatim; got {result:?}"
+        );
+        assert!(
+            result.contains("@kernel fn k()"),
+            "the kernel body must survive; got {result:?}"
+        );
+    }
+
+    /// AT-2831: `@intent("...")` prose decoy before the real block. A
+    /// `@strategy` substring inside an `@intent("...")` string literal is part
+    /// of a `String` token, not an `Annotation` token, so it must not be
+    /// mistaken for the real block either.
+    #[test]
+    fn at_2831_intent_prose_decoy_does_not_block_real_strip() {
+        let src = "@intent(\"explores @strategy space\")\n@strategy { x: ?[1] }\n@kernel fn k() -> void { return; }\n";
+        let result = strip_strategy_annotation_block(src);
+        assert!(
+            !result.contains("@strategy {"),
+            "the real @strategy block must be stripped; got {result:?}"
+        );
+        assert!(
+            result.contains("@intent(\"explores @strategy space\")"),
+            "the @intent(...) prose (including its @strategy substring) must survive verbatim; got {result:?}"
+        );
+    }
+
+    /// AT-2832: real block alone, behavior preserved — pins the `@`-sigil byte
+    /// offset by asserting the result is byte-identical to `source` with
+    /// exactly the `@strategy { ... }` span removed (no off-by-one).
+    #[test]
+    fn at_2832_real_block_alone_sigil_offset_correct() {
+        let src = "@kernel @workgroup(64,1,1) @strategy { rb_m: ?[2] } fn k() -> void { return; }";
+        let result = strip_strategy_annotation_block(src);
+        let expected = "@kernel @workgroup(64,1,1)  fn k() -> void { return; }";
+        assert_eq!(
+            result, expected,
+            "stripped result must equal source with exactly the `@strategy {{...}}` span removed"
+        );
+    }
+
+    /// AT-2833: no `@strategy` anywhere → source returned unchanged (identity).
+    #[test]
+    fn at_2833_no_strategy_is_identity() {
+        let src = "@kernel @workgroup(64,1,1) fn k() -> void { return; }";
+        let result = strip_strategy_annotation_block(src);
+        assert_eq!(result, src, "source with no @strategy must be returned unchanged");
+    }
+
+    /// AT-2834: call-form `@strategy(foo)` (annotation followed by `(`, not
+    /// `{`) → unchanged. The `{`-guard escape hatch still holds after the
+    /// lexer-anchor rewrite.
+    #[test]
+    fn at_2834_call_form_is_unchanged() {
+        let src = "@kernel @strategy(foo) fn k() -> void { return; }";
+        let result = strip_strategy_annotation_block(src);
+        assert_eq!(result, src, "@strategy(...) call form must be left unchanged");
+    }
+
+    /// AT-2835: corpus regression anchor. `naive_strip_reference` reproduces
+    /// the OLD (pre-M3.15) `source.find("@strategy")` algorithm VERBATIM —
+    /// this half is load-bearing and MUST NOT be "improved". For every
+    /// `examples/*.axc` containing `@strategy`, asserts the NEW lexer-anchored
+    /// `strip_strategy_annotation_block` is BYTE-IDENTICAL to the old
+    /// algorithm's output (zero behavior change on the real corpus), and
+    /// separately asserts no residual LIVE `@strategy {` remains — scoped to
+    /// non-comment lines only, exactly mirroring the existing AT-1576
+    /// precedent below (`examples/matmul_f32_tiled.axc:13` carries a
+    /// brace-form `@strategy {` INSIDE a `//` comment, which correctly
+    /// survives the lexer-anchored strip; an unscoped residual check would
+    /// wrongly flag that file). The non-comment scoping applies ONLY to the
+    /// residual clause, never to the `== naive_strip_reference` equality.
+    #[test]
+    fn at_2835_corpus_regression_anchor_matches_naive_reference() {
+        /// Verbatim reproduction of the OLD `source.find("@strategy")`
+        /// algorithm (pre-M3.15). Do NOT "fix" this — it is the regression
+        /// baseline the new implementation is pinned against.
+        fn naive_strip_reference(source: &str) -> String {
+            let Some(at_pos) = source.find("@strategy") else {
+                return source.to_string();
+            };
+            let after_keyword: &str = &source[at_pos + "@strategy".len()..];
+            let trimmed: &str = after_keyword.trim_start_matches([' ', '\t', '\r', '\n']);
+            if !trimmed.starts_with('{') {
+                return source.to_string();
+            }
+            let open_brace_offset: usize = at_pos
+                + "@strategy".len()
+                + (after_keyword.len() - trimmed.len());
+            let bytes: &[u8] = source.as_bytes();
+            let mut depth: usize = 0;
+            let mut close_pos: Option<usize> = None;
+            for (i, &byte) in bytes.iter().enumerate().skip(open_brace_offset) {
+                match byte {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close_pos = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let close_pos: usize = match close_pos {
+                Some(p) => p,
+                None => return source.to_string(),
+            };
+            let before: &str = &source[..at_pos];
+            let after: &str = &source[close_pos + 1..];
+            format!("{before}{after}")
+        }
+
+        let manifest_dir: PathBuf = PathBuf::from(
+            std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"),
+        );
+        let examples_dir: PathBuf = manifest_dir.join("..").join("..").join("examples");
+        let mut checked: usize = 0;
+        for entry in std::fs::read_dir(&examples_dir)
+            .unwrap_or_else(|e| panic!("failed to read {examples_dir:?}: {e}"))
+        {
+            let entry = entry.expect("dir entry read failed");
+            let path: PathBuf = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("axc") {
+                continue;
+            }
+            let src: String = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("failed to read {path:?}: {e}"));
+            if !src.contains("@strategy") {
+                continue;
+            }
+            checked += 1;
+
+            let naive: String = naive_strip_reference(&src);
+            let robust: String = strip_strategy_annotation_block(&src);
+            assert_eq!(
+                robust, naive,
+                "strip_strategy_annotation_block must be byte-identical to the old \
+                 algorithm on {path:?} (zero behavior change on the real corpus)"
+            );
+
+            // Residual `@strategy {` check, scoped to NON-COMMENT lines only —
+            // mirrors AT-1576 above. An unscoped check would wrongly flag
+            // matmul_f32_tiled.axc's comment-form decoy at line 13.
+            let has_live_strategy_block: bool = robust
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .any(|line| line.contains("@strategy {"));
+            assert!(
+                !has_live_strategy_block,
+                "{path:?}: a live (non-comment) `@strategy {{` block survived stripping"
+            );
+        }
+        assert!(
+            checked > 0,
+            "expected at least one examples/*.axc containing @strategy to exercise this regression anchor"
+        );
+    }
+
     // ── AT-1575: scalar_ty_to_coopmat_scalar_meta — no panic (M3.1.5 D) ─────────
 
     /// AT-1575: Valid CoopMat scalar types map to Ok; invalid types return Err without panic.
@@ -750,5 +1004,37 @@ mod tests {
             "SPIR-V magic must be correct");
         assert_eq!(meta.workgroup_size, [128, 1, 1],
             "workgroup_size must reflect resolved wg_x=128");
+    }
+
+    // ── AT-2828: build_bench_command — pure argv/env mapping (EB.3, M3.15) ─────
+
+    /// AT-2828: build_bench_command produces the exact test-pinned argv/env mapping.
+    #[test]
+    fn at_2828_build_bench_command_mapping() {
+        assert_eq!(
+            build_bench_command(None, false),
+            (
+                "cargo".to_owned(),
+                vec!["bench".to_owned(), "-p".to_owned(), "axc-driver".to_owned()],
+                Vec::<(String, String)>::new(),
+            ),
+            "no filter, no bless: base argv, no env overrides"
+        );
+
+        assert_eq!(
+            build_bench_command(Some("cpu_saxpy"), true),
+            (
+                "cargo".to_owned(),
+                vec![
+                    "bench".to_owned(),
+                    "-p".to_owned(),
+                    "axc-driver".to_owned(),
+                    "--".to_owned(),
+                    "cpu_saxpy".to_owned(),
+                ],
+                vec![("AXC_BLESS_BASELINES".to_owned(), "1".to_owned())],
+            ),
+            "filter + bless: filter appended after `--`, AXC_BLESS_BASELINES=1 set"
+        );
     }
 }

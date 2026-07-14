@@ -3,6 +3,8 @@
 This document describes the Criterion-based benchmark harness for AXIOM-Compute.
 See also `DESIGN.md §3.1.7` for the design-level context.
 
+_Last updated: M3.15. Covers the harness through M3.14; the M3.x A/B campaign sections below are historical record._
+
 ---
 
 ## Measured results

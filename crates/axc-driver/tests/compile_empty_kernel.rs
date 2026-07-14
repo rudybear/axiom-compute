@@ -150,6 +150,35 @@ fn test_compile_empty_kernel_produces_valid_spirv() {
     // 6. In-process SPIR-V validation via spirv-tools crate (always mandatory).
     validate_spirv(&all_words, "empty_kernel");
 
-    // 7. Clean up temp file (best-effort; don't fail test on cleanup error)
+    // 7. AT-2838 (M3.15): full-body byte-identical comparison against a
+    //    committed golden. `compile_file` → `compile_source_with_meta` →
+    //    `emit_module_bytes` with `CodegenOptions::default()` runs no
+    //    spirv-opt pass, so codegen output is byte-deterministic (the project
+    //    asserts byte-identity across milestones everywhere) — a committed
+    //    full-body golden is stable and version-independent within a fixed
+    //    rustc + `Cargo.lock`.
+    //
+    //    Regen (only after a LEGITIMATE codegen or rspirv dependency change):
+    //      axc compile examples/empty_kernel.axc -o tests/fixtures/empty_kernel.spv.golden
+    let golden_path: PathBuf = manifest_dir
+        .join("..")
+        .join("..")
+        .join("tests")
+        .join("fixtures")
+        .join("empty_kernel.spv.golden");
+    let golden_bytes: Vec<u8> = std::fs::read(&golden_path)
+        .unwrap_or_else(|e| panic!("AT-2838: failed to read golden fixture {golden_path:?}: {e}"));
+    assert_eq!(
+        spv_bytes, golden_bytes,
+        "AT-2838: emitted empty-kernel SPIR-V is not byte-identical to the committed golden \
+         ({golden_path:?}). Within a fixed rustc + Cargo.lock this output is byte-deterministic \
+         (no spirv-opt pass, generator word forced to 0), so a mismatch here means either (a) a \
+         codegen or `rspirv` dependency change (e.g. an rspirv/codegen bump in Cargo.lock that \
+         shifts SPIR-V ID allocation) — re-bless via: \
+         `axc compile examples/empty_kernel.axc -o tests/fixtures/empty_kernel.spv.golden`, or \
+         (b) a real regression — do not re-bless blindly."
+    );
+
+    // 8. Clean up temp file (best-effort; don't fail test on cleanup error)
     let _ = std::fs::remove_file(&out_path);
 }
