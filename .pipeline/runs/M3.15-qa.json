@@ -1,0 +1,54 @@
+{
+  "verdict": "PASS",
+  "agent": "qa_agent",
+  "milestone_id": "M3.15-debt-bundle",
+  "design_revision": "r3",
+  "branch": "coder/M315-20260713-1500/M3.15-debt-bundle",
+  "requirements_total": 15,
+  "requirements_covered": 15,
+  "requirements_missing": [],
+  "test_results": {
+    "cargo_test_workspace_total": 1036,
+    "passed": 1036,
+    "failed": 0,
+    "ignored": 112,
+    "note": "Full un-truncated capture (previous tail-piped run had clipped output to 80 lines and undercounted); re-ran to a file and aggregated all 'test result:' lines. Matches coder's claimed 1036/0/112 exactly."
+  },
+  "verification_results": {
+    "cargo_build_workspace": "PASS",
+    "clippy_check": "PASS (0 warnings, --workspace --lib --tests -D warnings)",
+    "diff_check": "PASS — all 6 spec items present in git diff main...HEAD; 13 files changed matching the plan (baselines.json, CHANGELOG.md new, CLAUDE.md +1 line, cli.rs, lib.rs, main.rs, baselines_roundtrip.rs new, common_helpers.rs, compile_empty_kernel.rs, doc_accuracy.rs new, empty_kernel.spv.golden new, BENCHMARKS.md +2 lines). M3.15-debt-bundle.md itself is also in the diff (spec doc, expected).",
+    "scope_check": "PASS — git diff main...HEAD --stat touches NO files under crates/axc-{lexer,parser,hir,mir,codegen} and NO examples/*.axc (verified via targeted grep, zero hits). ci.yml, BENCHMARKS.md:230, axc-runtime/src/lib.rs, axc-runtime/src/icd.rs all confirmed absent from the diff (untouched, as r3 requires).",
+    "at_2826_through_2840_status": "PASS — all 15 tests (AT-2826..2840) individually located and confirmed 'ok' in the full test-run log. AT-2837 confirmed NOT #[ignore]-gated (grep for 'ignore' in baselines_roundtrip.rs returns nothing) — green-this-cycle as the r2/r3 spec requires.",
+    "strip_strategy_fix_adversarial_check": "PASS — independently wrote two throwaway adversarial fixtures (added temporarily to lib.rs's #[cfg(test)] mod, ran, then reverted; git diff on lib.rs confirmed clean afterward, nothing left in the repo). Probe 1: a source combining a line-comment decoy (`// @strategy { decoy_in_comment: ?[9] }`), an @intent(...) prose decoy containing '@strategy' twice, AND a real `@strategy { rb_m: ?[1,2], rb_n: ?[1,2] }` block later in the SAME file. Result: the real block was fully and exclusively removed (rb_m/rb_n gone, no live non-comment `@strategy {` residual) while BOTH decoys survived verbatim. Probe 2: a comment decoy with the brace immediately adjacent (`// @strategy{ ... }`, no space) followed by the real block — same correct outcome. No case broke the fix.",
+    "golden_spv_independent_regen": "PASS — ran the built `axc compile examples/empty_kernel.axc -o <scratch>.spv` independently (not via the test harness) and `cmp`'d it byte-for-byte against the committed tests/fixtures/empty_kernel.spv.golden: BYTE-IDENTICAL. AT-2838's panic message independently read and confirmed it names both the regen one-liner and 'a codegen or `rspirv` dependency change' as the expected legitimate cause, per the r2 spec requirement. Note: the `spirv-val` CLI binary is not present on this box/PATH; validity is established via the project's in-process spirv-tools crate validator inside test_compile_empty_kernel_produces_valid_spirv (step 6, pre-existing, ran and passed as part of the full workspace test run) — this is the project's documented mandatory validation path, not a gap introduced by M3.15.",
+    "eb4_baselines_check": "PASS — .pipeline/benchmarks/baselines.json has schema_version 2, top-level shape {schema_version, machines}, exactly 2 machine keys: nvidia_rtx_pro_6000_blackwell_workstation_edition and llvmpipe_llvm_20_1_2_256_bits (confirmed both by direct JSON inspection and by AT-2837 passing). lvp_icd.json (no .x86_64 suffix) independently confirmed present via `ls /usr/share/vulkan/icd.d/` on this box, matching the vulkan_icd field recorded in the llvmpipe block and matching the coder's ICD-path claim.",
+    "eb3_bench_help_check": "PASS — built ./target/debug/axc and ran `axc bench --help` directly (not `cargo run`, per the deadlock-avoidance note). Output confirmed to contain --filter, --bless, 'baseline' (in the --bless help text), and the full self-deadlock note verbatim ('run the INSTALLED/built `axc` binary, NOT `cargo run -p axc-driver -- bench`... self-deadlock').",
+    "gpu_spot_check": "PASS — real hardware confirmed present (nvidia-smi: NVIDIA RTX PRO 6000 Blackwell Workstation Edition). Independently ran `AXC_ENABLE_GPU_TESTS=1 cargo test -p axc-driver --test dispatch_matmul_tile -- --ignored`: 4/4 passed (at_1509_matmul_tile_pipeline_create_succeeds, at_1510_matmul_tile_nvidia_first_coopmat_dispatch_bit_close, at_1506_force_no_coopmat_exercises_skip_on_nvidia, at_1505_matmul_tile_lavapipe_graceful_skip) — confirms the strip_strategy_annotation_block rewrite (a driver-level source-text pass every compile goes through) did not regress the GPU dispatch/compile path.",
+    "coder_self_report_matches_reality": true
+  },
+  "deviations_reviewed": [
+    {
+      "deviation": "AT-2830..2835 placed as unit tests inside crates/axc-driver/src/lib.rs's existing #[cfg(test)] mod tests rather than in a tests/ integration file, because strip_strategy_annotation_block is pub(crate).",
+      "verdict": "ACCEPTED — independently verified via `git show main:crates/axc-driver/src/lib.rs | grep AT-1043` that the pre-existing AT-1043 (substitute_strategy_holes) and AT-1044 (strip_strategy_annotation_block, same function) tests for this exact function already live in lib.rs's mod tests on main, pre-dating this milestone. The precedent claim is factually correct and the visibility constraint (pub(crate), unreachable from an external tests/ binary) is real. No coverage or assertion content was weakened — confirmed by reading and adversarially probing the actual test bodies."
+    },
+    {
+      "deviation": "EB.4 bless scoped to 5 targeted bench binaries (compile, cpu_reference, dispatch, dispatch_q4km, postprocess) instead of the spec's literal unfiltered `cargo bench -p axc-driver`, terminating/skipping ~13 non-baseline-writing perf-diagnostic resident_* bench binaries.",
+      "verdict": "ACCEPTED — independently read crates/axc-driver/benches/postprocess.rs's KNOWN_BENCHES constant (14 entries across 5 groups: compile_pipeline, cpu_reference, dispatch_gpu, dispatch_gpu_amortized, dispatch_gpu_q4_0, dispatch_gpu_q4km) and grepped bench_function(\"...\") names in all 22 [[bench]] targets in Cargo.toml. Every KNOWN_BENCHES name is produced exclusively by compile.rs / cpu_reference.rs / dispatch.rs / dispatch_q4km.rs; none of the 17 resident_*/dispatch_q4km_ab bench binaries produce a name postprocess.rs reads. The scoping is provably equivalent to an unfiltered run for baselines.json's contents. baselines.json entry count (15 per machine block, matching the pre-existing AT-EB2-05 shape) is consistent with this."
+    },
+    {
+      "deviation": "Pre-existing at_eb2_05_nvidia_baselines_preserved_full_field frozen-value table in common_helpers.rs updated to the new NVIDIA-refresh medians rather than left as-is.",
+      "verdict": "ACCEPTED — this is exactly the spec's own EB.4 step 1 instruction ('Refreshes the nvidia_rtx_pro_6000_... block (git_sha/date/medians)'). Diff reviewed: only the numeric literals in the frozen tuple table changed (group/bench names, structure, and assertion logic are untouched); an explanatory comment pointing at the coder run JSON was added directly above the table. Leaving the old frozen values would have been the actual regression."
+    }
+  ],
+  "findings": [
+    {
+      "severity": "informational",
+      "item": "spirv-val CLI binary absent from PATH/system on this box",
+      "expected": "qa_agent template's default checklist mentions running the spirv-val binary directly",
+      "observed": "No spirv-val executable found anywhere on the filesystem (searched via `find / -iname spirv-val*`). The project's actual, documented validation path for this test is the in-process spirv-tools Rust crate binding, which the pre-existing test step 6 already exercises and which passed. Not a defect introduced by M3.15 (no spirv-val CLI invocation was ever part of this milestone's test suite); noted for completeness since the QA template references the CLI tool."
+    }
+  ],
+  "memory_footprint_ok": true,
+  "summary": "M3.15 PASSES QA. All 6 spec items (EB.3 axc bench subcommand, the lexer-anchored strip_strategy_annotation_block fix, EB.4 two-key baseline re-bless + round-trip test, AT-103 golden full-byte upgrade, CHANGELOG.md backfill, doc-accuracy sweep) are present in the diff exactly as r3 specifies, with all 15 acceptance tests (AT-2826..2840) passing. cargo build/clippy(-D warnings)/test all clean: 1036 passed, 0 failed, 112 ignored (full recount from an untruncated log, matching the coder's claim exactly — the QA agent's first `cargo test` capture had been accidentally truncated by a `tail -80` pipe and was corrected by re-running to a file). Independently regenerated the empty-kernel SPIR-V golden via the built axc binary and confirmed byte-for-byte identity with `cmp` (not just the test's own assertion). Independently wrote and ran two adversarial decoy fixtures beyond the spec's own AT-2830/2831 (a combined comment+intent-prose decoy with a real block later in the same file, and a brace-adjacent comment decoy) against the actual strip_strategy_annotation_block function (temporarily inlined into lib.rs's test module, then fully reverted — git diff on lib.rs confirmed clean) — both passed, no gap found beyond what the spec's fixtures already cover. Ran the real GPU dispatch smoke suite on the present NVIDIA RTX PRO 6000 hardware: 4/4 pass. Confirmed scope discipline: zero touches to axc-lexer/parser/hir/mir/codegen crates or examples/*.axc, and zero touches to ci.yml, BENCHMARKS.md:230, or the two axc-runtime ICD doc-comments (all correctly left CI-canonical per the r3 reversal). All 3 coder-documented deviations were independently checked against their claimed justifications (AT-1043/1044 precedent, the 5-bench postprocess.rs KNOWN_BENCHES scoping, and the frozen-value re-pin being the spec's own anticipated consequence) and found accurate — no scope creep, no weakened assertions, no undisclosed gaps. Recommend proceeding to code review."
+}

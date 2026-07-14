@@ -1,0 +1,51 @@
+{
+  "verdict": "APPROVE",
+  "agent": "optimistic_code_reviewer",
+  "milestone_id": "M3.15-debt-bundle",
+  "design_revision": "r3",
+  "branch": "coder/M315-20260713-1500/M3.15-debt-bundle",
+  "spec_compliance": true,
+  "items_verified": [
+    {
+      "item": "1 — EB.3 axc bench subcommand",
+      "status": "matches spec exactly",
+      "notes": "Command::Bench variant, doc-comment (including the self-deadlock note), pure build_bench_command(filter, bless) -> (program, args, env_overrides) in lib.rs, and the main.rs run_bench spawn handler with inherited stdio + the three specified error paths (cargo-not-found, non-zero exit, happy path) all present verbatim. Follows the exact same match-arm-delegates-to-helper idiom as the existing Mcp/Optimize subcommands (run_mcp_server / run_bench). AT-2826, AT-2827, AT-2828, AT-2829 all present and independently re-run: pass."
+    },
+    {
+      "item": "2 — strip_strategy_annotation_block robust fix",
+      "status": "matches spec exactly",
+      "notes": "Anchors on the first TokenKind::Annotation(\"strategy\") token via axc_lexer::tokenize, with the @-sigil off-by-one guarded by an if-fallback plus a debug_assert as the spec required, then falls through to the existing verbatim brace-scan/splice logic. Doc-comment correctly rewritten to describe the lexer-token anchor and drops the stale 'finds the first @strategy in the text' wording. AT-2830..2835 all present, independently re-run: pass, including the AT-2835 corpus regression anchor (naive_strip_reference reproduced verbatim, non-comment-line scoping applied ONLY to the residual clause, not the equality) and AT-2832's exact byte-offset pin via full-string equality."
+    },
+    {
+      "item": "3 — EB.4 baseline re-bless + prune + round-trip",
+      "status": "matches spec exactly",
+      "notes": "baselines.json holds exactly two machine keys (nvidia_rtx_pro_6000_blackwell_workstation_edition, llvmpipe_llvm_20_1_2_256_bits), both git_sha 305cc24, generated timestamps consistent with the common_helpers.rs re-pin comment (2026-07-14T02:53:54Z NVIDIA / 2026-07-14T03:31:34Z Lavapipe). baselines_roundtrip.rs reuses benches/common.rs via #[path] exactly as bench_regression.rs does. AT-2836/AT-2837 present and independently re-run: pass. AT-2837 is NOT #[ignore]-gated (green-this-cycle, as r2/r3 required) and asserts len()==2 / exact nvidia key / exactly-one llvmpipe-prefixed key / every key == sanitize(key), none weakened to >=1."
+    },
+    {
+      "item": "4 — AT-103 golden full-bytes upgrade",
+      "status": "matches spec exactly",
+      "notes": "tests/fixtures/empty_kernel.spv.golden (140 bytes) committed; compile_empty_kernel.rs appends a strict assert_eq!(spv_bytes, golden_bytes) after the existing header/spirv-val checks, with a panic message naming both the regen one-liner and the 'codegen or rspirv dependency change' cause per the r2 addendum. Independently re-ran: pass."
+    },
+    {
+      "item": "5 — CHANGELOG.md backfill",
+      "status": "matches spec exactly",
+      "notes": "Milestone-level (not per-commit), spot-checked M3.6/M3.7/M3.8/M3.13/M3.14/M4.1/EB.2 entries against `git log --oneline` — headline claims (M3.6 2.39x scale-caching bit-identical, M3.7/M3.8 honest negatives, M3.13 KHR-blocked PRONG B verdict, M3.14 AT-2811..2823 Q6_K/Q5_K_M) match the actual commit messages and MEMORY.md record. Contains the required M3.14, M3.6, and M3.15 bullets (AT-2839)."
+    },
+    {
+      "item": "6 — Doc-accuracy sweep",
+      "status": "matches spec exactly",
+      "notes": "Verified by direct grep: body.rs contains no 'cap = 6' / 'Float64 cap = 6' anywhere (Float64 capability=10 comments are correct per SPIR-V 3.31). BENCHMARKS.md carries the 'Last updated: M3.15' one-line note (2 lines added, within the ≤5-line budget). CLAUDE.md line 171 (`lvp_icd.x86_64.json`, CI-canonical) is left untouched and exactly one note line is added beneath it documenting the env-dependence, matching the r3 changelog's option-B reversal of the r2 mistake precisely. AT-2840 asserts presence of both ICD names (not absence of .x86_64) and independently re-run: pass."
+    }
+  ],
+  "positive_feedback": [
+    "The strip-fix is the standout piece of this bundle: the doc-comment clearly explains why the lexer-token anchor is comment/string-safe, the @-sigil offset handling is defensive (fallback + debug_assert) rather than assumed, and AT-2835's naive_strip_reference is a genuinely load-bearing regression anchor against the real examples/ corpus rather than a synthetic-only test.",
+    "build_bench_command is a clean, idiomatic pure-function seam — exactly the kind of untestable-shell-out/testable-mapping split the spec asked for, and main.rs's run_bench follows the same match-arm-delegates-to-helper pattern already used by Mcp/Optimize.",
+    "The r3 CLAUDE.md fix is handled with precision: line 171 (CI-canonical, matches ci.yml's 6 refs) is left alone and exactly one explanatory line is added, which is the narrowest possible diff that fixes the r2 regression without touching BENCHMARKS.md:230 or the axc-runtime doc-comments.",
+    "AT-2840's design ('lvp_icd.json' is not a substring-trap of 'lvp_icd.x86_64.json') is a nice touch that makes the guard assert presence of the intended note rather than just absence of a string.",
+    "CHANGELOG.md content is factually accurate against git log and MEMORY.md on every spot-checked entry, including numerically precise claims (2.39x, 87,000x, 31 TFLOPS / 24.96% cuBLAS)."
+  ],
+  "minor_issues": [],
+  "deviations_reviewed": "All 3 QA-accepted deviations (AT-2830..2835 placed as lib.rs unit tests due to pub(crate) visibility; EB.4 bless scoped to the 5 KNOWN_BENCHES-producing bench binaries; the pre-existing AT-EB2-05 frozen-value table re-pinned to the new NVIDIA medians) are consistent with the spec's own text (Item 3 procedure explicitly calls for the NVIDIA block refresh) and standard precedent (AT-1043/1044 already live in lib.rs for the same function). No objection.",
+  "independent_verification": "Re-ran (not just re-read QA's claims): cargo test -p axc-driver --lib at_28* (14 tests, all pass), cargo test -p axc-driver --test baselines_roundtrip --test doc_accuracy --test compile_empty_kernel (5 tests, all pass), cargo clippy -p axc-driver --lib --tests -- -D warnings (clean). Independently grepped body.rs, BENCHMARKS.md, CLAUDE.md, ci.yml for the doc-accuracy claims and confirmed the diffs are exactly as described. Independently inspected the committed baselines.json machine-block generated/git_sha fields against the common_helpers.rs re-pin comment — consistent.",
+  "summary": "M3.15 implements all six spec items exactly as r3 describes, with no scope drift beyond the three QA-reviewed and independently-re-verified deviations. Code quality is high: the strip-fix is well-commented and defensively written for the next maintainer, the CLI subcommand follows existing patterns, and the CHANGELOG/doc edits spot-check accurate against git history. No blocking or minor issues found. Recommend proceeding to pessimistic code review."
+}

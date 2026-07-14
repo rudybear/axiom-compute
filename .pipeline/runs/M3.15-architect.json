@@ -1,0 +1,42 @@
+{
+  "verdict": "PROPOSED",
+  "agent": "architect",
+  "milestone_id": "M3.15-debt-bundle",
+  "revision": "r3",
+  "final_allowed_cycle": true,
+  "summary": "r3 fixes the single r2 pessimistic critical: the r2 CLAUDE.md `lvp_icd.x86_64.json -> lvp_icd.json` swap + the AT-2840 'contains NO .x86_64' clause were a doc/CI regression. `.x86_64.json` is the CI-canonical Ubuntu path, verified hard-wired in `.github/workflows/ci.yml` (6 places: lines 17,18,35,53,54), `BENCHMARKS.md:230`, `crates/axc-runtime/src/lib.rs:45`, `crates/axc-runtime/src/icd.rs:72`. CLAUDE.md's GPU-execution section explicitly documents CI, so the swap desynced it from ci.yml and AT-2840 would have forbidden the exact string CI depends on. Chose option (B): keep CLAUDE.md line 171 on the CI-canonical name and ADD one env-dependent note line; re-word AT-2840 to assert the PRESENCE of the both-names note. Confined to CLAUDE.md's env-var section (one line kept + one line added). Nothing else moved.",
+  "chosen_option": "B — document BOTH names as environment-dependent in CLAUDE.md's env-var section (CI Ubuntu = lvp_icd.x86_64.json, local Mesa may be lvp_icd.json), and make AT-2840 assert the note's presence. Rationale: (B) is the truthful fix — it keeps CLAUDE.md consistent with ci.yml's 6 refs AND stops the next engineer tripping on the exact ICD-name ambiguity that tripped this pipeline twice (r1 over-generalized the box-local path; r2 faithfully but wrongly applied it). Option (A) (drop the swap + clause entirely) would have been correct-but-silent; (B) additionally records the environment-dependence so the failure mode cannot recur.",
+  "changes_this_pass": [
+    {
+      "item": "Item 6 — CLAUDE.md ICD portion",
+      "change": "REVERSED the r2 swap. CLAUDE.md line 171 stays exactly as-is on the CI-canonical `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json`. ADD one note line directly beneath it: '_ICD filename is environment-dependent: Ubuntu/CI (`mesa-vulkan-drivers`) installs the arch-suffixed `lvp_icd.x86_64.json` (used above and throughout `ci.yml`); some local Mesa builds name it `lvp_icd.json` (no suffix). Run `ls /usr/share/vulkan/icd.d/` to confirm which is present._'. Confined to CLAUDE.md's env-var section: one existing line kept + one line added. BENCHMARKS.md:230, the two axc-runtime doc-comments, and ci.yml are NOT touched (all correctly CI-canonical)."
+    },
+    {
+      "item": "AT-2840 — CLAUDE.md guard clause",
+      "change": "DELETED the r2 'assert CLAUDE.md contains NO lvp_icd.x86_64.json' clause (it forbade the CI-canonical string and would have gone red the moment anyone re-aligned CLAUDE.md with ci.yml). REPLACED with: assert CLAUDE.md contains BOTH `lvp_icd.x86_64.json` (CI-canonical, must not be removed) AND `lvp_icd.json` (box-local alternate in the env-note). `lvp_icd.json` is not a substring of `lvp_icd.x86_64.json`, so the plain contains-check passes only when the env-note is genuinely present — asserts the PRESENCE of the both-names note instead of forbidding `.x86_64`. body.rs `cap = 6` grep-negative and BENCHMARKS.md `Last updated: M3.15` assertions unchanged."
+    },
+    {
+      "item": "Item-6 scope-table row + spec header",
+      "change": "Header marked r3 with the critical summary; Items-in-scope table row 6 label 'CLAUDE.md ICD-path fix' -> 'CLAUDE.md ICD-name env-note'. r3 changelog appended above the r2 changelog."
+    }
+  ],
+  "explicitly_unchanged_from_r2": [
+    "AT-2835 non-comment-scoped residual clause (matmul_f32_tiled.axc:13 decoy) + unscoped == naive_strip_reference equality half",
+    "AT-2837 green-this-cycle plan + #[ignore]-only-on-runtime-failure fallback; len()==2 / starts_with('llvmpipe') never weakened",
+    "EB.3 Item 1 nested-cargo self-deadlock note (run installed axc, not `cargo run -p axc-driver -- bench`)",
+    "AT-2838 golden re-bless wording (names 'a codegen or rspirv dependency change')",
+    "EB.4 bless procedure (Item 3, step 2) keeps box-local lvp_icd.json unconditionally with its ls-confirm step — orthogonal to the CLAUDE.md doc note",
+    "Item 1 build_bench_command pure seam, Item 2 lexer-anchor strip mechanism, two-key baseline shape, golden full-bytes approach, CHANGELOG backfill, all deferrals, dependency graph, correctness-oracle set"
+  ],
+  "verification_performed": [
+    "grep -n lvp_icd .github/workflows/ci.yml -> 6 hits (lines 17,18,35,53,54 = 5 lines, VK_DRIVER_FILES + VK_ICD_FILENAMES); confirmed all `.x86_64.json`",
+    "grep confirmed BENCHMARKS.md:230, crates/axc-runtime/src/lib.rs:45, crates/axc-runtime/src/icd.rs:72 all carry `lvp_icd.x86_64.json`",
+    "Read CLAUDE.md lines 158-172: line 161 explicitly documents CI; line 171 carries `.x86_64.json` -> the r2 swap would have desynced it from ci.yml"
+  ],
+  "architecture_unchanged": true,
+  "files_written": [
+    ".pipeline/milestones/M3.15-debt-bundle.md",
+    ".pipeline/runs/M3.15-architect.json"
+  ],
+  "next": "Re-review by pessimistic + optimistic design reviewers; on dual APPROVE -> Coder."
+}
