@@ -301,4 +301,75 @@ mod tests {
         let p = strategy_sidecar_path(std::path::Path::new("out.spv"));
         assert_eq!(p, std::path::PathBuf::from("out.spv.axc.strategy.json"));
     }
+
+    // ── M3.22: AT-2984·A — run_optimize completes on a shared-len hole ────────
+
+    /// Returns true if `asm` contains an `OpConstant ... <value>` line whose
+    /// LAST whitespace-separated token is exactly `value` (avoids substring
+    /// false-positives, e.g. `64` inside `164`).
+    fn asm_has_opconstant_value(asm: &str, value: i64) -> bool {
+        let needle: String = value.to_string();
+        asm.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed.contains("OpConstant") && trimmed.split_whitespace().next_back() == Some(needle.as_str())
+        })
+    }
+
+    /// AT-2984·A (leg A — no GPU): `run_optimize` on a single-kernel
+    /// shared-len-hole fixture (`shared[i32,?WG]`, `@strategy { WG: ?[32, 64] }`)
+    /// completes WITHOUT failing closed (`OptimizeError::GridSearch` /
+    /// `NoSuccessfulVariants`) — the honest, bounded payoff of the
+    /// `resolve_single_variant` fix (M3.22 spec §1.2b). Writes a winner `.spv`
+    /// AND a strategy sidecar; the written winner's `OpTypeArray` shared
+    /// length equals ITS OWN sidecar assignment. Does NOT assert which
+    /// candidate wins (the mock bench ties every variant at a fixed
+    /// `1000ns`) or any GPU-computed output.
+    #[test]
+    fn at_2984a_run_optimize_completes_on_shared_len_hole_fixture() {
+        let src = "@kernel @workgroup(64,1,1) @strategy { WG: ?[32, 64] } \
+                   @intent(\"AT-2984 shared-len hole fixture\") @complexity(O(1)) \
+                   fn k(out: buffer[i32]) -> void { \
+                   shared t: shared[i32, ?WG]; \
+                   let lid: u32 = gid(0u32); \
+                   t[lid] = out[lid]; \
+                   workgroup_barrier(); \
+                   out[lid] = t[lid]; \
+                   return; }";
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input_path = dir.path().join("fixture.axc");
+        std::fs::write(&input_path, src).expect("write fixture");
+        let output_path = dir.path().join("fixture.spv");
+
+        let result = run_optimize(&input_path, &output_path, "none", None);
+        assert!(result.is_ok(), "run_optimize must NOT fail closed on a shared-len hole: {result:?}");
+
+        assert!(output_path.exists(), "winner .spv must be written");
+        let sidecar_path = strategy_sidecar_path(&output_path);
+        assert!(sidecar_path.exists(), "strategy sidecar must be written");
+
+        let sidecar_json: String = std::fs::read_to_string(&sidecar_path).expect("read sidecar");
+        let sidecar: axc_optimize::grid_search::GridSearchResult = serde_json::from_str(&sidecar_json)
+            .expect("sidecar must deserialize as GridSearchResult");
+        let winning_wg: i64 = *sidecar.winner_assignments.values.get("WG")
+            .expect("winner_assignments must contain WG");
+
+        // The written winner .spv's OpTypeArray shared length must equal ITS
+        // OWN sidecar assignment (mock bench ties every variant — don't
+        // assert WHICH candidate wins).
+        let spv_bytes: Vec<u8> = std::fs::read(&output_path).expect("read winner spv");
+        let words: Vec<u32> = spv_bytes.chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let mut loader = rspirv::dr::Loader::new();
+        rspirv::binary::parse_words(&words, &mut loader).expect("rspirv parse");
+        let asm: String = {
+            use rspirv::binary::Disassemble;
+            loader.module().disassemble()
+        };
+        assert!(
+            asm_has_opconstant_value(&asm, winning_wg),
+            "winner .spv must have an OpConstant matching the winning WG ({winning_wg}); asm:\n{asm}"
+        );
+    }
 }

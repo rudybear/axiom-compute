@@ -51,7 +51,7 @@ pub use hir::{
     DebugOperand,
 };
 pub use lower::lower_module;
-pub use validate::{HirError, HirWarning, validate};
+pub use validate::{HirError, HirWarning};
 pub use ty::{ScalarTy, IntLiteralValue, FloatLiteralValue, LiteralRangeErr, fit_int_literal, fit_float_literal};
 pub use expr::{
     KernelBodyTyped, HirExpr, HirExprKind, HirStmt, Binding, BindingId, BindingTy,

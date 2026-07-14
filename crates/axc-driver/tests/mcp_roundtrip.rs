@@ -763,6 +763,107 @@ fn at_1117_grid_search_history_roundtrip_via_optimization_history() {
     assert!(ts0 <= ts1, "entries must be in ascending timestamp order: {ts0} > {ts1}");
 }
 
+// ── AT-2984·B (M3.22, GPU-gated): grid_search genuinely dispatches BOTH ───────
+//    shared-len variants ────────────────────────────────────────────────────
+
+/// Fixture: single-kernel, `shared[i32, ?WG]` bound to the SAME `?WG` hole as
+/// `@workgroup(?WG,1,1)`. The textual MCP path substitutes `?WG` in BOTH
+/// positions, so workgroup size and shared-tile size track together (M3.22
+/// spec §1.2b — the `@workgroup(?WG)` convention-keyed trap of
+/// `resolve_single_variant` does NOT apply on this textual path). Global
+/// addressing (`gid`) sizes the buffer; local addressing (`local_invocation_id`)
+/// sizes the shared tile — both exactly cover 64 elements for EITHER WG
+/// candidate (32 -> 2 groups of 32, or 64 -> 1 group of 64).
+const SHARED_LEN_HOLE_SRC: &str = r#"
+@kernel
+@workgroup(?WG, 1, 1)
+@intent("AT-2984 shared-len hole dispatch fixture")
+@complexity(O(1))
+@strategy { WG: ?[32, 64] }
+fn shared_len_hole_k(out: buffer[i32]) -> void {
+    shared t: shared[i32, ?WG];
+    let gi: u32 = gid(0u32);
+    let lid: u32 = local_invocation_id(0u32);
+    t[lid] = out[gi];
+    workgroup_barrier();
+    out[gi] = t[lid];
+    return;
+}
+"#;
+
+/// AT-2984·B (leg B — GPU): the textual MCP `grid_search` path genuinely
+/// dispatches BOTH shared-len variants (`WG` in {32, 64}) with real, non-mock
+/// timing samples — the honest home of "the autotuner truly benchmarks
+/// shared-tile variants" (M3.22 spec §1.2b). Neither variant is
+/// `correctness_rejected`; each returns `Ok` or `NotChecked` (this kernel has
+/// no registered CPU oracle, so `NotChecked` is expected — genuine dispatch +
+/// real timings is the load-bearing claim here, not an oracle verdict).
+#[test]
+fn at_2984b_grid_search_genuinely_dispatches_both_shared_len_variants() {
+    if std::env::var("AXC_ENABLE_GPU_TESTS").unwrap_or_default() != "1" {
+        eprintln!("AT-2984b: skipped (AXC_ENABLE_GPU_TESTS != 1)");
+        return;
+    }
+    let history_dir: tempfile::TempDir = tempfile::tempdir().expect("tempdir");
+    let history_env: String = history_dir.path().to_str().unwrap().to_string();
+
+    let axc: PathBuf = axc_binary_path();
+    let req: serde_json::Value = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "grid_search",
+        "params": {
+            "source": SHARED_LEN_HOLE_SRC,
+            "input_sizes": [256],
+            "sample_count": 3
+        }
+    });
+
+    let mut child: std::process::Child = Command::new(&axc)
+        .args(["mcp", "--log", "null"])
+        .env("AXC_MCP_HISTORY_DIR", &history_env)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn axc mcp");
+    {
+        let mut stdin_pipe = child.stdin.take().unwrap();
+        writeln!(stdin_pipe, "{req}").unwrap();
+    }
+    let output: std::process::Output = child.wait_with_output().expect("wait_with_output");
+    let stdout_str: &str = std::str::from_utf8(&output.stdout).unwrap();
+    let resp: serde_json::Value = serde_json::from_str(
+        stdout_str.lines().next().expect("at least one response line")
+    ).expect("valid JSON response");
+
+    assert!(resp["error"].is_null(), "grid_search error: {}", resp["error"]);
+    let ranked: &Vec<serde_json::Value> = resp["result"]["ranked"].as_array().expect("ranked array");
+    assert_eq!(ranked.len(), 2, "expected exactly 2 variants (WG in {{32,64}}); got {}", ranked.len());
+
+    let mut seen_wg: Vec<i64> = Vec::new();
+    for r in ranked {
+        let correctness_status: &str = r["correctness"]["status"].as_str().unwrap_or("");
+        assert!(
+            correctness_status == "ok" || correctness_status == "not_checked",
+            "variant must not be correctness_rejected; got status={correctness_status:?}, variant={r}"
+        );
+        let outcome: &str = r["outcome"].as_str().unwrap_or("");
+        assert!(
+            outcome == "ok" || outcome == "not_checked",
+            "variant must have genuinely dispatched (outcome ok/not_checked, not failed/correctness_rejected); got {outcome:?}: {r}"
+        );
+        let median_ns: u64 = r["median_ns"].as_u64()
+            .unwrap_or_else(|| panic!("variant must have a real (non-null) median_ns (genuine dispatch, not mock): {r}"));
+        assert!(median_ns > 0, "median_ns must be > 0: {r}");
+
+        let wg: i64 = r["assignments"]["WG"].as_i64().expect("assignments.WG must be present");
+        seen_wg.push(wg);
+    }
+    seen_wg.sort_unstable();
+    assert_eq!(seen_wg, vec![32_i64, 64], "both WG=32 and WG=64 variants must have genuinely dispatched");
+}
+
 // ── AT-1118: history_path_for_source uses xxh3_hex16 (unit test) ─────────────
 
 #[test]

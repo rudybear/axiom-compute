@@ -147,9 +147,8 @@ fn at2931_reference_to_never_declared_array_name_is_unknown_binding() {
 ///
 /// Reachable via `TypecheckError::LocalArrayTooLarge` (constructed during lowering,
 /// mirrors `SharedMemoryTooLarge`'s ACTUAL reachable placement in
-/// `typecheck_kernel_body` — see that variant's doc for why `validate.rs`'s
-/// `HirError::LocalArrayTooLarge` mirrors shared's separate, unreachable-via-the-
-/// driver-pipeline `validate()` duplication instead).
+/// `typecheck_kernel_body` — the sole check since M3.22 deleted `validate.rs`'s
+/// dead, zero-caller `validate()` pass that used to duplicate it).
 #[test]
 fn at2932_local_array_too_large_hard_error() {
     let src = "@kernel @workgroup(1,1,1) fn k() -> void { array big: array[f32, 1025]; return; }";

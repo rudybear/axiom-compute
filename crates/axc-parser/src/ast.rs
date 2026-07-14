@@ -134,6 +134,21 @@ pub enum TypeRef {
     },
 }
 
+/// The result of parsing a `shared[elem, N]` length position (M3.22).
+///
+/// `parse_shared_len` returns this so the two call sites (`shared[..]` in type
+/// position, and the `shared name: shared[..];` declaration statement) can each
+/// decide how to represent a hole. `array[elem, N]`'s length parser (local-array,
+/// M3.20) has NO equivalent — `?N` there still hard-rejects at parse (deliberate
+/// asymmetry, see the shared-only / local-array-deferred decision, M3.22 spec §3).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParsedSharedLen {
+    /// An unsuffixed positive integer literal, already range-checked.
+    Lit(u32),
+    /// `?name` — a hole reference site in length position.
+    Hole(String),
+}
+
 /// An annotation on a kernel: `@name` or `@name(arg, …)`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Annotation {
@@ -323,7 +338,15 @@ pub enum Stmt {
         /// Element type scalar reference.
         elem: ScalarTypeRef,
         /// Length (number of elements), as a spanned u32 for error messages.
+        ///
+        /// M3.22: when `len_hole.is_some()`, this holds the placeholder `1` —
+        /// the real length is not known until the hole is resolved (either by
+        /// textual substitution before parse, or by the enumerator's
+        /// `resolve_single_variant`, see `axc_hir::shared::SharedDecl::len_hole`).
         len: axc_lexer::Spanned<u32>,
+        /// M3.22: `?name` in length position (`shared[T, ?name]`) — additive,
+        /// `None` for the common literal-length case. See `ParsedSharedLen`.
+        len_hole: Option<axc_lexer::Spanned<String>>,
     },
     /// `array name: array[elem, N];` — per-invocation local array declaration (M3.20+).
     ///

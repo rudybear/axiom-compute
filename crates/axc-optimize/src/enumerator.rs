@@ -35,7 +35,7 @@
 
 use std::collections::BTreeMap;
 use xxhash_rust::xxh3::xxh3_64;
-use axc_hir::hir::{Kernel, KernelAnnotations, Module as HirModule, StrategyHoles, WorkgroupDims};
+use axc_hir::hir::{Kernel, KernelAnnotations, KernelBody, Module as HirModule, StrategyHoles, WorkgroupDims};
 use crate::EnumerateError;
 
 /// Soft limit: warn (but don't fail) when the Cartesian product exceeds this.
@@ -131,9 +131,16 @@ pub fn enumerate_strategy(holes: &StrategyHoles) -> Result<Vec<StrategyVariant>,
 /// Apply `assignments` to a `Kernel`, producing a resolved kernel ready for
 /// codegen.
 ///
-/// Resolution currently applies to `@workgroup(x, y, z)` dimensions: any
-/// placeholder dimension stored as `1` due to a `HoleRef` is replaced by the
-/// concrete value from `assignments`.
+/// Resolution applies to:
+/// - `@workgroup(x, y, z)` dimensions: any placeholder dimension stored as `1`
+///   due to a `HoleRef` is replaced by the concrete value from `assignments`,
+///   keyed on the `workgroup_x`/`workgroup_y`/`workgroup_z` CONVENTION names
+///   (not the hole's own name — see `resolve_wg_dim`).
+/// - M3.22: `shared[T, ?name]` length holes in THIS (the single benched)
+///   kernel's typed body — keyed on the hole's OWN name (unlike `@workgroup`).
+///   See `resolve_shared_len_holes`. A sibling kernel's shared-len hole (on a
+///   multi-kernel module) is NOT touched here — it is resolved textually by
+///   the driver's module-wide cross-validate before any output is written.
 ///
 /// Returns `EnumerateError::UnknownHole` if an assignment key names a hole
 /// that isn't present in `kernel.annotations.strategy`.
@@ -141,7 +148,9 @@ pub fn enumerate_strategy(holes: &StrategyHoles) -> Result<Vec<StrategyVariant>,
 /// a non-positive workgroup dimension.
 ///
 /// On success, the returned kernel has `annotations.strategy = None` so it
-/// passes the codegen backstop guard.
+/// passes the codegen backstop guard. Any shared-len hole whose name is absent
+/// from `assignments` is left unresolved (`len_hole` stays `Some(_)`) so the
+/// codegen `UnresolvedSharedLenHole` backstop fails that variant closed.
 pub fn resolve_single_variant(
     kernel: &Kernel,
     assignments: &StrategyAssignments,
@@ -188,9 +197,39 @@ pub fn resolve_single_variant(
         annotations: new_annotations,
         params: kernel.params.clone(),
         binding_plan: kernel.binding_plan.clone(),
-        body: kernel.body.clone(),
+        body: resolve_shared_len_holes(&kernel.body, assignments),
         span: kernel.span,
     })
+}
+
+/// M3.22: substitute `shared[T, ?name]` length holes in a kernel body, keyed on
+/// the hole's OWN name (not a `workgroup_x`-style convention).
+///
+/// For each shared decl with `len_hole == Some(name)`: if `assignments` has a
+/// positive value for `name`, set `ty.len` to it and clear `len_hole`;
+/// otherwise leave `len_hole` untouched so the codegen `UnresolvedSharedLenHole`
+/// backstop fails that variant closed rather than sizing an array from the
+/// placeholder length (1). `local_arrays` has no hole support (M3.22 §3 —
+/// deliberately deferred) and is untouched.
+fn resolve_shared_len_holes(body: &KernelBody, assignments: &StrategyAssignments) -> KernelBody {
+    let KernelBody::Typed(tb) = body else {
+        return KernelBody::Empty;
+    };
+    let mut resolved = tb.clone();
+    for decl in resolved.shared.iter_mut() {
+        let Some(name) = decl.len_hole.clone() else {
+            continue;
+        };
+        if let Some(&value) = assignments.values.get(&name) {
+            if value > 0 {
+                decl.ty.len = value as u32;
+                decl.len_hole = None;
+            }
+            // value <= 0: leave len_hole Some(_) — fail-closed via the codegen backstop.
+        }
+        // name absent from assignments: leave len_hole Some(_) — fail-closed.
+    }
+    KernelBody::Typed(resolved)
 }
 
 /// Resolve a single workgroup dimension, substituting from `assignments` when
@@ -528,6 +567,107 @@ mod tests {
         assert!(
             matches!(result, Err(crate::EnumerateError::UnknownHole { ref name }) if name == "nonexistent_hole"),
             "expected UnknownHole for unknown name; got {result:?}"
+        );
+    }
+
+    // ── M3.22: AT-2983 — resolve_single_variant substitutes shared-len holes ──
+
+    /// Build a kernel with a `@strategy` map and a typed body carrying ONE
+    /// shared decl whose `len_hole == Some(hole_name)` at the placeholder
+    /// length (1). Mirrors `make_kernel_with_strategy` but with a non-empty
+    /// typed body (M3.22, AT-2983).
+    fn make_kernel_with_shared_len_hole(hole_name: &str, holes_map: BTreeMap<String, Vec<i64>>) -> Kernel {
+        use axc_hir::expr::KernelBodyTyped;
+        use axc_hir::shared::{SharedDecl, SharedId, SharedTy};
+        use axc_hir::ty::ScalarTy;
+
+        let typed_body = KernelBodyTyped {
+            bindings: Vec::new(),
+            stmts: Vec::new(),
+            shared: vec![SharedDecl {
+                id: SharedId(0),
+                name: "tile".to_string(),
+                ty: SharedTy { elem: ScalarTy::I32, len: 1 },
+                span: Span::new(0, 1),
+                len_hole: Some(hole_name.to_string()),
+            }],
+            local_arrays: Vec::new(),
+        };
+
+        Kernel {
+            id: KernelId(0),
+            name: "test_kernel".to_string(),
+            annotations: KernelAnnotations {
+                workgroup: WorkgroupDims { x: 1, y: 1, z: 1 },
+                intent: None,
+                complexity: None,
+                preconditions: Vec::new(),
+                subgroup_uniform: false,
+                cooperative_matrix: false,
+                coop_matrix: None,
+                strategy: if holes_map.is_empty() { None } else { Some(StrategyHoles { map: holes_map }) },
+                debug_checks: Vec::new(),
+                opt_log: None,
+            },
+            params: Vec::new(),
+            binding_plan: axc_hir::param::ParamBindingPlan {
+                buffers: Vec::new(),
+                scalars: Vec::new(),
+                push_constant_total_bytes: 0,
+            },
+            body: KernelBody::Typed(typed_body),
+            span: Span::new(0, 1),
+        }
+    }
+
+    /// AT-2983 (positive): resolve_single_variant substitutes a shared-len hole
+    /// BY ITS OWN NAME (unlike `@workgroup`, which is convention-keyed).
+    #[test]
+    fn at_2983_resolve_single_variant_substitutes_shared_len_hole() {
+        let mut holes_map: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+        holes_map.insert("WG".to_string(), vec![32, 64]);
+        let kernel = make_kernel_with_shared_len_hole("WG", holes_map);
+
+        let mut assignment_values: BTreeMap<String, i64> = BTreeMap::new();
+        assignment_values.insert("WG".to_string(), 64);
+        let assignments = StrategyAssignments { values: assignment_values };
+
+        let resolved = resolve_single_variant(&kernel, &assignments).expect("resolve failed");
+        let KernelBody::Typed(tb) = &resolved.body else {
+            panic!("expected Typed body, got {:?}", resolved.body);
+        };
+        assert_eq!(tb.shared.len(), 1);
+        assert_eq!(tb.shared[0].ty.len, 64, "shared decl length must be substituted to 64");
+        assert!(tb.shared[0].len_hole.is_none(), "len_hole must be cleared after substitution");
+    }
+
+    /// AT-2983 (negative, fail-closed): an assignment that does NOT contain the
+    /// referenced hole name leaves `len_hole == Some(_)`, and the subsequent
+    /// `emit_module` returns `CodegenError::UnresolvedSharedLenHole` — never a
+    /// placeholder-(1)-sized array.
+    #[test]
+    fn at_2983_resolve_single_variant_unmatched_shared_len_hole_stays_unresolved() {
+        let mut holes_map: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+        holes_map.insert("OTHER".to_string(), vec![1]);
+        let kernel = make_kernel_with_shared_len_hole("WG", holes_map);
+
+        // Assignment names a DIFFERENT (but known) hole; "WG" is absent.
+        let mut assignment_values: BTreeMap<String, i64> = BTreeMap::new();
+        assignment_values.insert("OTHER".to_string(), 1);
+        let assignments = StrategyAssignments { values: assignment_values };
+
+        let resolved = resolve_single_variant(&kernel, &assignments).expect("resolve must still succeed");
+        let KernelBody::Typed(tb) = &resolved.body else {
+            panic!("expected Typed body, got {:?}", resolved.body);
+        };
+        assert_eq!(tb.shared[0].len_hole.as_deref(), Some("WG"), "unmatched hole must stay unresolved");
+
+        // Fail-closed backstop fires at emit_module.
+        let hir_module = HirModule { kernels: vec![resolved] };
+        let result = axc_codegen::emit::emit_module(&hir_module, &axc_codegen::emit::CodegenOptions::default());
+        assert!(
+            matches!(result, Err(axc_codegen::CodegenError::UnresolvedSharedLenHole { ref name, .. }) if name == "WG"),
+            "expected UnresolvedSharedLenHole; got {result:?}"
         );
     }
 

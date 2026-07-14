@@ -283,6 +283,29 @@ pub fn lower_module(ast: &AstModule) -> (HirModule, Vec<HirError>, Vec<HirWarnin
                 // Determine body: Empty if trivial (only void return), Typed otherwise.
                 let body = lower_kernel_body(&kd.body.node, &params, &mut errors, &mut warnings);
 
+                // M3.22: validate shared-array length HoleRefs (`shared[T, ?name]`)
+                // against declared @strategy holes — best-effort parity with
+                // `validate_hole_refs`'s annotation-arg coverage above, which cannot
+                // see body statements (shared-decl lengths are not `AnnotationArg`s).
+                // A dangling reference here does NOT block HIR construction (the
+                // codegen `UnresolvedSharedLenHole` backstop is the hard guarantee);
+                // this only surfaces the typo/undeclared-hole diagnostic early.
+                if let KernelBody::Typed(ref tb) = body {
+                    for decl in &tb.shared {
+                        if let Some(ref hole_name) = decl.len_hole {
+                            let declared: bool = strategy_holes_opt.as_ref()
+                                .map(|s| s.map.contains_key(hole_name.as_str()))
+                                .unwrap_or(false);
+                            if !declared {
+                                errors.push(HirError::UndefinedStrategyHole {
+                                    name: hole_name.clone(),
+                                    span: decl.span,
+                                });
+                            }
+                        }
+                    }
+                }
+
                 // M3.1: Derive coopmat shape from the typechecked body.
                 // Only attempted when the @cooperative_matrix flag is set.
                 let coop_matrix: Option<CoopMatrixShape> = if cooperative_matrix {

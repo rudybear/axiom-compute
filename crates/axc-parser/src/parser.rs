@@ -20,6 +20,7 @@ use axc_lexer::{Token, TokenKind, Span, Spanned, LexError, is_reserved_subgroup_
 use crate::ast::{
     Module, Item, KernelDecl, Annotation, AnnotationArg, Block, Stmt, Expr, TypeRef, Param,
     BinOp, UnaryOp, ShortCircuitOp, ScalarTypeRef, ElseArm, CoopMatUseAst, RecordField, RecordValue,
+    ParsedSharedLen,
 };
 
 /// Maximum expression nesting depth before emitting ExpressionNestingTooDeep.
@@ -1293,8 +1294,14 @@ impl<'tok> Parser<'tok> {
         if !self.expect_token(TokenKind::Comma, ",") {
             return None;
         }
-        // Parse N — unsuffixed positive integer literal.
-        let len: u32 = self.parse_shared_len()?;
+        // Parse N — unsuffixed positive integer literal, or a `?name` hole.
+        // A hole in TYPE position uses a placeholder length (1): `TypeRef::Shared`
+        // is only reachable as a kernel-parameter type, which is always rejected
+        // downstream regardless of its length — see `TypeRef::Shared`'s doc.
+        let len: u32 = match self.parse_shared_len()? {
+            ParsedSharedLen::Lit(n) => n,
+            ParsedSharedLen::Hole(_) => 1,
+        };
         if !self.expect_token(TokenKind::RBracket, "]") {
             return None;
         }
@@ -1324,11 +1331,12 @@ impl<'tok> Parser<'tok> {
         }
     }
 
-    /// Parse an unsuffixed positive integer literal N for `shared[elem, N]`.
+    /// Parse either an unsuffixed positive integer literal N, or a `?name` hole
+    /// reference, for `shared[elem, N]` (M3.22: hole support added).
     ///
-    /// Validates: N >= 1 (zero rejected); N <= MAX_SHARED_ELEMS (65536).
-    /// Suffix → error. Non-integer → error.
-    fn parse_shared_len(&mut self) -> Option<u32> {
+    /// Literal: validates N >= 1 (zero rejected); N <= MAX_SHARED_ELEMS (65536).
+    /// Suffix → error. Non-integer, non-hole → error.
+    fn parse_shared_len(&mut self) -> Option<ParsedSharedLen> {
         let len_span: Span = self.peek_span();
         match self.peek_kind().clone() {
             TokenKind::IntLiteral { value, suffix: None, .. } => {
@@ -1351,7 +1359,7 @@ impl<'tok> Parser<'tok> {
                     });
                     return None;
                 }
-                Some(n)
+                Some(ParsedSharedLen::Lit(n))
             }
             TokenKind::IntLiteral { suffix: Some(_), .. } => {
                 self.advance();
@@ -1368,6 +1376,16 @@ impl<'tok> Parser<'tok> {
                     span: len_span,
                 });
                 None
+            }
+            // M3.22: `?name` — a hole reference site in shared-array length
+            // position (`shared[i32, ?WG]`). Mirrors the `OptHole` -> `HoleRef`
+            // arm in `parse_annotation_arg`. Resolved to a concrete literal
+            // either by textual substitution before parse, or by the
+            // enumerator's `resolve_single_variant`; unresolved holes are
+            // caught fail-closed by codegen's `UnresolvedSharedLenHole` backstop.
+            TokenKind::OptHole(name) => {
+                self.advance();
+                Some(ParsedSharedLen::Hole(name))
             }
             other => {
                 self.errors.push(ParseError::SharedSizeMustBeUnsuffixedPositiveIntegerLiteral {
@@ -1452,11 +1470,13 @@ impl<'tok> Parser<'tok> {
             return None;
         }
 
-        // N — length
+        // N — length, or a `?name` hole (M3.22). A hole leaves `len` at the
+        // placeholder `1` and carries the hole name additively in `len_hole`.
         let len_span: Span = self.peek_span();
-        let len_opt: Option<u32> = self.parse_shared_len();
-        let len: u32 = match len_opt {
-            Some(n) => n,
+        let len_opt: Option<ParsedSharedLen> = self.parse_shared_len();
+        let (len, len_hole): (u32, Option<Spanned<String>>) = match len_opt {
+            Some(ParsedSharedLen::Lit(n)) => (n, None),
+            Some(ParsedSharedLen::Hole(hole_name)) => (1, Some(Spanned::new(hole_name, len_span))),
             None => {
                 self.recover_to_semicolon_or_brace();
                 return None;
@@ -1481,6 +1501,7 @@ impl<'tok> Parser<'tok> {
                 name: Spanned::new(name, name_span),
                 elem,
                 len: Spanned::new(len, len_span),
+                len_hole,
             },
             full_span,
         ))
@@ -3935,6 +3956,61 @@ mod tests {
             matches!(kd.return_type.node, TypeRef::LocalArray { .. }),
             "return type should parse as TypeRef::LocalArray (HIR rejects it later): {:?}",
             kd.return_type.node
+        );
+    }
+
+    // ── M3.22: shared[T,N] length accepts a HoleRef ───────────────────────────
+
+    /// AT-2973: `shared t: shared[i32, ?WG];` parses with ZERO parse errors; the
+    /// AST `Stmt::SharedDecl` carries `len_hole == Some("WG")` with placeholder
+    /// `len == 1`. Regression guard: `shared[i32, 64]` still parses to a plain
+    /// literal with `len_hole == None`.
+    #[test]
+    fn at_2973_shared_decl_len_accepts_hole_ref() {
+        let src = "@kernel @workgroup(64,1,1) fn k() -> void { shared t: shared[i32, ?WG]; return; }";
+        let (module, errors) = parse_src(src);
+        assert!(errors.is_empty(), "unexpected parse errors: {errors:?}");
+        let crate::ast::Item::Kernel(ref kd) = module.items[0].node;
+        match &kd.body.node.stmts[0].node {
+            Stmt::SharedDecl { name, elem, len, len_hole } => {
+                assert_eq!(name.node, "t");
+                assert_eq!(*elem, crate::ast::ScalarTypeRef::I32);
+                assert_eq!(len.node, 1, "placeholder length must be 1 when a hole is present");
+                assert_eq!(
+                    len_hole.as_ref().map(|s| s.node.as_str()),
+                    Some("WG"),
+                    "len_hole must carry the hole name"
+                );
+            }
+            other => panic!("expected Stmt::SharedDecl, got {other:?}"),
+        }
+
+        // Regression guard: the literal form is unaffected.
+        let lit_src = "@kernel @workgroup(64,1,1) fn k() -> void { shared t: shared[i32, 64]; return; }";
+        let (lit_module, lit_errors) = parse_src(lit_src);
+        assert!(lit_errors.is_empty(), "unexpected parse errors: {lit_errors:?}");
+        let crate::ast::Item::Kernel(ref lit_kd) = lit_module.items[0].node;
+        match &lit_kd.body.node.stmts[0].node {
+            Stmt::SharedDecl { len, len_hole, .. } => {
+                assert_eq!(len.node, 64);
+                assert!(len_hole.is_none(), "literal shared decl must have no len_hole");
+            }
+            other => panic!("expected Stmt::SharedDecl, got {other:?}"),
+        }
+    }
+
+    /// AT-2978 (deferral guard, symmetric NEGATIVE): `array[i32, ?N]` is still
+    /// REJECTED at parse — `array[T,N]`'s length position deliberately does NOT
+    /// accept a HoleRef (M3.22 spec §3, a recorded deferral, not an oversight).
+    /// Pins the asymmetry and guards against an accidental half-implementation.
+    #[test]
+    fn at_2978_local_array_len_still_rejects_hole_ref() {
+        let src = "@kernel @workgroup(1,1,1) fn k() -> void { array a: array[i32, ?N]; return; }";
+        let (_module, errors) = parse_src(src);
+        assert!(!errors.is_empty(), "array[i32, ?N] must still be rejected at parse");
+        assert!(
+            errors.iter().any(|e| matches!(e, ParseError::LocalArraySizeMustBeUnsuffixedPositiveIntegerLiteral { .. })),
+            "expected LocalArraySizeMustBeUnsuffixedPositiveIntegerLiteral; got {errors:?}"
         );
     }
 }
