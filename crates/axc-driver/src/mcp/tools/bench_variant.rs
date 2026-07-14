@@ -300,13 +300,14 @@ pub(crate) fn handle(
     sorted_samples.sort_unstable();
     let median_ns: u64 = sorted_samples[sorted_samples.len() / 2];
 
-    // Correctness oracle
+    // Correctness oracle (M3.17 at_1115: device-keyed ULP tolerance)
     let correctness: CorrectnessStatus = check_correctness(
         &metadata.kernel_name,
         &metadata.binding_plan,
         &input_data,
         last_outputs.as_deref(),
         &req.assignments,
+        vk.physical_device_name(),
     );
 
     let machine: MachineMetadata = build_machine_metadata(vk, ctx.git_sha.as_deref());
@@ -367,6 +368,7 @@ fn check_correctness(
     inputs: &[Vec<u8>],
     outputs: Option<&[Vec<u8>]>,
     _assignments: &BTreeMap<String, i64>,
+    device_name: &str,
 ) -> CorrectnessStatus {
     let oracle_kind = match pick_cpu_reference(kernel_name, plan) {
         Some(k) => k,
@@ -390,8 +392,8 @@ fn check_correctness(
     };
 
     match oracle_kind {
-        CpuReferenceKind::Saxpy => check_saxpy(inputs, outputs),
-        CpuReferenceKind::VectorAdd => check_vector_add(inputs, outputs),
+        CpuReferenceKind::Saxpy => check_saxpy(inputs, outputs, device_name),
+        CpuReferenceKind::VectorAdd => check_vector_add(inputs, outputs, device_name),
         CpuReferenceKind::Q4_0DequantMatvec => {
             // Q4_0 oracle is complex; defer to NotChecked for M2.4 scope.
             CorrectnessStatus::NotChecked {
@@ -401,6 +403,62 @@ fn check_correctness(
     }
 }
 
+/// M3.17 (at_1115): device-keyed ULP tolerance for `check_saxpy`/`check_vector_add` ONLY.
+/// `within_ulp_f32` is FROZEN (spec §10, reused verbatim by M3.16 rewrite-verify at a
+/// fixed 4 ULP) — this only supplies the PER-CALL tolerance argument.
+///
+/// Keys on the `"llvmpipe"` substring (case-insensitive; `"lavapipe"` never appears
+/// in `VkPhysicalDeviceProperties.deviceName` and MUST NOT be matched). Every other
+/// device (NVIDIA, AMD, Intel, real hardware) stays at the frozen 4-ULP bar.
+///
+/// ## Measurement — a corrected root cause (see M3.17-coder.json for the full trace)
+///
+/// Cross-checked the α=0 saxpy identity fixture on BOTH Lavapipe/Mesa 25.2.8 AND
+/// real NVIDIA hardware. Measured max GENUINE ULP delta: **0** on both. Every "bad"
+/// element (4-7/1024, seed-dependent) was a device-INDEPENDENT oracle bug, not a
+/// Mesa FP-lowering drift: (1) the old `expected = y_in[i]` shortcut ignored
+/// `x[i]`, missing that `0.0 * NaN/Inf` is itself NaN — fixed by computing
+/// `expected = 0.0 * x[i] + y_in[i]`; (2) a NaN's payload is implementation-defined
+/// even when correct on both sides — fixed by `correctness_match`'s "both NaN ⇒
+/// match" rule (does not touch `within_ulp_f32`). With both fixed, Lavapipe passes
+/// at_1115 deterministically even at 4 ULP — zero widening was empirically
+/// required; a defensive 2× margin (8) is kept for other, untested kernels.
+///
+/// Honest scope note: NVIDIA hardware itself still occasionally fails at_1115 via
+/// an ALREADY-DOCUMENTED, unrelated, pre-existing defect (`ROADMAP.md`'s M3.16
+/// backlog "W2: within_ulp_f32 sign-boundary false-mismatch" — the `to_bits() as
+/// i32` trick is not a valid ULP distance across the signed-zero/opposite-sign
+/// boundary). Out of scope here (§10 forbids touching `within_ulp_f32`); this
+/// function's "NVIDIA never weakened" contract is honored regardless.
+pub(crate) fn ulp_tolerance_for_device(device_name: &str) -> u32 {
+    const REAL_HARDWARE_ULP: u32 = 4;
+    const LLVMPIPE_ULP_TOLERANCE: u32 = 8;
+    if device_name.to_ascii_lowercase().contains("llvmpipe") {
+        LLVMPIPE_ULP_TOLERANCE
+    } else {
+        REAL_HARDWARE_ULP
+    }
+}
+
+/// Compare a CPU-oracle `expected` value against the GPU's `got` value (M3.17
+/// at_1115 root-cause fix — see `ulp_tolerance_for_device` doc for the measurement).
+///
+/// BOTH sides being NaN is treated as a match, regardless of exact payload: when a
+/// NaN is produced by an invalid operation (e.g. `0.0 * Inf`) or propagated through
+/// `+`, IEEE-754 leaves the resulting payload implementation-defined — a CPU
+/// reference and a GPU kernel (or even two different NaN-producing instruction
+/// sequences on the SAME device, e.g. contracted `FMA` vs separate mul+add) are not
+/// guaranteed to pick the identical payload even though BOTH results are correct.
+/// Comparing NaN payloads bit-for-bit is therefore not a meaningful correctness
+/// signal. Any OTHER mismatch (exactly one side NaN, or two differing finite
+/// values) still fails via `within_ulp_f32`, unchanged.
+fn correctness_match(expected: f32, got: f32, ulp_tolerance: u32) -> bool {
+    if expected.is_nan() && got.is_nan() {
+        return true;
+    }
+    within_ulp_f32(expected, got, ulp_tolerance)
+}
+
 /// CPU saxpy reference: `y[i] += alpha * x[i]`.
 ///
 /// Assumes:
@@ -408,7 +466,7 @@ fn check_correctness(
 /// - `inputs[1]` is the initial y buffer (f32 array)
 /// - `outputs[1]` is the result y buffer
 /// - push constants provide n (u32) and alpha (f32) — but we use buffer length as n here.
-fn check_saxpy(inputs: &[Vec<u8>], outputs: &[Vec<u8>]) -> CorrectnessStatus {
+fn check_saxpy(inputs: &[Vec<u8>], outputs: &[Vec<u8>], device_name: &str) -> CorrectnessStatus {
     if inputs.len() < 2 || outputs.len() < 2 {
         return CorrectnessStatus::NotChecked {
             reason: "saxpy needs at least 2 input and 2 output buffers".to_string(),
@@ -425,22 +483,32 @@ fn check_saxpy(inputs: &[Vec<u8>], outputs: &[Vec<u8>]) -> CorrectnessStatus {
         };
     }
 
-    // Use alpha = 1.0 since we zero-filled push constants (n:u32=0, alpha:f32=0.0).
-    // The GPU kernel dispatched with alpha=0.0, so y_out[i] = y_in[i] + 0 * x[i] = y_in[i].
-    // We check that y_out matches y_in (since alpha = 0.0 from zero push constants).
-    let ulp_tolerance: u32 = 4;
+    // The kernel dispatched with alpha=0.0 (zero-filled push constants: n:u32=0,
+    // alpha:f32=0.0), so y_out[i] = alpha * x[i] + y_in[i] = 0.0 * x[i] + y_in[i].
+    // M3.17 (at_1115) oracle fix: compute this explicitly rather than assuming "y
+    // unchanged" — when x[i] is NaN/Inf, `0.0 * x[i]` is ALSO NaN (IEEE-754
+    // invalid-operation), which the old `expected = y_in[i]` shortcut missed,
+    // producing spurious device-independent oracle mismatches whenever the seeded
+    // random bytes happened to land x[i] in the NaN/Inf range (~0.4% of elements).
+    const ALPHA: f32 = 0.0;
+    let ulp_tolerance: u32 = ulp_tolerance_for_device(device_name);
     let mut bad_count: usize = 0;
+    let mut max_ulp: u32 = 0;
     for i in 0..x.len() {
-        let expected: f32 = y_in[i]; // alpha=0 → y unchanged
+        let expected: f32 = ALPHA * x[i] + y_in[i];
         let got: f32 = y_out[i];
-        if !within_ulp_f32(expected, got, ulp_tolerance) {
+        max_ulp = max_ulp.max(observed_ulp_f32(expected, got));
+        if !correctness_match(expected, got, ulp_tolerance) {
             bad_count += 1;
         }
     }
 
     if bad_count > 0 {
         CorrectnessStatus::Failed {
-            reason: format!("{bad_count}/{} elements exceeded {ulp_tolerance} ULP tolerance", x.len()),
+            reason: format!(
+                "{bad_count}/{} elements exceeded {ulp_tolerance} ULP tolerance (device={device_name:?}, max observed ULP={max_ulp})",
+                x.len()
+            ),
         }
     } else {
         CorrectnessStatus::Ok
@@ -448,7 +516,7 @@ fn check_saxpy(inputs: &[Vec<u8>], outputs: &[Vec<u8>]) -> CorrectnessStatus {
 }
 
 /// CPU vector_add reference: `out[i] = a[i] + b[i]`.
-fn check_vector_add(inputs: &[Vec<u8>], outputs: &[Vec<u8>]) -> CorrectnessStatus {
+fn check_vector_add(inputs: &[Vec<u8>], outputs: &[Vec<u8>], device_name: &str) -> CorrectnessStatus {
     if inputs.len() < 3 || outputs.is_empty() {
         return CorrectnessStatus::NotChecked {
             reason: "vector_add needs at least 3 input buffers and 1 output".to_string(),
@@ -465,22 +533,35 @@ fn check_vector_add(inputs: &[Vec<u8>], outputs: &[Vec<u8>]) -> CorrectnessStatu
         };
     }
 
-    let ulp_tolerance: u32 = 4;
+    let ulp_tolerance: u32 = ulp_tolerance_for_device(device_name);
     let mut bad_count: usize = 0;
     for i in 0..a.len() {
         let expected: f32 = a[i] + b[i];
-        if !within_ulp_f32(expected, c_out[i], ulp_tolerance) {
+        if !correctness_match(expected, c_out[i], ulp_tolerance) {
             bad_count += 1;
         }
     }
 
     if bad_count > 0 {
         CorrectnessStatus::Failed {
-            reason: format!("{bad_count}/{} elements exceeded {ulp_tolerance} ULP tolerance", a.len()),
+            reason: format!("{bad_count}/{} elements exceeded {ulp_tolerance} ULP tolerance (device={device_name:?})", a.len()),
         }
     } else {
         CorrectnessStatus::Ok
     }
+}
+
+/// The observed ULP delta between two f32 values (0 for NaN operands or exact
+/// equality — mirrors `within_ulp_f32`'s own special cases). Used only for
+/// diagnostic `max observed ULP` reporting in a `Failed` reason; NOT part of the
+/// pass/fail decision (`within_ulp_f32` remains the sole source of truth for that).
+fn observed_ulp_f32(a: f32, b: f32) -> u32 {
+    if a.is_nan() || b.is_nan() || a == b {
+        return 0;
+    }
+    let ai: i32 = a.to_bits() as i32;
+    let bi: i32 = b.to_bits() as i32;
+    ai.abs_diff(bi)
 }
 
 /// Convert a byte slice to f32 values (little-endian, truncating to complete words).
@@ -527,6 +608,45 @@ mod tests {
         // Empty input_sizes → fallback
         let wg3 = derive_workgroups(&[], [64, 1, 1], None);
         assert_eq!(wg3, [1, 1, 1]);
+    }
+
+    /// AT-2876: `ulp_tolerance_for_device` returns 4 for NVIDIA/real-hw AND for a
+    /// non-`llvmpipe` guard name (proving `within_ulp_f32`'s M3.16 rewrite-verify
+    /// reuse stays unweakened), and a WIDENED (> 4) value for the `llvmpipe`
+    /// substring — matched case-insensitively, and `"lavapipe"` (which never
+    /// appears in the real device name) must NOT match.
+    #[test]
+    fn at_2876_ulp_tolerance_for_device_keyed_on_llvmpipe_substring() {
+        assert_eq!(ulp_tolerance_for_device("NVIDIA RTX PRO 6000 Blackwell Workstation Edition"), 4);
+        assert_eq!(ulp_tolerance_for_device("AMD Radeon RX 7900 XTX"), 4, "guard leg: non-llvmpipe device stays at 4");
+        assert_eq!(ulp_tolerance_for_device("Intel(R) Arc(TM) A770 Graphics"), 4, "guard leg: non-llvmpipe device stays at 4");
+
+        let widened = ulp_tolerance_for_device("llvmpipe (LLVM 20.1.2, 256 bits)");
+        assert!(widened > 4, "llvmpipe must be widened above the frozen 4-ULP bar; got {widened}");
+        assert!(widened <= 64, "ceiling rule: widened value must not exceed 64; got {widened}");
+
+        // Case-insensitive match.
+        assert_eq!(ulp_tolerance_for_device("LLVMPIPE (LLVM 20.1.2, 256 bits)"), widened);
+
+        // "lavapipe" (the colloquial name) NEVER appears in the real device string
+        // and must NOT be matched — only "llvmpipe" (§10 of the spec).
+        assert_eq!(ulp_tolerance_for_device("lavapipe"), 4, "the string \"lavapipe\" must NOT trigger widening");
+    }
+
+    /// M3.17: `correctness_match` treats both-NaN as a match regardless of exact
+    /// payload (the at_1115 root-cause fix), but still fails any other mismatch —
+    /// including exactly-one-side-NaN — via the untouched `within_ulp_f32`.
+    #[test]
+    fn correctness_match_both_nan_is_a_match_but_one_sided_nan_is_not() {
+        assert!(correctness_match(f32::NAN, f32::NAN, 4), "both-NaN (same payload) must match");
+        assert!(
+            correctness_match(f32::from_bits(0x7fc00001), f32::from_bits(0xffc00002), 4),
+            "both-NaN (DIFFERENT payload/sign) must still match"
+        );
+        assert!(!correctness_match(f32::NAN, 1.0, 4), "exactly one side NaN must NOT match");
+        assert!(!correctness_match(1.0, f32::NAN, 4), "exactly one side NaN must NOT match");
+        assert!(correctness_match(1.0, 1.0, 4), "identical finite values must match");
+        assert!(!correctness_match(1.0, 2.0, 4), "finite values outside tolerance must NOT match");
     }
 
     /// AT-1122: seeded_inputs deterministic.

@@ -1,0 +1,38 @@
+// precondition_saxpy.axc — saxpy with M3.17 runtime @precondition/@postcondition checks.
+//
+// Fixture for the M3.17 (FG.4) debug-check acceptance tests (AT-2866..2879):
+//   @precondition(gt(n, 0))        — bit 0, flag word 0 (pre)
+//   @precondition(gt(alpha, 0))    — bit 1, flag word 0 (pre) — f32 operand (`alpha`),
+//                                     used for the NaN-fail-loud test (AT-2878): a NaN
+//                                     alpha makes the ORDERED FOrdGreaterThan compare
+//                                     false, so OpLogicalNot flags a violation. The bare
+//                                     integer literal `0` takes `alpha`'s type (f32) —
+//                                     the v1 DSL grammar has no float-literal operand
+//                                     form (§3 of the spec: "integer literal or Ident").
+//   @postcondition(lt(alpha, 1000)) — bit 0, flag word 1 (post)
+//
+// Under `--debug` OFF (release), these annotations are INERT — the emitted SPIR-V
+// is byte-identical to saxpy.axc's own release output (AT-2866 golden-identity gate;
+// crates/axc-codegen/tests/golden/precondition_saxpy_release.spv is the committed
+// golden for this exact source).
+//
+// The kernel body is an UNCONDITIONAL top-level `y[i] = result;` write (no guard),
+// matching the §5 "elementwise 1-output-per-thread" shape the spec describes for a
+// lowerable postcondition — kept even though this milestone's postcondition support
+// is scalar-only in v1 (buffer-element postconditions are deferred, defer-list §9.1).
+
+@kernel
+@workgroup(64, 1, 1)
+@intent("saxpy with runtime precondition/postcondition debug checks (M3.17 FG.4)")
+@complexity(O(n))
+@precondition(gt(n, 0))
+@precondition(gt(alpha, 0))
+@postcondition(lt(alpha, 1000))
+fn precondition_saxpy(n: u32, alpha: f32, x: readonly_buffer[f32], y: buffer[f32]) -> void {
+    let i: u32 = gid(0);
+    let xi: f32 = x[i];
+    let yi: f32 = y[i];
+    let result: f32 = alpha * xi + yi;
+    y[i] = result;
+    return;
+}

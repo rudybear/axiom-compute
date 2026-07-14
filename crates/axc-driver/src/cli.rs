@@ -98,6 +98,15 @@ pub enum Command {
         /// HIR construction and codegen.  Does NOT enumerate candidates.
         #[arg(long = "strategy-value", value_name = "name=value")]
         strategy_values: Vec<StrategyValue>,
+        /// Enable runtime `@precondition`/`@postcondition` checks (M3.17 / FG.4).
+        ///
+        /// Injects a debug-flag SSBO + atomic-violation checks into the emitted
+        /// SPIR-V and writes schema-v4 metadata carrying `debug_checks`. Defaults to
+        /// `false` (release): the emitted SPIR-V is then byte-identical to a build
+        /// with no debug-check support at all (the golden-identity gate). No other
+        /// subcommand (`optimize`, `rewrite-verify`, `mcp`) exposes this flag.
+        #[arg(long)]
+        debug: bool,
     },
     /// Dump the lexed token stream (debug / diagnostic use).
     Lex {
@@ -210,6 +219,44 @@ pub enum Command {
 mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
+
+    // ── AT-2875: `--debug` on `compile` (M3.17 FG.4) ───────────────────────────
+
+    /// AT-2875a: `axc compile a.axc -o b.spv --debug` parses `debug: true`.
+    #[test]
+    fn at_2875a_compile_debug_flag_parses_true() {
+        let cli = Cli::parse_from(["axc", "compile", "a.axc", "-o", "b.spv", "--debug"]);
+        match cli.command {
+            Command::Compile { debug, .. } => assert!(debug, "--debug must parse to true"),
+            other => panic!("expected Command::Compile, got: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    /// AT-2875b: `axc compile a.axc -o b.spv` (no `--debug`) defaults to `debug: false` (release).
+    #[test]
+    fn at_2875b_compile_debug_flag_defaults_false() {
+        let cli = Cli::parse_from(["axc", "compile", "a.axc", "-o", "b.spv"]);
+        match cli.command {
+            Command::Compile { debug, .. } => assert!(!debug, "default must be release (debug: false)"),
+            other => panic!("expected Command::Compile, got: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    /// AT-2875c: no OTHER subcommand (`optimize`, `mcp`, `rewrite-verify`, `lex`,
+    /// `bench`) exposes a `--debug` flag — its rendered help must not mention it.
+    #[test]
+    fn at_2875c_no_other_subcommand_exposes_debug() {
+        let mut cmd = Cli::command();
+        for name in ["optimize", "mcp", "rewrite-verify", "lex", "bench"] {
+            let sub = cmd.find_subcommand_mut(name)
+                .unwrap_or_else(|| panic!("Cli must have a `{name}` subcommand"));
+            let help: String = sub.render_long_help().to_string();
+            assert!(
+                !help.contains("--debug"),
+                "`{name}` must NOT expose --debug; got help:\n{help}"
+            );
+        }
+    }
 
     // ── AT-2826/2827: `axc bench` CLI parsing (EB.3, M3.15) ────────────────────
 

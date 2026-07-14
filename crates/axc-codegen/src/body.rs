@@ -77,6 +77,31 @@ pub struct KernelResources<'r> {
     /// return `BodyCodegenError::UnexpectedHir` if this is `None` but a shared
     /// access is encountered (compiler bug — emit.rs must populate this).
     pub shared_bindings: Option<&'r crate::shared::SharedBindings>,
+    /// Runtime debug-check resources (M3.17 FG.4). `Some` only under `--debug`
+    /// (`CodegenOptions.debug_checks == true`); `None` otherwise — release SPIR-V
+    /// is completely unaffected (golden-identity gate, §6 of the spec).
+    pub debug: Option<&'r DebugCodegenCtx<'r>>,
+}
+
+/// M3.17 (FG.4): pre-emitted resources for runtime `@precondition`/`@postcondition`
+/// debug-check codegen. Built by `emit.rs` (which owns the flag-binding emission via
+/// `crate::debug_checks::emit_debug_flag_binding` and the scope/semantics constants)
+/// and consumed here by `emit_precondition_checks` / `emit_postcondition_checks`.
+pub struct DebugCodegenCtx<'r> {
+    /// The injected flag SSBO's `OpVariable` id (StorageBuffer, runtime array of u32).
+    pub flag_var_id: Word,
+    /// Pointer-to-u32-element type id for `OpAccessChain` into the flag buffer.
+    pub flag_elem_ptr_ty: Word,
+    /// Atomic scope constant id (`QueueFamily` under Vulkan/coopmat, `Device` under
+    /// GLSL450 — CRITICAL-1, keyed on the same `uses_coopmat` predicate as `emit.rs`'s
+    /// memory-model branch).
+    pub scope_const_id: Word,
+    /// `Relaxed` (0) memory-semantics constant id.
+    pub semantics_const_id: Word,
+    /// Lowered `@precondition` checks, emitted at function entry (flag word 0).
+    pub pre_checks: &'r [axc_hir::DebugCheck],
+    /// Lowered `@postcondition` checks, emitted before a trailing `return` (flag word 1).
+    pub post_checks: &'r [axc_hir::DebugCheck],
 }
 
 /// Errors from SPIR-V body emission.
@@ -505,10 +530,153 @@ pub fn emit_kernel_body(
         }
     }
 
+    // ── M3.17 (FG.4): entry-point precondition checks ─────────────────────────
+    // Emitted AFTER the OpVariable prelude (SPIR-V §2.16.1 requires all OpVariable
+    // first) and BEFORE any body statement — "function entry, before the body" (spec §4).
+    let debug_ctx: Option<&DebugCodegenCtx<'_>> = emitter.res.debug;
+    if let Some(dbg) = debug_ctx {
+        emit_precondition_checks(&mut emitter, dbg)?;
+    }
+
     // ── Emit statements ───────────────────────────────────────────────────────
     emit_stmts(&mut emitter, &body.stmts)?;
 
     Ok(first_block_label)
+}
+
+// ── M3.17 (FG.4): runtime debug-check emission ────────────────────────────────
+
+/// Emit all lowered `@precondition` checks at function entry.
+fn emit_precondition_checks(em: &mut BodyEmitter<'_>, dbg: &DebugCodegenCtx<'_>) -> Result<(), BodyCodegenError> {
+    for check in dbg.pre_checks {
+        emit_one_debug_check(em, dbg, check, 0)?;
+    }
+    Ok(())
+}
+
+/// Emit all lowered `@postcondition` checks immediately before a trailing `return`
+/// (called from `emit_stmt`'s `HirStmt::Return` arm). Guards EVERY top-level
+/// (non-loop) return it is invoked for — a conservative superset of the spec's
+/// "single trailing OpReturn" assumption, sound because postcondition operands are
+/// uniform push-constant scalars (buffer operands are never lowered in v1).
+fn emit_postcondition_checks(em: &mut BodyEmitter<'_>, dbg: &DebugCodegenCtx<'_>) -> Result<(), BodyCodegenError> {
+    for check in dbg.post_checks {
+        emit_one_debug_check(em, dbg, check, 1)?;
+    }
+    Ok(())
+}
+
+/// Emit one debug check: load operands, compare, `%bad = OpLogicalNot(%cmp)`, then a
+/// self-contained `OpSelectionMerge` + `OpBranchConditional %bad → atomicOr → merge`
+/// (observational-only — no early return, per spec §2, sidesteps `BarrierInDivergentContext`).
+fn emit_one_debug_check(
+    em: &mut BodyEmitter<'_>,
+    dbg: &DebugCodegenCtx<'_>,
+    check: &axc_hir::DebugCheck,
+    word_index: u32,
+) -> Result<(), BodyCodegenError> {
+    let lhs_id = emit_debug_operand(em, &check.lhs, check.ty)?;
+    let rhs_id = emit_debug_operand(em, &check.rhs, check.ty)?;
+    let cmp_id = emit_debug_compare(em, check.op, check.ty, lhs_id, rhs_id)?;
+    let bool_ty = em.type_id(ScalarTy::Bool);
+    // Pinned NaN-fail-loud form (spec §4): ORDERED compare + OpLogicalNot of the RESULT
+    // — NOT an unordered (`FUnord*`) compare, and NOT an inverted comparison operator.
+    let bad_id = em.b.logical_not(bool_ty, None, cmp_id)
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    emit_debug_violation_atomic(em, dbg, word_index, check.bit, bad_id)
+}
+
+/// Load one debug-check operand: a scalar push-constant param read, or a literal
+/// constant materialized at the check's resolved type.
+fn emit_debug_operand(
+    em: &mut BodyEmitter<'_>,
+    operand: &axc_hir::DebugOperand,
+    ty: ScalarTy,
+) -> Result<Word, BodyCodegenError> {
+    match operand {
+        axc_hir::DebugOperand::ScalarRef { position, .. } => emit_scalar_param_read(em, *position, ty),
+        axc_hir::DebugOperand::Lit(v) => match ty {
+            ScalarTy::F32 => Ok(em.get_const_float32((*v as f32).to_bits())),
+            ScalarTy::U32 | ScalarTy::I32 => {
+                // HIR lowering already range-checked this literal against `ty`
+                // (`lower_one_debug_predicate`); a failure here is a compiler bug.
+                let fitted = axc_hir::fit_int_literal(*v as i128, ty)
+                    .map_err(|_| BodyCodegenError::UnexpectedHir(
+                        "debug check literal out of range for its resolved type (should have been rejected at HIR lowering)"
+                    ))?;
+                Ok(em.get_const_int(ty, fitted.bits))
+            }
+            _ => Err(BodyCodegenError::UnexpectedHir("debug check literal: resolved ty is not U32/I32/F32")),
+        },
+    }
+}
+
+/// Evaluate the ORDERED comparison for one `(op, ty)` pair. `ty` is restricted to
+/// U32/I32/F32 by HIR lowering; any other type is a compiler bug.
+fn emit_debug_compare(
+    em: &mut BodyEmitter<'_>,
+    op: axc_hir::DebugCompareOp,
+    ty: ScalarTy,
+    lhs_id: Word,
+    rhs_id: Word,
+) -> Result<Word, BodyCodegenError> {
+    use axc_hir::DebugCompareOp::{Eq, Ge, Gt, Le, Lt, Ne};
+    let bool_ty = em.type_id(ScalarTy::Bool);
+    let result = match (op, ty) {
+        (Gt, ScalarTy::U32) => em.b.u_greater_than(bool_ty, None, lhs_id, rhs_id),
+        (Gt, ScalarTy::I32) => em.b.s_greater_than(bool_ty, None, lhs_id, rhs_id),
+        (Gt, ScalarTy::F32) => em.b.f_ord_greater_than(bool_ty, None, lhs_id, rhs_id),
+        (Ge, ScalarTy::U32) => em.b.u_greater_than_equal(bool_ty, None, lhs_id, rhs_id),
+        (Ge, ScalarTy::I32) => em.b.s_greater_than_equal(bool_ty, None, lhs_id, rhs_id),
+        (Ge, ScalarTy::F32) => em.b.f_ord_greater_than_equal(bool_ty, None, lhs_id, rhs_id),
+        (Lt, ScalarTy::U32) => em.b.u_less_than(bool_ty, None, lhs_id, rhs_id),
+        (Lt, ScalarTy::I32) => em.b.s_less_than(bool_ty, None, lhs_id, rhs_id),
+        (Lt, ScalarTy::F32) => em.b.f_ord_less_than(bool_ty, None, lhs_id, rhs_id),
+        (Le, ScalarTy::U32) => em.b.u_less_than_equal(bool_ty, None, lhs_id, rhs_id),
+        (Le, ScalarTy::I32) => em.b.s_less_than_equal(bool_ty, None, lhs_id, rhs_id),
+        (Le, ScalarTy::F32) => em.b.f_ord_less_than_equal(bool_ty, None, lhs_id, rhs_id),
+        (Eq, ScalarTy::U32) | (Eq, ScalarTy::I32) => em.b.i_equal(bool_ty, None, lhs_id, rhs_id),
+        (Eq, ScalarTy::F32) => em.b.f_ord_equal(bool_ty, None, lhs_id, rhs_id),
+        (Ne, ScalarTy::U32) | (Ne, ScalarTy::I32) => em.b.i_not_equal(bool_ty, None, lhs_id, rhs_id),
+        (Ne, ScalarTy::F32) => em.b.f_ord_not_equal(bool_ty, None, lhs_id, rhs_id),
+        (_, _) => return Err(BodyCodegenError::UnexpectedHir("debug check: resolved ty is not U32/I32/F32")),
+    };
+    result.map_err(|e| BodyCodegenError::Rspirv(e.to_string()))
+}
+
+/// Emit the observational-only violation branch: `OpSelectionMerge` +
+/// `OpBranchConditional %bad → then(atomicOr) → merge`. The happy path (bad == false)
+/// issues ZERO atomics (spec §2). Control always resumes in `merge_label`.
+fn emit_debug_violation_atomic(
+    em: &mut BodyEmitter<'_>,
+    dbg: &DebugCodegenCtx<'_>,
+    word_index: u32,
+    bit: u32,
+    bad_id: Word,
+) -> Result<(), BodyCodegenError> {
+    let then_label: Word = em.b.id();
+    let merge_label: Word = em.b.id();
+    em.b.selection_merge(merge_label, SelectionControl::NONE)
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    em.b.branch_conditional(bad_id, then_label, merge_label, [])
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+
+    em.b.begin_block(Some(then_label))
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    let u32_ty: Word = em.type_id(ScalarTy::U32);
+    let zero_id: Word = em.get_const_int(ScalarTy::U32, 0);
+    let word_id: Word = em.get_const_int(ScalarTy::U32, word_index as u64);
+    let chain_id: Word = em.b.access_chain(dbg.flag_elem_ptr_ty, None, dbg.flag_var_id, [zero_id, word_id])
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    let mask_id: Word = em.get_const_int(ScalarTy::U32, 1u64 << bit);
+    em.b.atomic_or(u32_ty, None, chain_id, dbg.scope_const_id, dbg.semantics_const_id, mask_id)
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    em.b.branch(merge_label)
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+
+    em.b.begin_block(Some(merge_label))
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+    Ok(())
 }
 
 /// Emit a sequence of statements, respecting `current_block_terminated`.
@@ -568,6 +736,11 @@ fn emit_stmt(em: &mut BodyEmitter<'_>, stmt: &HirStmt) -> Result<(), BodyCodegen
             // AT-323: return inside a loop is deferred to M1.4.
             if !em.loop_stack.is_empty() {
                 return Err(BodyCodegenError::ReturnInsideLoopDeferred { span: *span });
+            }
+            // M3.17 (FG.4): postcondition checks, immediately before the return.
+            let debug_ctx: Option<&DebugCodegenCtx<'_>> = em.res.debug;
+            if let Some(dbg) = debug_ctx {
+                emit_postcondition_checks(em, dbg)?;
             }
             em.b.ret().map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
             em.current_block_terminated = true;

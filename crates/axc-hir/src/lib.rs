@@ -41,6 +41,10 @@ pub use hir::{
     ComplexityVar,
     PORTABLE_MIN_WORKGROUP_INVOCATIONS,
     DESKTOP_MAX_WORKGROUP_INVOCATIONS,
+    DebugCheck,
+    DebugCheckKind,
+    DebugCompareOp,
+    DebugOperand,
 };
 pub use lower::lower_module;
 pub use validate::{HirError, HirWarning, validate};

@@ -504,9 +504,14 @@ fn at_2601_carry_sequence_equals_div_mod_over_k_range() {
 
 #[test]
 fn at_2607_no_regression_empty_codegen_diff() {
-    // The empty-codegen-diff anchor: `git diff main` must touch NO file under the codegen / HIR /
-    // typecheck / parser / lexer source trees. M3.11a is a PURE-SOURCE kernel + tests + docs + a
-    // bench — it adds ZERO codegen (same discipline as M3.10a/M3.10b).
+    // The empty-codegen-diff anchor is a HISTORICAL fact about the M3.11a commit itself,
+    // not a perpetual gate on all future work: M3.11a's own patch touched NO file under the
+    // codegen / HIR / typecheck / parser / lexer source trees. Pinned to fixed SHAs (not
+    // `main`, which moves) so later milestones that DO legitimately touch codegen (e.g.
+    // M3.17's @precondition/@postcondition runtime checks, explicitly in-spec) do not
+    // spuriously fail this M3.11a-specific anchor.
+    const M311A_BASE: &str = "d57535ebe16b1ceffcb7ee19f4d038fc470e311d";
+    const M311A_COMMIT: &str = "5315d7432bd7963c504ba1c2debb4556a96ede0a";
     let manifest_dir =
         std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let repo_root = manifest_dir.join("..").join("..");
@@ -514,7 +519,7 @@ fn at_2607_no_regression_empty_codegen_diff() {
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(&repo_root)
-        .args(["diff", "--name-only", "main", "--"])
+        .args(["diff", "--name-only", M311A_BASE, M311A_COMMIT, "--"])
         .args([
             "crates/axc-codegen/src",
             "crates/axc-hir/src",

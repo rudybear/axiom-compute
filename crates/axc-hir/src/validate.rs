@@ -57,7 +57,7 @@ pub enum HirError {
         #[label("duplicate here")]
         span: Span,
     },
-    #[error("unknown annotation `@{name}` (M0 allows: @kernel, @workgroup, @intent, @complexity, @precondition, @strict, @subgroup_uniform, @cooperative_matrix)")]
+    #[error("unknown annotation `@{name}` (M0 allows: @kernel, @workgroup, @intent, @complexity, @precondition, @postcondition, @strict, @subgroup_uniform, @cooperative_matrix)")]
     UnknownAnnotationInM0 {
         name: String,
         #[label("here")]
@@ -289,6 +289,37 @@ pub enum HirError {
         #[label("here")]
         span: Span,
     },
+
+    // ── M3.17 (FG.4): runtime debug-check errors ─────────────────────────────
+
+    /// A `@precondition` operand references a buffer element (`elem(buf)`).
+    /// Preconditions are thread-uniform-only in v1 — a hard rejection (unlike a
+    /// postcondition buffer operand, which is a deferred `PostconditionNotLowerable`).
+    #[error("@precondition operand references a buffer (`elem(...)`) — preconditions are thread-uniform-only in M3.17 v1; use a scalar push-constant parameter instead")]
+    PreconditionOperandNotScalar {
+        #[label("here")]
+        span: Span,
+    },
+
+    /// A `@precondition`/`@postcondition` predicate is not in the v1 whitelist, or
+    /// an operand is malformed (wrong arity, non-scalar/non-literal, ambiguous
+    /// literal-only comparison with no type-bearing operand, etc.).
+    #[error("unsupported debug-check predicate `{name}` (M3.17 v1 whitelist: gt/ge/lt/le/eq/ne over u32/i32/f32 scalar params or integer literals for @precondition/@postcondition; is_finite(elem(buf)) for @postcondition only)")]
+    UnsupportedDebugPredicate {
+        name: String,
+        #[label("here")]
+        span: Span,
+    },
+
+    /// More than 32 lowerable `@precondition` (or `@postcondition`) conditions were
+    /// declared on one kernel — the flag word only has 32 bits.
+    #[error("kernel declares {got} {kind:?} debug conditions, exceeding the 32-bit flag-word capacity")]
+    TooManyDebugConditions {
+        kind: crate::hir::DebugCheckKind,
+        got: usize,
+        #[label("here")]
+        span: Span,
+    },
 }
 
 /// Non-fatal diagnostic warning from HIR validation.
@@ -371,6 +402,16 @@ pub enum HirWarning {
     /// in general. Add `workgroup_barrier()` if cross-invocation visibility is required.
     SharedWriteWithoutBarrierBeforeRead {
         name: String,
+        span: Span,
+    },
+
+    /// M3.17 (FG.4): a `@postcondition(...)` predicate referenced a buffer element
+    /// (`elem(buf)` or `is_finite(elem(buf))`). v1 never lowers buffer postconditions
+    /// (defer-list §9.1, which also removes the CRITICAL-2 dominance-analysis surface) —
+    /// the condition is dropped, compilation succeeds, and no runtime check is emitted.
+    PostconditionNotLowerable {
+        buf: String,
+        reason: String,
         span: Span,
     },
 }
@@ -467,6 +508,7 @@ mod tests {
                     cooperative_matrix: false,
                     coop_matrix: None,
                     strategy: None,
+                    debug_checks: Vec::new(),
                 },
                 params: Vec::new(),
                 binding_plan: ParamBindingPlan {

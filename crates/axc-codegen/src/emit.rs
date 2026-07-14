@@ -17,16 +17,17 @@ use rspirv::spirv::{
     Capability, AddressingModel, MemoryModel, ExecutionModel, ExecutionMode, FunctionControl,
     BuiltIn,
 };
-use axc_hir::{HirModule, KernelBody};
+use axc_hir::{HirModule, KernelBody, DebugCheck, DebugCheckKind};
 use axc_hir::expr::{HirExprKind, HirStmt, KernelBodyTyped};
 use axc_hir::coopmat::CoopMatBuiltin;
 use axc_hir::subgroup::SubgroupOp;
-use crate::body::{ScalarTypeCache, CapabilitiesRequired, KernelResources, emit_kernel_body};
+use crate::body::{ScalarTypeCache, CapabilitiesRequired, KernelResources, DebugCodegenCtx, emit_kernel_body};
 use crate::buffers::{
     emit_buffer_globals, emit_push_constant_block, emit_gid_variable,
     emit_local_invocation_id_variable,
     BufferBindings, PushConstantBlock, GlobalInvocationIdVar, LocalInvocationIdVar,
 };
+use crate::debug_checks::{emit_debug_flag_binding, debug_atomic_scope_value, DEBUG_ATOMIC_SEMANTICS_RELAXED};
 use crate::subgroup::{SubgroupBuiltinVars, emit_subgroup_scalar_builtin_var};
 use crate::shared::{SharedBindings, emit_shared_globals};
 
@@ -54,6 +55,10 @@ pub struct CodegenOptions {
     /// Defaults to 0 to override rspirv's 0x000f_0000 built-in default,
     /// keeping output deterministic across rspirv upgrades (AT-12).
     pub generator_magic: u32,
+    /// M3.17 (FG.4): enable runtime `@precondition`/`@postcondition` checks.
+    /// Defaults to `false` (release): no injected binding/atomic/capability/type —
+    /// byte-identical to a build with no debug-check support (golden-identity gate).
+    pub debug_checks: bool,
 }
 
 impl CodegenOptions {
@@ -66,6 +71,7 @@ impl Default for CodegenOptions {
         Self {
             spirv_version: Self::DEFAULT_SPIRV_VERSION,
             generator_magic: Self::DEFAULT_GENERATOR_MAGIC,
+            debug_checks: false,
         }
     }
 }
@@ -187,13 +193,48 @@ pub fn emit_module(hir: &HirModule, opts: &CodegenOptions) -> Result<Vec<u32>, C
 
             let mut type_cache = ScalarTypeCache::new();
 
-            // (a1) Buffer globals.
-            let buffer_bindings: Option<BufferBindings> =
-                if !kernel.binding_plan.buffers.is_empty() {
-                    Some(emit_buffer_globals(&mut b, &mut type_cache, &kernel.binding_plan.buffers))
-                } else {
-                    None
-                };
+            // (a1) Buffer globals. Under `--debug`, the injected debug-flag SSBO is
+            // APPENDED to the user buffer list via the SAME `emit_buffer_globals` call
+            // (see `crate::debug_checks`); the `!opts.debug_checks` branch below is
+            // BYTE-IDENTICAL to the pre-M3.17 path (golden-identity gate, §6 of the spec).
+            let buffer_bindings: Option<BufferBindings> = if opts.debug_checks {
+                Some(emit_debug_flag_binding(&mut b, &mut type_cache, &kernel.binding_plan.buffers))
+            } else if !kernel.binding_plan.buffers.is_empty() {
+                Some(emit_buffer_globals(&mut b, &mut type_cache, &kernel.binding_plan.buffers))
+            } else {
+                None
+            };
+
+            // Pre-split the lowered debug checks by kind (owned, outer scope, so
+            // `debug_ctx` below can borrow stable slices past `emit_kernel_body`).
+            let pre_checks: Vec<DebugCheck> = kernel.annotations.debug_checks.iter()
+                .filter(|c| c.kind == DebugCheckKind::Pre).cloned().collect();
+            let post_checks: Vec<DebugCheck> = kernel.annotations.debug_checks.iter()
+                .filter(|c| c.kind == DebugCheckKind::Post).cloned().collect();
+
+            // (a1b) Injected flag binding's scope/semantics constants — only built
+            // under `--debug`, so release SPIR-V is unaffected.
+            let debug_ctx: Option<DebugCodegenCtx> = if opts.debug_checks {
+                let bindings = buffer_bindings.as_ref()
+                    .expect("opts.debug_checks implies buffer_bindings is Some (flag binding always injected)");
+                let flag_position: u32 = kernel.binding_plan.buffers.len() as u32;
+                let flag_var_id = *bindings.var_ids.get(&flag_position)
+                    .expect("emit_debug_flag_binding always emits the flag slot at buffer_position == num_user_buffers");
+                let flag_elem_ptr_ty = *bindings.elem_ptr_ids.get(&flag_position)
+                    .expect("emit_debug_flag_binding always emits the flag slot's elem pointer type");
+                let semantics_const_id = type_cache.get_or_emit_u32_const(&mut b, DEBUG_ATOMIC_SEMANTICS_RELAXED);
+                let scope_const_id = type_cache.get_or_emit_u32_const(&mut b, debug_atomic_scope_value(uses_coopmat));
+                Some(DebugCodegenCtx {
+                    flag_var_id,
+                    flag_elem_ptr_ty,
+                    scope_const_id,
+                    semantics_const_id,
+                    pre_checks: &pre_checks,
+                    post_checks: &post_checks,
+                })
+            } else {
+                None
+            };
 
             // (a2) Push-constant block.
             let push_constant: Option<PushConstantBlock> =
@@ -304,6 +345,8 @@ pub fn emit_module(hir: &HirModule, opts: &CodegenOptions) -> Result<Vec<u32>, C
                 subgroup_vars: subgroup_vars_ref,
                 // M3.2: shared-array bindings (None for kernels without shared arrays).
                 shared_bindings: shared_bindings.as_ref(),
+                // M3.17: debug-check resources (None unless --debug).
+                debug: debug_ctx.as_ref(),
             };
 
             emit_kernel_body(&mut b, typed_body, &mut type_cache, &mut caps, &res)
@@ -906,6 +949,7 @@ mod tests {
         let opts_custom = CodegenOptions {
             spirv_version: (1, 3),
             generator_magic: 0xDEAD_BEEF,
+            debug_checks: false,
         };
         let words2 = emit_module(&hir, &opts_custom).expect("emit failed (custom)");
         assert_eq!(words2[2], 0xDEAD_BEEF_u32, "custom generator magic not applied");
@@ -1023,6 +1067,7 @@ mod tests {
                 cooperative_matrix: false,
                 coop_matrix: None,
                 strategy: None,
+                debug_checks: Vec::new(),
             },
             params: Vec::new(),
             binding_plan: ParamBindingPlan {
