@@ -1,0 +1,239 @@
+{
+  "verdict": "COMPLETE",
+  "agent": "coder",
+  "milestone_id": "M3.21-multi-kernel",
+  "branch": "coder/M321-20260715-0100/M3.21-multi-kernel",
+  "files_created": [
+    "examples/two_pass_reduce.axc",
+    "crates/axc-driver/tests/dispatch_two_pass_reduce.rs",
+    "crates/axc-driver/tests/m321_multi_kernel_cli.rs",
+    "crates/axc-driver/tests/m321_optimize_module_wide.rs",
+    ".pipeline/runs/M3.21-coder.json"
+  ],
+  "files_modified": [
+    "crates/axc-driver/src/lib.rs",
+    "crates/axc-driver/src/cli.rs",
+    "crates/axc-driver/src/main.rs",
+    "crates/axc-driver/src/optimize.rs",
+    "crates/axc-driver/src/verify.rs",
+    "crates/axc-driver/src/fuzz.rs",
+    "crates/axc-driver/src/rewrite_verify.rs",
+    "crates/axc-driver/src/log_opt.rs",
+    "crates/axc-driver/src/mcp/tools/load_source.rs",
+    "crates/axc-driver/src/mcp/tools/enumerate_variants.rs",
+    "crates/axc-driver/src/mcp/tools/compile_variant.rs",
+    "crates/axc-driver/src/mcp/tools/bench_variant.rs",
+    "crates/axc-driver/src/mcp/tools/grid_search.rs",
+    "crates/axc-driver/src/mcp/tools/verify_rewrite.rs",
+    "crates/axc-optimize/src/lib.rs",
+    "crates/axc-optimize/src/enumerator.rs",
+    "crates/axc-hir/src/lower.rs",
+    "crates/axc-hir/src/validate.rs",
+    "crates/axc-codegen/src/emit.rs",
+    "crates/axc-driver/tests/fuzz_gpu.rs",
+    "crates/axc-driver/tests/rewrite_verify_cli.rs",
+    "crates/axc-driver/tests/rewrite_verify_gpu.rs"
+  ],
+  "public_apis_implemented": [
+    "pub struct axc_driver::CompiledKernel { name, spirv, metadata }",
+    "pub fn axc_driver::compile_module_all(source: &str, debug_checks: bool) -> Result<Vec<CompiledKernel>, DriverError>",
+    "pub fn axc_driver::compile_source_with_meta_kernel(source: &str, kernel: Option<&str>, debug_checks: bool) -> Result<(Vec<u8>, KernelMetadata), DriverError>",
+    "pub fn axc_driver::select_kernel<'a>(kernels: &'a [axc_hir::Kernel], kernel: Option<&str>) -> Result<&'a axc_hir::Kernel, DriverError>",
+    "pub fn axc_driver::compile_source_with_assignments_kernel(source, assignments, kernel: Option<&str>) -> Result<(Vec<u8>, KernelMetadata), DriverError>",
+    "pub fn axc_driver::compile_file_kernel(input, output, kernel: Option<&str>, debug_checks) -> Result<(), DriverError>",
+    "pub fn axc_driver::all_output_stem(output: &Path) -> PathBuf",
+    "pub fn axc_driver::per_kernel_output_path(stem: &Path, kernel_name: &str) -> PathBuf",
+    "pub fn axc_driver::substitute_strategy_holes(source, assignments) -> String  (F1 boundary-safe rewrite, visibility raised pub(crate)->pub)",
+    "pub(crate) fn axc_driver::strip_all_strategy_annotation_blocks(source: &str) -> String  (F2)",
+    "DriverError::AmbiguousKernel { available: Vec<String> }",
+    "DriverError::UnknownKernel { name: String, available: Vec<String> }",
+    "pub fn axc_optimize::enumerator::union_module_holes(module: &HirModule) -> Result<StrategyHoles, EnumerateError>",
+    "EnumerateError::ConflictingHoleCandidates { name }",
+    "EnumerateError::PrefixCollidingHoleNames { shorter, longer }",
+    "pub fn axc_driver::optimize::run_optimize(input, output, correctness_str, kernel: Option<&str>) -> Result<(), OptimizeError>  (F3 union discovery + F4 cross-validation, signature gained kernel param)",
+    "OptimizeError::WinnerInvalidModuleWide { broken_kernel: Option<String>, detail: String }",
+    "HirError::DuplicateKernelName { name, span, original_span }",
+    "CLI: Command::Compile { kernel: Option<String>, all: bool }, Command::Optimize/RewriteVerify/Test { kernel: Option<String> }",
+    "MCP: LoadSourceRequest/CompileVariantRequest/BenchVariantRequest/GridSearchRequest/EnumerateVariantsRequest/VerifyRewriteRequest gained kernel: Option<String>",
+    "verify::VerifyReport gained kernels: Vec<String>"
+  ],
+  "tests_added": [
+    "AT-2945 (lib.rs unit + dispatch_two_pass_reduce.rs real-file corroboration)",
+    "AT-2946 (lib.rs unit + dispatch_two_pass_reduce.rs)",
+    "AT-2947 (lib.rs: single-kernel golden vs compile_source_with_meta)",
+    "AT-2948 (lib.rs: whole-corpus golden, all single-kernel examples/*.axc)",
+    "AT-2949, AT-2950, AT-2951, AT-2952 (m321_multi_kernel_cli.rs subprocess tests)",
+    "AT-2953, AT-2954, AT-2972 (axc-optimize/src/enumerator.rs union_module_holes tests)",
+    "AT-2955 (lib.rs: strip_all_strategy_annotation_blocks removes both blocks)",
+    "AT-2956 (lib.rs inline fixture + dispatch_two_pass_reduce.rs real-file corroboration)",
+    "AT-2957 (m321_optimize_module_wide.rs)",
+    "AT-2958 (dispatch_two_pass_reduce.rs, spirv-val both kernels)",
+    "AT-2959 / AT-2960 (dispatch_two_pass_reduce.rs, GPU-gated, run on real NVIDIA + Lavapipe)",
+    "AT-2961 (mcp/tools/load_source.rs)",
+    "AT-2962 (mcp/tools/enumerate_variants.rs, compile_variant.rs, bench_variant.rs, grid_search.rs)",
+    "AT-2963 (rewrite_verify.rs)",
+    "AT-2964 (fuzz.rs)",
+    "AT-2965 (verify.rs)",
+    "AT-2966 (log_opt.rs, renamed/extended existing test)",
+    "AT-2967 (axc-codegen emit.rs, renamed/annotated existing test)",
+    "AT-2968(a)/(b) (lib.rs: prefix-collision miscompile + comment-decoy)",
+    "AT-2969 (lib.rs: wrong-metadata guard, distinct-dims fixture)",
+    "AT-2970 (m321_optimize_module_wide.rs: F4 fires internally via ordinal-0 mock-bench winner, r3 zero-artifacts assertion)",
+    "AT-2971 (lib.rs: at_2835 block-count branch)",
+    "CLI parse tests for --kernel/--all on Compile/Optimize/RewriteVerify/Test (cli.rs)",
+    "Assorted regression/edge-case unit tests: DuplicateKernelName (implicit via HIR error variant), empty-module compile_module_all, single-kernel golden-identity via compile_source_with_meta_kernel(None)"
+  ],
+  "loc_self_report": {
+    "method": "RECOMPUTED post-QA (qa_fix pass): `git diff main...HEAD --numstat` on the merged milestone commit (7700123), read verbatim per-file -- NOT hand-estimated. `net_total` = (sum of all insertions, EXCLUDING the 539-line .pipeline/milestones/M3.21-multi-kernel.md spec doc) minus (sum of all deletions). `breakdown` below lists each file's RAW INSERTION COUNT (the same number `git diff --numstat` reports in its first column) -- it is intentionally NOT net-of-deletions per file, so `sum(breakdown values) == insertions_total` exactly (independently checkable), and `net_total == insertions_total - deletions_total` is a second, separate arithmetic step, not a re-derivation of the breakdown sum. This two-step method is the fix for the QA MEDIUM-severity LOC-bookkeeping finding (M3.21-qa.json deviation #2): the original self-report's breakdown table summed to 2520 against a claimed/verified net_total of 2284 with no reconciling remainder -- several individual entries (main.rs 98 vs actual 71, fuzz.rs 66 vs 61, grid_search.rs 80 vs 70, load_source.rs 63 vs 53, and others) were hand-estimated rather than read from `git diff --numstat`, and one real file (crates/axc-optimize/src/lib.rs, +12) was omitted from the table entirely. All values below are freshly re-verified against `git diff main...HEAD --numstat` at qa_fix time.",
+    "insertions_total_excl_spec_doc": 2408,
+    "deletions_total": 124,
+    "net_total": 2284,
+    "spec_target": 1790,
+    "spec_cap": 2200,
+    "over_cap_by": 84,
+    "breakdown_reconciliation_note": "sum(breakdown) below == 2408 == insertions_total_excl_spec_doc, verified by direct addition. net_total (2284) = 2408 - deletions_total (124); deletions are NOT itemized per-file above (git diff --numstat's own per-file deletion counts are in the 0-29 range each and not separately interesting), only aggregated once here, so the breakdown table and net_total are two independently-checkable numbers rather than the same claim stated twice inconsistently (the QA-caught bug).",
+    "breakdown": {
+      "crates/axc-driver/src/lib.rs (compile_module_all, compile_source_with_meta_kernel, select_kernel, F1 boundary-safe substitute, F2 strip_all, all_output_stem/per_kernel_output_path, compile_file_kernel, AT-2945/2946/2947/2948/2955/2968/2969 unit tests, AT-2971 at_2835 fix)": 643,
+      "crates/axc-optimize/src/enumerator.rs (union_module_holes + AT-2953/2954/2972 tests) + crates/axc-optimize/src/lib.rs (ConflictingHoleCandidates/PrefixCollidingHoleNames error variants -- omitted from the original table entirely)": 198,
+      "crates/axc-driver/src/optimize.rs (F3 union bench-kernel wiring, F4 cross_validate_winner_module_wide + name_broken_kernel span-attribution, r3 write-order)": 135,
+      "crates/axc-driver/src/cli.rs (--kernel/--all flags on 4 subcommands + parse tests)": 111,
+      "crates/axc-driver/src/main.rs (run_compile dispatcher, kernel threading into fuzz/rewrite-verify) -- pre-qa_fix figure; see \"qa_fix\" section for this pass's additional +13/-3": 71,
+      "crates/axc-driver/src/mcp/tools/grid_search.rs (kernel param, union discovery, parse_source_for_grid_search + tests)": 70,
+      "crates/axc-driver/src/rewrite_verify.rs (kernel field + AT-2963 tests)": 67,
+      "crates/axc-driver/src/fuzz.rs (kernel field + select_kernel + AT-2964 tests)": 61,
+      "crates/axc-driver/src/mcp/tools/load_source.rs (kernel param + AT-2961 tests)": 53,
+      "crates/axc-driver/src/verify.rs (kernels: Vec<String> field + AT-2965 tests)": 48,
+      "crates/axc-driver/src/mcp/tools/enumerate_variants.rs (union-based discovery, lying-text removed, AT-2962 test)": 39,
+      "crates/axc-driver/src/mcp/tools/bench_variant.rs (kernel field + AT-2962 test)": 39,
+      "crates/axc-driver/src/mcp/tools/compile_variant.rs (kernel param + AT-2962 test)": 38,
+      "crates/axc-driver/src/log_opt.rs (message text update, AT-2966 test)": 26,
+      "crates/axc-codegen/src/emit.rs (TooManyKernelsInM0 redoc, AT-2967 test rename)": 23,
+      "crates/axc-hir/src/lower.rs + validate.rs (DuplicateKernelName)": 32,
+      "crates/axc-driver/src/mcp/tools/verify_rewrite.rs (kernel field passthrough)": 4,
+      "examples/two_pass_reduce.axc (new example, trimmed from 146 to 121 lines)": 121,
+      "crates/axc-driver/tests/dispatch_two_pass_reduce.rs (new: AT-2945/2946/2956/2958/2959/2960)": 191,
+      "crates/axc-driver/tests/m321_multi_kernel_cli.rs (new: AT-2949/2950/2951/2952 subprocess) -- pre-qa_fix figure; see \"qa_fix\" section for this pass's additional +90 (AT-2963b)": 248,
+      "crates/axc-driver/tests/m321_optimize_module_wide.rs (new: AT-2957/2970)": 177,
+      "misc test-fixture updates (fuzz_gpu.rs +2, rewrite_verify_cli.rs +1, rewrite_verify_gpu.rs +10 — new struct field threading)": 13
+    },
+    "overage_explanation": "The r2 spec itself flagged that its own pessimistic +150 LOC estimate 'omitted the AT-2969 distinct-dims fixture kernel and the F4 negative-fixture' -- both of those (AT-2969, AT-2970) turned out to need real, non-trivial fixtures plus (for F4) a genuine span-based kernel-attribution algorithm (name_broken_kernel) that the spec did not itemize at all. The other major driver is documentation density: F1's boundary-safe scan, the WRONG-METADATA guard, and the shared[T,N]-HoleRef grammar-gap discovery (a real pre-existing limitation found empirically while building the example, not anticipated by the spec) all carry load-bearing rationale comments. No corner was cut to hit the cap; the 84-line overage (~4% over cap, ~1900 total code the reviewer will actually read once blank lines are excluded) reflects real, verified scope, not padding."
+  },
+  "qa_fix": {
+    "finding_closed": "M3.21-qa.json discrepancies_severity_ordered[0] (MEDIUM) and [1] (LOW)",
+    "medium_finding_fix": {
+      "root_cause": "`resolve_size_shortcut` in crates/axc-driver/src/main.rs called the kernel-agnostic `axc_driver::compile_source_with_assignments` (always `kernel=None` internally) instead of the kernel-aware `axc_driver::compile_source_with_assignments_kernel`, so `axc rewrite-verify --kernel K --size N` on a 2+-kernel source always hit `AmbiguousKernel` regardless of `--kernel` -- `--kernel` was silently inert for that one flag combination. Fails closed (an ERROR verdict, exit 2), never a miscompile.",
+      "fix": "Added a `kernel: Option<&str>` parameter to `resolve_size_shortcut` and switched its compile call from `compile_source_with_assignments` to `compile_source_with_assignments_kernel(original_src, assignments, kernel)` -- the SAME kernel-aware surface the `--buffer-sizes`-only path already used (and that AT-2963 already covered at the library level). Threaded `kernel.as_deref()` through both of `resolve_size_shortcut`'s call sites (`run_test`'s `--fuzz --size` path and `run_rewrite_verify`'s `--size` path).",
+      "files_touched": [
+        "crates/axc-driver/src/main.rs"
+      ],
+      "new_tests": [
+        "AT-2963b (crates/axc-driver/tests/m321_multi_kernel_cli.rs, real `axc` binary subprocess, extends AT-2963): (1) `at_2963b_size_shortcut_honors_kernel_selector_on_multi_kernel_source` -- 2-kernel fixture, `rewrite-verify multi.axc multi.axc --kernel final_reduce --size 64` reaches the `dispatch`/`output` stage (compile succeeds on both sides) and exits 0; (2) `at_2963b_size_shortcut_still_fails_closed_when_ambiguous` -- the SAME fixture with `--size 64` and NO `--kernel` is confirmed UNCHANGED: still exits 2 with verdict `ERROR` and an `AmbiguousKernel`-shaped message naming both kernels."
+      ],
+      "live_verification": "Manually ran the built `axc` binary (not just the automated test) on the 2-kernel fixture twice: (1) real NVIDIA hardware (default ICD, no VK_DRIVER_FILES override) -- `--kernel final_reduce --size 64` returned verdict=PASS, stage=output, both sides' kernel_name=final_reduce, exit 0; (2) VK_DRIVER_FILES=lvp_icd.json (Lavapipe) -- same invocation, verdict=PASS, device='llvmpipe (LLVM 20.1.2, 256 bits)', exit 0. The ambiguous (no --kernel) case was independently re-run too: verdict=ERROR, stage=preflight, message names both `partial_reduce` and `final_reduce`, exit 2 -- byte-for-byte the pre-fix fail-closed behavior."
+    },
+    "low_finding_fix": "Reworked `loc_self_report` in this file (see above): replaced hand-estimated per-file breakdown numbers with values read directly from `git diff main...HEAD --numstat`, added the previously-omitted crates/axc-optimize/src/lib.rs (+12) line item (folded into the enumerator.rs entry), and made the breakdown-vs-net_total relationship an explicit two-step (sum(breakdown)=insertions_total=2408; net_total=insertions_total-deletions_total=2408-124=2284) instead of an unreconciled single claim.",
+    "loc_delta": {
+      "method": "git diff --numstat (uncommitted working tree vs the merged HEAD 7700123), this qa_fix pass only",
+      "files": {
+        "crates/axc-driver/src/main.rs (thread kernel: Option<&str> through resolve_size_shortcut + both call sites, doc-comment)": {
+          "insertions": 13,
+          "deletions": 3
+        },
+        "crates/axc-driver/tests/m321_multi_kernel_cli.rs (AT-2963b: 2 new subprocess tests)": {
+          "insertions": 90,
+          "deletions": 0
+        }
+      },
+      "insertions_total": 103,
+      "deletions_total": 3,
+      "net_total": 100
+    },
+    "verification": {
+      "cargo_build_workspace": "PASS (clean)",
+      "cargo_clippy_workspace_lib_tests_D_warnings": "PASS (0 warnings)",
+      "cargo_test_workspace": "PASS -- all packages green under `--test-threads=1` (the pre-existing axc-runtime icd:: env-var-race flake, already reproduced independently by QA on a clean main worktree, is order/parallelism-sensitive and does not reproduce single-threaded; re-ran `-p axc-runtime --lib icd::` alone single-threaded as a targeted confirmation: 4/4 pass)",
+      "rewrite_verify_cli_tests": "PASS -- `cargo test -p axc-driver --test m321_multi_kernel_cli` (8/8, including both new AT-2963b tests) and `cargo test -p axc-driver --test rewrite_verify_cli --test rewrite_verify_gpu -- --ignored --test-threads=1` under AXC_ENABLE_GPU_TESTS=1 + VK_DRIVER_FILES=lvp_icd.json (Lavapipe): 9/9 pass, 0 failed",
+      "lavapipe_leg": "PASS -- VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json; rewrite_verify_gpu.rs's 9 ignored tests (AT-2851/2852/2853/2855/2856/2857/2858/2859/2860) all pass; the new AT-2963b CLI-subprocess scenario was additionally hand-verified against Lavapipe (see live_verification above)",
+      "scope_check": "git diff (uncommitted) touches exactly 2 files: crates/axc-driver/src/main.rs and crates/axc-driver/tests/m321_multi_kernel_cli.rs -- no other file changed by this pass besides this run-JSON itself"
+    }
+  },
+  "platform_results": {
+    "cargo_build_workspace": "pass",
+    "cargo_clippy_workspace_lib_tests_dwarnings": "pass",
+    "cargo_test_workspace_no_gpu": "pass (one pre-existing, unrelated flaky test in axc-runtime::icd -- env-var race between two tests mutating global VK_DRIVER_FILES/VK_ICD_FILENAMES concurrently; passes under --test-threads=1; axc-runtime is untouched by M3.21 per the spec's 0-LOC runtime claim; confirmed pre-existing, not a regression)",
+    "corpus_golden_vs_main": "pass -- built main in a read-only git worktree, compiled all examples/*.axc via compile_source_with_meta on both main and this branch, diffed the two output directories (spv bytes + metadata JSON): byte-identical for all 34 single-kernel files that compile standalone; the only diff is two_pass_reduce.axc's .ERR file (new file, correctly AmbiguousKernel on the default path, absent on main since the file didn't exist there)",
+    "spirv_val_two_pass_reduce": "pass (AT-2958, both partial_reduce and final_reduce, Vulkan_1_1 target)",
+    "gpu_nvidia": "pass (AT-2959) -- RTX PRO 6000 Blackwell, AXC_ENABLE_GPU_TESTS=1, real hardware, bit-exact (gpu_sum == cpu_sum, max_diff == 0)",
+    "gpu_lavapipe": "pass (AT-2960) -- llvmpipe (LLVM 20.1.2, 256 bits), VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json, bit-exact (gpu_sum == cpu_sum, max_diff == 0)"
+  },
+  "while_loop_vs_unroll_outcome": {
+    "chosen": "PRIMARY (workgroup-uniform while-loop reduction)",
+    "detail": "The while-loop form (`while stride > 0u32 { if lid < stride { ... } workgroup_barrier(); stride = lshr(stride, 1u32); }`) compiled cleanly with ZERO HIR errors/warnings on the first attempt: OQ2 (divergent-barrier hard error) did not fire because `conditional_depth` is bumped only by if/else, not while, confirmed by reading axc-hir/src/typecheck.rs's TypeChecker::conditional_depth field doc and the OQ2 firing site (both pre-existing, unmodified code); OQ1 (missing-barrier SET analysis) did not fire either. Verified empirically via a throwaway compile_module_all + spirv-val run before committing to the design, and again in the final AT-2958/2959/2960 tests. The FALLBACK (single-candidate fully-unrolled straight-line tree reduction) was NOT needed.",
+    "unplanned_deviation_discovered": "The milestone spec's illustrative shared-hole example puts `?WG` inside `shared[i32, ?WG]`. Empirically, axc-parser's `parse_shared_len` only accepts an unsuffixed integer LITERAL there (no HoleRef support) -- confirmed by directly parsing the pre-existing matmul_shared_f32.axc example, which already relies on this gap and only ever compiles via text substitution, never a raw parse. Since M3.21's new union_module_holes-based discovery (axc optimize/verify/MCP) parses the RAW file first, a hole inside shared[T,N] would break discovery for two_pass_reduce.axc. Fixing the grammar is out of scope (axc-parser is not in the milestone's touched-crates list). Resolution: `?WG` is used ONLY in `@workgroup(?WG,1,1)` (both kernels, single-candidate `?[64]`, matching the spec's own explicitly-authorized single-candidate fallback for a DIFFERENT reason -- OQ1/OQ2, which turned out not to need it); the shared-array size and tree-reduction stride are fixed literals (64/32) matching the sole candidate. AT-2956 is additionally proven via an inline two-kernel string fixture (unit-test level, not the real file) that exercises the literal `shared[i32,?WG]` substitution text the spec describes, directly against `substitute_strategy_holes` -- so the substitution correctness claim is fully covered even though the real example can't exercise it end-to-end."
+  },
+  "self_assessment": {
+    "spec_coverage": "All AT-2945..AT-2972 implemented and passing (34 test functions across lib.rs, cli.rs, verify.rs, fuzz.rs, rewrite_verify.rs, log_opt.rs, axc-codegen/emit.rs, axc-optimize/enumerator.rs, and 3 new integration test files). All F1-F4 hardening items from the r2 spec implemented: F1 boundary-safe substitute (single left-to-right scan, longest-name-first tiebreak, following-byte boundary guard), F2 strip-all (while-changed termination), F3 module-global union discovery (union_module_holes with ConflictingHoleCandidates + PrefixCollidingHoleNames), F4 winner cross-validation with the r3 patch (runs before EITHER the .spv or the sidecar is written; AT-2970 asserts both absent on injected failure). Wrong-metadata guard (compile_source_with_meta_kernel threads ONE 1-kernel HirModule through both emit and metadata) implemented and AT-2969-pinned. Corpus golden identity verified against main via a real worktree diff, not just internal self-consistency. Fail-closed selection implemented on compile/optimize/rewrite-verify/test/all 5 MCP tools. two_pass_reduce.axc GPU-validated bit-exact on both real NVIDIA and Lavapipe.",
+    "known_limitations": [
+      "The shared[T,N] grammar does not accept a HoleRef in the array-length position (pre-existing, discovered during this milestone, documented in two_pass_reduce.axc's header and in this JSON's while_loop_vs_unroll_outcome field). Not fixed -- axc-parser is out of scope per the milestone's touched-crates list. AT-2956's shared[i32,?WG] substitution claim is proven via an inline unit fixture instead of the real example file.",
+      "F4's 'name the broken sibling' (AT-2970) uses a best-effort span-based attribution (name_broken_kernel in optimize.rs): exact for axc_codegen::CodegenError::UnresolvedStrategyHole (which already carries a kernel_name); for whole-module HIR errors (e.g. BadWorkgroupDim) it attributes via the error's diagnostic span vs. each kernel's name-span position (the annotation-precedes-the-fn-name heuristic). This is sound for the AT-2970 fixture and for the common case (a bad annotation on the kernel itself) but is not a fully general per-kernel error isolator for every conceivable HIR error shape.",
+      "MCP grid_search tool does not run its own F4 cross-validation pass (only axc optimize / run_optimize does, per the spec's F4 requirement, which is scoped to run_optimize). The MCP grid_search tool's per-tool table entry only asked for union holes + kernel bench target + fail-closed, which is what's implemented.",
+      "One pre-existing, unrelated flaky test in axc-runtime (icd.rs, AT-709 env-var race under parallel test execution) -- not touched by this milestone, not a regression."
+    ],
+    "deviations": [
+      "two_pass_reduce.axc: ?WG is confined to @workgroup(?WG,1,1) in both kernels (not also shared[i32,?WG] as the spec's illustrative text shows) due to a real, empirically-confirmed axc-parser grammar gap discovered while building the example (see known_limitations and while_loop_vs_unroll_outcome). AT-2956 (the shared[i32,?WG] substitution claim) is still fully proven, via an inline unit-test fixture rather than the real file.",
+      "LOC: net ~2284 vs spec target 1790 / cap 2200 (84 over cap, ~4%). See loc_self_report.overage_explanation -- driven by the AT-2969/AT-2970 fixtures and F4 attribution logic the spec itself flagged as undercounted, plus load-bearing documentation for two genuinely subtle areas (F1 boundary-safety, the shared[T,N] grammar gap). No functional scope was cut to manage this; every AT in the spec's table passes.",
+      "compile_source_with_meta_kernel's WRONG-METADATA guard doc/AT-2969 fixture, and F4's name_broken_kernel, are more elaborate than the spec's terse signature-only description implied -- necessary to make the guarantees testable and to correctly attribute F4 failures (see LOC overage note)."
+    ]
+  },
+  "git_commits": [],
+  "review_fix": {
+    "finding_closed": "M3.21-pessimistic-code-review.json critical_bugs[0] PCR-1 (HIGH) and M3.21-optimistic-code-review.json blocking_issues (MAJOR: DESIGN.md §3.1.45 missing; MEDIUM: stale LOC restate)",
+    "pcr1_fix": {
+      "root_cause": "substitute_strategy_holes_boundary_safe (crates/axc-driver/src/lib.rs, F1 scan) compared each hole-name candidate via a direct slice `&source[after_q..end]`. The `end <= bytes.len()` bound was checked but `end`'s char-boundary-ness was not: when a candidate name's byte length reached PAST the start of a following multibyte UTF-8 character, `end` landed mid-character and the raw &str slice panicked ('byte index N is not a char boundary') -- a regression from the OLD str::replace algorithm, which silently left such input untouched.",
+      "exact_code_form_chosen": "Replaced `if end <= bytes.len() && &source[after_q..end] == name` with `if source.get(after_q..end) == Some(name)` -- the Option-returning slice form. `str::get` returns `None` for BOTH out-of-bounds and non-char-boundary ranges, so the comparison itself can never panic; a non-char-boundary end can never equal an ASCII hole name anyway, so refusing to match there and falling through to the existing verbatim per-char copy is trivially correct (not merely panic-free, but semantically unchanged for all valid-boundary cases). Chose the `.get()` form over an explicit `source.is_char_boundary(end)` guard because it is shorter, still panic-free by construction (no risk of a future edit dropping the guard), and the review's own fix suggestion listed both as equivalent.",
+      "file": "crates/axc-driver/src/lib.rs:551 (function substitute_strategy_holes_boundary_safe, lib.rs:528)",
+      "other_slices_audit": "Audited every `&source[..]` / `source[..]` slice reachable from substitute_strategy_holes_boundary_safe per the review's request. (1) lib.rs ~574: `source[i..]`/`source[i..i+ch_len]` in the verbatim-copy fallback -- `i` is always on a char boundary by induction (starts at 0; each loop iteration either advances by `ch_len = source[i..].chars().next().len_utf8()`, which by definition lands on the next char boundary, or advances to `end` from a match, which is now proven on a char boundary because `source.get(after_q..end)` only returns `Some` for a valid, boundary-aligned range) -- PROVEN SAFE, no change needed. (2) `bytes.get(end)` in the following-byte boundary check reads a single raw byte from the `&[u8]` view, which never panics regardless of UTF-8 structure (byte indexing has no boundary concept) -- SAFE by construction, unaffected by PCR-1. (3) The sibling function strip_strategy_annotation_block (lib.rs ~635/671/672: `&source[at_pos + \"@strategy\".len()..]`, `&source[..at_pos]`, `&source[close_pos + 1..]`) was also checked even though the review scoped the finding to the F1 scan: `at_pos` comes from a lexer token span (already char-boundary-aligned by construction) with a `starts_with(\"@strategy\")` verification; `\"@strategy\".len()` is 9 ASCII bytes added past a byte offset already verified to start that exact ASCII string, so the sum lands on a char boundary; `close_pos`/`close_pos+1` come from a byte-scan that only tracks ASCII `{`/`}`, so `+1` is always a boundary too -- PROVEN SAFE, pre-existing and unaffected, no change needed. No other panic-risk slice found in the substitution/strip code path.",
+      "at_2968c": "Two new tests added directly after AT-2968b in crates/axc-driver/src/lib.rs's test module: (1) at_2968c_multibyte_boundary_no_panic_comment_untouched -- reproduces the review's exact fixture (a `//` comment containing `?W` immediately followed by `€`, WG registered as a hole name whose length reaches 1 byte into `€`'s 3-byte encoding); asserts the low-level scan does not panic and leaves the truncated candidate verbatim, AND that the whole module still compiles clean end-to-end via compile_source_with_assignments (SPIR-V magic + workgroup_size correct). (2) at_2968c_multibyte_adjacent_hole_substitutes_correctly -- a REAL multibyte-adjacent hole (`?WG€`, full-length match landing exactly on the char boundary before `€`) still substitutes to `128€`, proving the fix does not overcorrect into refusing valid matches.",
+      "result": "PASS -- 4/4 AT-2968(a/b/c/c-variant) tests green; cargo test -p axc-driver --lib at_2968 confirms no panic, correct substitution, and correct comment-decoy handling."
+    },
+    "design_doc_fix": {
+      "section_added": "DESIGN.md §3.1.45 'M3.21 -- multi-kernel modules (ROADMAP FG.9)', inserted after §3.1.44 (M3.20) and before the '### 3.1 Types' heading, following §3.1.44's style (what/why paragraph, mechanism paragraphs, Files, Tests with AT range, Design status footer).",
+      "content_coverage": "N-separate-modules architectural decision (single-entry-point Vulkan compute pipelines, not one fat multi-entry-point module); compile_module_all/select_kernel/compile_source_with_meta_kernel layering and the WRONG-METADATA GUARD (AT-2969); fail-closed select_kernel shared across CLI/MCP/autotuner/fuzz/rewrite-verify; F1 boundary-safe substitution scan (the ?WG/?WG2 prefix-collision miscompile history) AND this pass's PCR-1 char-boundary fix + AT-2968c, inline in the same paragraph; F2 strip-all-blocks termination predicate; F3/F4 union_module_holes + cross_validate_winner_module_wide (fail-closed, zero-artifact winner validation, AT-2970); the two_pass_reduce.axc GPU proof (spirv-val + bit-exact NVIDIA/Lavapipe dispatch, AT-2958/2959/2960); full Files and Tests (AT-2945..2972 plus AT-2963b/AT-2968c) lists; Design status footer noting the review-fix pass.",
+      "survey_table_reconciliation": "Two stale §3.1.43 cross-references fixed: (1) the '@transfer ... FG.9 territory, not built' phrase describing log_opt's LogOptError::Multikernel fail-closed boundary -- now explicitly reconciled as a DELIBERATE M3.21-era scope decision (axc log-opt still targets one kernel's history per entry; extending it to multi-kernel attribution remains a separate, still-open item), not a pre-FG.9 'not built yet'. (2) the '@transfer' exact-revisit-trigger paragraph's 'naturally revisited alongside FG.9 multi-kernel modules' prediction -- reconciled as a prediction that did NOT fire: FG.9 shipped and used explicit typed mechanisms (union_module_holes, cross_validate_winner_module_wide) instead of @transfer-based handoff, so @transfer remains NO-BUILD under its original two conditions, now with one fewer speculative co-trigger. Also added a new annotation/feature survey-table row (next to the M3.20 array[T,N] row) cross-referencing §3.1.45 for 'N × @kernel fn per file'.",
+      "result": "DESIGN.md +29/-2 lines (net +27); no code changes in this doc-only edit set."
+    },
+    "loc_restate": {
+      "method": "git diff --numstat, this review-fix pass only, uncommitted working tree vs the merged qa_fix HEAD (eb762b4) -- same two-step discipline as the qa_fix section: a breakdown total independently checkable against a separately-computed net_total.",
+      "this_pass_files": {
+        "crates/axc-driver/src/lib.rs (PCR-1 fix: source.get(..)==Some(name) + doc-comment; AT-2968c: 2 new tests)": {
+          "insertions": 66,
+          "deletions": 1
+        },
+        "DESIGN.md (§3.1.45 new section + §3.1.43 stale-cross-reference reconciliation + survey-table row, documentation only, excluded from the code LOC cap per the project's standing spec-doc exclusion)": {
+          "insertions": 29,
+          "deletions": 2
+        }
+      },
+      "this_pass_code_insertions_total": 66,
+      "this_pass_code_deletions_total": 1,
+      "this_pass_code_net": 65,
+      "prior_total_net_code_loc_post_qa_fix": 2384,
+      "prior_total_source": "M3.21-optimistic-code-review.json blocking_issues[1]: git diff main...HEAD --numstat across both commits (7700123 feat + eb762b4 qa_fix) = 3050 insertions / 127 deletions; excluding the 539-line .pipeline/milestones/M3.21-multi-kernel.md spec doc: (3050-539)-127 = 2384.",
+      "new_total_net_code_loc": 2449,
+      "new_total_derivation": "2384 (prior, confirmed) + 65 (this pass's code-only net, DESIGN.md excluded as a spec/doc file per the established exclusion) = 2449.",
+      "spec_cap": 2200,
+      "over_cap_by": 249,
+      "over_cap_pct": "~11.3%",
+      "overage_note": "The two independently-checkable numbers: (a) this pass's own delta, 66 insertions / 1 deletion in lib.rs = 65 net (verifiable via `git diff --numstat` against eb762b4), and (b) the new grand total, 2384 (the last independently-verified figure, from the optimistic code review's own recount) + 65 = 2449 against the 2200 cap. The overage growth this pass is a panic-safety fix plus its regression test -- not scope creep; DESIGN.md's +27 net lines are documentation, not counted against the code cap, matching the milestone's own established insertions_total_excl_spec_doc convention."
+    },
+    "verification": {
+      "cargo_build_workspace": "PASS (clean)",
+      "cargo_clippy_workspace_lib_tests_D_warnings": "PASS (0 warnings)",
+      "cargo_test_workspace": "PASS -- every package green, 0 failed across the full run (unit + integration + doctests)",
+      "at_2968c_tests": "PASS -- `cargo test -p axc-driver --lib at_2968` : 4/4 (at_2968a, at_2968b, at_2968c_multibyte_boundary_no_panic_comment_untouched, at_2968c_multibyte_adjacent_hole_substitutes_correctly)",
+      "m321_cli_suite": "PASS -- `cargo test -p axc-driver --test m321_multi_kernel_cli --test m321_optimize_module_wide` : 11/11 (8 + 3)",
+      "lavapipe_leg": "PASS -- `AXC_ENABLE_GPU_TESTS=1 VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json cargo test -p axc-driver --test dispatch_two_pass_reduce -- --ignored` : at_2959_2960_two_stage_dispatch_bit_exact_sum PASS (bit-exact, non-simulated)",
+      "scope_check": "git diff (uncommitted, this pass) touches exactly 2 source files (crates/axc-driver/src/lib.rs, DESIGN.md) plus this run-JSON -- no other file changed"
+    }
+  }
+}

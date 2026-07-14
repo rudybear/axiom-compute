@@ -1,0 +1,98 @@
+{
+  "verdict": "PASS",
+  "agent": "qa_agent",
+  "milestone_id": "M3.21-multi-kernel",
+  "branch": "coder/M321-20260715-0100/M3.21-multi-kernel",
+  "requirements_total": 28,
+  "requirements_covered": 28,
+  "requirements_missing": [],
+  "test_results": {
+    "workspace_no_gpu_total_passed": 1329,
+    "workspace_no_gpu_total_failed": 0,
+    "workspace_no_gpu_total_ignored": 135,
+    "main_baseline_passed": 1277,
+    "main_baseline_ignored": 134,
+    "delta_passed": 52,
+    "delta_ignored": 1,
+    "note": "Baseline reproduced independently via a read-only `main` worktree: 1277/0/134 exactly matches the milestone's claimed baseline. Branch delta (+52 passed, +1 ignored) is consistent with ~34 new AT test functions plus renamed/extended existing tests (AT-2966/AT-2967) and 2 new GPU-gated (ignored-by-default) tests."
+  },
+  "verification_results": {
+    "build_check": "PASS (cargo build --workspace clean)",
+    "clippy_check": "PASS (cargo clippy --workspace --all-targets -- -D warnings, 0 warnings)",
+    "diff_check": "PASS (all 27 planned files present in git diff main...HEAD; axc-runtime untouched, confirmed 0 lines in `git diff --stat -- crates/axc-runtime/`)",
+    "coder_self_report_matches_reality": true,
+    "icd_flake_reproduction": "REPRODUCED on THIS branch (1/3 parallel runs of axc-runtime icd:: tests failed) AND independently REPRODUCED on a clean main worktree (1/8 runs failed) — confirms the coder's claim that this is a pre-existing, unrelated env-var race, not a regression. axc-runtime has zero diff in this milestone so the two branches are running byte-identical code.",
+    "substitution_fix_F1": {
+      "status": "PASS -- verified sound, not just the coder's own cherry-picked tests",
+      "coder_tests_reproduced": "AT-2968a (WG/WG2 prefix collision, no 1282) and AT-2968b (comment-decoy) both pass as claimed",
+      "independent_probes": [
+        "?G / ?WG suffix pair (short name G is a SUFFIX, not prefix, of nothing in WG -- sanity that the boundary logic isn't special-cased to the WG/WG2 example): resolves correctly to '@workgroup(128,1,1) foo(7)'",
+        "?WG followed by digit '2' with WG2 UNDECLARED: boundary check correctly blocks WG from matching (next byte '2' is alnum), so `?WG2` is left untouched as an unresolved hole -- confirmed via substitute_strategy_holes() directly AND via a full real-pipeline compile attempt, which fails closed with a parse-level error (SharedSizeMustBeUnsuffixedPositiveIntegerLiteral{found_kind:\"OptHole(\\\"WG2\\\")\"}), never silently miscompiling"
+      ]
+    },
+    "fail_closed_selection": {
+      "status": "PASS with one real gap found (see discrepancies)",
+      "compile_cli": "AmbiguousKernel (no file written), UnknownKernel (no file written), --all (2 outputs, collision-proof `<stem>.<kernel>.spv` naming, distinct bytes), --kernel+--all conflict (clap usage error) -- all independently reproduced via direct subprocess invocation of the built `axc` binary on both a hole-free fixture and the real examples/two_pass_reduce.axc",
+      "optimize_cli": "no --kernel on a 2-kernel @strategy source -> AmbiguousKernel, no output; --kernel final_reduce -> succeeds, sidecar+winner written -- independently reproduced",
+      "test_fuzz_cli": "no --kernel on 2-kernel source -> ERROR JSON with reason.kind=\"ambiguous_kernel\", exit 2 -- independently reproduced",
+      "rewrite_verify_cli": "--kernel works correctly when combined with --buffer-sizes (independently reproduced: PASS verdict, kernel_name=\"final_reduce\" on both sides). --buffer-sizes-derived-from---size path is BROKEN for --kernel (see discrepancies) -- still fails closed (no incorrect verification result), but --kernel is functionally inert for that specific flag combination.",
+      "single_kernel_unaffected": "byte-identical confirmed (coder's own m321_single_kernel_compile_unaffected_by_new_flags CLI test, reproduced passing)"
+    },
+    "corpus_golden": {
+      "status": "PASS -- independently reproduced end-to-end, not just re-reading the coder's claim",
+      "method": "Built a clean read-only `main` worktree, compiled all 54 (pre-M3.21) examples/*.axc through both the main and branch `axc` binaries with no extra flags, diffed the two output directories with `diff -rq` and independently with `md5sum`.",
+      "result": "34/54 examples compile without --strategy-value on both branches (identical set of 34 filenames on both sides, confirmed via `comm -3`); all 34 .spv files AND all 34 .spv.axc.meta.json sidecars are byte-identical (md5sum match, `diff -rq` clean). The remaining 20 require --strategy-value on BOTH branches identically (pre-existing, unrelated to M3.21)."
+    },
+    "no_orphan_rule_F4": {
+      "status": "PASS",
+      "coder_fixture_AT_2970": "reproduced passing: BadWorkgroupDim-class sibling failure (BAD=8 legal for bench_target, illegal for sibling via multiplied dims) correctly fires WinnerInvalidModuleWide{broken_kernel:Some(\"sibling\")} from inside run_optimize's own winner-selection path (not just an external proof), and neither .spv nor sidecar exists afterward.",
+      "independent_scenario": "Constructed an additional sibling-failure fixture using a DIFFERENT failure mechanism (workgroup-invocation-count overflow via a fixed z=32 dimension on the sibling only, SZ=64 ordinal-0 breaks sibling, SZ=16 does not) to confirm F4 generalizes beyond the coder's one exact fixture shape. Result: WinnerInvalidModuleWide correctly fired naming \"sibling\", zero artifacts on disk afterward. Scratch test file removed after verification (not part of the milestone diff)."
+    },
+    "gpu_bit_exact": {
+      "status": "PASS -- independently run, not re-trusting the coder's report",
+      "nvidia": "RTX PRO 6000 Blackwell Workstation Edition (real hardware, AXC_ENABLE_GPU_TESTS=1, default VulkanContext): at_2959_2960_two_stage_dispatch_bit_exact_sum PASSED, gpu_sum==cpu_sum, max_diff==0",
+      "lavapipe": "llvmpipe (LLVM 20.1.2, 256 bits) via VK_DRIVER_FILES=lvp_icd.json: same test PASSED independently, gpu_sum=-3 cpu_sum=-3, max_diff==0"
+    },
+    "spirv_val_check": "PASS (AT-2958 reproduced: both partial_reduce and final_reduce validate clean against Vulkan_1_1 target)"
+  },
+  "deviation_assessments": [
+    {
+      "deviation": "1 -- shared[T,N] HoleRef parser gap; ?WG confined to @workgroup only in the shipped example",
+      "verdict": "VERIFIED, ACCURATE, PRE-EXISTING",
+      "evidence": "Independently confirmed empirically on a CLEAN MAIN worktree (not just this branch): `shared[i32, ?WG]` fails to parse with `SharedSizeMustBeUnsuffixedPositiveIntegerLiteral{found_kind:\"OptHole(\\\"WG\\\")\"}` BEFORE any substitution occurs, both with and without a supplied assignment. This is genuinely pre-existing (axc-parser is untouched by this milestone -- confirmed 0 diff for crates/axc-parser). Cross-kernel binding claim independently verified: examples/two_pass_reduce.axc's real AT-2956 test (reproduced passing) confirms BOTH kernels' @workgroup(?WG,1,1) resolve to @workgroup(64,1,1) after substitution and both @strategy blocks are stripped. The AT-2956 'inline unit fixture' the coder's self-report references is at_2968a_prefix_collision_no_miscompile (a shared[i32,?WG2]-shaped string, not a full 2-@kernel-function fixture) -- it is non-vacuous (asserts the resolved shared[i32,?WG2] literally becomes shared[i32,64]) but is a generic text-substitution proof, not a dedicated 2-kernel AT-2956 fixture; the REAL cross-kernel proof is dispatch_two_pass_reduce.rs's at_2956_resolving_wg_rewrites_both_kernels_workgroup, which IS a genuine two-@kernel-function fixture and was independently reproduced passing."
+    },
+    {
+      "deviation": "2 -- LOC 2284 vs cap 2200 (~4% over)",
+      "verdict": "NET TOTAL VERIFIED CORRECT; ITEMIZED BREAKDOWN DOES NOT RECONCILE (self-report internal inconsistency)",
+      "evidence": "`git diff main...HEAD --numstat`: total insertions 2947, of which 539 are the milestone spec doc (non-code, not counted), total deletions 124. (2947-539)-124 = 2284, exactly matching the coder's claimed net_total. HOWEVER the coder's own per-file 'breakdown' table (loc_self_report.breakdown) sums to 2520, not 2284 -- a 236-line (~10%) internal inconsistency between the claimed net_total and the itemization meant to justify it. Spot-checking individual entries against numstat also shows mismatches beyond rounding: main.rs breakdown claims 98 lines vs numstat's actual 71 insertions (27-line overstatement); fuzz.rs breakdown claims 66 vs numstat's 61 insertions; grid_search.rs claims 80 vs numstat's 70; load_source.rs claims 63 vs numstat's 53. The AGGREGATE net_total is real and independently verified (2284, under no dispute), but the itemized justification the coder presents for the 84-line overage does not actually sum correctly, so the per-area attribution in the overage_explanation should not be taken as precise."
+    }
+  ],
+  "scope_check": {
+    "axc_runtime_untouched": "PASS (0 lines in git diff --stat for crates/axc-runtime/)",
+    "axc_codegen_doc_only": "PASS (git diff for crates/axc-codegen/src/emit.rs read directly: only doc comments, an error message string change, and a test rename -- zero logic/control-flow change)",
+    "frozen_tolerances_untouched": "PASS (grep of the full diff for '1e-3'/'equiv_fp_tol'/tolerance-constant patterns shows zero value changes; the only hits are the new i32 bit-exact fixture's doc note that it needs no @equiv_fp_tol, and use of the pre-existing TolerancePolicy::BitExact enum variant in new tests)"
+  },
+  "additional_unit_level_checks": {
+    "duplicate_kernel_name": "PASS -- independently reproduced via direct CLI compile of a hand-written 2-same-named-kernel fixture: fails at the HIR stage (1 hir error), exit 1, no output written",
+    "log_opt_multikernel_fail_closed": "PASS -- independently reproduced via direct CLI invocation on a 2-kernel fixture: exit 4, JSON error with the updated message text ('multi-kernel log-opt selection is deferred...'), source file byte-unchanged (md5sum before/after identical)",
+    "enumerate_variants_real_count_check": "PASS -- confirmed union_module_holes-based (not a stub); confirmed the old lying 'source must declare exactly one @kernel function' string is now grep-clean across the entire crates/ tree except in comments documenting its historical removal",
+    "load_source_fail_closed": "PASS -- AT-2961 tests reproduced passing (ambiguous-without-kernel-param fails closed; kernel-param selects named kernel)",
+    "mcp_tools_at_2962": "PASS -- all 5 MCP tool AT-2962 unit tests (enumerate_variants, compile_variant, bench_variant, grid_search, and the parse_source_for_grid_search helper) reproduced passing via `cargo test --package axc-driver --lib mcp::tools::`",
+    "at_2971_at_2835_forward_collision_fix": "PASS -- reproduced passing; read the test body directly and confirmed the block-count branch genuinely exercises strip_all_strategy_annotation_blocks on two_pass_reduce.axc's 2-block case while keeping the single-block naive-reference equality clause unweakened for every other file",
+    "verify_at_2965": "PASS -- reproduced passing via `cargo test --package axc-driver --lib verify::`"
+  },
+  "memory_footprint_ok": true,
+  "discrepancies_severity_ordered": [
+    {
+      "severity": "MEDIUM",
+      "finding": "`axc rewrite-verify --kernel K --size N` (the `--size` convenience-shortcut path) does not actually work on a genuinely multi-kernel source, regardless of what `--kernel` is set to. `resolve_size_shortcut` in crates/axc-driver/src/main.rs (the CLI-level function that expands `--size N` into per-buffer sizes) calls the OLD kernel-agnostic `axc_driver::compile_source_with_assignments` and never receives the `kernel` selector at all -- so on any 2+-kernel source it always fails closed with AmbiguousKernel, even when `--kernel` correctly names one of the kernels. This is NOT a silent-wrong-answer bug (it fails closed, matching the project's fail-closed discipline) and the explicit `--buffer-sizes` path (bypassing `--size`) DOES correctly honor `--kernel` (independently reproduced: PASS verdict, correct kernel_name on both sides). But it is a real functional gap in the milestone's own promise ('Add --kernel NAME (applies to both original & rewritten sides)' for rewrite-verify), it was not caught by the coder's own test suite because AT-2963's tests call the library `verify_rewrite` function directly with an explicit `buffer_sizes` vector, never exercising the CLI's `--size` shortcut, and the milestone's own AT table marks AT-2963 as verified via 'CLI/integration' when the actual test is unit-level only. Recommend: either thread `kernel` into `resolve_size_shortcut` (and its one call site) in a small follow-up, or explicitly document `--size` as `--buffer-sizes`-only for multi-kernel sources.",
+      "does_this_block_merge": "No -- fails closed, no correctness risk, narrow CLI-convenience-flag gap, easily fixed in a follow-up patch."
+    },
+    {
+      "severity": "LOW",
+      "finding": "The LOC overage self-report's itemized per-file breakdown sums to 2520 lines, not the claimed/actual net_total of 2284 -- a ~10% internal arithmetic inconsistency in the coder's own accounting (net_total itself IS correct and independently verified against git diff --numstat). Several individual line items also diverge from the real numstat insertions by 10-40%, notably main.rs (breakdown 98 vs actual 71) and load_source.rs (breakdown 63 vs actual 53). This affects only the narrative/attribution of WHERE the 84-line cap overage came from, not the actual (verified, real, ~4% over cap) overage itself, and not any functional claim.",
+      "does_this_block_merge": "No -- cosmetic self-report bookkeeping issue, does not affect code correctness or the real (verified) LOC total."
+    }
+  ],
+  "summary": "Independently re-verified essentially every claim in the coder's self-report by re-running the actual pipeline (not re-reading test output): rebuilt and re-ran the full test suite (1329 passed / 0 failed, clippy clean, working tree clean); reproduced the exact 1277/134 baseline on a fresh main worktree; independently drove the built `axc` CLI binary through every fail-closed path (compile AmbiguousKernel/UnknownKernel/--all/--kernel+--all-conflict, optimize ambiguous-bench-target, fuzz ambiguous, log-opt Multikernel, DuplicateKernelName) and confirmed each fails closed with no partial output; independently reproduced the F1 boundary-safe substitution fix with two NEW probes beyond the coder's own tests (suffix-name pair, undeclared-longer-hole-with-digit-collision) and confirmed it is genuinely sound, including a full real-pipeline fail-closed check; independently reproduced the corpus golden-identity claim end-to-end (fresh main worktree build, md5sum-verified byte-identical .spv + sidecar JSON for all 34 eligible examples); independently constructed and ran a SECOND, mechanistically-different F4/AT-2970 sibling-failure fixture (workgroup-invocation overflow rather than the coder's dim-multiplication overflow) confirming zero orphaned artifacts; ran the GPU dispatch test on real NVIDIA hardware (RTX PRO 6000 Blackwell) AND on Lavapipe independently, both bit-exact; confirmed Deviation 1 (shared[T,N] HoleRef gap) is genuinely pre-existing by reproducing the parse failure on a clean main worktree; confirmed axc-runtime is truly untouched (0-diff) and reproduced the icd flake on BOTH branches, proving it is pre-existing. Found two real, well-substantiated discrepancies: (1) MEDIUM -- the rewrite-verify `--size` shortcut silently fails to thread `--kernel` through in CLI code (fails closed, not a correctness bug, but a real functional gap the milestone's own AT table over-claims as CLI-tested), and (2) LOW -- the coder's LOC self-report breakdown table has an internal ~10% arithmetic inconsistency versus its own claimed (and independently-verified-correct) net total. Neither discrepancy involves a correctness risk, a missing acceptance test, a silently-wrong result, or scope creep into the frozen/off-limits areas (axc-runtime, frozen tolerances, axc-codegen logic). All 28 acceptance tests (AT-2945..AT-2972) are present, pass, and were independently re-run (not merely re-read) at least once each, several with additional adversarial probes beyond the coder's own fixtures. VERDICT: PASS."
+}

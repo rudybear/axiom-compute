@@ -1,0 +1,77 @@
+{
+  "verdict": "REVISED",
+  "agent": "architect",
+  "revision": "r2",
+  "milestone_id": "M3.21-multi-kernel",
+  "roadmap_item": "FG.9",
+  "spec_path": ".pipeline/milestones/M3.21-multi-kernel.md",
+  "architecture_unchanged": true,
+  "one_line": "Surgical r2: closed the CRITICAL prefix-collision miscompile with a boundary-safe single-scan substitution (+ discovery-time prefix guard), forced the 1-kernel-wrap through both emit AND metadata, enforced 'winner valid module-wide' by cross-compiling, fixed the at_2835 two-block forward-collision, and corrected the load_source/enumerate_variants/grid_search attributions. N-separate-modules architecture, name-matched sharing, two_pass_reduce example, and fail-closed discipline all STAND.",
+  "review_inputs": {
+    "optimistic": "NEEDS_DISCUSSION — 1 concrete gap (at_2835 forward-collision) + 2 citation fixes",
+    "pessimistic": "NEEDS_REVISION — 1 CRITICAL proven miscompile + 2 warnings (metadata-wrap, winner-module-wide) + 1 attribution + strip-predicate warning"
+  },
+  "fixes": [
+    {
+      "id": "F1",
+      "severity": "CRITICAL",
+      "issue": "substitute_strategy_holes (lib.rs:327-346) raw str::replace over ascending BTreeMap: ?WG corrupts ?WG2 -> shared[i32,1282] (empirically proven silent miscompile). Third naive-text-transform instance (M3.14, M3.15).",
+      "resolution": "Boundary-safe substitution. Exact mechanism = a single left-to-right manual scan (regex-free): at each '?', greedily match the LONGEST hole name present at that offset whose FOLLOWING byte is NOT [A-Za-z0-9_], substitute and advance; else copy the byte. The following-byte boundary check is the SOUND guarantee; longest-name-first is only a same-offset tiebreak, not relied on alone. Single forward scan also eliminates the ascending-order hazard. Protects all callers incl. rewrite-verify's compile_source_with_assignments. Defense-in-depth: union_module_holes ALSO fails closed EnumerateError::PrefixCollidingHoleNames{shorter,longer} at discovery time (~10 LOC). Both layers ship.",
+      "comment_scope_decision": "The boundary fix is prefix-safe but DELIBERATELY NOT comment-aware. Raw substitution already rewrites ?name inside // comments today (pre-existing; substitute path is not lexer-anchored). A substituted comment is semantically HARMLESS — the lexer discards comments before HIR, so it cannot change compiled SPIR-V, hole resolution, or golden bytes. The miscompile the fix closes lives only in LIVE code. So comment-awareness of the SUBSTITUTE path is deferred with rationale; this is CORRECT asymmetry vs the STRIP path (which IS lexer-anchored, because there a comment decoy removes the WRONG block — a real failure mode). AT-2968(b) pins a `// ?WG2` comment-decoy: the LIVE ?WG2 still resolves to 64, resolved source has no 1282.",
+      "tests": ["AT-2968 (proven ?WG/?WG2 fixture -> no 1282 + comment-decoy)", "AT-2972 (PrefixCollidingHoleNames discovery guard)"],
+      "spec_note_added": "Project-wide durable note in §4: 3rd naive-text-transform footgun (M3.14/M3.15/M3.21); any future text transform on ?holes/@annotations/identifiers MUST be token/boundary-disciplined; a bare .replace(\"?\"..)/.find(\"@\"..) on live source is a defect on sight."
+    },
+    {
+      "id": "F-metadata",
+      "severity": "WARNING",
+      "issue": "compile_source_with_meta_kernel(Some(NAME)) could feed a filtered module to emit but build metadata from the original multi-kernel HIR (extract_workgroup_dims codegen/lib.rs:42 + hir.kernels.first() lib.rs:153), pairing a non-first kernel's SPIR-V with kernel[0]'s workgroup_size/name. Masked because AT-2950's example kernels share ?WG.",
+      "resolution": "§8 + §5 now MANDATE building ONE HirModule{kernels:vec![selected.clone()]} and threading THAT SAME module through BOTH emit_module_bytes AND the metadata block. Added extract_workgroup_dims (codegen/lib.rs:42) and the metadata-build path (lib.rs:152-153) as explicit §5 survey rows.",
+      "tests": ["AT-2969 (DISTINCT per-kernel @workgroup dims; --kernel selects non-first; sidecar carries ITS OWN workgroup_size + entry_point)"]
+    },
+    {
+      "id": "F4",
+      "severity": "WARNING",
+      "issue": "AT-2957 asserted 'winner valid module-wide' but grid-search benches/compiles ONLY the --kernel target; a winner could break a sibling kernel (shared-mem overflow / invalid SPIR-V) yet be crowned. Masked because the example's shared ?WG in {64,128,256} is valid for both.",
+      "resolution": "§4 F4: run_optimize MUST cross-compile the winning assignment across ALL kernels via compile_module_all BEFORE writing the winner sidecar, and fail closed naming the broken sibling if any fails to compile/validate. AT-2957 reworded.",
+      "tests": ["AT-2970 (candidate valid for benched kernel, invalid for sibling -> fail closed before sidecar write, names sibling)"]
+    },
+    {
+      "id": "F-at2835",
+      "severity": "GAP (optimistic)",
+      "issue": "at_2835_corpus_regression_anchor (lib.rs:911-994) walks examples/ and asserts no live @strategy { survives the OLD single-block strip. two_pass_reduce.axc has TWO blocks: the naive-reference EQUALITY clause still holds (both algorithms strip only the first block identically) but the residual-block clause FAILS.",
+      "resolution": "§5 adds the anchor as a survey row. Fix: residual clause branches on brace-form block count — strip_all_… residual check for >1-block files; single-block strip residual check AND the load-bearing naive-reference equality UNCHANGED for single-block files (equality clause never weakened).",
+      "tests": ["AT-2971"]
+    },
+    {
+      "id": "F-attribution",
+      "severity": "FACTUAL",
+      "issue": "r1 told the Coder to fix a lying 'exactly one @kernel' string in load_source; grep-confirmed that string is ONLY in enumerate_variants.rs:82. load_source.rs:120 is silent hir.kernels.into_iter().next() with no such text — a DISTINCT defect. Also §3 grid_search.rs:200 was ambiguous between two same-named files.",
+      "resolution": "§5 table corrected: load_source row = silent-first-pick (add count-check + selector, NO text to delete); enumerate_variants row = sole liar (delete the 'exactly one' text). §3 seam citation disambiguated to crates/axc-optimize/src/grid_search.rs:200 vs the MCP tool file crates/axc-driver/src/mcp/tools/grid_search.rs. strip_all_… termination predicate pinned to 'while the strip changed the source' (NOT token-existence — the @strategy(...) call-form is a strip no-op and a token-existence loop would infinite-loop)."
+    }
+  ],
+  "loc": {
+    "r1_target": 1560,
+    "r2_target": 1790,
+    "delta": 230,
+    "cap": 2200,
+    "note": "Under cap. The pessimistic ~+150 estimate omitted the AT-2969 distinct-dims fixture kernel and the F4 negative fixture; honest recount is ~+230 (F1 substitute ~25, F4 cross-validate ~30, PrefixColliding guard included in union +15, metadata-wrap threading +10, at_2835 branch +20, four new ATs ~130).",
+    "runtime_crate_loc": 0
+  },
+  "at_range": {
+    "start": "AT-2945",
+    "end": "AT-2972",
+    "added": ["AT-2968", "AT-2969", "AT-2970", "AT-2971", "AT-2972"],
+    "within_mandated_cap": "AT-2972 (mandate: may grow <= AT-2972)"
+  },
+  "unchanged_and_standing": [
+    "N separate SPIR-V modules (1 OpEntryPoint each) — Option A; Option B deferred",
+    "per-kernel @strategy blocks with module-global name-matched sharing",
+    "examples/two_pass_reduce.axc (i32 associative bit-exact, two-stage GPU dispatch)",
+    "fail-closed-never-silently-pick discipline across all source-consuming surfaces",
+    "golden-corpus byte-identity (AT-2947/2948)",
+    "barrier-in-loop PRIMARY RISK + unroll fallback (pessimistic confirmed the analyzer permits while-body workgroup barriers; fallback is a real safety net)",
+    "LOC-itemize-don't-trust-roadmap method",
+    "runtime crate 0 LOC"
+  ],
+  "ready_for": "Coder (both design reviewers' blocking findings addressed in-spec; no re-architecture)"
+}
