@@ -1,0 +1,54 @@
+{
+  "verdict": "APPROVE",
+  "agent": "pessimistic_code_reviewer",
+  "milestone_id": "M3.20-local-arrays",
+  "branch": "coder/M320-20260714-2000/M3.20-local-arrays",
+  "review_scope": "Adversarial miscompile hunt on the 4-crate array[T,N] change. Disassembled emitted SPIR-V (custom word-level parser, no spirv-dis CLI available), ran the in-process spirv-tools 0.13 Validator (Vulkan_1_1) on fresh fixtures, wrote throwaway HIR/codegen probes (deleted, zero net tree diff), read the load-bearing source (codegen/local.rs, body.rs prelude, hir/local.rs, typecheck.rs collision+disambiguation+cap+const-OOB, validate.rs, verify.rs, doc_accuracy.rs).",
+  "spirv_val_check": "PASS",
+  "ub_check": "PASS",
+  "race_condition_check": "PASS (N/A — Function/private storage has no cross-invocation hazard; no barriers needed, none emitted)",
+  "vendor_divergence_check": "PASS (no new capability/extension; single OpCapability Shader; Function storage is core Shader; f16/u8/i16/i64/f64 element caps set on-demand mirroring shared, NO StorageBuffer8/16BitAccess)",
+  "critical_bugs": [],
+  "warnings": [
+    {
+      "description": "Two same-shape local arrays emit REDUNDANT duplicate OpTypeArray ids. emit_local_array_types (codegen/local.rs:140-141) forces a fresh id per decl via b.id()+type_array_id(Some(..)) instead of letting rspirv dedup, so `array a: array[u32,4]; array b: array[u32,4];` yields two identical OpTypeArray (%14 and %17). VALID SPIR-V (redundant types are legal; spirv-opt would merge), and — importantly — the two arrays get DISTINCT OpVariables (%20/%21) so they do NOT alias (verified: writes/reads to a use %20, to b use %21). Pure minor size waste, not a correctness bug.",
+      "file": "crates/axc-codegen/src/local.rs",
+      "line": "140-141",
+      "severity": "informational"
+    },
+    {
+      "description": "validate.rs::HirError::LocalArrayTooLarge lives in the validate() pass, which has ZERO callers outside its own tests (lower_module never invokes it). It is DEAD. However: (a) this is honestly disclosed in an in-code comment (validate.rs M3.20 section), (b) it exactly mirrors the pre-existing dead SharedMemoryTooLarge in the same pass (not introduced/worsened by M3.20), and (c) the REACHABLE aggregate cap check is TypecheckError::LocalArrayTooLarge (typecheck.rs:1465), which I independently confirmed fires at 4097 bytes and passes at 4096. No user-visible gap.",
+      "file": "crates/axc-hir/src/validate.rs",
+      "line": "586-608",
+      "severity": "informational"
+    },
+    {
+      "description": "AT-2940 (corpus-wide byte-identity golden) has NO committed in-tree regression test (grep for '2940' in tests = 0 hits) — it is inherently a cross-branch two-version procedure and was verified by QA reproducing it in a separate main worktree (33/33 non-array kernels byte-identical). Consequence: future codegen milestones are not guarded by an automated full-corpus byte-identity fence (partial coverage exists via spirv-val suites + compile_shared_examples-style tests). Matches how the spec framed AT-2940; informational only.",
+      "file": ".pipeline/milestones/M3.20-local-arrays.md",
+      "line": "AT-2940",
+      "severity": "informational"
+    },
+    {
+      "description": "check_local_array_write runs the const-OOB check (typecheck.rs:4365) BEFORE typechecking the value, so `h[8] = <type-mismatched-value>` reports only LocalArrayConstIndexOutOfBounds, not the value mismatch. And mark_local_array_written fires only after a SUCCESSFUL value typecheck, so a value-error write does not populate the write-set (could yield a spurious ReadBeforeAnyWrite advisory on already-erroring code). Both are on code that already fails to compile — harmless diagnostic-ordering nits, not correctness issues.",
+      "file": "crates/axc-hir/src/typecheck.rs",
+      "line": "4364-4388",
+      "severity": "informational"
+    }
+  ],
+  "adversarial_findings": {
+    "spirv_histogram_disassembly": "PASS — OpTypeArray %u32 %const(8) correct element+length; OpTypePointer Function(literal 7) x2 (whole-array %18 + elem %19); the array OpVariable (%29, type %18, Function) is emitted AFTER the 8 let-scalar OpVariables (%21-%28) but BEFORE the first non-var instruction (OpLoad) — var_after_non_var invariant HOLDS with BOTH scalars and array present; single-index OpAccessChain %19 ..%29 %idx for both read and write (SSBO uses a DISTINCT 2-index %8 chain — no confusion); zero OpPhi; single OpCapability Shader.",
+    "var_after_non_var_both_present": "PASS — confirmed structurally in histogram (8 scalars + 1 array) AND at the validator level: a fresh fixture with a local array + two let scalars compiled to VALID SPIR-V (Vulkan_1_1).",
+    "dynamic_oob_ub_surface": "PASS — a fixture indexing array[u32,4] with an unbounded gid() value compiles, produces a RAW single-index OpAccessChain with the gid load fed directly as index (no OpUMin/clamp/OpSelect/ExtInst/bounds), and VALIDATES clean under the in-process Validator. UB is runtime, documented, NOT silently clamped — matches the by-design semantics.",
+    "type_table_pollution_ondemand": "PASS — saxpy.axc (no local array) disassembles with ZERO sized OpTypeArray (only the SSBO OpTypeRuntimeArray). On-demand emission confirmed at the disassembly level (complements QA's corpus byte-cmp).",
+    "collision_guard_bidirectional": "PASS — via throwaway HIR probe: `array a; array a` -> LocalArrayDuplicateName; `let x; array x` -> LocalArrayNameCollision; `array x; let x` -> LocalArrayNameCollision (BOTH declaration orders rejected — NO shadowing miscompile). register_shared and register_local_array genuinely cross-check each other's maps (typecheck.rs:979 and :1035), and let-binding registration also rejects a prior array name.",
+    "cap_accounting_mixed_type": "PASS — mixed f32[1023](=4092B)+u8[4](=4B)=4096 -> clean + LocalArrayMaySpill advisory (boundary is '> MAX', inclusive at cap); +u8[5]=4097 -> LocalArrayTooLarge{total_bytes:4097}. Proves per-element byte accounting multiplies correctly (f32 x4, u8 x1) and aggregates across differing element types. total_byte_size = len(u64) * elem_byte_size(u64), no overflow.",
+    "init_hazard_advisory_surface": "PASS — LocalArrayReadBeforeAnyWrite fires through BOTH `axc verify` (C-class surface: reported with correct line number, summary '1 warning', non-blocking rc=0) and `axc compile` (stderr warning, rc=0). The verify.rs 2-line change is exactly the HirWarning span-mapping arms that give the advisory its line number in verify — a correct, intended surfacing, NO other behavior change. Path-insensitive presence-set (mark on any LocalArrayWrite regardless of loop/if nesting) matches the honest §5 disclosure: a zero-trip-loop write still marks the set so a later uninit read passes silently — by design.",
+    "parser_report_all": "PASS — a source with three malformed decls (missing N, non-int N 3.0, N>ceiling 99999999) reports 3 parse errors in one pass, no panic, no cascade (anti-pattern #6).",
+    "at2918_repin": "PASS — pinned SHAs cb750ec (pre-M3.19/M3.17 feat) and 6c7732d (M3.19 feat) are BOTH confirmed ancestors of HEAD; the diff range changed from live working-tree-vs-HEAD to fixed SHAs; assertion logic is byte-preserved (added lines must equal 'opt_log: None,', zero removed lines) + graceful skip fallback; the test PASSES (not skips) standalone. The re-pin is necessary — a live-HEAD empty-diff gate would wrongly fail on M3.20's legitimate new codegen module.",
+    "multi_array_no_alias": "PASS — `array a; array b` (same shape) get DISTINCT Function OpVariables (%20 vs %21); writes/reads to a use %20, to b use %21 — no aliasing.",
+    "test_integrity": "PASS — AT-2935 capability check compiles a plain-let-scalar twin and asserts BYTE-IDENTICAL capability_set (not vacuous); the var-ordering test scans disassembly for any OpVariable following a non-var instruction; AT-2936 declares (never writes) an f16/u8 array to set the cap while dodging the unrelated M1.1 f16/u8-literal restriction. Real M3.20 suites: local_array_typecheck + local_array_codegen + compile_local_array_examples all pass (34 tests, 0 failures)."
+  },
+  "verify_rs_2line_change": "Adds two arms to hir_warning_span() mapping LocalArrayMaySpill and LocalArrayReadBeforeAnyWrite to their spans. Sole effect: `axc verify` reports these two new warnings with a source line number instead of dropping the span. No other behavior change to `axc verify`.",
+  "cross_vendor_note": "Emitted SPIR-V is portable (core Shader, no vendor-specific ops). GPU proof AT-2937/2938 ran bit-exact (max_diff==0) on NVIDIA RTX PRO 6000 Blackwell AND Lavapipe/llvmpipe per QA. Function-storage spill/occupancy is a driver-side perf concern (honestly documented in the example header + DESIGN §3.1.44), not a correctness/divergence risk.",
+  "summary": "APPROVE. Independent adversarial review found NO miscompiles and NO correctness holes. Disassembled the emitted SPIR-V directly (histogram + 4 fresh fixtures): OpTypeArray element/length correct, single-index Function OpAccessChain for read and write, the Function OpVariable is placed FIRST in the entry block even with both let-scalars and the array present (var_after_non_var holds), zero OpPhi, single Shader capability, and dynamic gid-indexing produces a RAW unclamped access chain that still VALIDATES (UB-by-design, no silent clamp). Independently confirmed via throwaway probes: the bidirectional name-collision guard rejects both declaration orders (array/shared and array/let) so no name resolves to two decls; the reachable typecheck cap multiplies per-element bytes correctly across mixed types with an exact 4096/4097 boundary; the init-hazard advisory is a path-insensitive presence-set that surfaces through `axc verify` (non-blocking) exactly as disclosed; the parser reports all three malformed decls without cascade; two same-shape arrays get distinct non-aliasing OpVariables. The verify.rs change is a benign 2-line span-mapping addition. The AT-2918 re-pin uses fixed ancestor SHAs with byte-preserved assertion logic and passes (not skips). Four informational nits (redundant duplicate OpTypeArray for identical arrays; the dead validate() cap check mirroring shared's pre-existing dead check; AT-2940 having no in-tree automated fence; const-OOB short-circuiting before value typecheck) are all non-correctness and non-blocking. Full M3.20 test suites pass (34 tests, 0 failures); GPU bit-exactness confirmed by QA on NVIDIA + Lavapipe."
+}

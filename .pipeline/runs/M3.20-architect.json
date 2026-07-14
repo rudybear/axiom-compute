@@ -1,0 +1,126 @@
+{
+  "verdict": "PROPOSED",
+  "agent": "architect",
+  "revision": "r2",
+  "milestone_id": "M3.20-local-arrays",
+  "title": "Sized local arrays array[T, N] (ROADMAP FG.7) — the private-memory sibling of shared[T,N]",
+  "spec_file": ".pipeline/milestones/M3.20-local-arrays.md",
+  "at_range": "AT-2927..AT-2944",
+  "at_count": 18,
+  "loc_target": 1600,
+  "loc_cap": 2000,
+  "loc_cap_note": "Honest overage cap. r1's 800 is formally retracted as a planning failure (3.4x under the optimistic reviewer's measured ~2745 comparable subset). 2000 = optimistic-measured mirror MINUS the ~700 LOC barrier-hazard proof M3.20 provably does not build. Coder is told overage toward 2000 is expected and must be self-reported per the M3.18/M3.19 precedent, never hidden by under-testing.",
+  "core_design_unchanged": true,
+  "core_design_summary": "array[T,N] is the private-memory (Function storage) sibling of shared[T,N]: array-keyword mirror syntax, OpVariable emitted in the function entry-block prelude (like let scalars), single-index OpAccessChain read/write, N-literal-only, 4096-byte hard cap / 1024-byte spill advisory, no runtime metadata/preflight, GPU-proven local_histogram.axc. UNCHANGED from r1.",
+  "r1_to_r2_delta": [
+    {
+      "fix": "Name-collision miscompile",
+      "source": "pessimistic MEDIUM #1",
+      "severity": "MEDIUM",
+      "r1": "Asserted (unsubstantiated, false as specified) that 'a name cannot be two of these (collision rejected at registration)'. register_shared (typecheck.rs:812) knows nothing of local arrays and a mirror register_local_array would not consult shared_name_map, so shared foo + array foo would be accepted and every foo[i] would silently resolve to the local array (miscompile).",
+      "r2": "MANDATED bidirectional, order-independent cross-check: register_local_array MUST reject names present in shared_name_map, AND register_shared MUST be extended to reject names present in the local-array name map. Caught regardless of source order. New AT-2942 tests BOTH declaration orders (plus param/binding collision). Spec section 8.",
+      "resolved": true
+    },
+    {
+      "fix": "Hoist-no-reset foot-gun",
+      "source": "pessimistic MEDIUM #2",
+      "severity": "MEDIUM",
+      "decision": "REJECT nested decls (option a)",
+      "r1": "Silent: an array decl inside if/for/while is hoisted to the entry prelude (SPIR-V 2.16.1) and allocated once, never reset per iteration, unlike let's per-iteration OpStore. Spec neither restricted nor documented it.",
+      "r2": "Nested array decls (inside any control-flow block) are a HARD HIR ERROR: HirError::LocalArrayDeclNotAtBlockScope, enforced in HIR (parser still recovers/reports-ALL). Chosen over document-hoist-once because cheaper (~10 LOC scope check, no reset codegen), least-surprise, and matches shared's de-facto top-level discipline; histogram + all use cases already declare at top level. Array is still fully usable inside loops (declared at top, indexed in loop; OpVariable persists across iterations, proven by AT-2938). New AT-2943. Spec section 5.1.",
+      "resolved": true
+    },
+    {
+      "fix": "Schema version v3 -> v4",
+      "source": "optimistic FACTUAL ERROR",
+      "severity": "MEDIUM",
+      "r1": "Spec repeatedly claimed metadata schema 'stays v3 unchanged'.",
+      "r2": "Corrected to v4 everywhere: CURRENT_SCHEMA_VERSION = 4 (metadata.rs:194, bumped at M3.17). Fixed in section 1 summary, section 3 semantics table, section 9 runtime note, and the literal assertions in AT-2939 and AT-2941. Substantive claim (no bump, metadata-inert) unchanged.",
+      "resolved": true
+    },
+    {
+      "fix": "LOC reconciliation",
+      "source": "reviewers DISAGREE (optimistic ~2745 measured vs pessimistic ~700 credible)",
+      "severity": "PLANNING",
+      "r2": "Resolved with numbers in section 12. Optimistic measured the comparable M3.2 subset at ~2745 LOC (3.4x r1's 800 cap). Pessimistic's ~700 counted only the two new modules (shared.rs hir 191 + codegen 223 = 414, verified by wc -l) + small deltas, undercounting the typecheck/validate/body/emit dispatch-site deltas and the 18-AT test code. Reconciliation: 2745 comparable MINUS ~700 barrier-hazard proof M3.20 sheds = ~2045 (the cap, 2000). Target 1600 = further trim for genuine reuse (presence-only write-set BTreeMap<u32,()> vs shared's Vec<HirExprKind>; no aggregate-preflight; copy-rename of proven modules). Itemized table: lexer token.rs ~30, parser ~200, hir local.rs ~200, expr ~40, typecheck ~260, validate ~150, lower ~20, codegen local.rs ~230, body+emit prelude+accesschain ~140, example ~35 (source subtotal ~1305) + 18 ATs ~500 = ~1805 worst-case. Both reviewers' evidence consistent at target 1600 / cap 2000.",
+      "resolved": true
+    },
+    {
+      "fix": "AT-2940 golden corpus-wide",
+      "source": "pessimistic LOW",
+      "severity": "LOW",
+      "r2": "AT-2940 extended from the 5-kernel set to the ENTIRE examples/ corpus (a new hard lexer keyword can perturb ANY source). Safe by construction: verified array appears in existing .axc ONLY inside // comments (matmul_shared_coopmat.axc:32-33, flash_attention.axc:46, matmul_rb_coopmat.axc:14, et al.), which the lexer strips before tokenizing.",
+      "resolved": true
+    },
+    {
+      "fix": "files_to_modify lexer file",
+      "source": "pessimistic Q3",
+      "severity": "LOW",
+      "r2": "Corrected to crates/axc-lexer/src/token.rs (TokenKind::Array variant, keyword_from_str ~line 256, reserved deny-list match ~line 326, exhaustive TokenKind matches). lib.rs only re-exports. Fixed in section 12 and files_to_modify below.",
+      "resolved": true
+    },
+    {
+      "fix": "Const-index OOB decidable error",
+      "source": "pessimistic LOW #3",
+      "severity": "LOW",
+      "r2": "Added HirError::LocalArrayConstIndexOutOfBounds: a constant literal index >= N is decidable and zero-false-positive, so it is a HARD ERROR (not warning). Dynamic/symbolic indices stay UB-by-design and documented. ~10 LOC. New AT-2944. Spec section 5.2.",
+      "resolved": true
+    },
+    {
+      "fix": "Advisory path-insensitivity disclosure",
+      "source": "pessimistic LOW #4",
+      "severity": "LOW",
+      "r2": "Section 5 now honestly discloses the write-before-read advisory is a source-order presence set (path-insensitive): zero false-positive but MISSES true positives (a write inside an if or a zero-trip loop populates the write-set unconditionally, so an else-path or post-loop read is not flagged). Same conservatism as shared's SET-based barrier analysis; uninitialized-read stays UB-by-design on any path.",
+      "resolved": true
+    },
+    {
+      "fix": "Forward-compat array-as-field-key",
+      "source": "pessimistic Q4",
+      "severity": "LOW/non-blocking",
+      "r2": "Section 15 acknowledges that once array is a hard keyword it can no longer be an @optimization_log RecordField key (key parser at parser.rs:735 accepts only Ident + special-cased Kernel). No existing schema field is named array (golden-identity holds); disclosed as a namespace narrowing. Also reframed the M3.12 citation as a register-pressure analogy (M3.12 did not measure array byte-size-vs-occupancy) per optimistic minor.",
+      "resolved": true
+    }
+  ],
+  "new_ats": [
+    "AT-2942 (HIR name-collision, BOTH declaration orders + param/binding) -- guards the bidirectional cross-check",
+    "AT-2943 (HIR nested-decl rejection LocalArrayDeclNotAtBlockScope; top-level decl indexed inside a loop compiles clean)",
+    "AT-2944 (HIR const-index OOB hard error LocalArrayConstIndexOutOfBounds; in-bounds const clean; symbolic index clean/UB)"
+  ],
+  "new_error_variants": [
+    "HirError::LocalArrayDeclNotAtBlockScope (nested decl)",
+    "HirError::LocalArrayConstIndexOutOfBounds (constant index >= N)"
+  ],
+  "files_to_modify": [
+    "crates/axc-lexer/src/token.rs (TokenKind::Array variant, keyword_from_str ~256, reserved deny-list match ~326, exhaustive TokenKind matches -- NOT lib.rs, which only re-exports)",
+    "crates/axc-parser/src/parser.rs (TypeRef::LocalArray, Stmt::LocalArrayDecl, type+stmt parse arms, parse_local_array_len/_elem_type, 3 ParseErrors, report-ALL recovery)",
+    "crates/axc-hir/src/local.rs (NEW: LocalArrayId/Ty/Decl, consts MAX_LOCAL_ARRAY_BYTES=4096 / LOCAL_ARRAY_SPILL_ADVISORY_BYTES=1024, is_allowed_local_element)",
+    "crates/axc-hir/src/expr.rs (LocalArrayRead / LocalArrayWrite / LocalArrayDeclMarker + KernelBodyTyped.local_arrays)",
+    "crates/axc-hir/src/typecheck.rs (register_local_array + find_local_array + BIDIRECTIONAL collision cross-check in register_shared too, index disambiguation, read/write checks, presence write-set advisory, nested-decl scope check, const-OOB check)",
+    "crates/axc-hir/src/validate.rs (10 error variants incl LocalArrayDeclNotAtBlockScope + LocalArrayConstIndexOutOfBounds, 2 warnings, aggregate byte cap)",
+    "crates/axc-hir/src/lower.rs (scan arms for the 3 new nodes)",
+    "crates/axc-codegen/src/local.rs (NEW: LocalArrayBindings, emit_local_array_types, emit_local_array_read/_write)",
+    "crates/axc-codegen/src/body.rs (prelude OpVariable in the entry-block prelude loop ~509, dispatch)",
+    "crates/axc-codegen/src/emit.rs (emit_local_array_types call in type-setup ~313, 4 recursion arms)",
+    "examples/local_histogram.axc (NEW)",
+    "DESIGN.md (section 3.1.44 entry)"
+  ],
+  "no_change_crates": [
+    "axc-runtime (no metadata field, no schema bump -- stays v4, no preflight)",
+    "axc-driver (derive_workgroups guard keys on shared_memory_bytes>0 || coopmat; a pure local-array kernel sets neither)"
+  ],
+  "verified_facts_r2": [
+    "CURRENT_SCHEMA_VERSION = 4 at crates/axc-runtime/src/metadata.rs:194 (confirmed).",
+    "shared.rs is 191 LOC (axc-hir) + 223 LOC (axc-codegen) = 414 (wc -l confirmed).",
+    "token.rs is the lexer keyword file (keyword_from_str at line 256 has \"shared\" => Shared; reserved match at line 326); lib.rs only re-exports (confirmed).",
+    "array appears in examples/*.axc ONLY inside // comments (grep confirmed: matmul_shared_coopmat.axc:32-33, flash_attention.axc:46, matmul_rb_coopmat.axc:14, matmul_msg_coopmat.axc:62, q4km_matmul_rb_coopmat_f32acc_db.axc:102) -- golden-identity safe."
+  ],
+  "outstanding_open_questions": [
+    "Register-file / local-memory spill thresholds (1024 advisory / 4096 hard cap) are static heuristics; device register budget is not portably queryable in Vulkan. Acceptable now; revisit if EB.1 hardware data suggests a per-vendor tuning."
+  ],
+  "handoff_notes_for_coder": [
+    "Insert the array OpVariable loop INSIDE the body.rs entry-block prelude loop (after the BindingTy::Scalar loop, before precondition checks / body statements) so the var_after_non_var assertion (body.rs:2532) holds even when let-scalars and arrays coexist. This is the ONLY legal place for a Function-storage OpVariable.",
+    "register_shared MUST be extended (not just mirrored) to cross-check the local-array name map -- this is the #1 blocker fix; do not skip the register_shared side.",
+    "Nested-decl rejection is enforced in HIR, not the parser (parser still recovers and reports ALL other errors in the same pass).",
+    "Overage toward the 2000 cap is expected and must be self-reported per the M3.18/M3.19 precedent -- do not under-test to hit a number."
+  ]
+}
