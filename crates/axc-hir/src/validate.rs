@@ -1,24 +1,23 @@
-//! Post-lowering validation rules for the HIR.
+//! `HirError` / `HirWarning`: the diagnostic types produced while lowering and
+//! typechecking a `HirModule`.
 //!
-//! - Rule M0-V1: every `@kernel` must carry exactly one `@workgroup(X,Y,Z)` with
-//!   X, Y, Z >= 1.
-//! - Rule M0-V2 (two-tier cap, per spec rev 2 boundary clarification):
-//!   - product in [1, 128]: CLEAN
-//!   - product in [129, 1024]: WARN (`WorkgroupExceedsPortableFloor`)
-//!   - product > 1024: ERROR (`BadWorkgroupDim`)
-//! - Rule M0-V3: unknown annotations are rejected (whitelist in `lower.rs`).
+//! M3.22 deleted this module's `pub fn validate()` post-lowering pass: it had
+//! ZERO callers workspace-wide (only its own tests), and every check it ran
+//! duplicated a REACHABLE equivalent that already fires through the normal
+//! compile pipeline:
+//! - Rule M0-V1/V2 (workgroup dims `>= 1`, two-tier cap) → `lower.rs`'s
+//!   `validate_workgroup_dims`, called from `lower_module`.
+//! - Aggregate shared-memory size → `TypecheckError::SharedMemoryTooLarge`,
+//!   checked in `typecheck.rs`'s `typecheck_kernel_body`.
+//! - Aggregate local-array size → `TypecheckError::LocalArrayTooLarge`, same
+//!   placement.
+//!
+//! (Rule M0-V3, unknown annotations, is enforced by `lower.rs`'s whitelist —
+//! it was never part of this module's `validate()` pass either.)
 
 use axc_lexer::Span;
-use crate::hir::{
-    Module as HirModule,
-    KernelBody,
-    PORTABLE_MIN_WORKGROUP_INVOCATIONS,
-    DESKTOP_MAX_WORKGROUP_INVOCATIONS,
-};
 use crate::typecheck::TypecheckError;
 use crate::param::BindingPlanError;
-use crate::shared::{PORTABLE_MIN_SHARED_BYTES, MAX_SHARED_BYTES};
-use crate::local::{MAX_LOCAL_ARRAY_BYTES, LOCAL_ARRAY_SPILL_ADVISORY_BYTES};
 
 /// Diagnostic error from HIR validation.
 #[derive(Debug, thiserror::Error, miette::Diagnostic)]
@@ -279,18 +278,6 @@ pub enum HirError {
         span: Span,
     },
 
-    /// Aggregate shared bytes exceed the compiler's static maximum (65536 bytes).
-    ///
-    /// This is a compile-time ceiling. At runtime, `SharedMemoryExceedsDeviceLimit`
-    /// may fire even below this threshold if the device's `maxComputeSharedMemorySize`
-    /// is smaller (e.g. a 16 KiB mobile GPU).
-    #[error("kernel uses {total_bytes} bytes of shared memory (sum of all shared arrays), exceeding the compile-time maximum of 65536 bytes; reduce shared array sizes")]
-    SharedMemoryTooLarge {
-        total_bytes: u64,
-        #[label("here")]
-        span: Span,
-    },
-
     // ── M3.17 (FG.4): runtime debug-check errors ─────────────────────────────
 
     /// A `@precondition` operand references a buffer element (`elem(buf)`).
@@ -350,15 +337,12 @@ pub enum HirError {
     // `LocalArrayAsParameter` is constructed at lower.rs param-lowering time — a
     // REAL, reachable-via-`lower_module` check (mirrors `SharedTypeNotAllowedAsParam`).
     //
-    // `LocalArrayTooLarge` here mirrors `SharedMemoryTooLarge`'s existence in this
-    // `validate()` pass, which — like `SharedMemoryTooLarge` — is NOT wired into
-    // `lower_module` or the driver's compile path (`validate()` has no caller
-    // outside its own tests as of M3.2/M3.20; a pre-existing, unrelated gap this
-    // milestone does not attempt to fix). The REACHABLE aggregate check is
+    // The aggregate local-array size check does NOT live here: it is
     // `TypecheckError::LocalArrayTooLarge` in typecheck.rs's `typecheck_kernel_body`
-    // (mirrors `TypecheckError::SharedMemoryTooLarge`'s real placement); use that
-    // variant (wrapped as `HirError::Typecheck(..)`) to observe the error through
-    // the normal compile pipeline.
+    // (mirrors `TypecheckError::SharedMemoryTooLarge`'s placement) — the SOLE
+    // aggregate check, wrapped as `HirError::Typecheck(..)` and reachable through
+    // the normal compile pipeline. (M3.22 deleted this module's dead, zero-caller
+    // `validate()` pass, which used to duplicate both aggregate checks here.)
     //
     // All other per-declaration/per-use local-array diagnostics live in
     // `TypecheckError` (typecheck.rs) — see that enum's M3.20 section for why.
@@ -367,16 +351,6 @@ pub enum HirError {
     #[error("local-array type `array[T, N]` cannot be used as a kernel parameter (`{param_name}`); local arrays are kernel-local and consume no descriptor")]
     LocalArrayAsParameter {
         param_name: String,
-        #[label("here")]
-        span: Span,
-    },
-
-    /// Aggregate local-array bytes exceed the compiler's static per-kernel maximum
-    /// (4096 bytes — 16x tighter than shared's 65536, because private arrays are
-    /// replicated PER-THREAD; M3.20 spec §6).
-    #[error("kernel uses {total_bytes} bytes of local-array storage (sum of all local arrays), exceeding the compile-time maximum of 4096 bytes; reduce local array sizes or use shared[T,N] for workgroup-cooperative data")]
-    LocalArrayTooLarge {
-        total_bytes: u64,
         #[label("here")]
         span: Span,
     },
@@ -539,199 +513,9 @@ pub enum HirWarning {
     },
 }
 
-/// Run post-lowering validation rules on a `HirModule`.
-///
-/// Returns `(errors, warnings)` — both lists are populated even if the other is
-/// non-empty (collect-all, not short-circuit).
-pub fn validate(module: &HirModule) -> (Vec<HirError>, Vec<HirWarning>) {
-    let mut errors: Vec<HirError> = Vec::new();
-    let mut warnings: Vec<HirWarning> = Vec::new();
-
-    for kernel in &module.kernels {
-        let wg = &kernel.annotations.workgroup;
-
-        // Rule M0-V1: dimensions >= 1
-        if wg.x < 1 || wg.y < 1 || wg.z < 1 {
-            errors.push(HirError::BadWorkgroupDim {
-                x: wg.x as i64,
-                y: wg.y as i64,
-                z: wg.z as i64,
-                product: wg.product(),
-                max: DESKTOP_MAX_WORKGROUP_INVOCATIONS,
-                span: kernel.span,
-            });
-            continue;
-        }
-
-        // Rule M0-V2: two-tier cap
-        let product: u64 = wg.product();
-        if product > DESKTOP_MAX_WORKGROUP_INVOCATIONS as u64 {
-            errors.push(HirError::BadWorkgroupDim {
-                x: wg.x as i64,
-                y: wg.y as i64,
-                z: wg.z as i64,
-                product,
-                max: DESKTOP_MAX_WORKGROUP_INVOCATIONS,
-                span: kernel.span,
-            });
-        } else if product > PORTABLE_MIN_WORKGROUP_INVOCATIONS as u64 {
-            warnings.push(HirWarning::WorkgroupExceedsPortableFloor {
-                name: kernel.name.clone(),
-                product,
-                floor: PORTABLE_MIN_WORKGROUP_INVOCATIONS,
-                span: kernel.span,
-            });
-        }
-        // product <= PORTABLE_MIN: clean, no action needed
-
-        // M3.2: Validate aggregate shared memory size.
-        if let KernelBody::Typed(ref tb) = kernel.body {
-            let total_bytes: u64 = tb.shared.iter()
-                .map(|s| s.ty.total_byte_size())
-                .sum();
-            if total_bytes > MAX_SHARED_BYTES {
-                errors.push(HirError::SharedMemoryTooLarge {
-                    total_bytes,
-                    span: kernel.span,
-                });
-            } else if total_bytes > u64::from(PORTABLE_MIN_SHARED_BYTES) {
-                warnings.push(HirWarning::SharedMemoryExceedsPortableMinimum {
-                    total_bytes,
-                    min_bytes: PORTABLE_MIN_SHARED_BYTES,
-                    span: kernel.span,
-                });
-            }
-        }
-
-        // M3.20: Validate aggregate local-array size (the single source of truth for
-        // this check — unlike shared's aggregate check, which is ALSO duplicated at
-        // typecheck.rs lowering time, M3.20 deliberately does not repeat that; see
-        // the TypecheckError M3.20 section's placement note).
-        if let KernelBody::Typed(ref tb) = kernel.body {
-            let total_bytes: u64 = tb.local_arrays.iter()
-                .map(|a| a.ty.total_byte_size())
-                .sum();
-            if total_bytes > MAX_LOCAL_ARRAY_BYTES {
-                errors.push(HirError::LocalArrayTooLarge {
-                    total_bytes,
-                    span: kernel.span,
-                });
-            } else if total_bytes > LOCAL_ARRAY_SPILL_ADVISORY_BYTES {
-                warnings.push(HirWarning::LocalArrayMaySpill {
-                    total_bytes,
-                    advisory_bytes: LOCAL_ARRAY_SPILL_ADVISORY_BYTES as u32,
-                    span: kernel.span,
-                });
-            }
-        }
-    }
-
-    (errors, warnings)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axc_lexer::Span;
-    use crate::hir::{
-        Module as HirModule, Kernel, KernelId, KernelAnnotations, WorkgroupDims, KernelBody,
-    };
-
-    /// Build a minimal HIR module with one kernel and the given workgroup dims.
-    fn make_module(x: u32, y: u32, z: u32) -> HirModule {
-        use crate::param::ParamBindingPlan;
-        HirModule {
-            kernels: vec![Kernel {
-                id: KernelId(0),
-                name: "test_kernel".into(),
-                annotations: KernelAnnotations {
-                    workgroup: WorkgroupDims { x, y, z },
-                    intent: None,
-                    complexity: None,
-                    preconditions: Vec::new(),
-                    subgroup_uniform: false,
-                    cooperative_matrix: false,
-                    coop_matrix: None,
-                    strategy: None,
-                    debug_checks: Vec::new(),
-                    opt_log: None,
-                },
-                params: Vec::new(),
-                binding_plan: ParamBindingPlan {
-                    buffers: Vec::new(),
-                    scalars: Vec::new(),
-                    push_constant_total_bytes: 0,
-                },
-                body: KernelBody::Empty,
-                span: Span::new(0, 10),
-            }],
-        }
-    }
-
-    // ── AT-5: two-tier workgroup cap (all sub-cases) ──────────────────────────
-
-    #[test]
-    fn workgroup_dim_tiers() {
-        // (a) product == 0 (zero dimension) → ERROR
-        let m = make_module(0, 1, 1);
-        let (errors, warnings) = validate(&m);
-        assert!(!errors.is_empty(), "(a) expected error for zero dim");
-        assert!(warnings.is_empty(), "(a) expected no warnings");
-
-        // (b) @workgroup(8,8,2) product==128 (at portable floor) → CLEAN
-        let m = make_module(8, 8, 2);
-        let (errors, warnings) = validate(&m);
-        assert!(errors.is_empty(), "(b) expected no errors: {errors:?}");
-        assert!(warnings.is_empty(), "(b) expected no warnings: {warnings:?}");
-
-        // (c) @workgroup(129,1,1) product==129 (first over floor) → WARN
-        let m = make_module(129, 1, 1);
-        let (errors, warnings) = validate(&m);
-        assert!(errors.is_empty(), "(c) expected no errors: {errors:?}");
-        assert!(!warnings.is_empty(), "(c) expected warning for product=129");
-
-        // (d) @workgroup(16,8,2) product==256 → WARN
-        let m = make_module(16, 8, 2);
-        let (errors, warnings) = validate(&m);
-        assert!(errors.is_empty(), "(d) expected no errors: {errors:?}");
-        assert!(!warnings.is_empty(), "(d) expected warning for product=256");
-
-        // (e) @workgroup(16,8,8) product==1024 (at desktop ceiling) → WARN (rev-2 boundary fix)
-        let m = make_module(16, 8, 8);
-        let (errors, warnings) = validate(&m);
-        assert!(errors.is_empty(), "(e) expected no errors at product=1024: {errors:?}");
-        assert!(!warnings.is_empty(), "(e) expected warning at product=1024 (boundary)");
-        if let HirWarning::WorkgroupExceedsPortableFloor { product, .. } = &warnings[0] {
-            assert_eq!(*product, 1024);
-        } else {
-            panic!("expected WorkgroupExceedsPortableFloor warning, got: {:?}", &warnings[0]);
-        }
-
-        // (f) @workgroup(16,8,9) product==1152 → ERROR
-        let m = make_module(16, 8, 9);
-        let (errors, _warnings) = validate(&m);
-        assert!(errors.iter().any(|e| matches!(e, HirError::BadWorkgroupDim { product, .. } if *product == 1152)),
-            "(f) expected BadWorkgroupDim{{product:1152}}: {errors:?}");
-    }
-
-    // ── Boundary: product == 128 is the last CLEAN value ─────────────────────
-
-    #[test]
-    fn product_128_is_clean_no_warning() {
-        let m = make_module(8, 8, 2); // 8*8*2 == 128
-        let (errors, warnings) = validate(&m);
-        assert!(errors.is_empty(), "errors: {errors:?}");
-        assert!(warnings.is_empty(), "expected no warning at product=128");
-    }
-
-    // ── Large but valid product (overflow-safe u64 check) ────────────────────
-
-    #[test]
-    fn product_over_ceiling_is_error() {
-        let m = make_module(1025, 1, 1);
-        let (errors, _) = validate(&m);
-        assert!(!errors.is_empty());
-    }
 
     // ── M1.3 validate.rs tests ────────────────────────────────────────────────
 

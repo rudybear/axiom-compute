@@ -6,19 +6,9 @@
 // oracle, via the simplest honest multi-stage shape (partial-sums, then a
 // final reduce).
 //
-// DEVIATION (documented): the spec's illustrative text also puts `?WG`
-// inside `shared[i32, ?WG]`, but `parse_shared_len` (axc-parser) only
-// accepts an unsuffixed integer LITERAL there, not a HoleRef — confirmed
-// empirically (matmul_shared_f32.axc already relies on this gap and is
-// ONLY EVER compiled via text substitution, never a raw parse). M3.21's
-// NEW union_module_holes-based discovery (axc optimize/verify/MCP) parses
-// the RAW file first, so a hole in `shared[T,N]` here would break discovery
-// for this file. Fixing the grammar is out of scope (axc-parser untouched
-// by M3.21). So `?WG` lives ONLY in `@workgroup(?WG,1,1)`; the shared-array
-// size and tree-reduction stride are FIXED LITERALS matching the hole's
-// sole candidate (64) — single-candidate, mirroring the spec's own
-// authorized fallback. AT-2956's inline two-kernel string fixture (not this
-// file) separately proves the literal `shared[i32,?WG]` substitution text.
+// M3.22: the shared hole is live — `shared[i32, ?WG]` now parses (the M3.21
+// deviation, `parse_shared_len` rejecting a HoleRef, is closed). `?WG` binds
+// BOTH `@workgroup(?WG,1,1)` and `shared[i32,?WG]` in each kernel.
 //
 // Stage 1 (partial_reduce): each of n/64 workgroups reduces its 64-element
 // chunk of `input` to one partial, written to partials[workgroup_index].
@@ -51,7 +41,7 @@
 @intent("two-pass i32 sum reduction, stage 1: each workgroup reduces its 64-element chunk of input to one partial sum")
 @complexity(O(n))
 fn partial_reduce(input: readonly_buffer[i32], partials: buffer[i32], n: u32) -> void {
-    shared tile: shared[i32, 64];
+    shared tile: shared[i32, ?WG];
 
     let gi: u32 = gid(0u32);
     let lid: u32 = local_invocation_id(0u32);
@@ -93,7 +83,7 @@ fn partial_reduce(input: readonly_buffer[i32], partials: buffer[i32], n: u32) ->
 @intent("two-pass i32 sum reduction, stage 2: the single workgroup reduces the 64 partial sums to out[0]")
 @complexity(O(1))
 fn final_reduce(partials: readonly_buffer[i32], out: buffer[i32], n_parts: u32) -> void {
-    shared acc: shared[i32, 64];
+    shared acc: shared[i32, ?WG];
 
     let lid: u32 = local_invocation_id(0u32);
 

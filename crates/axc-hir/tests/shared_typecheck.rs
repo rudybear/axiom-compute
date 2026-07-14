@@ -56,7 +56,7 @@ fn at1601_parse_shared_decl_ok() {
     let stmts = &kd.body.node.stmts;
     // First stmt should be SharedDecl, second should be Return
     let has_shared_decl = stmts.iter().any(|s| {
-        matches!(&s.node, axc_parser::ast::Stmt::SharedDecl { name, elem, len }
+        matches!(&s.node, axc_parser::ast::Stmt::SharedDecl { name, elem, len, .. }
             if name.node == "tile"
             && *elem == axc_parser::ast::ScalarTypeRef::F32
             && len.node == 256)

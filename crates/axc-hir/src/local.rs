@@ -21,7 +21,7 @@ pub const MAX_LOCAL_ARRAY_ELEMS: u32 = 65536;
 /// Maximum total local-array bytes enforced at compile time, PER KERNEL.
 ///
 /// Any single kernel whose aggregate `sum(total_byte_size())` over all declared
-/// local arrays exceeds this is rejected with `HirError::LocalArrayTooLarge`.
+/// local arrays exceeds this is rejected with `TypecheckError::LocalArrayTooLarge`.
 /// 16x tighter than `MAX_SHARED_BYTES` (65536) because private arrays are
 /// replicated PER-THREAD (not per-workgroup) — see M3.20 spec §6.
 pub const MAX_LOCAL_ARRAY_BYTES: u64 = 4096;

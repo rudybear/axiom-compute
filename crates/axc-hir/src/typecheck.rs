@@ -681,10 +681,11 @@ pub enum TypecheckError {
     // Placement note: these mirror the M3.2 `Shared*` precedent exactly — the
     // per-declaration / per-use diagnostics live here (constructed in typecheck.rs,
     // where the registration and index/value checks happen), NOT in
-    // `validate::HirError` (which only carries the two errors that are genuinely
-    // constructed post-lowering / at param-lowering time: `LocalArrayAsParameter`
-    // and `LocalArrayTooLarge`). Reconciles the r2 review note that shared's
-    // `HirError::Shared*` duplicates are dead code — M3.20 does not repeat that.
+    // `validate::HirError` (which only carries `LocalArrayAsParameter`, genuinely
+    // constructed at param-lowering time; the aggregate check lives here as
+    // `TypecheckError::LocalArrayTooLarge`, the sole reachable-via-the-pipeline
+    // check — M3.22 deleted the dead, zero-caller `validate()` pass that used to
+    // duplicate this alongside `Shared*`).
 
     /// `hist[i]` where `i` is not `U32` — no implicit coercion (anti-pattern #1).
     #[error("local array index must be `u32`; got `{got}` (no implicit coercion — anti-pattern #1)")]
@@ -787,9 +788,9 @@ pub enum TypecheckError {
 
     /// Aggregate local-array memory > 4096 bytes — compile-time ceiling exceeded
     /// (M3.20 spec §6). This is the REACHABLE aggregate check (mirrors
-    /// `SharedMemoryTooLarge`'s placement here in `typecheck_kernel_body`); the
-    /// `HirError::LocalArrayTooLarge` variant in `validate.rs` mirrors the same
-    /// shared precedent's post-lowering `validate()` pass duplication.
+    /// `SharedMemoryTooLarge`'s placement here in `typecheck_kernel_body`). M3.22
+    /// deleted `validate.rs`'s dead, zero-caller `validate()` pass, which used to
+    /// duplicate this check post-lowering — this is now the sole check.
     #[error("kernel uses {total_bytes} bytes of local-array storage (sum of all local arrays), exceeding the compile-time maximum of 4096 bytes; reduce local array sizes or use shared[T,N] for workgroup-cooperative data")]
     LocalArrayTooLarge {
         total_bytes: u64,
@@ -950,11 +951,15 @@ impl<'p> TypeChecker<'p> {
     }
 
     /// Register a new shared array declaration.
+    ///
+    /// `len_hole`: `Some(name)` when the declaration's length is an unresolved
+    /// `?name` hole (M3.22) — `ty.len` then holds the placeholder `1`.
     /// Returns `Some(SharedId)` on success, `None` on duplicate (error pushed).
     fn register_shared(
         &mut self,
         name: &str,
         ty: SharedTy,
+        len_hole: Option<String>,
         span: Span,
     ) -> Option<SharedId> {
         if self.shared_name_map.contains_key(name) {
@@ -990,6 +995,7 @@ impl<'p> TypeChecker<'p> {
             name: name.to_owned(),
             ty,
             span,
+            len_hole,
         });
         self.shared_name_map.insert(name.to_owned(), idx);
         Some(id)
@@ -1414,8 +1420,8 @@ pub fn typecheck_kernel_body(
                 }
             }
             // M3.2: workgroup-shared array declaration.
-            past::Stmt::SharedDecl { name, elem, len } => {
-                if let Some(stmt) = check_shared_decl_stmt(&mut tc, name, elem, len, spanned_stmt.span) {
+            past::Stmt::SharedDecl { name, elem, len, len_hole } => {
+                if let Some(stmt) = check_shared_decl_stmt(&mut tc, name, elem, len, len_hole, spanned_stmt.span) {
                     hir_stmts.push(stmt);
                 }
             }
@@ -1434,7 +1440,12 @@ pub fn typecheck_kernel_body(
     // M3.2: Check aggregate shared-memory size limits.
     // - > MAX_SHARED_BYTES (65536) → SharedMemoryTooLarge hard error.
     // - > PORTABLE_MIN_SHARED_BYTES (16384) → advisory warning.
-    {
+    //
+    // M3.22: skipped entirely when any shared decl still carries an unresolved
+    // `len_hole` — its placeholder length (1) would spuriously undercount the
+    // aggregate. Mirrors `lower.rs`'s existing skip of workgroup-dim validation
+    // when `@workgroup` has holes.
+    if !tc.shared_decls.iter().any(|s| s.len_hole.is_some()) {
         use crate::shared::{MAX_SHARED_BYTES, PORTABLE_MIN_SHARED_BYTES};
         let total_bytes: u64 = tc.shared_decls.iter()
             .map(|s| s.ty.total_byte_size())
@@ -2041,8 +2052,8 @@ fn typecheck_block_stmts(tc: &mut TypeChecker<'_>, stmts: &[axc_lexer::Spanned<p
                 }
             }
             // M3.2: shared array declarations are allowed in nested blocks too.
-            past::Stmt::SharedDecl { name, elem, len } => {
-                if let Some(stmt) = check_shared_decl_stmt(tc, name, elem, len, spanned_stmt.span) {
+            past::Stmt::SharedDecl { name, elem, len, len_hole } => {
+                if let Some(stmt) = check_shared_decl_stmt(tc, name, elem, len, len_hole, spanned_stmt.span) {
                     hir_stmts.push(stmt);
                 }
             }
@@ -4185,11 +4196,19 @@ fn check_shared_read(
 ///
 /// Validates N > 0, N <= MAX_SHARED_ELEMS, allowed elem type, no collision,
 /// then registers the shared array in the TypeChecker.
+///
+/// M3.22: when `len_hole.is_some()`, `len.node` is the parser's placeholder
+/// `1` — a valid length (`>= 1`, `<= MAX_SHARED_ELEMS`), so the per-declaration
+/// `SharedZeroLength`/`SharedTooLarge` checks below run unchanged and pass. The
+/// hole name is carried into the registered `SharedDecl` additively; the
+/// AGGREGATE shared-byte check (below, in the caller) is skipped separately
+/// for any kernel with an unresolved hole.
 fn check_shared_decl_stmt(
     tc: &mut TypeChecker<'_>,
     name: &axc_lexer::Spanned<String>,
     elem: &axc_parser::ast::ScalarTypeRef,
     len: &axc_lexer::Spanned<u32>,
+    len_hole: &Option<axc_lexer::Spanned<String>>,
     stmt_span: Span,
 ) -> Option<HirStmt> {
     // Validate element type.
@@ -4244,7 +4263,8 @@ fn check_shared_decl_stmt(
     }
 
     let ty = SharedTy { elem: elem_ty, len: n };
-    let maybe_id = tc.register_shared(&name.node, ty, stmt_span);
+    let hole_name: Option<String> = len_hole.as_ref().map(|h| h.node.clone());
+    let maybe_id = tc.register_shared(&name.node, ty, hole_name, stmt_span);
 
     let shared_id = maybe_id?;
 

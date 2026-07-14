@@ -2,20 +2,30 @@
 //!
 //! AT-2958: spirv-val clean on BOTH emitted kernel modules (runs unconditionally,
 //! no GPU required).
-//! AT-2959/AT-2960: two-stage sequential GPU dispatch (`partial_reduce` then
-//! `final_reduce`, two independent pipelines — the "N separate SPIR-V modules"
-//! v1 architecture, §3 of the spec) is bit-exact vs a CPU `i64`-accumulated sum
-//! oracle (`max_diff == 0`, i32 addition is associative so grouping cannot
-//! perturb the result). Runs on whichever real Vulkan device is available
-//! (NVIDIA when `AXC_ENABLE_GPU_TESTS=1` + a discrete GPU; Lavapipe as the CI
+//! AT-2959/AT-2960 (== AT-2977 as of M3.22, the shared-len hole restoration):
+//! two-stage sequential GPU dispatch (`partial_reduce` then `final_reduce`, two
+//! independent pipelines — the "N separate SPIR-V modules" v1 architecture, §3
+//! of the spec) is bit-exact vs a CPU `i64`-accumulated sum oracle (`max_diff
+//! == 0`, i32 addition is associative so grouping cannot perturb the result).
+//! Runs on whichever real Vulkan device is available (NVIDIA when
+//! `AXC_ENABLE_GPU_TESTS=1` + a discrete GPU; Lavapipe as the CI
 //! software-rasterizer fallback) — the SAME test code proves both legs, since
 //! this kernel uses only `shared[i32,N]` + `workgroup_barrier()` + `gid()` +
 //! `local_invocation_id()`, all shipped since M3.2/M3.3d with no coopmat
 //! dependency requiring a typed-skip.
+//!
+//! M3.22 restored the shared-len hole (`shared[i32, ?WG]`, both kernels — the
+//! M3.21 deviation is closed) into the source this file compiles, so
+//! AT-2959/AT-2960 now ALSO exercise the textual substitution path (§1.1/§1.2b
+//! of the M3.22 spec) end-to-end through `substitute_strategy_holes` ->
+//! `compile_source_with_meta_kernel` -> dispatch — this IS AT-2977.
 
 use std::collections::BTreeMap;
 
-use axc_driver::{compile_module_all, compile_source_with_meta_kernel, substitute_strategy_holes};
+use axc_driver::{
+    compile_module_all, compile_source_with_assignments, compile_source_with_meta,
+    compile_source_with_meta_kernel, substitute_strategy_holes,
+};
 use axc_runtime::VulkanContext;
 
 const TWO_PASS_REDUCE_SRC: &str = include_str!("../../../examples/two_pass_reduce.axc");
@@ -48,6 +58,56 @@ fn at_2945_two_pass_reduce_has_two_kernels() {
     assert_eq!(hir.kernels.len(), 2, "two_pass_reduce.axc must declare exactly 2 kernels");
     assert_eq!(hir.kernels[0].name, "partial_reduce");
     assert_eq!(hir.kernels[1].name, "final_reduce");
+}
+
+/// AT-2974 (M3.22, the confirmed-on-main bug this milestone fixes): the raw,
+/// UNSUBSTITUTED source (`shared[i32, ?WG]` in both kernels) parses AND
+/// lowers with ZERO hir errors — i.e. discovery's full lower+typecheck pass on
+/// the placeholder `SharedTy.len == 1` succeeds (per-decl `SharedZeroLength`/
+/// `SharedTooLarge` and the OQ1/OQ2 barrier/cross-slot analysis are all
+/// length-independent or trivially satisfied at len=1) — mirroring
+/// `run_optimize`'s own parse-then-lower_module sequence (`optimize.rs:87-96`),
+/// which does NOT abort on `hir_errs` here. `union_module_holes` then
+/// discovers the shared `WG` hole across both kernels — the flow that
+/// aborted at parse before this milestone's fix now completes end-to-end.
+#[test]
+fn at_2974_raw_source_discovers_wg_hole_via_union_module_holes() {
+    let (ast, lex_errs, parse_errs) = axc_parser::parse(TWO_PASS_REDUCE_SRC);
+    assert!(lex_errs.is_empty() && parse_errs.is_empty(), "lex/parse errors: {lex_errs:?} {parse_errs:?}");
+    let (hir, hir_errs, _warns) = axc_hir::lower_module(&ast);
+    assert!(
+        hir_errs.is_empty(),
+        "raw discovery lower must NOT abort on hir_errs (mirrors optimize.rs:96): {hir_errs:?}"
+    );
+
+    let holes = axc_optimize::enumerator::union_module_holes(&hir)
+        .expect("union_module_holes must succeed on the raw two-kernel source");
+    assert_eq!(holes.map.len(), 1, "expected exactly one shared hole axis; got {:?}", holes.map);
+    assert_eq!(holes.map.get("WG"), Some(&vec![64_i64]), "WG must be discovered with candidate [64]");
+}
+
+/// AT-2975 (golden-identity): textual substitution `?WG`->`64` of
+/// `shared[i32,?WG]` compiles to SPIR-V byte-identical to compiling the
+/// pre-fix literal `shared[i32,64]` source — proves the parser fix adds NO
+/// codegen change on the substituted (compile) path.
+#[test]
+fn at_2975_substituted_shared_hole_compiles_byte_identical_to_literal() {
+    let hole_src = "@kernel @workgroup(64,1,1) @strategy { WG: ?[64] } \
+                    fn k() -> void { shared t: shared[i32, ?WG]; return; }";
+    let lit_src = "@kernel @workgroup(64,1,1) \
+                   fn k() -> void { shared t: shared[i32, 64]; return; }";
+
+    let mut assignments: BTreeMap<String, i64> = BTreeMap::new();
+    assignments.insert("WG".to_string(), 64);
+    let (hole_bytes, _hole_meta) = compile_source_with_assignments(hole_src, &assignments)
+        .expect("substituted-hole source must compile");
+    let (lit_bytes, _lit_meta) = compile_source_with_meta(lit_src)
+        .expect("literal source must compile");
+
+    assert_eq!(
+        hole_bytes, lit_bytes,
+        "substituted-hole SPIR-V must be byte-identical to the pre-fix literal form"
+    );
 }
 
 /// AT-2956 (real-file corroboration): resolving ?WG=64 rewrites BOTH kernels'

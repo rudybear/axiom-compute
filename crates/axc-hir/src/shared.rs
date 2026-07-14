@@ -24,7 +24,9 @@ pub const PORTABLE_MIN_SHARED_BYTES: u32 = 16384;
 /// Maximum total shared memory bytes enforced at compile time.
 ///
 /// Any single kernel whose aggregate `sum(total_byte_size())` exceeds this is rejected
-/// with `HirError::SharedMemoryTooLarge` — independent of device limits.
+/// with `TypecheckError::SharedMemoryTooLarge` — independent of device limits. (M3.22:
+/// the check is skipped for a kernel with an unresolved shared-len hole, since the
+/// placeholder length is not the real size — see `SharedDecl::len_hole`.)
 pub const MAX_SHARED_BYTES: u64 = 65536;
 
 /// Opaque identifier for a workgroup-shared array within a kernel body.
@@ -107,10 +109,21 @@ pub struct SharedDecl {
     pub id: SharedId,
     /// Source-level name (e.g. `"tile"`).
     pub name: String,
-    /// Element type and length.
+    /// Element type and length. When `len_hole.is_some()`, `ty.len` holds the
+    /// placeholder `1` (the real length is not yet known).
     pub ty: SharedTy,
     /// Source span of the full declaration for error messages.
     pub span: Span,
+    /// M3.22: `Some(name)` when `shared[T, ?name]` — an unresolved hole in
+    /// length position (additive; `None` for the common literal-length case).
+    ///
+    /// Resolved to a concrete literal (clearing this field) either by textual
+    /// substitution before parse (`axc_driver::substitute_strategy_holes`), or
+    /// by the enumerator's `resolve_single_variant`. If a module still carries
+    /// `Some(_)` here at codegen time, `emit_module` refuses with
+    /// `CodegenError::UnresolvedSharedLenHole` (fail-closed backstop) rather
+    /// than sizing an `OpTypeArray` from the placeholder `1`.
+    pub len_hole: Option<String>,
 }
 
 /// Returns `true` if `ty` is an allowed shared-array element type.

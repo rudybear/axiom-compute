@@ -107,6 +107,22 @@ pub enum CodegenError {
         kernel_name: String,
         holes: Vec<String>,
     },
+    /// M3.22: Backstop guard — a `shared[T, ?name]` length hole must be resolved
+    /// to a concrete literal before codegen. This catches a declared-but-
+    /// unassigned or typo'd hole that survived F2's `@strategy` strip (the
+    /// `UnresolvedStrategyHole` backstop above only inspects
+    /// `kernel.annotations.strategy`, which is already `None` by the time F2
+    /// strips it — a shared-len hole is carried separately in the body, so it
+    /// needs its own guard). Refusing here is required so codegen never sizes
+    /// an `OpTypeArray` from the placeholder length (1).
+    #[error(
+        "kernel `{kernel_name}` has an unresolved shared-array length hole `?{name}`; \
+         resolve via axc-optimize (or textual substitution) before calling emit_module"
+    )]
+    UnresolvedSharedLenHole {
+        kernel_name: String,
+        name: String,
+    },
 }
 
 /// Emit a SPIR-V word stream (`Vec<u32>`) from a validated HIR module.
@@ -134,6 +150,17 @@ pub fn emit_module(hir: &HirModule, opts: &CodegenOptions) -> Result<Vec<u32>, C
             kernel_name: kernel.name.clone(),
             holes: hole_names,
         });
+    }
+
+    // M3.22: Backstop guard — refuse to emit SPIR-V if a shared-array length
+    // hole (`shared[T, ?name]`) is unresolved. See `CodegenError::UnresolvedSharedLenHole`.
+    if let KernelBody::Typed(ref tb) = kernel.body {
+        if let Some(unresolved) = tb.shared.iter().find(|s| s.len_hole.is_some()) {
+            return Err(CodegenError::UnresolvedSharedLenHole {
+                kernel_name: kernel.name.clone(),
+                name: unresolved.len_hole.clone().unwrap_or_default(),
+            });
+        }
     }
 
     let wg = &kernel.annotations.workgroup;
@@ -1891,6 +1918,36 @@ mod tests {
                     "holes should list 'workgroup_x'; got {holes:?}");
             }
             other => panic!("expected UnresolvedStrategyHole, got {other:?}"),
+        }
+    }
+
+    // ── M3.22: AT-2976 — codegen backstop for unresolved shared-len holes ─────
+
+    /// AT-2976: `emit_module` must return `UnresolvedSharedLenHole` when a
+    /// kernel's typed body carries a shared decl whose `len_hole.is_some()` (a
+    /// declared-but-unassigned or typo'd `?WG` that survived F2's `@strategy`
+    /// strip — here, simply never declared in `@strategy` at all). Mirrors
+    /// AT-1013: codegen must refuse rather than size an `OpTypeArray` from the
+    /// placeholder length (1).
+    #[test]
+    fn at_2976_codegen_rejects_unresolved_shared_len_hole() {
+        let src = "@kernel @workgroup(64,1,1) fn mykern2() -> void { \
+                   shared t: shared[i32, ?WG]; return; }";
+        let (ast, lex_errs, parse_errs) = parse(src);
+        assert!(lex_errs.is_empty(), "lex errors: {lex_errs:?}");
+        assert!(parse_errs.is_empty(), "parse errors: {parse_errs:?}");
+        let (hir, _hir_errs, _warns) = lower_module(&ast);
+        // HIR construction succeeds regardless of the undeclared-hole diagnostic
+        // (AT-2974's finding) — the backstop below is the hard guarantee.
+        assert_eq!(hir.kernels.len(), 1);
+
+        let result = emit_module(&hir, &CodegenOptions::default());
+        match result {
+            Err(CodegenError::UnresolvedSharedLenHole { ref kernel_name, ref name }) => {
+                assert_eq!(kernel_name, "mykern2", "kernel_name should be 'mykern2'; got {kernel_name:?}");
+                assert_eq!(name, "WG", "name should be 'WG'; got {name:?}");
+            }
+            other => panic!("expected UnresolvedSharedLenHole, got {other:?}"),
         }
     }
 }

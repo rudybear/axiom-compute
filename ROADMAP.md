@@ -2,7 +2,7 @@
 
 This document is the **comprehensive remaining work plan** as of 2026-04-28. The project's first 13 milestones (M0 → M2.6) are merged on `main`; this plan covers what's left to reach the thesis claims in `DESIGN.md` §5 (kill criteria) and beyond.
 
-Last updated: 2026-04-28. Test count baseline: **713**.
+Last updated: 2026-07-15 (M3.22). Test count baseline: **1339** (full workspace `cargo test`, incl. doc-tests and GPU-gated `#[ignore]` tests; this baseline line itself lagged several milestones behind — the historical **713** was as of 2026-04-28).
 
 ---
 
@@ -404,10 +404,11 @@ IMPLEMENTED as M3.21 — the LAST substantive non-gated feature gap. N kernels p
 | M3.18 W1/W2 (pessimistic code review, both fail-loud): early-return SKIPPED paths discard accumulated `worst` (latent, unreachable today — fold into record_worst) + `negate_one` unsound for f32 ge/le at large magnitudes (unreachable by v1 alpha-pin) | low | 100 LOC |
 | M3.16 W1/W2 (routed from pessimistic code review, both safe-direction): `rel:` comparator near-zero denominator (seed-pinned in AT-2855) + `within_ulp_f32` sign-boundary false-mismatch — candidates for a condition-aware tolerance follow-up | low | 300 LOC |
 | M3.19 low warts (pessimistic code review, none gate): out-of-i64-range int literals in annotation args silently clamp to i64::MAX/MIN with no diagnostic (parser.rs — reject instead); log-opt inserts LF separator into CRLF files; no per-note length cap on MCP append_optimization_log | low | 100 LOC |
-| `validate()` in axc-hir has ZERO callers workspace-wide (discovered M3.20) — HirError::SharedMemoryTooLarge/LocalArrayTooLarge there are dead code; the reachable checks live in typecheck. Either wire validate() into the pipeline or fold its checks into typecheck and delete | medium | 200 LOC |
+| ~~`validate()` in axc-hir has ZERO callers workspace-wide (discovered M3.20) — HirError::SharedMemoryTooLarge/LocalArrayTooLarge there are dead code; the reachable checks live in typecheck. Either wire validate() into the pipeline or fold its checks into typecheck and delete~~ ✅ RESOLVED (M3.22): FOLD-AND-DELETE — every check duplicated a reachable typecheck/lower equivalent, nothing unique to fold; `validate()` + the two dead `HirError` twins deleted, AT-2980..2982 | — | — |
 | M3.20 nit: identical same-shape local arrays emit redundant duplicate OpTypeArray ids (valid SPIR-V, minor size waste) | low | 50 LOC |
-| Pre-existing parser gap (discovered M3.21): `shared[T,N]` length position never accepted a `HoleRef` (`shared[i32,?WG]` fails to parse — confirmed on main) — blocks hole-tuned shared tiles; fix in axc-parser + AT | medium | 150 LOC |
+| ~~Pre-existing parser gap (discovered M3.21): `shared[T,N]` length position never accepted a `HoleRef` (`shared[i32,?WG]` fails to parse — confirmed on main) — blocks hole-tuned shared tiles; fix in axc-parser + AT~~ ✅ RESOLVED (M3.22): `parse_shared_len` accepts a HoleRef (additive `SharedDecl.len_hole`); `resolve_single_variant` substitutes it by name; fail-closed `UnresolvedSharedLenHole` codegen backstop; `two_pass_reduce.axc` restored to `shared[i32,?WG]` (closes the M3.21 deviation), bit-exact on NVIDIA + Lavapipe (AT-2977); AT-2973..2977, AT-2979, AT-2983, AT-2984 | — | — |
 | M3.21 PCR-2 (accepted residual): `--all` multi-file write loop isn't atomic — a mid-loop I/O error leaves partial artifacts (same class as pre-existing single-kernel .spv-then-sidecar); tempfile-rename discipline would close it | low | 100 LOC |
+| `array[T,N]` length position does not accept a `HoleRef` — symmetric to the shared gap closed in M3.22 (§3 of the M3.22 spec); deliberately deferred (no driving example; symmetric plumbing would roughly double the touch-sites of a corpus-golden-re-blessing parser change); guarded by AT-2978 (negative test pins the deferral) | low | 120 LOC |
 
 ---
 
