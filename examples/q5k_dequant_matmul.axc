@@ -1,0 +1,131 @@
+// q5k_dequant_matmul.axc — M3.14b: multi-row Q5_K_M dequant + matmul (NO coopmat).
+//
+// Mirrors examples/q4km_dequant_matmul.axc (M3.1) VERBATIM except: block stride 176 (not 144);
+// qs base = base+48 (not base+16); qh base = base+16 (NEW); and the nibble->5-bit promotion of
+// §3.2 (`nib5 = nib + hi*16`). Scale/min decode (get_scale_min_k4, d*sc, dmin*m) is
+// byte-identical to Q4_K_M. All-unsigned — no signed technique needed.
+//
+// Layout (block_q5_K, K_SCALE_SIZE=12 variant, 176 bytes / 256 weights — FROZEN §3.2):
+//   q: weight matrix as n_rows consecutive weight-rows, row-major.
+//      weight-row `row` = bytes [row * n_blocks_per_row * 176 .. (row+1) * n_blocks_per_row * 176]
+//      Each 176-byte superblock:
+//        [0..2)     d         ggml_half super-scale (for the 6-bit scales)
+//        [2..4)     dmin      ggml_half super-min  (for the 6-bit mins)
+//        [4..16)    scales[12] packed 8x(6-bit scale, 6-bit min) — IDENTICAL to Q4_K_M
+//        [16..48)   qh[32]    high bit of each weight (QK_K/8 = 32)
+//        [48..176)  qs[128]   low 4 bits of each weight (2 nibbles/byte) — IDENTICAL to Q4_K_M qs
+//   x: dense input matrix, column-of-output-major: x[k * n_cols + col], k in 0..n_blocks_per_row*256.
+//   y: output, row-major: y[row * n_cols + col].
+//
+// DEQUANT: chunk = k/64 (0..3), l = (k%64)%32 (0..31), is_hi = (k%64)/32 (0=lo,1=hi),
+// is = chunk*2 + is_hi (ALSO the qh_bit_index — both use the SAME `chunk*2+is_hi` formula, so a
+// single is0/is1 per chunk drives BOTH the get_scale_min_k4 lookup AND the qh bit-shift amount):
+//   nib   = (is_hi==0) ? (qs[chunk*32+l] & 0x0F) : ((qs[chunk*32+l] >> 4) & 0x0F)
+//   hi    = (qh[l] >> is) & 1
+//   nib5  = nib + hi*16                                  // 0..31, UNSIGNED
+//   y[k]  = d*sc[is] * nib5 - dmin*m[is]                 // SAME multiply-then-subtract as Q4_K_M
+//
+// Bit-exact vs q5k_oracle::q5k_dequant_matmul_f32_cpu for a K=256 fixture (AT-2819).
+// NOT #[ignore] — runs on Lavapipe AND NVIDIA.
+//
+// Anti-pattern #2: explicit `return;`.
+// Anti-pattern #8: no `>>` (use shr/lshr for shifts).
+
+@kernel
+@workgroup(64, 1, 1)
+@intent("Multi-row Q5_K_M dequant + matmul: y[row,col] = sum_k dequant_q5k(q[row,k]) * x[k,col]")
+@complexity(O(n))
+@precondition(true)
+fn q5k_dequant_matmul(
+    q: readonly_buffer[u8],
+    x: readonly_buffer[f32],
+    y: buffer[f32],
+    n_rows: u32,
+    n_cols: u32,
+    n_blocks_per_row: u32,
+) -> void {
+    let i: u32 = gid(0u32);
+    let total_outputs: u32 = n_rows * n_cols;
+    if i >= total_outputs { return; }
+    let row: u32 = i / n_cols;
+    let col: u32 = i - row * n_cols;
+    let mut sum: f32 = 0.0f32;
+    // Walk all superblocks for this weight row.
+    for sb in range(0u32, n_blocks_per_row) {
+        // Byte offset of superblock sb in weight-row `row` (176 bytes/superblock — NOT 144).
+        let base: u32 = row * n_blocks_per_row * 176u32 + sb * 176u32;
+        // Load super-scale d and super-min dmin (f16, bytes [base..base+4]) — byte-identical Q4_K_M.
+        let d_bits: u32 = ptr_read_u16_zext(q, base);
+        let dmin_bits: u32 = ptr_read_u16_zext(q, base + 2u32);
+        let d: f32 = f16_bits_to_f32(d_bits);
+        let dmin: f32 = f16_bits_to_f32(dmin_bits);
+        let scales_base: u32 = base + 4u32;
+        let qh_base: u32 = base + 16u32;   // NEW vs Q4_K_M.
+        let qs_base: u32 = base + 48u32;   // was base+16u32 in Q4_K_M.
+        // Four chunks of 64 elements each (4 * 64 = 256 per superblock).
+        for chunk in range(0u32, 4u32) {
+            let is0: u32 = chunk * 2u32;
+            let is1: u32 = is0 + 1u32;
+            // Inline get_scale_min_k4 for sub-block is0 — byte-identical to Q4_K_M.
+            let mut sc0: u32 = 0u32;
+            let mut m0: u32 = 0u32;
+            if is0 < 4u32 {
+                sc0 = band(ptr_read_u8_zext(q, scales_base + is0), 63u32);
+                m0  = band(ptr_read_u8_zext(q, scales_base + is0 + 4u32), 63u32);
+            } else {
+                let lo4_sc: u32 = band(ptr_read_u8_zext(q, scales_base + is0 + 4u32), 0x0Fu32);
+                let hi2_sc: u32 = band(lshr(ptr_read_u8_zext(q, scales_base + is0 - 4u32), 6u32), 0x03u32);
+                sc0 = bor(lo4_sc, shl(hi2_sc, 4u32));
+                let lo4_m: u32 = band(lshr(ptr_read_u8_zext(q, scales_base + is0 + 4u32), 4u32), 0x0Fu32);
+                let hi2_m: u32 = band(lshr(ptr_read_u8_zext(q, scales_base + is0), 6u32), 0x03u32);
+                m0 = bor(lo4_m, shl(hi2_m, 4u32));
+            }
+            // Inline get_scale_min_k4 for sub-block is1 — byte-identical to Q4_K_M.
+            let mut sc1: u32 = 0u32;
+            let mut m1v: u32 = 0u32;
+            if is1 < 4u32 {
+                sc1 = band(ptr_read_u8_zext(q, scales_base + is1), 63u32);
+                m1v = band(ptr_read_u8_zext(q, scales_base + is1 + 4u32), 63u32);
+            } else {
+                let lo4_sc1: u32 = band(ptr_read_u8_zext(q, scales_base + is1 + 4u32), 0x0Fu32);
+                let hi2_sc1: u32 = band(lshr(ptr_read_u8_zext(q, scales_base + is1 - 4u32), 6u32), 0x03u32);
+                sc1 = bor(lo4_sc1, shl(hi2_sc1, 4u32));
+                let lo4_m1: u32 = band(lshr(ptr_read_u8_zext(q, scales_base + is1 + 4u32), 4u32), 0x0Fu32);
+                let hi2_m1: u32 = band(lshr(ptr_read_u8_zext(q, scales_base + is1), 6u32), 0x03u32);
+                m1v = bor(lo4_m1, shl(hi2_m1, 4u32));
+            }
+            // Per-sub-block scale and min coefficients.
+            let d1:  f32 = d    * f32_from_u32(sc0);
+            let m1f: f32 = dmin * f32_from_u32(m0);
+            let d2:  f32 = d    * f32_from_u32(sc1);
+            let m2f: f32 = dmin * f32_from_u32(m1v);
+            // Inner 32-iteration loop: each qs byte has lo nibble (is0) and hi nibble (is1).
+            for l in range(0u32, 32u32) {
+                let byte_off: u32 = qs_base + chunk * 32u32 + l;
+                let byte: u32 = ptr_read_u8_zext(q, byte_off);
+                let lo_nib: u32 = band(byte, 0x0Fu32);
+                let hi_nib: u32 = band(lshr(byte, 4u32), 0x0Fu32);
+
+                // qh[l] holds the high bit for ALL 8 (chunk,is_hi) combos of this l (one byte,
+                // 8 bit positions); the bit-shift amount is is0/is1 (== qh_bit_index, same formula
+                // as the scale sub-block index — see the header comment).
+                let qh_byte: u32 = ptr_read_u8_zext(q, qh_base + l);
+                let hi_bit_lo: u32 = band(lshr(qh_byte, is0), 1u32);
+                let hi_bit_hi: u32 = band(lshr(qh_byte, is1), 1u32);
+                let nib5_lo: u32 = lo_nib + hi_bit_lo * 16u32;
+                let nib5_hi: u32 = hi_nib + hi_bit_hi * 16u32;
+
+                let lo_f: f32 = d1 * f32_from_u32(nib5_lo) - m1f;
+                let hi_f: f32 = d2 * f32_from_u32(nib5_hi) - m2f;
+                // k indices for x access (column-of-output-major layout).
+                let k_lo: u32 = sb * 256u32 + chunk * 64u32 + l;
+                let k_hi: u32 = sb * 256u32 + chunk * 64u32 + 32u32 + l;
+                let x_lo: f32 = x[k_lo * n_cols + col];
+                let x_hi: f32 = x[k_hi * n_cols + col];
+                sum = sum + lo_f * x_lo + hi_f * x_hi;
+            }
+        }
+    }
+    y[row * n_cols + col] = sum;
+    return;
+}

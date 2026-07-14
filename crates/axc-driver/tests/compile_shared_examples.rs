@@ -2257,3 +2257,247 @@ fn at_2703_ablation_variants_compile_capset_identical() {
          correctness gate (AT-2705)."
     );
 }
+
+// ── AT-2813/AT-2818/AT-2821: M3.14 Q6_K + Q5_K_M — compile + spirv-val + no-new-capability ────
+//            + referenced-builtin-set ⊆ baseline ("zero-NEW-builtin anchor", r2 FIX-3) ──────────
+
+/// Extract the set of "identifier(" call-site names referenced in AXIOM source text (a
+/// mechanical proxy for the referenced-builtin set — AT-2813/2818/2821). Strips `//` line
+/// comments AND double-quoted string literal contents (e.g. `@intent("...")` free-text, which
+/// otherwise produces false "identifier(" matches like a documentation mention of
+/// `dequant_q6k(...)` inside the intent string), and EXCLUDES the kernel's own declared
+/// `fn <name>(` identifier(s) (so the function's own name at its declaration site is not
+/// mistaken for a "call"). This is a set-INCLUSION check (⊆ baseline), NOT an "only reserved
+/// builtins" check — the r2 FIX-3 wording: kernels legitimately call
+/// band/bor/gid/coopmat_*/workgroup_barrier, none of which are in RESERVED_Q4_0_BUILTIN_NAMES,
+/// so the meaningful mechanical guard is
+/// referenced_call_names(new) ⊆ referenced_call_names(baseline) — no ADDITION.
+fn referenced_call_names(src: &str) -> std::collections::BTreeSet<String> {
+    use std::collections::BTreeSet;
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for line in src.lines() {
+        let no_comment: &str = match line.find("//") {
+            Some(pos) => &line[..pos],
+            None => line,
+        };
+        // Blank out double-quoted string literal CONTENTS (naive, non-escape-aware — sufficient
+        // for this codebase's single-line annotation strings) so free-text mentions of builtin-
+        // looking names inside @intent(...) don't produce false matches.
+        let mut code_buf: String = String::with_capacity(no_comment.len());
+        let mut in_string = false;
+        for ch in no_comment.chars() {
+            if ch == '"' {
+                in_string = !in_string;
+                code_buf.push(' ');
+            } else if in_string {
+                code_buf.push(' ');
+            } else {
+                code_buf.push(ch);
+            }
+        }
+        let code: &str = &code_buf;
+        let bytes = code.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                let mut j = i;
+                while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b'(' {
+                    names.insert(code[start..i].to_string());
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+    for decl_name in declared_fn_names(src) {
+        names.remove(&decl_name);
+    }
+    names
+}
+
+/// Extract all `fn <name>(` declared identifiers from AXIOM source text (used to exclude a
+/// kernel's own name from `referenced_call_names`'s mechanical "identifier(" scan).
+fn declared_fn_names(src: &str) -> std::collections::BTreeSet<String> {
+    use std::collections::BTreeSet;
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    let bytes = src.as_bytes();
+    let mut search_from = 0usize;
+    while let Some(rel) = src[search_from..].find("fn ") {
+        let start = search_from + rel + 3;
+        let mut j = start;
+        while j < bytes.len() && bytes[j] == b' ' {
+            j += 1;
+        }
+        let name_start = j;
+        while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+            j += 1;
+        }
+        if j > name_start {
+            out.insert(src[name_start..j].to_string());
+        }
+        search_from = start;
+    }
+    out
+}
+
+/// AT-2813 (M3.14a, CI no-GPU): q6k_dequant_matmul.axc compiles, passes spirv-val, emits a
+/// capability set EQUAL to q4km_dequant_matmul.axc's (no new capability/extension — the signed
+/// int8 scale path is pure-source f32 arithmetic, no signed-int builtin), and its referenced-
+/// builtin set is a SUBSET of q4km_dequant_matmul.axc's builtin set (zero-NEW-builtin anchor;
+/// per the r2 FIX-3 wording this is NOT "only reserved Q4_0 builtins" — the kernel legitimately
+/// also calls band/bor/shl/lshr/gid/f32_from_u32/f16_bits_to_f32, none of which are reserved).
+#[test]
+fn at_2813_q6k_dequant_matmul_compiles_capset_and_builtinset() {
+    use std::collections::BTreeSet;
+
+    let q6k_src = include_str!("../../../examples/q6k_dequant_matmul.axc");
+    let q4km_src = include_str!("../../../examples/q4km_dequant_matmul.axc");
+
+    let q6k_words = compile_words(q6k_src, None, "q6k_dequant_matmul.axc");
+    let q4km_words = compile_words(q4km_src, None, "q4km_dequant_matmul.axc");
+
+    let (q6k_caps, q6k_exts) = capability_extension_sets(&q6k_words);
+    let (q4km_caps, q4km_exts) = capability_extension_sets(&q4km_words);
+
+    let q6k_cap_set: BTreeSet<u32> = q6k_caps.iter().copied().collect();
+    let q4km_cap_set: BTreeSet<u32> = q4km_caps.iter().copied().collect();
+    assert_eq!(
+        q6k_cap_set, q4km_cap_set,
+        "AT-2813: q6k_dequant_matmul.axc capability set must EQUAL q4km_dequant_matmul.axc's \
+         (q6k={q6k_caps:?}, q4km={q4km_caps:?})"
+    );
+    assert_eq!(
+        q6k_exts, q4km_exts,
+        "AT-2813: q6k_dequant_matmul.axc extension set must EQUAL q4km_dequant_matmul.axc's"
+    );
+
+    let q6k_builtins = referenced_call_names(q6k_src);
+    let q4km_builtins = referenced_call_names(q4km_src);
+    let extra_builtins: Vec<String> = q6k_builtins.difference(&q4km_builtins).cloned().collect();
+    assert!(
+        extra_builtins.is_empty(),
+        "AT-2813: q6k_dequant_matmul.axc references call-site names NOT in \
+         q4km_dequant_matmul.axc's set (zero-NEW-builtin anchor violated): {extra_builtins:?} \
+         (q6k={q6k_builtins:?}, q4km={q4km_builtins:?})"
+    );
+
+    eprintln!(
+        "AT-2813 PASS: q6k_dequant_matmul.axc compiles + spirv-val clean; caps == q4km baseline \
+         ({q6k_caps:?}); referenced-builtin set ⊆ baseline ({q6k_builtins:?} ⊆ {q4km_builtins:?})"
+    );
+}
+
+/// AT-2818 (M3.14b, CI no-GPU): q5k_dequant_matmul.axc compiles, passes spirv-val, emits a
+/// capability set EQUAL to q4km_dequant_matmul.axc's, and its referenced-builtin set is a
+/// SUBSET of q4km_dequant_matmul.axc's (zero-NEW-builtin anchor; all-unsigned, no new
+/// technique needed beyond the Q4_K_M builtin set).
+#[test]
+fn at_2818_q5k_dequant_matmul_compiles_capset_and_builtinset() {
+    use std::collections::BTreeSet;
+
+    let q5k_src = include_str!("../../../examples/q5k_dequant_matmul.axc");
+    let q4km_src = include_str!("../../../examples/q4km_dequant_matmul.axc");
+
+    let q5k_words = compile_words(q5k_src, None, "q5k_dequant_matmul.axc");
+    let q4km_words = compile_words(q4km_src, None, "q4km_dequant_matmul.axc");
+
+    let (q5k_caps, q5k_exts) = capability_extension_sets(&q5k_words);
+    let (q4km_caps, q4km_exts) = capability_extension_sets(&q4km_words);
+
+    let q5k_cap_set: BTreeSet<u32> = q5k_caps.iter().copied().collect();
+    let q4km_cap_set: BTreeSet<u32> = q4km_caps.iter().copied().collect();
+    assert_eq!(
+        q5k_cap_set, q4km_cap_set,
+        "AT-2818: q5k_dequant_matmul.axc capability set must EQUAL q4km_dequant_matmul.axc's \
+         (q5k={q5k_caps:?}, q4km={q4km_caps:?})"
+    );
+    assert_eq!(
+        q5k_exts, q4km_exts,
+        "AT-2818: q5k_dequant_matmul.axc extension set must EQUAL q4km_dequant_matmul.axc's"
+    );
+
+    let q5k_builtins = referenced_call_names(q5k_src);
+    let q4km_builtins = referenced_call_names(q4km_src);
+    let extra_builtins: Vec<String> = q5k_builtins.difference(&q4km_builtins).cloned().collect();
+    assert!(
+        extra_builtins.is_empty(),
+        "AT-2818: q5k_dequant_matmul.axc references call-site names NOT in \
+         q4km_dequant_matmul.axc's set (zero-NEW-builtin anchor violated): {extra_builtins:?} \
+         (q5k={q5k_builtins:?}, q4km={q4km_builtins:?})"
+    );
+
+    eprintln!(
+        "AT-2818 PASS: q5k_dequant_matmul.axc compiles + spirv-val clean; caps == q4km baseline \
+         ({q5k_caps:?}); referenced-builtin set ⊆ baseline ({q5k_builtins:?} ⊆ {q4km_builtins:?})"
+    );
+}
+
+/// AT-2821 (M3.14b, CI no-GPU): q5km_matmul_rb_coopmat_f32acc_cached.axc (the M3.6 leader
+/// extended to Q5_K_M) compiles, passes spirv-val, emits a capability set BYTE-IDENTICAL to
+/// the M3.6 leader q4km_matmul_rb_coopmat_f32acc_cached.axc's, reports
+/// shared_memory_bytes == 4096 ((512+512)×2 f16 a/b tiles + (256+256)×4 f32 dsc/dmm caches —
+/// UNCHANGED from M3.6, the extra qh read adds no shared state), and its referenced-builtin set
+/// is a SUBSET of the M3.6 leader's (zero-NEW-builtin anchor; the baseline already uses
+/// coopmat_load/mul_add/store/zero, workgroup_barrier, gid, subgroup builtins).
+#[test]
+fn at_2821_q5km_coopmat_cached_compiles_capset_and_builtinset() {
+    use std::collections::BTreeSet;
+
+    let q5km_src = include_str!("../../../examples/q5km_matmul_rb_coopmat_f32acc_cached.axc");
+    let q4km_leader_src = include_str!("../../../examples/q4km_matmul_rb_coopmat_f32acc_cached.axc");
+
+    let assignments = rb2x2_assignments();
+
+    let (q5km_bytes, meta) = compile_source_with_assignments(q5km_src, &assignments)
+        .unwrap_or_else(|e| panic!("q5km_matmul_rb_coopmat_f32acc_cached.axc: compile failed: {e:?}"));
+    let q5km_words = words_and_validate(q5km_bytes, "q5km_matmul_rb_coopmat_f32acc_cached.axc");
+    let leader_words = compile_words(
+        q4km_leader_src, Some(&assignments), "q4km_matmul_rb_coopmat_f32acc_cached.axc");
+
+    let (q5km_caps, q5km_exts) = capability_extension_sets(&q5km_words);
+    let (leader_caps, leader_exts) = capability_extension_sets(&leader_words);
+
+    let q5km_cap_set: BTreeSet<u32> = q5km_caps.iter().copied().collect();
+    let leader_cap_set: BTreeSet<u32> = leader_caps.iter().copied().collect();
+    assert_eq!(
+        q5km_cap_set, leader_cap_set,
+        "AT-2821: q5km_matmul_rb_coopmat_f32acc_cached.axc capability set must be \
+         BYTE-IDENTICAL to the M3.6 leader's (q5km={q5km_caps:?}, leader={leader_caps:?})"
+    );
+    let extra_exts: Vec<String> = q5km_exts.difference(&leader_exts).cloned().collect();
+    assert!(
+        extra_exts.is_empty(),
+        "AT-2821: q5km kernel declares extensions NOT in the M3.6 leader's set: {extra_exts:?}"
+    );
+
+    // shared_memory_bytes == 4096: a_tile+b_tile (2048) + dsc+dmm cache (2048) — UNCHANGED vs M3.6.
+    let expected_shared_bytes: u32 = (512 + 512) * 2 + 2 * 256 * 4;
+    assert_eq!(
+        meta.shared_memory_bytes, expected_shared_bytes,
+        "AT-2821: shared_memory_bytes must be {expected_shared_bytes} (UNCHANGED vs M3.6 — the \
+         qh read adds no new shared state); got {}", meta.shared_memory_bytes
+    );
+
+    let q5km_builtins = referenced_call_names(q5km_src);
+    let leader_builtins = referenced_call_names(q4km_leader_src);
+    let extra_builtins: Vec<String> = q5km_builtins.difference(&leader_builtins).cloned().collect();
+    assert!(
+        extra_builtins.is_empty(),
+        "AT-2821: q5km_matmul_rb_coopmat_f32acc_cached.axc references call-site names NOT in \
+         the M3.6 leader's set (zero-NEW-builtin anchor violated): {extra_builtins:?} \
+         (q5km={q5km_builtins:?}, leader={leader_builtins:?})"
+    );
+
+    eprintln!(
+        "AT-2821 PASS: q5km_matmul_rb_coopmat_f32acc_cached.axc compiles + spirv-val clean; \
+         caps BYTE-IDENTICAL to M3.6 leader ({q5km_caps:?}); shared_memory_bytes=4096; \
+         referenced-builtin set ⊆ leader ({q5km_builtins:?} ⊆ {leader_builtins:?})"
+    );
+}
