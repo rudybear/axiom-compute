@@ -310,6 +310,7 @@ mod tests {
                 coop_matrix: None,
                 strategy: Some(StrategyHoles { map }),
                 debug_checks: Vec::new(),
+                opt_log: None,
             },
             params: Vec::new(),
             binding_plan: ParamBindingPlan {

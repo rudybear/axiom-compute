@@ -276,6 +276,70 @@ pub enum Command {
         #[arg(long = "strategy-value", value_name = "name=value")]
         strategy_values: Vec<StrategyValue>,
     },
+    /// Append one entry to a kernel source's `@optimization_log { ... }` block
+    /// (M3.19 / FG.3 — the ONE writer). Creates the block if absent. LLM-free,
+    /// GPU-free, CI-runnable. Source-preserving splice: every byte outside the
+    /// spliced region is unchanged (AT-2906).
+    ///
+    /// Three ways to supply the entry:
+    /// 1. Raw flags: `--kernel --metric --unit --verdict` (all four required).
+    /// 2. `--from-verify <VerifyReport.json>`: derives `verdict` from the
+    ///    report (§1.5 exhaustive mapping); `--metric`/`--unit` still apply
+    ///    (default `0`/`ns` — a `rewrite_verify::VerifyReport` is a
+    ///    CORRECTNESS report and carries no throughput number); `--kernel`
+    ///    defaults to the report's rewritten (or original) kernel name.
+    /// 3. `--from-grid <HistoryEntryRecord.json>`: derives `metric`/`unit`
+    ///    from the grid winner (`winner_median_ns`/`ns`) and `verdict` from
+    ///    `--baseline-median-ns` (REGRESS if the winner is slower than the
+    ///    baseline, PASS otherwise, or PASS when no baseline is given);
+    ///    `--kernel` is REQUIRED (a `HistoryEntryRecord` carries no kernel
+    ///    name).
+    ///
+    /// Fails closed (exit 3 = `LogOptError::Full`, exit 4 =
+    /// `LogOptError::Multikernel`, exit 2 = any other usage/parse/malformed
+    /// error) and NEVER partially writes `source`.
+    LogOpt {
+        /// Kernel source file (`.axc`) to append to.
+        source: PathBuf,
+        /// Kernel name for the new entry (raw mode: required; `--from-verify`
+        /// mode: optional override; `--from-grid` mode: required).
+        #[arg(long)]
+        kernel: Option<String>,
+        /// Throughput/latency/size metric (raw mode: required; `--from-verify`
+        /// mode: optional, default `0`; ignored in `--from-grid` mode, which
+        /// always uses `winner_median_ns`).
+        #[arg(long)]
+        metric: Option<i64>,
+        /// Unit for `--metric`: `mtflops|pct_milli|ns|us|ms|bytes` (raw mode:
+        /// required; `--from-verify` mode: optional, default `ns`; ignored in
+        /// `--from-grid` mode, which always uses `ns`).
+        #[arg(long)]
+        unit: Option<String>,
+        /// Verdict: `PASS|FAIL|REJECT|SKIPPED|NONDETERMINISTIC_ORACLE|ERROR|REGRESS`
+        /// (raw mode only — `--from-verify`/`--from-grid` derive it).
+        #[arg(long)]
+        verdict: Option<String>,
+        /// Explicit RFC3339 timestamp. Default: wall-clock `now()` UTC —
+        /// NON-REPRODUCIBLE (fine for production agent/CLI use, but BANNED in
+        /// every golden/round-trip test fixture; those must pass this flag).
+        #[arg(long)]
+        ts: Option<String>,
+        /// Optional free-form note.
+        #[arg(long)]
+        note: Option<String>,
+        /// Ingest a `rewrite_verify::VerifyReport` JSON file instead of
+        /// `--verdict` (mutually exclusive with `--from-grid`).
+        #[arg(long = "from-verify")]
+        from_verify: Option<PathBuf>,
+        /// Ingest a `grid_search::HistoryEntryRecord` JSON file instead of
+        /// `--verdict` (mutually exclusive with `--from-verify`).
+        #[arg(long = "from-grid")]
+        from_grid: Option<PathBuf>,
+        /// `--from-grid` only: prior baseline median ns to compare the grid
+        /// winner against (REGRESS if the winner is slower).
+        #[arg(long = "baseline-median-ns")]
+        baseline_median_ns: Option<u64>,
+    },
 }
 
 #[cfg(test)]
@@ -478,6 +542,96 @@ mod tests {
         match cli.command {
             Command::Verify { json, .. } => assert!(!json),
             other => panic!("expected Command::Verify, got: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    // ── AT-2914: `axc log-opt` CLI parsing (M3.19 / FG.3) ──────────────────────
+
+    /// AT-2914: raw-flag mode parses all four required flags plus `--ts`/`--note`.
+    #[test]
+    fn at_2914_log_opt_raw_flags_parse() {
+        let cli = Cli::parse_from([
+            "axc", "log-opt", "k.axc",
+            "--kernel", "saxpy",
+            "--metric", "42860",
+            "--unit", "mtflops",
+            "--verdict", "PASS",
+            "--ts", "2026-07-14T12:00:00.000Z",
+            "--note", "leader",
+        ]);
+        match cli.command {
+            Command::LogOpt { source, kernel, metric, unit, verdict, ts, note, from_verify, from_grid, baseline_median_ns } => {
+                assert_eq!(source, PathBuf::from("k.axc"));
+                assert_eq!(kernel, Some("saxpy".to_string()));
+                assert_eq!(metric, Some(42860));
+                assert_eq!(unit, Some("mtflops".to_string()));
+                assert_eq!(verdict, Some("PASS".to_string()));
+                assert_eq!(ts, Some("2026-07-14T12:00:00.000Z".to_string()));
+                assert_eq!(note, Some("leader".to_string()));
+                assert_eq!(from_verify, None);
+                assert_eq!(from_grid, None);
+                assert_eq!(baseline_median_ns, None);
+            }
+            other => panic!("expected Command::LogOpt, got: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    /// AT-2914: `--from-verify` mode parses (no `--verdict` required at the CLI layer).
+    #[test]
+    fn at_2914_log_opt_from_verify_parses() {
+        let cli = Cli::parse_from([
+            "axc", "log-opt", "k.axc",
+            "--from-verify", "report.json",
+            "--ts", "2026-07-14T12:00:00.000Z",
+        ]);
+        match cli.command {
+            Command::LogOpt { from_verify, verdict, ts, .. } => {
+                assert_eq!(from_verify, Some(PathBuf::from("report.json")));
+                assert_eq!(verdict, None);
+                assert_eq!(ts, Some("2026-07-14T12:00:00.000Z".to_string()));
+            }
+            other => panic!("expected Command::LogOpt, got: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    /// AT-2914: `--from-grid` mode parses with `--baseline-median-ns`.
+    #[test]
+    fn at_2914_log_opt_from_grid_parses() {
+        let cli = Cli::parse_from([
+            "axc", "log-opt", "k.axc",
+            "--from-grid", "history.json",
+            "--kernel", "matmul",
+            "--baseline-median-ns", "1000",
+        ]);
+        match cli.command {
+            Command::LogOpt { from_grid, kernel, baseline_median_ns, .. } => {
+                assert_eq!(from_grid, Some(PathBuf::from("history.json")));
+                assert_eq!(kernel, Some("matmul".to_string()));
+                assert_eq!(baseline_median_ns, Some(1000));
+            }
+            other => panic!("expected Command::LogOpt, got: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    /// `axc log-opt` (no flags at all) parses fine at the CLI layer — the
+    /// missing-required-combination usage ERROR is raised by `main.rs`'s
+    /// handler, not clap (mirrors the `RewriteVerify`/`emit_usage_error` split).
+    #[test]
+    fn at_2914_log_opt_no_flags_parses_defaults_none() {
+        let cli = Cli::parse_from(["axc", "log-opt", "k.axc"]);
+        match cli.command {
+            Command::LogOpt { kernel, metric, unit, verdict, ts, note, from_verify, from_grid, baseline_median_ns, .. } => {
+                assert_eq!(kernel, None);
+                assert_eq!(metric, None);
+                assert_eq!(unit, None);
+                assert_eq!(verdict, None);
+                assert_eq!(ts, None);
+                assert_eq!(note, None);
+                assert_eq!(from_verify, None);
+                assert_eq!(from_grid, None);
+                assert_eq!(baseline_median_ns, None);
+            }
+            other => panic!("expected Command::LogOpt, got: {:?}", std::mem::discriminant(&other)),
         }
     }
 }

@@ -342,17 +342,19 @@ Three layers over one core: `crates/axc-driver/src/rewrite_verify.rs` (`verify_r
 
 **Effort:** ~2000 LOC. AT-2841..2860.
 
-### FG.2 — `@transfer { ... }` blocks for inter-agent handoff
+### FG.2 — `@transfer { ... }` blocks for inter-agent handoff ⛔ NO-BUILD (M3.19, 2026-07-14, paper finding)
 
-DESIGN.md §3.2 lists `@transfer` as an annotation. Idea: structured handoff between agents with confidence scores ("agent A optimized for tile size; agent B should explore @async_copy"). Currently parsed but no semantics.
+NO-BUILD as M3.19 — the M3.10b falsifiable-value bar fails: no MCP tool reads it TODAY (the registry is exactly 8 tools post-M3.19, none named `transfer`/handoff-reader — AT-2916), the 7-agent supervisor routes via external `.pipeline/runs/*.json` verdict files, and the autotuner consumes `@strategy`. A confidence-scored handoff protocol with nothing that acts on the confidence score is speculative infrastructure. `@transfer` remains rejected as `HirError::UnknownAnnotationInM0` (AT-2915, current-state anchor) — zero parser/AST/HIR/codegen change. Correction to this row's prior "Currently parsed but no semantics" framing: the annotation *name* lexes, but HIR's closed whitelist rejects it outright — it does not compile today.
 
-**Effort:** ~800 LOC + protocol design.
+**Exact revisit trigger:** build it — validate-and-preserve first, then the protocol — when a concrete consumer is specified: EITHER (1) an agent-orchestration MCP tool (a 9th tool, e.g. `next_step`/`route`) is designed to READ a kernel's `@transfer` block and drive the next optimization action, OR (2) the 7-agent supervisor is changed to consume in-source `@transfer` handoff instead of (or alongside) external `.pipeline/runs/*.json` verdicts. Also naturally revisited alongside FG.9 multi-kernel modules. See DESIGN.md §3.1.43.
 
-### FG.3 — `@optimization_log {}` block
+**Effort:** ~800 LOC + protocol design (not spent — NO-BUILD).
 
-Per-kernel embedded history of prior optimization runs. Currently stored externally in `.pipeline/history/<hash>.jsonl` (M2.4). The block embeds it into source so the kernel is self-describing.
+### FG.3 — `@optimization_log {}` block ✅ IMPLEMENTED (M3.19, 2026-07-14, minimal-build)
 
-**Effort:** ~500 LOC.
+IMPLEMENTED as M3.19. Per-kernel embedded, rewrite-surviving history of prior optimization runs — repairs the VERIFIED weakness of the external `.pipeline/history/<xxh3_64(source)>.jsonl` (M2.4), which orphans on every source edit (exactly the operation the agent self-optimize loop performs). Read + validate + round-trip: a CLOSED value grammar (`AnnotationArg::Record`/`RecordField`/`RecordValue` — exactly three scalar shapes, no recursion, so nesting is structurally impossible); HIR schema + validator (`crates/axc-hir/src/opt_log.rs`, `MAX_OPT_LOG_ENTRIES = 64`, `SUPPORTED_OPT_LOG_VERSION = 1`, additive forward-compat via `version > SUPPORTED` preserve-and-warn); ONE writer (`axc log-opt`, LLM-free/GPU-free/CI-runnable, source-preserving splice, fails closed at capacity/on multi-kernel sources) + the `append_optimization_log` MCP tool (the 8th tool). Codegen-inert: byte-identical SPIR-V with/without the block (golden-gated, AT-2903). See DESIGN.md §3.1.43.
+
+**Effort:** ~500 LOC (spec estimate) → ~950 LOC actual (writer + MCP tool + round-trip formatter + r2 grammar hardening were not in the original estimate). AT-2900..2925.
 
 ### FG.4 — `@precondition` / `@postcondition` runtime checks ✅ IMPLEMENTED (M3.17, 2026-07-14)
 

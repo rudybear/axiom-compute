@@ -5,13 +5,14 @@
 //! `@complexity` is mapped to `ComplexityForm` enum values (never a String).
 
 use axc_lexer::Span;
-use axc_parser::ast::{Module as AstModule, Item, AnnotationArg, Stmt, TypeRef, ScalarTypeRef};
+use axc_parser::ast::{Module as AstModule, Item, AnnotationArg, Stmt, TypeRef, ScalarTypeRef, RecordField};
 use crate::hir::{
     Module as HirModule, Kernel, KernelId, KernelAnnotations, WorkgroupDims,
     KernelBody, ComplexityForm, ComplexityVar, PreconditionTrivial, StrategyHoles,
     DebugCheck, DebugCheckKind, DebugCompareOp, DebugOperand,
 };
 use crate::validate::{HirError, HirWarning};
+use crate::opt_log::OptimizationLog;
 use crate::typecheck::typecheck_kernel_body;
 use crate::ty::ScalarTy;
 use crate::buffer::{BufferAccess, BufferTy};
@@ -49,6 +50,9 @@ pub fn lower_module(ast: &AstModule) -> (HirModule, Vec<HirError>, Vec<HirWarnin
                 // operand resolution needs the kernel's scalar parameter table.
                 let mut precondition_calls: Vec<(String, Vec<axc_lexer::Spanned<AnnotationArg>>, Span)> = Vec::new();
                 let mut postcondition_calls: Vec<(String, Vec<axc_lexer::Spanned<AnnotationArg>>, Span)> = Vec::new();
+                // M3.19 (FG.3): @optimization_log block
+                let mut seen_optimization_log: bool = false;
+                let mut opt_log_result: Option<OptimizationLog> = None;
 
                 for ann in &kd.annotations {
                     let name: &str = &ann.node.name.node;
@@ -177,6 +181,29 @@ pub fn lower_module(ast: &AstModule) -> (HirModule, Vec<HirError>, Vec<HirWarnin
                             }
                             strategy_holes_opt = Some(holes);
                         }
+                        // M3.19 (FG.3): @optimization_log { version: N, entry {...}, ... }.
+                        // Codegen-inert (never read by axc-codegen; golden-gated AT-2903).
+                        // NOTE: `@transfer` (FG.2) is intentionally NOT added here — it
+                        // stays NO-BUILD and falls through to the `other =>` reject arm
+                        // below (`HirError::UnknownAnnotationInM0`), per the M3.19 spec's
+                        // paper-finding decision (AT-2915).
+                        "optimization_log" => {
+                            if seen_optimization_log {
+                                errors.push(HirError::DuplicateAnnotation {
+                                    name: "optimization_log".into(),
+                                    kernel: kd.name.node.clone(),
+                                    span: ann.span,
+                                });
+                                continue;
+                            }
+                            seen_optimization_log = true;
+                            opt_log_result = Some(lower_optimization_log_annotation(
+                                &ann.node.args,
+                                ann.span,
+                                &mut errors,
+                                &mut warnings,
+                            ));
+                        }
                         other => {
                             errors.push(HirError::UnknownAnnotationInM0 {
                                 name: other.to_owned(),
@@ -290,6 +317,7 @@ pub fn lower_module(ast: &AstModule) -> (HirModule, Vec<HirError>, Vec<HirWarnin
                     coop_matrix,
                     strategy: strategy_holes_opt,
                     debug_checks,
+                    opt_log: opt_log_result,
                 };
 
                 kernels.push(Kernel {
@@ -1109,6 +1137,125 @@ fn lower_strategy_annotation(
     }
 
     holes
+}
+
+/// M3.19 (FG.3): lower `@optimization_log { version: N, entry {...}, ... }`
+/// into a validated `OptimizationLog`. Never short-circuits (anti-pattern
+/// #6): a malformed block still produces a best-effort `OptimizationLog`
+/// (mirroring `lower_strategy_annotation`'s error-collect-and-continue
+/// discipline) so lowering of the REST of the kernel is never abandoned.
+///
+/// AST shape consumed (see `axc_parser::parser::parse_optimization_log_block`
+/// and `AnnotationArg::Record`'s doc comment for the producer side): `args` is
+/// a flat list where each element is EITHER:
+///
+/// - `AnnotationArg::Record { fields }` — a block-level scalar (currently
+///   only `version`), held directly (NOT `Call`-wrapped); or
+/// - `AnnotationArg::Call { name: "entry", args: [Record { fields }] }` —
+///   one `entry { ... }` declaration, `Call`-wrapped so downstream match
+///   arms stay uniform with `@strategy`'s `Call`-wrapped hole declarations
+///   (AT-2900).
+fn lower_optimization_log_annotation(
+    args: &[axc_lexer::Spanned<AnnotationArg>],
+    ann_span: Span,
+    errors: &mut Vec<HirError>,
+    warnings: &mut Vec<HirWarning>,
+) -> OptimizationLog {
+    let mut block_fields: Vec<RecordField> = Vec::new();
+    let mut entry_field_lists: Vec<(Vec<RecordField>, Span)> = Vec::new();
+
+    for arg in args {
+        match &arg.node {
+            AnnotationArg::Record { fields } => {
+                block_fields.extend(fields.iter().map(|f| f.node.clone()));
+            }
+            AnnotationArg::Call { name, args: inner } if name == "entry" => {
+                match inner.first() {
+                    Some(first) => match &first.node {
+                        AnnotationArg::Record { fields } => {
+                            entry_field_lists.push((fields.iter().map(|f| f.node.clone()).collect(), arg.span));
+                        }
+                        other => {
+                            errors.push(HirError::BadOptimizationLogEntry {
+                                detail: format!("malformed entry (unexpected internal AST shape {other:?})"),
+                                span: arg.span,
+                            });
+                        }
+                    },
+                    None => {
+                        errors.push(HirError::BadOptimizationLogEntry {
+                            detail: "malformed entry (empty internal AST shape)".to_string(),
+                            span: arg.span,
+                        });
+                    }
+                }
+            }
+            other => {
+                errors.push(HirError::BadOptimizationLog {
+                    detail: format!("unexpected @optimization_log argument shape: {other:?}"),
+                    span: arg.span,
+                });
+            }
+        }
+    }
+
+    let mut block_validated_ok: bool = true;
+    let mut log: OptimizationLog = match crate::opt_log::validate_block(&block_fields, ann_span) {
+        Ok(l) => l,
+        Err(e) => {
+            block_validated_ok = false;
+            errors.push(e);
+            OptimizationLog {
+                version: crate::opt_log::SUPPORTED_OPT_LOG_VERSION,
+                entries: Vec::new(),
+                forward_unknown: Vec::new(),
+            }
+        }
+    };
+
+    for (key, _) in &log.forward_unknown {
+        warnings.push(HirWarning::UnknownOptimizationLogKeyForward {
+            version: log.version,
+            key: key.clone(),
+            span: ann_span,
+        });
+    }
+
+    for (fields, entry_span) in &entry_field_lists {
+        if log.entries.len() >= crate::opt_log::MAX_OPT_LOG_ENTRIES {
+            errors.push(HirError::BadOptimizationLogEntry {
+                detail: format!(
+                    "@optimization_log has more than {} entries",
+                    crate::opt_log::MAX_OPT_LOG_ENTRIES
+                ),
+                span: *entry_span,
+            });
+            continue;
+        }
+        match crate::opt_log::validate_entry(fields, log.version, *entry_span) {
+            Ok(entry) => {
+                for (key, _) in &entry.forward_unknown {
+                    warnings.push(HirWarning::UnknownOptimizationLogKeyForward {
+                        version: log.version,
+                        key: key.clone(),
+                        span: *entry_span,
+                    });
+                }
+                log.entries.push(entry);
+            }
+            Err(e) => errors.push(e),
+        }
+    }
+
+    // §1.2: "Empty block (version only, zero entries)" — only warn when the
+    // block-level `version` itself validated cleanly (otherwise a
+    // `BadOptimizationLog` was already pushed above; adding a second, milder
+    // diagnostic on top would be noise, not signal).
+    if block_validated_ok && log.entries.is_empty() {
+        warnings.push(HirWarning::EmptyOptimizationLog { span: ann_span });
+    }
+
+    log
 }
 
 /// M2.3: Validate that every HoleRef across all annotations refers to a declared hole,
@@ -2031,5 +2178,270 @@ mod tests {
         assert!(warns_u.iter().any(|w| matches!(w, HirWarning::PostconditionNotLowerable { .. })));
         assert!(hir_u.kernels[0].annotations.debug_checks.is_empty(),
             "v1 shed scope: even an UNCONDITIONAL buffer-element postcondition is never lowered (defer-list §9.1)");
+    }
+
+    // ── M3.19 (FG.3): @optimization_log end-to-end ────────────────────────────
+
+    const OPT_LOG_SRC: &str = concat!(
+        "@kernel @workgroup(1,1,1)\n",
+        "@optimization_log {\n",
+        "  version: 1,\n",
+        "  entry { ts: \"2026-07-14T12:00:00.000Z\", kernel: \"k\", metric: 42860, unit: mtflops, verdict: PASS },\n",
+        "  entry { ts: \"2026-07-14T12:00:01.000Z\", kernel: \"k\", metric: 41640, unit: mtflops, verdict: REGRESS }\n",
+        "}\n",
+        "fn k() -> void { return; }\n",
+    );
+
+    /// AT-2900: `@optimization_log { version:1, entry {…}, entry {…} }` parses
+    /// (no parse error) to `Call{"entry",[Record]}` args + a block-level
+    /// `version` `Record`, and lowers with zero HIR errors.
+    #[test]
+    fn at_2900_parses_and_lowers_two_entries() {
+        let (ast, lex_errs, parse_errs) = parse(OPT_LOG_SRC);
+        assert!(lex_errs.is_empty(), "lex errors: {lex_errs:?}");
+        assert!(parse_errs.is_empty(), "parse errors: {parse_errs:?}");
+
+        let Item::Kernel(kd) = &ast.items[0].node;
+        let ann = kd.annotations.iter().find(|a| a.node.name.node == "optimization_log").unwrap();
+        let mut saw_version_record = false;
+        let mut entry_calls = 0;
+        for arg in &ann.node.args {
+            match &arg.node {
+                AnnotationArg::Record { fields } => {
+                    assert!(fields.iter().any(|f| f.node.key.node == "version"));
+                    saw_version_record = true;
+                }
+                AnnotationArg::Call { name, args } if name == "entry" => {
+                    assert_eq!(args.len(), 1);
+                    assert!(matches!(&args[0].node, AnnotationArg::Record { .. }));
+                    entry_calls += 1;
+                }
+                other => panic!("unexpected arg shape: {other:?}"),
+            }
+        }
+        assert!(saw_version_record, "block-level version Record must be present");
+        assert_eq!(entry_calls, 2, "expected two Call{{\"entry\",[Record]}} args");
+
+        let (hir, errors, warnings) = lower_module(&ast);
+        assert!(errors.is_empty(), "hir errors: {errors:?}");
+        assert!(warnings.is_empty(), "hir warnings: {warnings:?}");
+        let log = hir.kernels[0].annotations.opt_log.as_ref().expect("opt_log must be Some");
+        assert_eq!(log.version, 1);
+        assert_eq!(log.entries.len(), 2);
+        assert_eq!(log.entries[1].verdict, crate::opt_log::OptLogVerdict::Regress);
+    }
+
+    /// AT-2901: missing/unknown/duplicate field, out-of-set unit/verdict all
+    /// reject with `BadOptimizationLogEntry` end-to-end (through the parser).
+    #[test]
+    fn at_2901_bad_entry_shapes_rejected_end_to_end() {
+        let missing_field = concat!(
+            "@kernel @workgroup(1,1,1) @optimization_log { version: 1, ",
+            "entry { ts: \"2026-07-14T12:00:00.000Z\", kernel: \"k\", metric: 1, unit: mtflops } } ",
+            "fn k() -> void { return; }",
+        );
+        let (ast, _, parse_errs) = parse(missing_field);
+        assert!(parse_errs.is_empty(), "parse errors: {parse_errs:?}");
+        let (_, errors, _) = lower_module(&ast);
+        assert!(
+            errors.iter().any(|e| matches!(e, HirError::BadOptimizationLogEntry { .. })),
+            "missing `verdict` must reject: {errors:?}"
+        );
+
+        let bad_unit = concat!(
+            "@kernel @workgroup(1,1,1) @optimization_log { version: 1, ",
+            "entry { ts: \"2026-07-14T12:00:00.000Z\", kernel: \"k\", metric: 1, unit: gigaflops, verdict: PASS } } ",
+            "fn k() -> void { return; }",
+        );
+        let (ast2, _, parse_errs2) = parse(bad_unit);
+        assert!(parse_errs2.is_empty(), "parse errors: {parse_errs2:?}");
+        let (_, errors2, _) = lower_module(&ast2);
+        assert!(
+            errors2.iter().any(|e| matches!(e, HirError::BadOptimizationLogEntry { .. })),
+            "out-of-set unit must reject: {errors2:?}"
+        );
+    }
+
+    /// AT-2902 (anti-pattern #7): the lowered entry's fields are typed
+    /// (`String`/`i64`/closed-ident enums), never a single opaque string blob.
+    #[test]
+    fn at_2902_fields_are_typed_not_a_string_blob() {
+        let (ast, _, parse_errs) = parse(OPT_LOG_SRC);
+        assert!(parse_errs.is_empty());
+        let (hir, errors, _) = lower_module(&ast);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        let entry = &hir.kernels[0].annotations.opt_log.as_ref().unwrap().entries[0];
+        let _ts: &String = &entry.ts;
+        let _metric: i64 = entry.metric;
+        let _unit: crate::opt_log::OptLogUnit = entry.unit;
+        let _verdict: crate::opt_log::OptLogVerdict = entry.verdict;
+    }
+
+    /// AT-2909: `@optimization_log { version: 1 }` (zero entries) is accepted
+    /// with an `EmptyOptimizationLog` warning (mirrors `EmptyStrategyBlock`).
+    #[test]
+    fn at_2909_empty_block_warns() {
+        let src = "@kernel @workgroup(1,1,1) @optimization_log { version: 1 } fn k() -> void { return; }";
+        let (hir, errors, warnings) = lower_src(src);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        assert!(
+            warnings.iter().any(|w| matches!(w, HirWarning::EmptyOptimizationLog { .. })),
+            "expected EmptyOptimizationLog warning: {warnings:?}"
+        );
+        assert!(hir.kernels[0].annotations.opt_log.as_ref().unwrap().entries.is_empty());
+    }
+
+    /// AT-2910: duplicate `@optimization_log` on one kernel → `DuplicateAnnotation`
+    /// (mirrors `workgroup`).
+    #[test]
+    fn at_2910_duplicate_annotation_rejected() {
+        let src = concat!(
+            "@kernel @workgroup(1,1,1) ",
+            "@optimization_log { version: 1 } @optimization_log { version: 1 } ",
+            "fn k() -> void { return; }",
+        );
+        let (hir, errors, _) = lower_src(src);
+        let _ = hir;
+        assert!(
+            errors.iter().any(|e| matches!(e, HirError::DuplicateAnnotation { name, .. } if name == "optimization_log")),
+            "expected DuplicateAnnotation{{name:\"optimization_log\"}}: {errors:?}"
+        );
+    }
+
+    /// AT-2911: more than `MAX_OPT_LOG_ENTRIES` entries → `BadOptimizationLogEntry`.
+    #[test]
+    fn at_2911_too_many_entries_rejected() {
+        let mut src = String::from("@kernel @workgroup(1,1,1) @optimization_log { version: 1, ");
+        for i in 0..(crate::opt_log::MAX_OPT_LOG_ENTRIES + 1) {
+            src.push_str(&format!(
+                "entry {{ ts: \"2026-07-14T12:00:00.000Z\", kernel: \"k{i}\", metric: 1, unit: ns, verdict: PASS }}, "
+            ));
+        }
+        src.push_str("} fn k() -> void { return; }");
+        let (ast, _, parse_errs) = parse(&src);
+        assert!(parse_errs.is_empty(), "parse errors: {parse_errs:?}");
+        let (_, errors, _) = lower_module(&ast);
+        assert!(
+            errors.iter().any(|e| matches!(e, HirError::BadOptimizationLogEntry { detail, .. } if detail.contains("more than"))),
+            "expected an over-cap BadOptimizationLogEntry: {errors:?}"
+        );
+    }
+
+    /// AT-2915: current-state anchor (FG.2 NO-BUILD) — a kernel carrying
+    /// `@transfer { ... }` is REJECTED with `HirError::UnknownAnnotationInM0`
+    /// today; `@optimization_log` accepted alongside it composes without
+    /// interaction (§5 edge case).
+    #[test]
+    fn at_2915_transfer_still_rejected_unknown_annotation() {
+        // `@transfer { ... }` curly-brace sugar is NOT special-cased by the
+        // parser (only `@strategy`/`@optimization_log` get a block arm — FG.2
+        // is NO-BUILD, no parser change), so the call-form `@transfer(...)` is
+        // used here to reach a parseable source; the HIR-level rejection under
+        // test is identical either way (`lower.rs`'s whitelist match is on the
+        // annotation NAME, independent of arg shape).
+        let src = "@kernel @workgroup(1,1,1) @transfer(900) fn k() -> void { return; }";
+        let (ast, lex_errs, parse_errs) = parse(src);
+        assert!(lex_errs.is_empty() && parse_errs.is_empty(), "lex/parse errors: {lex_errs:?} {parse_errs:?}");
+        let (_, errors, _) = lower_module(&ast);
+        assert!(
+            errors.iter().any(|e| matches!(e, HirError::UnknownAnnotationInM0 { name, .. } if name == "transfer")),
+            "expected UnknownAnnotationInM0{{name:\"transfer\"}}: {errors:?}"
+        );
+    }
+
+    /// §5 edge case: `@transfer` + `@optimization_log` on one kernel —
+    /// `@optimization_log` accepted, `@transfer` still rejected; the two
+    /// decisions compose without interaction.
+    #[test]
+    fn transfer_and_optimization_log_compose_without_interaction() {
+        let src = concat!(
+            "@kernel @workgroup(1,1,1) @optimization_log { version: 1 } ",
+            "@transfer(900) fn k() -> void { return; }",
+        );
+        let (ast, _lex, parse_errs) = parse(src);
+        assert!(parse_errs.is_empty(), "parse errors: {parse_errs:?}");
+        let (hir, errors, _warnings) = lower_module(&ast);
+        assert!(
+            errors.iter().any(|e| matches!(e, HirError::UnknownAnnotationInM0 { name, .. } if name == "transfer")),
+            "expected UnknownAnnotationInM0{{name:\"transfer\"}}: {errors:?}"
+        );
+        assert!(hir.kernels[0].annotations.opt_log.is_some(), "@optimization_log must still lower");
+    }
+
+    /// AT-2919 (schema half): closed-value-grammar rejects — nested record,
+    /// call-as-value, hole-as-value, hole-ref-list-as-value, nested
+    /// `entry{entry{…}}`, and a typo block-item keyword ALL produce a parse
+    /// error and the malformed field/entry does not silently succeed.
+    #[test]
+    fn at_2919_closed_value_grammar_rejects() {
+        let cases: &[(&str, &str)] = &[
+            ("nested record", "entry { ts: { x: 1 } }"),
+            ("call-as-value", "entry { ts: f(3) }"),
+            ("hole-as-value", "entry { ts: ?x }"),
+            ("hole-ref-list-as-value", "entry { ts: ?[a,b] }"),
+            ("nested entry", "entry { entry { ts: \"x\" } }"),
+            ("typo keyword", "netry { ts: \"x\" }"),
+        ];
+        for (label, item) in cases {
+            let src = format!(
+                "@kernel @workgroup(1,1,1) @optimization_log {{ version: 1, {item} }} fn k() -> void {{ return; }}"
+            );
+            let (_ast, _lex, parse_errs) = parse(&src);
+            assert!(
+                !parse_errs.is_empty(),
+                "case `{label}` must produce a parse error; source: {src}"
+            );
+        }
+    }
+
+    /// AT-2921: two-level trailing comma tolerance (after the last `entry` AND
+    /// after the last field inside an `entry`) is accepted; a leading/double
+    /// comma is recovered from (reported, not silently dropped, and does not
+    /// abort the rest of the file).
+    #[test]
+    fn at_2921_trailing_comma_tolerance_both_levels() {
+        let trailing_both = concat!(
+            "@kernel @workgroup(1,1,1) @optimization_log { version: 1, ",
+            "entry { ts: \"2026-07-14T12:00:00.000Z\", kernel: \"k\", metric: 1, unit: ns, verdict: PASS, }, ",
+            "} fn k() -> void { return; }",
+        );
+        let (ast, _lex, parse_errs) = parse(trailing_both);
+        assert!(parse_errs.is_empty(), "trailing commas at both levels must be tolerated: {parse_errs:?}");
+        let (hir, errors, _) = lower_module(&ast);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        assert_eq!(hir.kernels[0].annotations.opt_log.as_ref().unwrap().entries.len(), 1);
+
+        let double_comma = concat!(
+            "@kernel @workgroup(1,1,1) @optimization_log { version: 1,, ",
+            "entry { ts: \"2026-07-14T12:00:00.000Z\", kernel: \"k\", metric: 1, unit: ns, verdict: PASS } ",
+            "} fn k() -> void { return; }",
+        );
+        let (_ast2, _lex2, parse_errs2) = parse(double_comma);
+        assert!(!parse_errs2.is_empty(), "a double comma must be reported (recover-and-report, not silently accepted)");
+    }
+
+    /// HIR-side companion to AT-2913 (the parser-level report-ALL test lives in
+    /// `axc-parser::parser::tests::at_2913_report_all_malformed_block_items_recovery_continues`):
+    /// a schema-unknown-key entry does not abort the rest of the block — ALL
+    /// bad entries are reported at the HIR layer too, AND a subsequent
+    /// well-formed entry is still parsed and lowered.
+    #[test]
+    fn hir_multiple_malformed_entries_all_reported_and_recovery_continues() {
+        let src = concat!(
+            "@kernel @workgroup(1,1,1) @optimization_log { version: 1, ",
+            "entry { unknown_key: 1 }, ",
+            "entry { also_unknown: 2 }, ",
+            "entry { ts: \"2026-07-14T12:00:00.000Z\", kernel: \"k\", metric: 1, unit: ns, verdict: PASS } ",
+            "} fn k() -> void { return; }",
+        );
+        let (ast, _lex, parse_errs) = parse(src);
+        assert!(parse_errs.is_empty(), "unknown keys are a schema (HIR) concern, not a parse error: {parse_errs:?}");
+        let (hir, errors, _warnings) = lower_module(&ast);
+        // Both malformed entries must be reported (report-ALL, not stop-at-first).
+        let bad_count = errors.iter().filter(|e| matches!(e, HirError::BadOptimizationLogEntry { .. })).count();
+        assert_eq!(bad_count, 2, "expected BOTH malformed entries reported: {errors:?}");
+        // The well-formed third entry must still have been parsed and lowered.
+        let log = hir.kernels[0].annotations.opt_log.as_ref().expect("opt_log must be Some");
+        assert_eq!(log.entries.len(), 1, "the one well-formed entry must still lower: {log:?}");
     }
 }

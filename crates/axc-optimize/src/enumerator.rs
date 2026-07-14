@@ -179,6 +179,7 @@ pub fn resolve_single_variant(
         // Resolution clears strategy → None so codegen backstop is satisfied.
         strategy: None,
         debug_checks: kernel.annotations.debug_checks.clone(),
+        opt_log: kernel.annotations.opt_log.clone(),
     };
 
     Ok(Kernel {
@@ -253,6 +254,7 @@ mod tests {
                     Some(StrategyHoles { map: holes_map })
                 },
                 debug_checks: Vec::new(),
+                opt_log: None,
             },
             params: Vec::new(),
             binding_plan: ParamBindingPlan {

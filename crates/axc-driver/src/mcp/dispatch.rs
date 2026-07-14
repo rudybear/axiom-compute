@@ -32,6 +32,8 @@ pub const METHOD_GRID_SEARCH: &str = "grid_search";
 pub const METHOD_OPTIMIZATION_HISTORY: &str = "optimization_history";
 /// M3.16 (FG.1): the LLM structural-rewrite verifier tool.
 pub const METHOD_VERIFY_REWRITE: &str = "verify_rewrite";
+/// M3.19 (FG.3): thin writer wrapper for `@optimization_log { ... }`.
+pub const METHOD_APPEND_OPTIMIZATION_LOG: &str = "append_optimization_log";
 
 /// All registered method names in alphabetical order (for error messages and initialize).
 pub const ALL_METHODS: &[&str] = &[
@@ -43,6 +45,7 @@ pub const ALL_METHODS: &[&str] = &[
     METHOD_GRID_SEARCH,
     METHOD_OPTIMIZATION_HISTORY,
     METHOD_VERIFY_REWRITE,
+    METHOD_APPEND_OPTIMIZATION_LOG,
 ];
 
 // ── McpContext ────────────────────────────────────────────────────────────────
@@ -355,6 +358,11 @@ fn route(env: RpcEnvelope, ctx: &mut McpContext, resp_id: Value) -> RpcResponse 
                 crate::mcp::tools::verify_rewrite::handle(req, c)
             })
         }
+        METHOD_APPEND_OPTIMIZATION_LOG => {
+            narrow_and_run(env.params, resp_id, |req| {
+                crate::mcp::tools::append_optimization_log::handle(req)
+            })
+        }
         unknown => {
             let data: Value = serde_json::json!({
                 "category": "method_not_found",
@@ -389,6 +397,7 @@ fn handle_initialize(resp_id: Value) -> RpcResponse {
             METHOD_GRID_SEARCH,
             METHOD_OPTIMIZATION_HISTORY,
             METHOD_VERIFY_REWRITE,
+            METHOD_APPEND_OPTIMIZATION_LOG,
         ],
     };
     match make_result_response(resp_id.clone(), &result) {
@@ -568,7 +577,24 @@ mod tests {
         assert!(tool_list.contains(&"grid_search"));
         assert!(tool_list.contains(&"optimization_history"));
         assert!(tool_list.contains(&"verify_rewrite"));
-        assert_eq!(tool_list.len(), 7);
+        assert!(tool_list.contains(&"append_optimization_log"));
+        assert_eq!(tool_list.len(), 8);
+    }
+
+    /// AT-2916 (FG.2 no-consumer finding, part 1): the MCP registry has
+    /// exactly the 7 pre-M3.19 tools PLUS the new `append_optimization_log`
+    /// (8 total) — none named `transfer`/handoff-reader. Anchors the paper
+    /// finding that no MCP tool reads an in-source `@transfer` handoff block.
+    #[test]
+    fn at_2916_no_transfer_or_handoff_reader_tool_registered() {
+        assert_eq!(ALL_METHODS.len(), 9, "8 real tools + `initialize`"); // initialize + 8 tools
+        for m in ALL_METHODS {
+            assert!(
+                !m.to_lowercase().contains("transfer") && !m.to_lowercase().contains("handoff"),
+                "no method may be named like a transfer/handoff reader; found `{m}`"
+            );
+        }
+        assert!(ALL_METHODS.contains(&METHOD_APPEND_OPTIMIZATION_LOG));
     }
 
     /// AT-2849: `verify_rewrite` appears in `initialize.tools` and its method

@@ -1068,6 +1068,7 @@ mod tests {
                 coop_matrix: None,
                 strategy: None,
                 debug_checks: Vec::new(),
+                opt_log: None,
             },
             params: Vec::new(),
             binding_plan: ParamBindingPlan {

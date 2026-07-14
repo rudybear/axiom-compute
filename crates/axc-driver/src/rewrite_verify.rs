@@ -1274,4 +1274,69 @@ mod tests {
         let c = build_inputs(&meta.binding_plan, &[400, 400], 43);
         assert_ne!(a, c);
     }
+
+    // ── AT-2925 (M3.19 / FG.3): @optimization_log survives the M3.16 rewrite-flow ──
+
+    /// AT-2925: a source carrying an `@optimization_log` block (including a
+    /// `version > SUPPORTED` forward-compat block/entry key) passes through
+    /// `verify_rewrite` — the SAME `original == rewritten` text compiles and
+    /// clears the interface gate cleanly (SKIPPED on vk=None, not
+    /// REJECT/FAIL), proving the block does not perturb the M3.16 pipeline —
+    /// AND, via the identical compile entrypoint `verify_rewrite` itself uses
+    /// (`compile_source_with_assignments`), the block's `forward_unknown`
+    /// keys are carried byte-verbatim through HIR (stronger than mere
+    /// accept: the exact key/value pairs from source are recoverable).
+    #[test]
+    fn at_2925_optimization_log_block_survives_rewrite_verify_flow_byte_verbatim() {
+        // NOTE: only an ENTRY-level unknown key is reachable via real source
+        // text — §1.3a's EBNF pins `block_item := version_field | entry_block`
+        // as CLOSED, so THIS compiler's parser can never produce a block-level
+        // `RecordField` other than `version` from source (a block-level
+        // forward_unknown key is forward-looking infra for a FUTURE parser
+        // that extends `block_item`; it is exercised only via direct HIR
+        // construction, see `opt_log::tests::at_2924_v2_unknown_block_key_preserved_not_rejected`).
+        // `field := ident ":" record_value` at the entry level, by contrast,
+        // admits ANY identifier key syntactically, so `future_entry_key` here
+        // is real, parser-reachable forward-compat input.
+        const SRC_WITH_BLOCK: &str = concat!(
+            "@kernel\n@workgroup(64, 1, 1)\n@intent(\"t\")\n@complexity(O(n))\n",
+            "@optimization_log {\n",
+            "  version: 2,\n",
+            "  entry { ts: \"2026-07-14T12:00:00.000Z\", kernel: \"saxpy\", metric: 42860, unit: mtflops, verdict: PASS, future_entry_key: \"x\" }\n",
+            "}\n",
+            "fn saxpy(n: u32, alpha: f32, x: readonly_buffer[f32], y: buffer[f32]) -> void {\n",
+            "    let i: u32 = gid(0);\n    y[i] = alpha * x[i] + y[i];\n    return;\n}\n",
+        );
+
+        let mut req = base_saxpy_request();
+        req.original = SRC_WITH_BLOCK.to_string();
+        req.rewritten = SRC_WITH_BLOCK.to_string();
+        req.push_constants = Some(vec![0_u8; 8]); // alpha:f32 present (CRIT-1)
+
+        let report = verify_rewrite(&req, None);
+        assert_eq!(
+            report.verdict,
+            Verdict::Skipped,
+            "block-carrying source must clear compile+interface (SKIPPED only for lack of GPU, never REJECT/FAIL): {report:?}"
+        );
+        assert_eq!(report.stage, "dispatch");
+
+        // Byte-verbatim carry check, through the SAME compile entrypoint
+        // verify_rewrite uses internally (compile_source_with_assignments),
+        // not a bespoke one.
+        let (_bytes, _meta) = crate::compile_source_with_assignments(SRC_WITH_BLOCK, &BTreeMap::new())
+            .expect("verify_rewrite's own compile path must succeed for a block-carrying source");
+        let (ast, lex_errs, parse_errs) = axc_parser::parse(SRC_WITH_BLOCK);
+        assert!(lex_errs.is_empty() && parse_errs.is_empty());
+        let (hir, hir_errs, _warnings) = axc_hir::lower_module(&ast);
+        assert!(hir_errs.is_empty(), "hir errors: {hir_errs:?}");
+        let log = hir.kernels[0].annotations.opt_log.as_ref().expect("opt_log must be Some");
+        assert_eq!(log.version, 2);
+        assert!(log.forward_unknown.is_empty(), "no block-level unknown key was declared in this source");
+        assert_eq!(
+            log.entries[0].forward_unknown,
+            vec![("future_entry_key".to_string(), axc_parser::ast::RecordValue::Str("x".to_string()))],
+            "entry-level forward_unknown must carry the exact source key/value"
+        );
+    }
 }

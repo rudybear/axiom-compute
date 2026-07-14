@@ -96,3 +96,90 @@ fn at_2840_doc_accuracy_grep_fence() {
          the environment-dependent ICD-name note is present"
     );
 }
+
+// ── M3.19 (FG.2/FG.3): doc-fence + codegen grep-fence ──────────────────────────
+
+/// AT-2917: the FG.2 `@transfer` revisit trigger is recorded verbatim in
+/// DESIGN.md `## 3.1.43` AND in ROADMAP.md's FG.2 row — both copies must
+/// name the SAME two concrete triggering conditions (an MCP consumer tool,
+/// or the 7-agent supervisor consuming in-source `@transfer`).
+#[test]
+fn at_2917_transfer_revisit_trigger_recorded_verbatim() {
+    let root: PathBuf = repo_root();
+
+    let design_md: String = std::fs::read_to_string(root.join("DESIGN.md"))
+        .expect("AT-2917: DESIGN.md must exist");
+    assert!(
+        design_md.contains("## 3.1.43 M3.19"),
+        "AT-2917: DESIGN.md must contain the `## 3.1.43 M3.19` subsection"
+    );
+    assert!(
+        design_md.contains("agent-orchestration MCP tool (a 9th tool, e.g. `next_step`/`route`)"),
+        "AT-2917: DESIGN.md §3.1.43 must record the exact MCP-consumer revisit trigger"
+    );
+    assert!(
+        design_md.contains("7-agent supervisor is changed to consume in-source `@transfer` handoff"),
+        "AT-2917: DESIGN.md §3.1.43 must record the exact supervisor-consumption revisit trigger"
+    );
+
+    let roadmap_md: String = std::fs::read_to_string(root.join("ROADMAP.md"))
+        .expect("AT-2917: ROADMAP.md must exist");
+    assert!(
+        roadmap_md.contains("FG.2") && roadmap_md.contains("NO-BUILD"),
+        "AT-2917: ROADMAP.md's FG.2 row must record the NO-BUILD verdict"
+    );
+    assert!(
+        roadmap_md.contains("agent-orchestration MCP tool (a 9th tool, e.g. `next_step`/`route`)"),
+        "AT-2917: ROADMAP.md's FG.2 row must record the exact MCP-consumer revisit trigger"
+    );
+    assert!(
+        roadmap_md.contains("7-agent supervisor is changed to consume in-source `@transfer` handoff"),
+        "AT-2917: ROADMAP.md's FG.2 row must record the exact supervisor-consumption revisit trigger"
+    );
+}
+
+/// AT-2918: whole-milestone codegen invariance. `crates/axc-codegen/src` has
+/// an EMPTY diff against the pre-M3.19 tree, with ONE documented mechanical
+/// exception: the single `opt_log: None,` line forced into a `#[cfg(test)]`
+/// `KernelAnnotations` literal by the new field on the shared HIR struct
+/// (test-only, non-behavioral). Complements — does NOT substitute for — the
+/// real binding proof, AT-2903's byte-identical golden SPIR-V gate.
+///
+/// NOTE (mirrors AT-2607's own documented caveat): this diffs the CURRENT
+/// working tree against `HEAD` (the commit this milestone branched from,
+/// since the Coder does not commit). Once this milestone is committed, a
+/// later reviewer should consider re-pinning this to fixed base/head SHAs
+/// the way AT-2607 does for M3.11a, so the fence keeps working after `HEAD`
+/// moves.
+#[test]
+fn at_2918_codegen_empty_diff_except_one_mechanical_test_line() {
+    let root: PathBuf = repo_root();
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["diff", "-U0", "--", "crates/axc-codegen/src"])
+        .output()
+        .expect("AT-2918: failed to run git diff");
+    assert!(output.status.success(), "AT-2918: git diff failed: {:?}", output.status);
+
+    let diff_text: String = String::from_utf8_lossy(&output.stdout).to_string();
+    // Every ADDED line (starting with a single `+`, not `+++`) must be
+    // exactly the one mechanical field addition; every REMOVED line
+    // (starting with a single `-`, not `---`) must not exist at all (this
+    // milestone only ADDS the new field, never removes codegen lines).
+    for line in diff_text.lines() {
+        if line.starts_with("+++") || line.starts_with("---") {
+            continue;
+        }
+        if let Some(added) = line.strip_prefix('+') {
+            assert_eq!(
+                added.trim(),
+                "opt_log: None,",
+                "AT-2918: crates/axc-codegen/src must have an EMPTY diff except the one \
+                 mechanical `opt_log: None,` test-fixture line; found an unexpected addition: {added:?}"
+            );
+        } else if line.starts_with('-') {
+            panic!("AT-2918: crates/axc-codegen/src must have ZERO removed lines; found: {line:?}");
+        }
+    }
+}
