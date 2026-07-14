@@ -1,0 +1,19 @@
+// fuzz_unsat.axc — M3.18 (FG.8) fixture for AT-2893 (fuzz UNSATISFIABLE, CPU-only).
+//
+// `@precondition(gt(n,10))` AND `@precondition(lt(n,5))` are two SEPARATE,
+// individually well-formed (arity==1) annotations — both lower cleanly to
+// `DebugCheck`s — but their intervals are disjoint: n > 10 AND n < 5 has no
+// solution. `solve()` must detect this and `axc test --fuzz` must report
+// UNSATISFIABLE (exit 3) WITHOUT attempting any GPU dispatch.
+
+@kernel
+@workgroup(64, 1, 1)
+@intent("unsatisfiable preconditions for the fuzz UNSATISFIABLE acceptance test")
+@complexity(O(n))
+@precondition(gt(n, 10))
+@precondition(lt(n, 5))
+fn fuzz_unsat(n: u32, x: buffer[u32]) -> void {
+    let i: u32 = gid(0);
+    x[i] = n;
+    return;
+}

@@ -1,0 +1,19 @@
+// verify_strict_incomplete.axc — M3.18 (FG.8) fixture for AT-2882 (verify C1 fail).
+//
+// `@strict` is present but `@complexity` is missing. `@intent` and a real
+// `@precondition` ARE present, so this fixture isolates exactly one missing
+// element (`strict_missing_complexity`).
+//
+// This still COMPILES cleanly (the compiler treats `@strict` as a documentation
+// no-op, per CLAUDE.md/lower.rs:167) — only `axc verify` is expected to flag it.
+
+@kernel
+@workgroup(64, 1, 1)
+@strict
+@intent("increment every element by one")
+@precondition(gt(n, 0))
+fn incr(n: u32, x: buffer[u32]) -> void {
+    let i: u32 = gid(0);
+    x[i] = x[i] + 1u32;
+    return;
+}

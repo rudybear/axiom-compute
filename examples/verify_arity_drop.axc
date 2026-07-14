@@ -1,0 +1,22 @@
+// verify_arity_drop.axc — M3.18 (FG.8) fixture for AT-2883 (verify C2(b) arity-drop).
+//
+// `@precondition(gt(n,0), gt(alpha,0))` has TWO arguments — a comma-conjunction,
+// which `lower.rs:118` silently DROPS (`if ann.node.args.len() == 1` has no
+// `else`). `axc compile` therefore accepts this source unchanged (frozen
+// invariant) and emits NO runtime check for either condition. `axc verify` is
+// the tool whose job is to catch this fail-open: it must FAIL with
+// `predicate_arity_dropped`.
+
+@kernel
+@workgroup(64, 1, 1)
+@intent("saxpy with a (silently dropped) two-argument precondition")
+@complexity(O(n))
+@precondition(gt(n, 0), gt(alpha, 0))
+fn saxpy_arity_drop(n: u32, alpha: f32, x: readonly_buffer[f32], y: buffer[f32]) -> void {
+    let i: u32 = gid(0);
+    let xi: f32 = x[i];
+    let yi: f32 = y[i];
+    let result: f32 = alpha * xi + yi;
+    y[i] = result;
+    return;
+}

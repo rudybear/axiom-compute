@@ -586,7 +586,12 @@ fn compare_outputs(
 /// Byte-for-byte comparison of the ORIGINAL dispatched twice (§3.1 step 7,
 /// r2/WARN-2). Returns `Some(stats)` describing every disagreeing buffer, or
 /// `None` when both runs are byte-identical on every non-skipped buffer.
-fn find_nondeterminism(
+///
+/// `pub(crate)` (M3.18 / r2 M-2): reused verbatim by `fuzz.rs`'s determinism leg
+/// (c) — avoids duplicating the ~20-LOC byte-diff (reuse-over-duplication,
+/// driver-crate-only visibility change, does NOT breach the zero-compiler-change
+/// gate).
+pub(crate) fn find_nondeterminism(
     run1: &[Vec<u8>],
     run2: &[Vec<u8>],
     output_sizes: &[usize],
