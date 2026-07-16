@@ -41,6 +41,12 @@ jobs:
     env:
       AXC_ENABLE_GPU_TESTS: "1"
       AXC_REQUIRE_SPIRV_VAL: "1"
+      # AT-3036 must-fix: without this, bench_regression.rs:209 short-circuits
+      # to a silent no-op ("skipping bench regression") and the step exits 0
+      # unconditionally — the exact vacuous-pass class this milestone's own
+      # AT-3033 discipline forbids. Mirrors ci.yml:61 (Lavapipe bench-regression
+      # job) verbatim.
+      AXC_ENABLE_BENCH_REGRESSION: "1"
       VK_DRIVER_FILES: /usr/share/vulkan/icd.d/radeon_icd.x86_64.json
       VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/radeon_icd.x86_64.json
     steps:
@@ -86,6 +92,8 @@ jobs:
     env:
       AXC_ENABLE_GPU_TESTS: "1"
       AXC_REQUIRE_SPIRV_VAL: "1"
+      # AT-3036 must-fix: see the amd-gpu job's identical comment above.
+      AXC_ENABLE_BENCH_REGRESSION: "1"
       VK_DRIVER_FILES: /usr/share/vulkan/icd.d/intel_icd.x86_64.json
       VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/intel_icd.x86_64.json
     steps:

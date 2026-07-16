@@ -162,4 +162,13 @@ jobs:
           echo "${ACTIONLINT_SHA256}  actionlint.tar.gz" | sha256sum -c -
           tar xzf actionlint.tar.gz actionlint
       - name: Run actionlint
-        run: ./actionlint .github/workflows/*.yml
+        # PESS-1 must-fix: GitHub Actions honors BOTH .yml and .yaml workflow
+        # file extensions equally, so the file selector must widen to match —
+        # a `.yaml` workflow would otherwise bypass actionlint entirely
+        # (proven by scratch injection during code review). Invoked with NO
+        # path args so actionlint auto-discovers every file in
+        # .github/workflows regardless of extension (.yml AND .yaml), instead
+        # of a `*.yml`-only glob that a literal, no-match `*.yaml` pattern
+        # would otherwise pass through unexpanded and fail on. Mirrors the
+        # all_workflow_files() widening in eb1_workflow_ci.rs (§2.4/§6.3).
+        run: ./actionlint

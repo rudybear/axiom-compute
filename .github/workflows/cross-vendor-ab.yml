@@ -94,13 +94,24 @@ jobs:
             echo "}"
           } > ab-provenance.json
       - name: Run the A/B harness
+        # PESS-2 (script-injection hygiene): `inputs.variant` is a free-form
+        # `type: string` and MUST NOT be interpolated directly into the `run:`
+        # body — GitHub splices `${{ }}` expressions into the script text
+        # BEFORE bash ever sees it, so a value like `; curl … | sh #` would
+        # execute. Passed via `env:` instead and referenced as `$VARIANT`
+        # (still deliberately unquoted below to preserve the original
+        # word-splitting behavior for a multi-flag variant string).
+        # workflow_dispatch is write-access-gated so this was never a
+        # privilege-escalation path, but the hardening is cheap.
+        env:
+          VARIANT: ${{ inputs.variant }}
         run: |
           set -euo pipefail
           ARGS=()
           if [ "${{ inputs.skip_llama_build }}" = "true" ]; then
             ARGS+=(--skip-build)
           fi
-          ARGS+=(${{ inputs.variant }})
+          ARGS+=($VARIANT)
           scripts/m34_llamacpp_ab.sh "${ARGS[@]}" 2>&1 | tee ab-run.log
       - uses: actions/upload-artifact@v4
         with:
@@ -161,13 +172,24 @@ jobs:
             echo "}"
           } > ab-provenance.json
       - name: Run the A/B harness
+        # PESS-2 (script-injection hygiene): `inputs.variant` is a free-form
+        # `type: string` and MUST NOT be interpolated directly into the `run:`
+        # body — GitHub splices `${{ }}` expressions into the script text
+        # BEFORE bash ever sees it, so a value like `; curl … | sh #` would
+        # execute. Passed via `env:` instead and referenced as `$VARIANT`
+        # (still deliberately unquoted below to preserve the original
+        # word-splitting behavior for a multi-flag variant string).
+        # workflow_dispatch is write-access-gated so this was never a
+        # privilege-escalation path, but the hardening is cheap.
+        env:
+          VARIANT: ${{ inputs.variant }}
         run: |
           set -euo pipefail
           ARGS=()
           if [ "${{ inputs.skip_llama_build }}" = "true" ]; then
             ARGS+=(--skip-build)
           fi
-          ARGS+=(${{ inputs.variant }})
+          ARGS+=($VARIANT)
           scripts/m34_llamacpp_ab.sh "${ARGS[@]}" 2>&1 | tee ab-run.log
       - uses: actions/upload-artifact@v4
         with:

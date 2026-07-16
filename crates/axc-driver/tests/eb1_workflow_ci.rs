@@ -80,21 +80,36 @@ const CI_YML: &str = ".github/workflows/ci.yml";
 /// is a hard failure, never a vacuous pass.
 const KNOWN_SELF_HOSTED_JOB_FLOOR: usize = 7;
 
-/// Glob `.github/workflows/*.yml` (NOT a hardcoded list) — AT-3032 requires
-/// every self-hosted job across every workflow file, including any future
-/// addition, to be caught by this scan.
+/// Glob `.github/workflows/*.{yml,yaml}` (NOT a hardcoded list) — AT-3032
+/// requires every self-hosted job across every workflow file, including any
+/// future addition, to be caught by this scan.
+///
+/// PESS-1 must-fix: GitHub Actions honors BOTH `.yml` and `.yaml` as valid
+/// workflow-file extensions (they are fully equivalent to the Actions
+/// runner). A `.yml`-only filter let a `.yaml` workflow bypass the entire
+/// security suite — proven during code review with a scratch
+/// `zz_scratch_hole.yaml` carrying a guardless self-hosted job, which the
+/// `.yml`-only scan reported as `test result: ok`. The accepted extension set
+/// is now exactly `{yml, yaml}` (see `WORKFLOW_FILE_EXTENSIONS` /
+/// [`at_3037_workflow_file_extension_set_is_exactly_yml_or_yaml`]).
+const WORKFLOW_FILE_EXTENSIONS: [&str; 2] = ["yml", "yaml"];
+
 fn all_workflow_files() -> Vec<PathBuf> {
     let dir = repo_root().join(".github/workflows");
     let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("eb1_workflow_ci: cannot read {}: {e}", dir.display()))
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("yml"))
+        .filter(|p| {
+            p.extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|ext| WORKFLOW_FILE_EXTENSIONS.contains(&ext))
+        })
         .collect();
     files.sort();
     assert!(
         !files.is_empty(),
-        "eb1_workflow_ci: the .github/workflows glob found ZERO .yml files — \
+        "eb1_workflow_ci: the .github/workflows glob found ZERO .yml/.yaml files — \
          an empty selector must fail, not pass vacuously"
     );
     files
@@ -645,6 +660,95 @@ fn at_3031_vendor_independence_bench_gate_parity() {
              (device selection is delegated to EB.2's machine_key, not a per-vendor script)"
         );
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// AT-3036: every job whose steps invoke `--test bench_regression` has
+// AXC_ENABLE_BENCH_REGRESSION: "1" somewhere in its effective env
+// (job-level or step-level) — the no-vacuous-gate regression this milestone's
+// own review found: bench_regression.rs:209 short-circuits to a silent
+// pass without it, and neither AT-3028 nor AT-3031 inspected the enclosing
+// env: block (they only checked the `run:` command string / other vars). A
+// GLOB over every workflow file (not a hardcoded amd-gpu/intel-gpu list) so
+// any future job that runs the bench_regression test inherits the same
+// no-vacuous-gate guarantee AT-3032 gives the self-hosted security posture.
+// ════════════════════════════════════════════════════════════════════════════
+
+fn find_step<'y>(job: &'y Yaml, needle: &str) -> Option<&'y Yaml<'y>> {
+    let steps = job.as_mapping_get("steps")?.as_sequence()?;
+    steps.iter().find(|step| get_str(step, "run").is_some_and(|run| run.contains(needle)))
+}
+
+/// True if `AXC_ENABLE_BENCH_REGRESSION: "1"` appears in the step's own
+/// `env:` block OR the enclosing job's `env:` block (GitHub Actions env
+/// resolution: step-level overrides job-level, but either location makes the
+/// gate live).
+fn bench_regression_enabled(job: &Yaml, step: &Yaml) -> bool {
+    let step_val = step.as_mapping_get("env").and_then(|e| get_str(e, "AXC_ENABLE_BENCH_REGRESSION"));
+    if step_val == Some("1") {
+        return true;
+    }
+    let job_val = job.as_mapping_get("env").and_then(|e| get_str(e, "AXC_ENABLE_BENCH_REGRESSION"));
+    job_val == Some("1")
+}
+
+#[test]
+fn at_3036_every_bench_regression_step_has_the_enabling_var() {
+    let mut checked = 0usize;
+    for path in all_workflow_files() {
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("eb1_workflow_ci: cannot read {}: {e}", path.display()));
+        let rel = path.strip_prefix(repo_root()).unwrap_or(&path).display().to_string();
+        let docs = parse_yaml_docs(&content, &rel);
+        for (job_name, job) in jobs_of(&docs[0]) {
+            if let Some(step) = find_step(job, "--test bench_regression") {
+                checked += 1;
+                assert!(
+                    bench_regression_enabled(job, step),
+                    "AT-3036: job '{job_name}' in {rel} runs `--test bench_regression` but \
+                     neither its job-level nor step-level `env:` sets \
+                     AXC_ENABLE_BENCH_REGRESSION: \"1\" — bench_regression.rs:209 short-circuits \
+                     to a silent no-op without it, so this step would pass vacuously"
+                );
+            }
+        }
+    }
+    assert!(
+        checked > 0,
+        "AT-3036: found ZERO jobs invoking `--test bench_regression` across all workflow \
+         files — an empty selector must fail, not pass vacuously"
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// AT-3037: the workflow-file extension set all_workflow_files() accepts is
+// exactly {yml, yaml} — PESS-1 regression guard (a `.yml`-only filter let a
+// `.yaml` workflow bypass the entire security suite; proven by scratch
+// injection during code review).
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn at_3037_workflow_file_extension_set_is_exactly_yml_or_yaml() {
+    let mut sorted = WORKFLOW_FILE_EXTENSIONS.to_vec();
+    sorted.sort_unstable();
+    assert_eq!(
+        sorted,
+        vec!["yaml", "yml"],
+        "AT-3037/PESS-1: all_workflow_files()'s accepted extension set must be exactly \
+         {{yml, yaml}} — GitHub Actions treats both as valid workflow-file extensions, so \
+         narrowing this set re-opens the .yaml security-scan bypass"
+    );
+
+    // Positive + negative probes directly against the classifier the scan
+    // actually uses, so a future refactor of `all_workflow_files()`'s filter
+    // predicate that silently narrows/widens the set trips this test even if
+    // no physical .yaml file exists on disk.
+    let is_workflow_ext = |ext: &str| WORKFLOW_FILE_EXTENSIONS.contains(&ext);
+    assert!(is_workflow_ext("yml"), "AT-3037: '.yml' must be accepted");
+    assert!(is_workflow_ext("yaml"), "AT-3037: '.yaml' must be accepted");
+    assert!(!is_workflow_ext("yml.bak"), "AT-3037: '.yml.bak' must NOT be accepted");
+    assert!(!is_workflow_ext("txt"), "AT-3037: '.txt' must NOT be accepted");
+    assert!(!is_workflow_ext(""), "AT-3037: an empty/absent extension must NOT be accepted");
 }
 
 // ════════════════════════════════════════════════════════════════════════════
