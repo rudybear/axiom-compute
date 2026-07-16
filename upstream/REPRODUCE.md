@@ -139,7 +139,7 @@ sizes, same device), writes `.pipeline/benchmarks/m34/ab_results_fused_f32acc_ca
 | 512 | 6.77–6.83 | 5.95–5.97 | 0.87–0.88× |
 | 768 | 14.20–14.21 | 11.31–11.63 | 0.80–0.82× |
 | 1024 | 23.80–23.87 | 17.67–17.68 | 0.74× |
-| 4096×512×14336 (A/B, one-shot MIN-of-10 GpuTimestamp measurement) | **44.06** | **22.26** | **0.505×** |
+| 4096×512×14336 (A/B, MIN-of-10 GpuTimestamp; stable across 11 bench invocations at 0.504–0.505×) | **44.11** | **22.26** | **0.505×** |
 
 All ggml-variant dispatches are combined-condition-aware ≤ FROZEN 1e-3 VALID (bit-identical to the
 leader's combined values at every size — expected, since the accumulator VALUES are bit-identical

@@ -36,6 +36,20 @@ use axc_runtime::{
     ResidentBenchConfig, ResidentTimingSource,
 };
 use std::collections::BTreeMap;
+use std::sync::Mutex;
+
+/// Per-(kernel, m, n, k) memo of the correctness pre-flight (combined, raw). The CPU oracle +
+/// abs_scale at the A/B shape cost MINUTES each; criterion re-invokes the measurement closure
+/// many times, and recomputing them every invocation made the bench take hours. The oracle IS
+/// still computed — exactly ONCE per (kernel, shape) per process — on the FIRST invocation (the
+/// fixture seeds are identical every invocation, so the value cannot differ); subsequent
+/// invocations reuse the memoized correctness value and re-time only the GPU dispatch (which is
+/// the thing criterion is actually sampling).
+#[allow(clippy::type_complexity)]
+static CORRECTNESS_MEMO: Mutex<BTreeMap<(u8, usize, usize, usize), (f64, f64)>> =
+    Mutex::new(BTreeMap::new());
+const MEMO_LEADER: u8 = 0;
+const MEMO_GGML: u8 = 1;
 
 const LEADER_SRC: &str =
     include_str!("../../../examples/q4km_matmul_rb_coopmat_f32acc_cached.axc");
@@ -243,19 +257,29 @@ fn measure_leader(
     let pc = assemble_pc_leader(plan, m as u32, n as u32, k as u32, n_bpr as u32);
     let workgroups = (wg_x as u32, wg_y as u32, 1);
 
-    let outputs = ctx.dispatch_handle(
-        handle, workgroups,
-        &[&q_bytes, &x_bytes, &vec![0u8; c_size]],
-        &[0, 0, c_size],
-        &pc,
-    ).ok()?;
-    let y_gpu: Vec<f32> = outputs[2].chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
-    let y_ref = common_q4km_f32ref::q4km_dequant_matmul_f32accum_cpu(&q_bytes, &x_f16, m, n, n_bpr);
-    let abs_scale = common_q4km_f32ref::q4km_abs_dot_scale(&q_bytes, &x_f16, m, n, n_bpr);
-    let combined = common_q4km_f32ref::max_rel_diff_combined(&y_gpu, &y_ref, &abs_scale);
-    let raw = common_q4km_f32ref::max_rel_diff(&y_gpu, &y_ref);
+    // Correctness pre-flight (memoized — the oracle runs ONCE per shape per process).
+    let memo_key = (MEMO_LEADER, m, n, k);
+    let cached = CORRECTNESS_MEMO.lock().unwrap().get(&memo_key).copied();
+    let (combined, raw) = match cached {
+        Some(v) => v,
+        None => {
+            let outputs = ctx.dispatch_handle(
+                handle, workgroups,
+                &[&q_bytes, &x_bytes, &vec![0u8; c_size]],
+                &[0, 0, c_size],
+                &pc,
+            ).ok()?;
+            let y_gpu: Vec<f32> = outputs[2].chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let y_ref = common_q4km_f32ref::q4km_dequant_matmul_f32accum_cpu(&q_bytes, &x_f16, m, n, n_bpr);
+            let abs_scale = common_q4km_f32ref::q4km_abs_dot_scale(&q_bytes, &x_f16, m, n, n_bpr);
+            let combined = common_q4km_f32ref::max_rel_diff_combined(&y_gpu, &y_ref, &abs_scale);
+            let raw = common_q4km_f32ref::max_rel_diff(&y_gpu, &y_ref);
+            CORRECTNESS_MEMO.lock().unwrap().insert(memo_key, (combined, raw));
+            (combined, raw)
+        }
+    };
 
     let (min_ns, ts) = resident_min_of_n(
         ctx, handle, &[&q_bytes, &x_bytes, &vec![0u8; c_size]], &[0, 0, c_size as u64], workgroups, pc,
@@ -299,20 +323,30 @@ fn measure_ggml(
     let pc = assemble_pc_ggml(plan, m as u32, n as u32, k as u32, stride_a, stride_b, stride_d);
     let workgroups = (wg_x as u32, wg_y as u32, 1);
 
-    let outputs = ctx.dispatch_handle(
-        handle, workgroups,
-        &[&q_bytes, &x_bytes, &vec![0u8; c_size]],
-        &[0, 0, c_size],
-        &pc,
-    ).ok()?;
-    let d_col_major: Vec<f32> = outputs[2].chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
-    let y_gpu = detranspose_d(&d_col_major, m, n, stride_d as usize);
-    let y_ref = common_q4km_f32ref::q4km_dequant_matmul_f32accum_cpu(&q_bytes, &x_f16, m, n, n_bpr);
-    let abs_scale = common_q4km_f32ref::q4km_abs_dot_scale(&q_bytes, &x_f16, m, n, n_bpr);
-    let combined = common_q4km_f32ref::max_rel_diff_combined(&y_gpu, &y_ref, &abs_scale);
-    let raw = common_q4km_f32ref::max_rel_diff(&y_gpu, &y_ref);
+    // Correctness pre-flight (memoized — the oracle runs ONCE per shape per process).
+    let memo_key = (MEMO_GGML, m, n, k);
+    let cached = CORRECTNESS_MEMO.lock().unwrap().get(&memo_key).copied();
+    let (combined, raw) = match cached {
+        Some(v) => v,
+        None => {
+            let outputs = ctx.dispatch_handle(
+                handle, workgroups,
+                &[&q_bytes, &x_bytes, &vec![0u8; c_size]],
+                &[0, 0, c_size],
+                &pc,
+            ).ok()?;
+            let d_col_major: Vec<f32> = outputs[2].chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let y_gpu = detranspose_d(&d_col_major, m, n, stride_d as usize);
+            let y_ref = common_q4km_f32ref::q4km_dequant_matmul_f32accum_cpu(&q_bytes, &x_f16, m, n, n_bpr);
+            let abs_scale = common_q4km_f32ref::q4km_abs_dot_scale(&q_bytes, &x_f16, m, n, n_bpr);
+            let combined = common_q4km_f32ref::max_rel_diff_combined(&y_gpu, &y_ref, &abs_scale);
+            let raw = common_q4km_f32ref::max_rel_diff(&y_gpu, &y_ref);
+            CORRECTNESS_MEMO.lock().unwrap().insert(memo_key, (combined, raw));
+            (combined, raw)
+        }
+    };
 
     let (min_ns, ts) = resident_min_of_n(
         ctx, handle, &[&q_bytes, &x_bytes, &vec![0u8; c_size]], &[0, 0, c_size as u64], workgroups, pc,

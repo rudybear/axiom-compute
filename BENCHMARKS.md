@@ -242,7 +242,7 @@ side-measurement.
 | 512 | 6.77–6.83 | 5.95–5.97 | 0.87–0.88× |
 | 768 | 14.20–14.21 | 11.31–11.63 | 0.80–0.82× |
 | 1024 | 23.80–23.87 | 17.67–17.68 | 0.74× |
-| 4096×512×14336 (A/B, one-shot MIN-of-10 GpuTimestamp) | **44.06** | **22.26** | **0.505×** |
+| 4096×512×14336 (A/B, MIN-of-10 GpuTimestamp; stable across 11 bench invocations at 0.504–0.505×) | **44.11** | **22.26** | **0.505×** |
 
 The ggml variant honestly runs at **0.50×–0.88× the leader's throughput**, WORST at the A/B
 (inference) shape — the extra per-B-element f32→f16 staging convert cost scales with `N*K`
