@@ -1,0 +1,78 @@
+name: Cross-vendor baseline bless (manual, first-run)
+
+# workflow_dispatch-ONLY. Blessing is NEVER automatic (AT-714b discipline) and
+# this job NEVER writes to the repo — it uploads the merged baselines.json as
+# an artifact for a MAINTAINER to review and commit via a normal PR. See
+# docs/EB1_RUNNER_SETUP.md §First-run bless for the full numbered checklist.
+#
+# Two literal-runs-on jobs (bless-amd / bless-intel), same rationale as
+# cross-vendor-ab.yml: no expression-derived `runs-on:`.
+on:
+  workflow_dispatch:
+    inputs:
+      vendor:
+        description: 'Target vendor'
+        required: true
+        type: choice
+        options:
+          - amd
+          - intel
+
+jobs:
+  bless-amd:
+    name: AMD RDNA3 (RADV) — first-run baseline bless
+    runs-on: [self-hosted, amd-rdna3]
+    if: >-
+      github.event.inputs.vendor == 'amd'
+      && vars.AMD_RUNNER_ONLINE == 'true'
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      VK_DRIVER_FILES: /usr/share/vulkan/icd.d/radeon_icd.x86_64.json
+      VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/radeon_icd.x86_64.json
+      AXC_ENABLE_GPU_BENCHES: "1"
+      # This is the ONE job in the whole milestone allowed to set this to "1"
+      # — a dedicated, human-triggered, workflow_dispatch-only bless job, never
+      # the per-PR gate (AT-3026 asserts the per-PR gate never does this).
+      AXC_BLESS_BASELINES: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build AXIOM (release)
+        run: cargo build --release -p axc-driver
+      - name: Bless AMD baselines (resident + cpu_reference benches)
+        # EB.2's merge_blessed performs a read-modify-write: it adds a NEW
+        # machine block keyed by sanitize(deviceName) and PRESERVES every
+        # other existing key (NVIDIA/Lavapipe are never overwritten).
+        run: cargo bench -p axc-driver
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cross-vendor-bless-amd-${{ github.run_id }}
+          path: .pipeline/benchmarks/baselines.json
+
+  bless-intel:
+    name: Intel Arc (ANV) — first-run baseline bless
+    runs-on: [self-hosted, intel-arc]
+    if: >-
+      github.event.inputs.vendor == 'intel'
+      && vars.INTEL_RUNNER_ONLINE == 'true'
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      VK_DRIVER_FILES: /usr/share/vulkan/icd.d/intel_icd.x86_64.json
+      VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/intel_icd.x86_64.json
+      AXC_ENABLE_GPU_BENCHES: "1"
+      AXC_BLESS_BASELINES: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build AXIOM (release)
+        run: cargo build --release -p axc-driver
+      - name: Bless Intel baselines (resident + cpu_reference benches)
+        run: cargo bench -p axc-driver
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cross-vendor-bless-intel-${{ github.run_id }}
+          path: .pipeline/benchmarks/baselines.json

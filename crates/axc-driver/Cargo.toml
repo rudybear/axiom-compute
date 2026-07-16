@@ -241,3 +241,9 @@ criterion = { workspace = true }
 # M2.2: Serde for baselines.json and candidate-baselines.json serialization.
 # M2.4: Temp file creation for history append tests.
 tempfile = { workspace = true }
+# EB.1-prep (§6.3): actively-maintained pure-Rust YAML parser for
+# eb1_workflow_ci.rs's structural/security ATs over .github/workflows/*.yml.
+# PINNED to saphyr (yaml-rust2's maintained successor) — NOT serde_yaml
+# (deprecated/archived by dtolnay, must not be introduced). Test-only:
+# no crate-graph edge into any src/.
+saphyr = "0.0.11"

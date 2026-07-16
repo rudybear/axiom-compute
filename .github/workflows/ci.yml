@@ -33,6 +33,15 @@ jobs:
         run: vulkaninfo --summary || echo 'vulkaninfo probe non-fatal'
         env:
           VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+      - name: Probe Mesa driver version (non-fatal)
+        # EB.1-prep fold-in (M3.23 discovery): Mesa 25.2.8 is KNOWN-BAD for the
+        # resident shared-mem dispatch path (SIGSEGV/heap corruption). We do not
+        # pin ubuntu-latest's Mesa here (hosted runner, apt mirror not ours to
+        # control) — this just surfaces the version in the log instead of a
+        # mystery segfault. See docs/EB1_RUNNER_SETUP.md §Mesa pin.
+        run: vulkaninfo | grep driverInfo || echo 'mesa-version probe non-fatal'
+        env:
+          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
       - name: Clippy
         # M4.1: --workspace includes axc-py (cdylib, extension-module) which builds on
         # Lavapipe CI without libpython. Clippy on the whole workspace stays useful.
@@ -94,9 +103,23 @@ jobs:
   # SKIPPED on the Lavapipe software-GPU CI (no CUDA, no NVIDIA Vulkan ICD). Mirrors
   # the M3.x #[ignore] GPU-test gating. continue-on-error keeps the PR mergeable while
   # the self-hosted runner fleet is provisioned; the cargo gate above stays blocking.
+  #
+  # EB.1-prep §2.3 hardening: this job is a self-hosted job on a `pull_request`
+  # trigger and was, before this change, the single LIVE fork-PR hole in the repo
+  # (no same-repo guard, no permissions pin, no timeout — a fork PR's
+  # `working-directory: py` build + `maturin develop --release` + `pytest` would
+  # execute attacker-controlled code on this maintainer's real NVIDIA GPU box).
+  # The three additions below close it; continue-on-error (PR-mergeability
+  # posture) and the AXC_ENABLE_GPU_TESTS/VK_DRIVER_FILES/steps are unchanged.
   pytorch-interop:
     runs-on: [self-hosted, nvidia, cuda]
     continue-on-error: true
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    if: >-
+      github.event_name != 'pull_request'
+      || github.event.pull_request.head.repo.full_name == github.repository
     env:
       AXC_ENABLE_GPU_TESTS: "1"
       VK_DRIVER_FILES: /usr/share/vulkan/icd.d/nvidia_icd.json
@@ -111,3 +134,32 @@ jobs:
       - name: Run zero-copy interop tests (AT-2100..2110)
         working-directory: py
         run: python -m pytest tests/ -v
+
+  # EB.1-prep §6.4: schema-level lint of every workflow file (bad `runs-on`,
+  # unknown keys, expression errors). Supply-chain-pinned: the actionlint
+  # binary is downloaded by an EXACT version tag and SHA-256-verified against a
+  # checksum committed in this file BEFORE it is executed — no unpinned network
+  # binary fetch. actionlint is never load-bearing for the security ATs; the
+  # authoritative structural/security coverage is the saphyr-backed
+  # eb1_workflow_ci.rs (unconditional parse, panics on failure, never a silent
+  # skip). Custom self-hosted labels (nvidia/cuda/amd-rdna3/intel-arc) are
+  # declared in .github/actionlint.yaml so the schema check doesn't flag them.
+  lint-workflows:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    env:
+      ACTIONLINT_VERSION: "1.7.12"
+      ACTIONLINT_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download + checksum-verify actionlint
+        run: |
+          set -euo pipefail
+          URL="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL -o actionlint.tar.gz "${URL}"
+          echo "${ACTIONLINT_SHA256}  actionlint.tar.gz" | sha256sum -c -
+          tar xzf actionlint.tar.gz actionlint
+      - name: Run actionlint
+        run: ./actionlint .github/workflows/*.yml
