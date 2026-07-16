@@ -368,7 +368,10 @@ fn build_push_constants(
 /// Apply the correctness oracle for known kernels.
 ///
 /// Returns `NotChecked` for unknown kernels (no CPU reference registered).
-fn check_correctness(
+///
+/// `pub(crate)` (M3.23): called from `optimize.rs`'s real-bench correctness
+/// closure, the ATTRIBUTOR face of the tri-state oracle (§1.5.1).
+pub(crate) fn check_correctness(
     kernel_name: &str,
     plan: &ParamBindingPlan,
     inputs: &[Vec<u8>],
@@ -458,11 +461,51 @@ pub(crate) fn ulp_tolerance_for_device(device_name: &str) -> u32 {
 /// Comparing NaN payloads bit-for-bit is therefore not a meaningful correctness
 /// signal. Any OTHER mismatch (exactly one side NaN, or two differing finite
 /// values) still fails via `within_ulp_f32`, unchanged.
-fn correctness_match(expected: f32, got: f32, ulp_tolerance: u32) -> bool {
+///
+/// `pub(crate)` (M3.23): the differential's per-element comparator (§1.5.1,
+/// `differential_mismatch` below) reuses this verbatim rather than duplicating
+/// the both-NaN-is-a-match rule.
+pub(crate) fn correctness_match(expected: f32, got: f32, ulp_tolerance: u32) -> bool {
     if expected.is_nan() && got.is_nan() {
         return true;
     }
     within_ulp_f32(expected, got, ulp_tolerance)
+}
+
+// ── M3.23 (§1.5.1, §1.6): variant-vs-variant differential (DETECTOR only) ──────
+
+/// Compare two variants' full readback buffer sets for the variant-vs-variant
+/// differential. BITWISE blob-equality fast-path FIRST — bit-identical ⇒
+/// match, done (exact `Vec<Vec<u8>>` equality via `PartialEq`); this makes a
+/// u32/copy kernel exact AND ensures two distinct garbage NaN-pattern buffers
+/// (whose BYTES differ) can never NaN-collapse into a spurious "match" via the
+/// f32-ULP leg below — only bit-INEQUAL buffers fall through to it (the r3
+/// MODERATE fix). The ULP leg then absorbs legitimate reduction-order float
+/// jitter within `ulp_tol` while still catching gross divergence.
+///
+/// Returns `Some((mismatch_count, max_observed_ulp))` on divergence, `None` on
+/// a match (bitwise OR within-tolerance).
+pub(crate) fn differential_mismatch(
+    reference: &[Vec<u8>],
+    got: &[Vec<u8>],
+    ulp_tol: u32,
+) -> Option<(usize, u32)> {
+    if reference == got {
+        return None; // bitwise fast-path: exact byte equality ⇒ match, done.
+    }
+    let mut mismatch_count: usize = 0;
+    let mut max_ulp: u32 = 0;
+    for (r, g) in reference.iter().zip(got.iter()) {
+        let rf: Vec<f32> = bytes_to_f32_slice(r);
+        let gf: Vec<f32> = bytes_to_f32_slice(g);
+        for i in 0..rf.len().min(gf.len()) {
+            if !correctness_match(rf[i], gf[i], ulp_tol) {
+                mismatch_count += 1;
+                max_ulp = max_ulp.max(observed_ulp_f32(rf[i], gf[i]));
+            }
+        }
+    }
+    if mismatch_count > 0 { Some((mismatch_count, max_ulp)) } else { None }
 }
 
 /// CPU saxpy reference: `y[i] += alpha * x[i]`.

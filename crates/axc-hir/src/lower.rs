@@ -213,12 +213,20 @@ pub fn lower_module(ast: &AstModule) -> (HirModule, Vec<HirError>, Vec<HirWarnin
                     }
                 }
 
+                // M3.23 (PW-1): a hole referenced ONLY in a `shared[T, ?name]` length is
+                // not an AnnotationArg, so `validate_hole_refs`'s annotation-only scan
+                // would spuriously report it as UnusedStrategyHole. Seed the body-scanned
+                // len-hole names into `referenced_holes` before that check.
+                let mut body_hole_refs: std::collections::HashSet<String> = std::collections::HashSet::new();
+                collect_shared_len_hole_refs(&kd.body.node, &mut body_hole_refs);
+
                 // M2.3: Validate HoleRefs across all annotations on this kernel.
                 validate_hole_refs(
                     &kd.annotations,
                     strategy_holes_opt.as_ref(),
                     &kd.params,
                     item.span,
+                    &body_hole_refs,
                     &mut errors,
                     &mut warnings,
                 );
@@ -1319,12 +1327,16 @@ fn validate_hole_refs(
     strategy: Option<&StrategyHoles>,
     params: &[axc_lexer::Spanned<axc_parser::ast::Param>],
     kernel_span: Span,
+    body_hole_refs: &std::collections::HashSet<String>,
     errors: &mut Vec<HirError>,
     warnings: &mut Vec<HirWarning>,
 ) {
     let _ = kernel_span; // currently unused; may be needed for future diagnostics
-    // Collect all hole names referenced via HoleRef across non-strategy annotations.
-    let mut referenced_holes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Collect all hole names referenced via HoleRef across non-strategy annotations,
+    // seeded (M3.23 PW-1) with any `shared[T, ?name]` length-hole references found
+    // in the kernel body (those are not AnnotationArgs, so the annotation scan below
+    // cannot see them).
+    let mut referenced_holes: std::collections::HashSet<String> = body_hole_refs.clone();
 
     for ann in annotations {
         if ann.node.name.node == "strategy" {
@@ -1363,6 +1375,36 @@ fn validate_hole_refs(
                 });
             }
         }
+    }
+}
+
+/// M3.23 (PW-1): recursively collect `shared[T, ?name]` length-hole names from
+/// `block`, including nested `if`/`for`/`while` bodies (`SharedDecl` is allowed in
+/// nested blocks per M3.2's `typecheck.rs` lowering).
+fn collect_shared_len_hole_refs(block: &axc_parser::ast::Block, out: &mut std::collections::HashSet<String>) {
+    for stmt in &block.stmts {
+        collect_shared_len_hole_refs_stmt(&stmt.node, out);
+    }
+}
+
+/// Single-statement worker for `collect_shared_len_hole_refs` (handles the
+/// `ElseArm::If` boxed-`Stmt` recursion, which is not itself a `Block`).
+fn collect_shared_len_hole_refs_stmt(stmt: &Stmt, out: &mut std::collections::HashSet<String>) {
+    match stmt {
+        Stmt::SharedDecl { len_hole: Some(h), .. } => {
+            out.insert(h.node.clone());
+        }
+        Stmt::If { then_block, else_arm, .. } => {
+            collect_shared_len_hole_refs(&then_block.node, out);
+            match else_arm.as_deref() {
+                Some(axc_parser::ast::ElseArm::Block(b)) => collect_shared_len_hole_refs(&b.node, out),
+                Some(axc_parser::ast::ElseArm::If(inner)) => collect_shared_len_hole_refs_stmt(&inner.node, out),
+                None => {}
+            }
+        }
+        Stmt::For { body, .. } => collect_shared_len_hole_refs(&body.node, out),
+        Stmt::While { body, .. } => collect_shared_len_hole_refs(&body.node, out),
+        _ => {}
     }
 }
 
@@ -2052,6 +2094,32 @@ mod tests {
         assert!(
             !warns.iter().any(|w| matches!(w, HirWarning::UnusedStrategyHole { name, .. } if name == "x")),
             "should NOT warn about x (it is referenced): {warns:?}"
+        );
+    }
+
+    /// AT-3009 (M3.23 PW-1): a hole referenced ONLY inside a `shared[i32, ?WG]`
+    /// length produces NO `UnusedStrategyHole` warning; a truly-unused sibling
+    /// hole in the SAME source still warns.
+    #[test]
+    fn at_3009_shared_len_hole_ref_is_not_unused() {
+        let src = "@kernel @workgroup(64, 1, 1) @strategy { WG: ?[32, 64], Z: ?[1] } \
+                   @intent(\"AT-3009\") @complexity(O(1)) \
+                   fn k(out: buffer[i32]) -> void { \
+                   shared t: shared[i32, ?WG]; \
+                   let lid: u32 = gid(0u32); \
+                   t[lid] = out[lid]; \
+                   workgroup_barrier(); \
+                   out[lid] = t[lid]; \
+                   return; }";
+        let (_, errors, warns) = lower_src(src);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        assert!(
+            !warns.iter().any(|w| matches!(w, HirWarning::UnusedStrategyHole { name, .. } if name == "WG")),
+            "WG is referenced only in the shared length; must NOT warn: {warns:?}"
+        );
+        assert!(
+            warns.iter().any(|w| matches!(w, HirWarning::UnusedStrategyHole { name, .. } if name == "Z")),
+            "Z is genuinely unused; must still warn: {warns:?}"
         );
     }
 

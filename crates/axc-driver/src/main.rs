@@ -34,7 +34,15 @@ fn main() -> miette::Result<()> {
             Ok(())
         }
         Command::Optimize { input, output, correctness, kernel } => {
-            run_optimize(&input, &output, &correctness, kernel.as_deref())
+            // M3.23: real-bench `run_optimize` requires a Vulkan device; wired
+            // via the same probe+construct pattern as `fuzz`/`rewrite-verify`
+            // (main.rs `run_fuzz`/`run_rewrite_verify`) — never a fake winner.
+            let vk: Option<axc_runtime::VulkanContext> = if axc_runtime::probe_vulkan_available() {
+                axc_runtime::VulkanContext::new().ok()
+            } else {
+                None
+            };
+            run_optimize(&input, &output, &correctness, kernel.as_deref(), vk.as_ref())
                 .map_err(|e| miette::miette!("{}", e))
         }
         Command::Mcp { log } => {

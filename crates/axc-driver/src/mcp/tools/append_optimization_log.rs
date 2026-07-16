@@ -59,8 +59,23 @@ pub struct AppendOptimizationLogResponse {
     pub ts: String,
 }
 
+/// M3.23 (M3.19c): per-note byte cap on the untrusted-agent MCP surface — an
+/// unbounded `note` lets an agent splice an arbitrarily long string into the
+/// source. Measured in BYTES via `str::len()` (cheap, unambiguous; documented
+/// as bytes rather than switched to `chars().count()` — see the milestone
+/// spec §2.4). A note of exactly `MAX_NOTE_LEN` bytes is accepted (at-cap).
+const MAX_NOTE_LEN: usize = 512;
+
 /// Handle an `append_optimization_log` request.
 pub(crate) fn handle(req: AppendOptimizationLogRequest) -> Result<AppendOptimizationLogResponse, McpToolError> {
+    if let Some(ref note) = req.note {
+        if note.len() > MAX_NOTE_LEN {
+            return Err(McpToolError::InvalidParams(format!(
+                "note exceeds MAX_NOTE_LEN (512 bytes): {} bytes",
+                note.len()
+            )));
+        }
+    }
     let unit: OptLogUnit = OptLogUnit::from_ident(&req.unit).ok_or_else(|| {
         McpToolError::InvalidParams(format!(
             "invalid `unit` `{}`; expected one of mtflops, pct_milli, ns, us, ms, bytes",
@@ -150,6 +165,40 @@ mod tests {
         };
         let err = handle(req).unwrap_err();
         assert!(matches!(err, McpToolError::InvalidParams(_)));
+    }
+
+    /// AT-3012 (M3.19c): a note over `MAX_NOTE_LEN` (512 bytes) is rejected with
+    /// `InvalidParams`; a note of EXACTLY 512 bytes is accepted (at-cap).
+    #[test]
+    fn at_3012_note_len_cap_512_bytes() {
+        let base_req = |note: Option<String>| AppendOptimizationLogRequest {
+            source_path: PathBuf::new(),
+            kernel: "k".to_string(),
+            metric: 1,
+            unit: "ns".to_string(),
+            verdict: "PASS".to_string(),
+            ts: Some("2026-07-14T12:00:00.000Z".to_string()),
+            note,
+        };
+
+        // 513 bytes: over cap, rejected BEFORE any file is touched (source_path
+        // is intentionally empty/invalid — proves the cap check runs first).
+        let over = "a".repeat(MAX_NOTE_LEN + 1);
+        let err = handle(base_req(Some(over))).unwrap_err();
+        match err {
+            McpToolError::InvalidParams(detail) => {
+                assert!(detail.contains("MAX_NOTE_LEN"), "detail: {detail}");
+                assert!(detail.contains("513"), "detail: {detail}");
+            }
+            other => panic!("expected InvalidParams; got {other:?}"),
+        }
+
+        // Exactly 512 bytes: accepted (at-cap) — splice against a real temp file.
+        let f = temp_axc_file("@kernel @workgroup(1,1,1) fn k() -> void { return; }");
+        let mut at_cap_req = base_req(Some("a".repeat(MAX_NOTE_LEN)));
+        at_cap_req.source_path = f.path().to_path_buf();
+        let resp = handle(at_cap_req).expect("exactly-512-byte note must be accepted");
+        assert_eq!(resp.kernel, "k");
     }
 
     /// AT-2912: MCP `append_optimization_log` produces a byte-identical result
