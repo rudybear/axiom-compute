@@ -1,0 +1,48 @@
+{
+  "verdict": "APPROVE",
+  "agent": "optimistic_code_reviewer",
+  "milestone_id": "EB1prep-cross-vendor-ci",
+  "branch": "coder/EB1prep-20260716-0600/EB1prep-cross-vendor-ci",
+  "commit": "a21b9dd",
+  "prior_verdict": "NEEDS_REVISION (commit b481048)",
+  "spec_compliance": false,
+  "positive_feedback": [
+    "The three new workflow files (cross-vendor-ci.yml, cross-vendor-ab.yml, cross-vendor-bless.yml) are exceptionally well-commented for a future runner-owner: each file leads with a block comment explaining the two-control activation mechanism (if:-gate vs runs-on:, the queue-forever trap), the fork-guard rationale, and the deliberate no-paths-filter constraint. A maintainer reading only the YAML (not the milestone doc) would understand why each guard exists.",
+    "docs/EB1_RUNNER_SETUP.md was walked mentally end-to-end as an AMD-box operator: driver install -> ICD path -> runner registration/labels -> activation switch -> device selection -> Mesa honesty -> fork-PR security (incl. the Dependabot same-repo-but-not-trusted caveat) -> branch-protection posture (skip-vs-pending trap) -> what-runs-per-PR -> first-run bless checklist -> A/B job -> validation-without-hardware. The sequencing is correct and nothing is presupposed; a first-time reader can execute it.",
+    "eb1_workflow_ci.rs's shared helpers (all_workflow_files/glob, scan_self_hosted_jobs, runs_on_kind, jobs_of, permissions_no_broader_than_contents_read) are genuinely reusable -- scan_self_hosted_jobs is called from both AT-3032 and AT-3034 rather than duplicated, and all_workflow_files is the single glob source for every ALL-files assertion. The independent (non-saphyr) raw-text cross-checks (grep_self_hosted_job_count, raw_top_level_job_names) are a nice belt-and-suspenders touch that directly serves the milestone's own no-vacuous-pass ethos.",
+    "Test naming/docs match repo convention exactly: fn at_NNNN_description() mirrors at_1560_*/at_eb2_* elsewhere, and the file-level //! doc with a '## AT-XXXX' subsection structure mirrors bench_regression.rs's own module doc style.",
+    "ROADMAP.md and UPSTREAM_PR_PLAN.md edits are accurate, proportionate, and consistent with the r2 spec's framing (prep MERGED / measurement still hardware-gated; A/B trigger now one workflow_dispatch click away, still UNMEASURED). No overclaiming.",
+    "pytorch-interop hardening in ci.yml (§2.3) is applied exactly as spec'd -- same-repo if:, permissions: contents: read, timeout-minutes: 30 -- with continue-on-error and the existing steps preserved verbatim.",
+    "saphyr scoped correctly as a axc-driver dev-dependency only; zero crates/*/src touches confirmed."
+  ],
+  "must_fix": [
+    {
+      "file": ".github/workflows/cross-vendor-ci.yml",
+      "jobs": ["amd-gpu", "intel-gpu"],
+      "description": "Both vendor jobs' 'Bench regression gate' step runs `cargo test --release -p axc-driver --test bench_regression -- --nocapture` but neither job's env: block (job-level or step-level) ever sets AXC_ENABLE_BENCH_REGRESSION=\"1\". crates/axc-driver/tests/bench_regression.rs:209-212 short-circuits (prints 'skipping bench regression' and returns Ok) whenever that var isn't exactly \"1\". Compare against the existing, working ci.yml `bench-regression` job (ci.yml:61 and :86), which DOES set AXC_ENABLE_BENCH_REGRESSION: \"1\" at job level -- that's the only reason it actually gates today. As merged, once an AMD/Intel runner activates, the vendor 'Bench regression gate' step will run, print the skip message, and exit 0 EVERY time, regardless of whether baselines.json has a key for that machine or whether a real regression occurred. This silently defeats one of the three §4.1 per-PR deliverables and directly contradicts the milestone's own no-vacuous-pass ethos (the same discipline AT-3033 exists to enforce for the YAML parser). Spec §4.1 explicitly requires 'AXC_ENABLE_BENCH_REGRESSION=1' in the vendor job's bench-regression step; the shipped YAML omits it.",
+      "why_untested": "AT-3028 (GPU-test step parity) only checks AXC_ENABLE_GPU_TESTS / VK_DRIVER_FILES on the ignored-suite step. AT-3031 (vendor-independence linkage) diffs only the `run:` command string between the Lavapipe and vendor bench-regression steps ('byte-identical modulo the ICD env') -- it never inspects the enclosing env: block, so two jobs with an identical command but a missing enabling var pass AT-3031 vacuously. No AT in the 3019..3035 range asserts AXC_ENABLE_BENCH_REGRESSION is present on the vendor bench-regression step.",
+      "suggested_fix": "Add `AXC_ENABLE_BENCH_REGRESSION: \"1\"` to the job-level env: block of both amd-gpu and intel-gpu in cross-vendor-ci.yml (alongside AXC_ENABLE_GPU_TESTS/AXC_REQUIRE_SPIRV_VAL). Recommend also tightening AT-3031 (or adding a new AT) to assert the bench-regression step's effective env includes AXC_ENABLE_BENCH_REGRESSION=\"1\" on every job that runs the `--test bench_regression` command, so this class of bug can't recur."
+    }
+  ],
+  "minor_issues": [
+    {
+      "file": "crates/axc-driver/tests/eb1_workflow_ci.rs",
+      "description": "AT-3031's 'vendor-independence linkage' framing ('byte-identical modulo the ICD env') is true only of the run: step text; it doesn't cover job env:, which is exactly where the AXC_ENABLE_BENCH_REGRESSION gap above lives. Worth broadening the assertion's scope or its doc comment to be explicit that it only proves command parity, not full environment parity."
+    }
+  ],
+  "summary": "The workflow YAML, EB1_RUNNER_SETUP.md, and eb1_workflow_ci.rs are all high quality, well-documented, and faithful to the r2 spec in every structural/security dimension the 17 ATs cover (activation gating, fork guard, permissions, timeouts, pull_request_target absence, Mesa honesty, docs completeness, ROADMAP/UPSTREAM_PR_PLAN edits). However, direct inspection found a concrete functional bug that slipped past the Coder, QA, and all 17 ATs: cross-vendor-ci.yml's amd-gpu/intel-gpu jobs never set AXC_ENABLE_BENCH_REGRESSION=\"1\", so their 'Bench regression gate' step will silently no-op (short-circuit and pass) on real hardware, contradicting spec §4.1 and the milestone's own anti-vacuous-pass principle. This is a small, precise, one-line-per-job fix, but it is spec non-compliance in a load-bearing deliverable, so verdict is NEEDS_REVISION rather than APPROVE.",
+  "recheck": {
+    "commit": "a21b9dd",
+    "verdict": "APPROVE",
+    "finding_status": "CLOSED",
+    "observed": [
+      "FIX PRESENT: cross-vendor-ci.yml now sets AXC_ENABLE_BENCH_REGRESSION: \"1\" at JOB level on BOTH vendor jobs — amd-gpu (line 49) and intel-gpu (line 96), alongside AXC_ENABLE_GPU_TESTS/AXC_REQUIRE_SPIRV_VAL exactly as suggested. Each carries an explanatory comment tying it to bench_regression.rs:209 and mirroring ci.yml:61.",
+      "NEW GUARD AT-3036: eb1_workflow_ci.rs:695-721 globs ALL workflow files (all_workflow_files(), not a hardcoded amd/intel list), finds every step whose run: contains '--test bench_regression', and asserts AXC_ENABLE_BENCH_REGRESSION==\"1\" in its effective env (step-level OR job-level via bench_regression_enabled()). checked>0 floor prevents a vacuous empty-selector pass. This exactly implements the suggested_fix's 'add a new AT that asserts the enabling var on every job running the bench_regression command'.",
+      "ADVERSARIAL PROOF (my own scratch injection, cleaned up): dropped .github/workflows/zz_scratch_opt.yml with a bench_regression run step and NO enabling var; AT-3036 FAILED CLOSED with the precise message naming the scratch job and citing bench_regression.rs:209. Deleted; git status clean; ls .github/workflows shows only the 4 real files.",
+      "bench_regression.rs short-circuit confirmed: `if env(AXC_ENABLE_BENCH_REGRESSION) != Ok(\"1\") { eprintln!(\"skipping...\"); return; }` — the silent-no-op the finding described is real, and the fix genuinely arms the gate.",
+      "eb1_workflow_ci suite 19/19 green (was 17; +AT-3036, +AT-3037). cargo test --workspace exits 0.",
+      "Spec lockstep: §7.1/§4.1 (AXC_ENABLE_BENCH_REGRESSION effective-env requirement) + the AT table now carries AT-3036 (row 274). The minor_issue (AT-3031 env-scope framing) is now moot — AT-3036 covers the env: block the old AT-3031 framing did not."
+    ],
+    "reverdict_rationale": "The single must-fix is closed exactly as suggested (job-level var on both vendor jobs) AND hardened against recurrence by a new glob-scoped AT that I independently proved fails-closed. No new issues found in the review-fix diff. APPROVE."
+  }
+}

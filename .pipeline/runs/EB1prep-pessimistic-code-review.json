@@ -1,0 +1,84 @@
+{
+  "verdict": "APPROVE",
+  "agent": "pessimistic_code_reviewer",
+  "milestone_id": "EB1prep-cross-vendor-ci",
+  "branch": "coder/EB1prep-20260716-0600/EB1prep-cross-vendor-ci",
+  "prior_verdict": "NEEDS_REVISION (commit b481048)",
+  "recheck_commit": "a21b9dd",
+  "reviewed_diff": "git diff main...HEAD (12 files, +2032/-2)",
+  "test_suite": "cargo test -p axc-driver --test eb1_workflow_ci → 17/17 green; independently reproduced 3 adversarial scratch injections (anchor-aliased runs-on, block-style guardless, .yaml-extension) — all cleaned up, git status clean",
+  "critical_bugs": [],
+  "must_fix": [
+    {
+      "id": "PESS-1",
+      "severity": "medium",
+      "title": "The 'regression-proof' self-hosted scan (AT-3032) AND the actionlint lint step both filter to `*.yml` — a GitHub-valid `.github/workflows/*.yaml` workflow escapes BOTH, defeating the milestone's headline BLOCKER-1 guarantee.",
+      "file": "crates/axc-driver/tests/eb1_workflow_ci.rs",
+      "line": "86-93 (all_workflow_files: `.filter(|p| p.extension()... == Some(\"yml\"))`); .github/workflows/ci.yml:165 (`./actionlint .github/workflows/*.yml`)",
+      "evidence": "PROVEN by scratch injection: dropped `.github/workflows/zz_scratch_hole.yaml` containing `runs-on: [self-hosted, amd-rdna3]` with NO fork guard, NO permissions, NO timeout. `cargo test ... at_3032` returned `test result: ok` — the guardless self-hosted job was invisible to the scan (glob excludes `.yaml`), and `.github/workflows/*.yml` also excludes it from actionlint. GitHub Actions honors BOTH `.yml` and `.yaml` extensions equally, so this is a fully functional workflow that would run fork/attacker code on the persistent GPU box with a GREEN CI.",
+      "why_it_matters": "The entire r2 revision (§2.4, 'closes BLOCKER-1') rests on the claim that the scan is 'a scan of ALL self-hosted jobs in ALL workflow files ... glob, not a hardcoded 4-file list ... so any future self-hosted job that regresses the guard is caught.' The `.yml`-only extension filter makes that guarantee false for a `.yaml` file — precisely the 'maintainer 6 months from now adds a new self-hosted job' scenario the AT exists to prevent. Not exploitable TODAY (no `.yaml` file exists, no runner registered — verified), so it is forward-defensive, not a live hole; but it is a demonstrated bypass of a security-critical, load-bearing AT.",
+      "fix": "One-line: extend `all_workflow_files()` to accept `Some(\"yml\") | Some(\"yaml\")`, and change the actionlint invocation to lint `*.yml` and `*.yaml` (or invoke `./actionlint` with no path args so it auto-discovers both). The independent grep cross-check (COND-2) already operates per-file so it needs no change once the file set includes `.yaml`. Spec text (§2.4/§6.3/§7.1 all say `*.yml`) should be updated in lockstep — minor Architect touch.",
+      "routes_to": "Coder (glob + actionlint arg); Architect (align spec `*.yml` wording to `*.yml|*.yaml`)"
+    }
+  ],
+  "warnings": [
+    {
+      "id": "PESS-2",
+      "severity": "low",
+      "title": "Untrusted-input-shaped interpolation: `${{ inputs.variant }}` is expanded directly inside `run:` shell bodies in the A/B job (classic GitHub script-injection sink).",
+      "file": ".github/workflows/cross-vendor-ab.yml",
+      "line": "103 and 170 (`ARGS+=(${{ inputs.variant }})`)",
+      "evidence": "`variant` is a free-form `type: string` workflow_dispatch input interpolated into the shell before parsing; a value like `; curl … | sh #` would execute. Bounded because `workflow_dispatch` is write-access-gated — the dispatcher is already a trusted collaborator who can run code on the runner via same-repo PRs anyway, so there is NO privilege escalation. Still a GitHub-hardening anti-pattern (their guide: never interpolate `${{ github.event.inputs.* }}` into `run:`; pass via `env:` and reference `\"$VARIANT\"`).",
+      "fix": "Pass `variant` through a step-level `env: VARIANT: ${{ inputs.variant }}` and use `\"$VARIANT\"` in the script. `skip_llama_build` is a `type: boolean` (constrained true/false) so its interpolation is safe. Non-blocking; defense-in-depth.",
+      "routes_to": "Coder (optional hardening)"
+    },
+    {
+      "id": "PESS-3",
+      "severity": "low",
+      "title": "`lint-workflows` has no `continue-on-error`/retry — a GitHub-release download or checksum flake turns the job red.",
+      "file": ".github/workflows/ci.yml",
+      "line": "147-165 (curl actionlint release + sha256sum -c, no retry)",
+      "evidence": "`curl -fsSL … | sha256sum -c -` fails hard on a transient release-CDN blip → job red. Not blocking today (main has no branch protection — verified 404 in spec §1.4) and the design (§6.4, edge-case §10) explicitly states actionlint is schema-lint-only, never load-bearing for the security ATs, and 'may be dropped entirely.' Honest assessment: real availability concern is low (GitHub-release fetch inside GitHub Actions is generally reliable), and the authoritative coverage is the unconditional saphyr test. Informational only.",
+      "fix": "Optional: add a small retry loop on the download, or drop actionlint per the design's own allowance. Non-blocking.",
+      "routes_to": "Coder (optional)"
+    }
+  ],
+  "verified_safe": [
+    "GUARD PRECEDENCE (cross-vendor-ci.yml:34-37): `vars.X_RUNNER_ONLINE == 'true' && (event_name != 'pull_request' || same-repo)` is correctly parenthesized. For a fork PR: `true && (false || false) = false` → job SKIPS (fork code never checked out). GA `&&`-binds-tighter-than-`||` cannot bypass it because the `||` is explicitly wrapped.",
+    "SAME-REPO COMPARE CASE-DIRECTION: `head.repo.full_name == github.repository` — any case/format drift makes the equality FALSE → job skips (fails CLOSED, the safe direction). A drift can only over-restrict (skip a legit same-repo run), never run a fork.",
+    "ANCHOR/ALIAS BYPASS (probed): a self-hosted `runs-on: *alias` is caught — saphyr resolves the alias (structural count +1) while the independent grep does not, so the COND-2 `assert_eq` count-mismatch fails the build CLOSED. There is no way to have a real self-hosted job that saphyr neither panics on (COND-1 NonLiteral) nor counts.",
+    "FLOW vs BLOCK style (probed): both `runs-on: [self-hosted, x]` and `runs-on:\\n  - self-hosted` are counted by both mechanisms; a guardless block-style job trips AT-3032(a).",
+    "runs-on MAPPING FORM `{group:, labels:}` → NonLiteral → COND-1 panic (fail-closed); self-hosted cannot hide in a labels mapping.",
+    "EXPRESSION-DERIVED runs-on → COND-1 fail-closed (QA-reproduced; A/B/bless deliberately use two literal-label jobs per vendor instead of one `${{ }}`-selected job).",
+    "A/B SHA ASSERTION ORDER: the `skip_llama_build` preflight (cross-vendor-ab.yml:61-78) asserts `git rev-parse HEAD == LLAMACPP_COMMIT` BEFORE the harness runs; and the script itself (scripts/m34_llamacpp_ab.sh:451-458) re-checks out + fail-closes on the pin before any llama build. `--skip-build` correctly maps to skipping the test-backend-ops build only (SKIP_BUILD forces rebuild if the binary is absent).",
+    "ARTIFACT NAMES collision-safe across vendors: `cross-vendor-ab-{amd,intel}-${{ github.run_id }}` and `cross-vendor-bless-{amd,intel}-…` are vendor+run-id keyed.",
+    "NEVER-AUTO-BLESS anchored on content: AT-3026 asserts cross-vendor-ci.yml never sets `AXC_BLESS_BASELINES: \"1\"`; bless.yml is the sole setter and is workflow_dispatch-only (AT-3023); the runner never writes to the repo (uploads baselines.json artifact for a human PR).",
+    "AT-3027 pin-drift guard reads BOTH the workflow env and scripts/m34_llamacpp_ab.sh and asserts equality (b9542 / 6b80c74…) — genuine cross-file check, confirmed against script lines 104-105.",
+    "ci.yml pytorch-interop STILL runs on push-to-main and same-repo PRs (if: `event_name != 'pull_request' || same-repo`), only fork PRs skip; `continue-on-error: true` preserved; timeout-minutes: 30, permissions: contents: read added (BLOCKER-1 in-place fix verified).",
+    "AT-3032 FLOOR cross-check cannot be inflated by a `self-hosted` token in a COMMENT: grep only matches lines whose trimmed prefix is `runs-on:` (comment lines start with `#`), and the saphyr↔grep `assert_eq` would fail CLOSED on any divergence anyway.",
+    "DOCS (EB1_RUNNER_SETUP.md): repo-scope registration, ephemeral/JIT REQUIRED, non-root REQUIRED, 'Require approval for all outside collaborators', registration uses a `<REG_TOKEN>` placeholder (not a broad-scope PAT), no runner-as-root guidance — no insecure-setup traps found. Mesa honesty (25.2.8 known-bad, good version UNKNOWN/TBD) intact; AT-3035 version-shape scanner enforces no fabricated good version."
+  ],
+  "spirv_val_check": "N/A (non-codegen milestone; zero crates/axc-*/src touches — verified `git diff --stat main...HEAD -- 'crates/*/src'` empty)",
+  "ub_check": "N/A",
+  "race_condition_check": "N/A",
+  "vendor_divergence_check": "PASS (documented honestly): coopmat/subgroup-32 tests typed-skip on AMD wave64 / Intel SIMD8-16 rather than fail; run log records skips; the portable subset is the real cross-vendor signal. The `cargo bench` bless path on wave64 is EB.1-proper hardware-gated and human-reviewed before commit — out of scope for this prep milestone.",
+  "memory_footprint_ok": true,
+  "summary": "EB.1-prep is high-quality, non-code (YAML+MD+one CPU-only test+one dev-dep), zero src touches, 17/17 ATs green, clippy clean, and all five QA security injections plus my three additional adversarial probes (anchor-aliased runs-on, block-style guardless, .yaml-extension) behave as expected — four of them fail CLOSED. Guard precedence, same-repo fail-direction, pin-drift, never-auto-bless, the in-place pytorch-interop BLOCKER-1 fix, and the docs security posture all check out. ONE must-fix: the self-hosted security scan (AT-3032) and the actionlint step both filter to `*.yml`, so a GitHub-valid `.github/workflows/*.yaml` workflow with a guardless self-hosted job escapes BOTH — I PROVED this with a scratch `.yaml` injection that AT-3032 passed green. This directly defeats the milestone's headline 'regression-proof scan of ALL self-hosted jobs in ALL workflow files' (BLOCKER-1 closure). It is forward-defensive (no `.yaml` file exists today, no runner registered) so not a live hole, and the fix is a one-line glob extension (`yml|yaml`) plus the actionlint arg — hence NEEDS_REVISION, not REJECT. Two low warnings (variant script-injection sink; lint-workflows network-flake redness) ride along as optional hardening.",
+  "recheck": {
+    "commit": "a21b9dd",
+    "verdict": "APPROVE",
+    "pess1_status": "CLOSED",
+    "pess2_status": "CLOSED (low warning; hardened)",
+    "observed": [
+      "PESS-1 GLOB FIX: eb1_workflow_ci.rs now defines WORKFLOW_FILE_EXTENSIONS = [\"yml\", \"yaml\"] (line 95) and all_workflow_files() filters on WORKFLOW_FILE_EXTENSIONS.contains(&ext) (lines 103-107) — the accepted set is now both extensions GitHub Actions honors.",
+      "PESS-1 ACTIONLINT FIX: ci.yml:174 invokes `./actionlint` with NO path args — extension-agnostic auto-discovery of every file under .github/workflows (.yml AND .yaml), strictly better than a `*.yml|*.yaml` glob (no unexpanded-no-match-pattern footgun). Confirmed the old `*.yml`-only invocation is gone.",
+      "PESS-1 PIN AT-3037: eb1_workflow_ci.rs:730-752 pins the accepted extension set to exactly {yml, yaml} with positive/negative probes (yml, yaml accept; yml.bak, txt, empty reject) so a future refactor that silently narrows the filter trips even with no physical .yaml on disk.",
+      "PESS-1 ADVERSARIAL RE-PROOF (my own scratch injection, cleaned up): re-injected .github/workflows/zz_scratch_pess1.yaml — a guardless self-hosted job (runs-on: [self-hosted, amd-rdna3], on: pull_request, NO fork guard / NO permissions / NO timeout). Whereas at b481048 this passed GREEN, at a21b9dd AT-3032 FAILED CLOSED ('AT-3032(a): ...scratch-hole... neither the same-repo fork guard...nor workflow_dispatch-only') AND AT-3034 FAILED CLOSED ('has no timeout-minutes'). The .yaml bypass is closed. Deleted; git status clean; ls .github/workflows shows only the 4 real files.",
+      "PESS-2 ENV-ROUTING FIX: cross-vendor-ab.yml — both A/B jobs now route inputs.variant through step-level `env: VARIANT: ${{ inputs.variant }}` (ab-amd line 106-107, ab-intel line 184-185) and reference `$VARIANT` in the run: body (line 114 / 192) instead of interpolating `${{ inputs.variant }}` into the shell text. The two interpolation sites the warning flagged (old lines 103/170) are gone. skip_llama_build stays a `type: boolean` (constrained) so its comparison is safe, as noted.",
+      "SPEC LOCKSTEP: §2.4 now reads 'ALL `.github/workflows/*.{yml,yaml}` (glob over BOTH extensions GitHub Actions honors)'; §6.3 carries the review-fix note pinning the accepted set to {yml,yaml} and citing AT-3037; §7.1 documents actionlint 'invoked with no path args so it auto-discovers every file...regardless of `.yml`/`.yaml`'; the AT table adds AT-3036 (row 274) and AT-3037 (row 275); §8 heading + r2 references updated to AT-3019..AT-3037.",
+      "SUITE: eb1_workflow_ci 19/19 green (was 17/17); cargo test --workspace exits 0. My earlier verified-safe list (guard precedence, same-repo fail-direction, anchor/alias, block-style, mapping/expression fail-closed, pin-drift, never-auto-bless) is unaffected by this diff (the runs_on_kind classifier and COND-1/COND-2 machinery are unchanged; only the file-extension selector widened)."
+    ],
+    "reverdict_rationale": "PESS-1 (the security-critical, load-bearing must-fix) is closed at both sinks — the saphyr scan glob and the actionlint invocation now cover .yaml — and I independently re-proved the exact .yaml bypass that was green at b481048 now fails CLOSED on both AT-3032 and AT-3034, plus AT-3037 regression-pins the extension set. PESS-2 (low) is hardened via env-routing at both interpolation sites. No new issues introduced by the review-fix diff; zero src touches preserved. APPROVE.",
+    "residual_low_warnings": "PESS-3 (lint-workflows network-flake redness) remains INFORMATIONAL/optional per the design's own allowance (actionlint is never load-bearing for the security ATs; the saphyr test is authoritative) — non-blocking, not required for APPROVE."
+  }
+}

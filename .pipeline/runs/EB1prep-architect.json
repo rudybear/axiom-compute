@@ -1,0 +1,81 @@
+{
+  "verdict": "REVISED",
+  "agent": "architect",
+  "milestone_id": "EB1prep-cross-vendor-ci",
+  "revision": "r2",
+  "supersedes": "r1 (PROPOSED)",
+  "review_inputs": {
+    "optimistic": "APPROVE (with rulings: ephemeral REQUIRED; env-approval docs-only; Windows out; add a proper YAML dev-dep; branch-protection paragraph)",
+    "pessimistic": "NEEDS_REVISION (2 CRITICAL + 3 must-fix + 4 warnings)"
+  },
+  "summary": "Surgical r2 revision. Both pessimistic CRITICAL blockers closed and all must-fix/warnings addressed; optimistic rulings folded. BLOCKER-1: the ALREADY-LIVE self-hosted pytorch-interop job (ci.yml:98) is now hardened in-place (same-repo if: guard + permissions: contents: read + timeout-minutes: 30), and the security AT is a glob-scan of EVERY self-hosted job in EVERY workflow file so future jobs cannot silently re-open the hole. BLOCKER-2: the YAML parse mechanism is PINNED to saphyr (test-only dev-dependency of axc-driver); the #[cfg]-guarded silent-no-op fallback is FORBIDDEN, with a no-vacuous-pass meta-assertion. serde_yaml explicitly rejected (deprecated). Timeouts, Mesa-honesty, branch-protection posture, and the three rulings are all in. AT range grows to AT-3019..AT-3035; LOC restated ~1,266 net, zero src/.",
+  "critical_fixes": [
+    {
+      "id": "BLOCKER-1",
+      "issue": "pytorch-interop (ci.yml:98, [self-hosted, nvidia, cuda], on: pull_request) had no fork guard, no permissions pin, no timeout -> fork-PR arbitrary code execution on the maintainer's GPU box today.",
+      "fix": "New spec section 2.3 hardens it in-place: same-repo `if: github.event_name != 'pull_request' || head.repo.full_name == github.repository`, `permissions: { contents: read }`, `timeout-minutes: 30`; continue-on-error (M4.1) preserved. New section 2.4 makes the security assertion a glob-scan (AT-3032) over every self-hosted-labelled job in ALL .github/workflows/*.yml (incl. pytorch-interop and future jobs), asserting fork-guard-or-workflow_dispatch-only + permissions<=contents:read + timeout-minutes.",
+      "status": "CLOSED"
+    },
+    {
+      "id": "BLOCKER-2",
+      "issue": "No YAML parser vendored; serde_yaml deprecated; the r1 '#[cfg]-guarded no-op when absent' fallback let the security ATs (fork-guard / no-pull_request_target / least-privilege / never-auto-bless) compile to vacuous green passes.",
+      "fix": "New section 6.3 PINS the mechanism to `saphyr` (maintained successor to yaml-rust2, real YAML AST) as a test-only [dev-dependencies] of axc-driver (zero src touch, satisfies no-runtime-code non-scope). serde_yaml explicitly rejected. Silent-no-op FORBIDDEN: parse is unconditional, missing parser is a compile error, parse failure panics. AT-3033 is a no-vacuous-pass meta-assertion (parse ran, jobs node resolved). actionlint demoted to belt-and-suspenders schema-lint (section 6.4).",
+      "status": "CLOSED"
+    }
+  ],
+  "must_fix_addressed": [
+    "timeout-minutes on EVERY self-hosted job: per-PR GPU test/bless = 30, A/B (llama source build) = 90, pytorch-interop = 30 (sections 2.3/3.1/4.1/4.2 + AT-3034).",
+    "Mesa honesty (section 5.3 reworded): 25.2.8 known-bad ONLY; known-good RADV/ANV Mesa is UNKNOWN/TBD until EB.1 hardware — no invented range; AT-3035 asserts the framing.",
+    "Branch-protection posture (new section 1.4): if-level-skip==PASS vs never-triggered==PENDING-FOREVER (paths-filter trap); don't mark vendor jobs required pre-activation; never add paths: filters. Anchored in AT-3029."
+  ],
+  "warnings_lowered": [
+    "A/B evidence provenance (section 3.1): dispatch github.actor + runner logs + embedded vulkaninfo device string documented as a bounded integrity anchor, honestly flagged as not a cryptographic proof.",
+    "skip_llama_build guarded (section 3.1 step 3): preflight asserts cached build exists AND `git rev-parse HEAD == 6b80c74...` pin; fails loudly instead of the obscure missing-test-backend-ops error.",
+    "actionlint supply-chain (section 6.4): version-pinned AND SHA-256-checksum-verified, or dropped in favor of the saphyr parser (never load-bearing for security ATs)."
+  ],
+  "optimistic_rulings_folded": [
+    "Ephemeral/JIT runner + non-root + 'require approval for outside collaborators' => REQUIRED (upgraded from strongly-recommend); rationale: same-repo if: guard is the sole primary control, no env-approval, no branch protection on main today. AT-3029 anchors the wording.",
+    "Environment-approval tier => DOCS-ONLY (confirmed): redundant second gate for trusted same-repo PRs; documented as the fork-PR upgrade path, not wired in.",
+    "Windows/AMD path => OUT OF SCOPE as an explicit non-goal in section 0 (Linux + Mesa RADV/ANV beachhead; different ICD stack + own security review)."
+  ],
+  "at_range": {
+    "before": "AT-3019 .. AT-3031 (13 ATs)",
+    "after": "AT-3019 .. AT-3035 (17 ATs)",
+    "added": [
+      "AT-3032: ALL-self-hosted-jobs security glob-scan (same-repo guard OR workflow_dispatch-only + permissions<=contents:read + timeout-minutes) across every workflow file incl. pytorch-interop.",
+      "AT-3033: no-vacuous-pass meta-assertion (saphyr parse ran, jobs node resolved; no #[cfg] skip).",
+      "AT-3034: every self-hosted job declares timeout-minutes within sane bounds (test/bless<=30, A/B<=90, pytorch-interop==30).",
+      "AT-3035: Mesa honesty — 25.2.8 known-bad AND explicit UNKNOWN/TBD known-good framing; no fabricated good-version."
+    ],
+    "ceiling_authorized": "AT-3035",
+    "collision_check": "clear (existing space tops out at AT-3018 per optimistic review)"
+  },
+  "loc_estimate": {
+    "cross-vendor-ci.yml": 110,
+    "cross-vendor-ab.yml": 90,
+    "cross-vendor-bless.yml": 60,
+    "ci.yml_edits": 40,
+    "eb1_workflow_ci.rs": 520,
+    "cargo.toml_dev_dep": 1,
+    "EB1_RUNNER_SETUP.md": 430,
+    "roadmap_upstream_doc_edits": 15,
+    "total_net_additions": 1266,
+    "src_loc": 0,
+    "note": "Only Rust added is a CPU-only test; only manifest change is a test-only saphyr dev-dependency. Zero crates/axc-*/src touches."
+  },
+  "files_to_create": [
+    ".github/workflows/cross-vendor-ci.yml",
+    ".github/workflows/cross-vendor-ab.yml",
+    ".github/workflows/cross-vendor-bless.yml",
+    "docs/EB1_RUNNER_SETUP.md",
+    "crates/axc-driver/tests/eb1_workflow_ci.rs"
+  ],
+  "files_to_modify": [
+    ".github/workflows/ci.yml",
+    "crates/axc-driver/Cargo.toml",
+    "ROADMAP.md",
+    "UPSTREAM_PR_PLAN.md"
+  ],
+  "spec_path": ".pipeline/milestones/EB1prep-cross-vendor-ci.md",
+  "ready_for": "re-review (both design reviewers) then Coder"
+}

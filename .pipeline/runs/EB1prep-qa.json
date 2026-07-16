@@ -1,0 +1,49 @@
+{
+  "verdict": "PASS",
+  "agent": "qa_agent",
+  "milestone_id": "EB1prep-cross-vendor-ci",
+  "branch": "coder/EB1prep-20260716-0600/EB1prep-cross-vendor-ci",
+  "commit": "b481048",
+  "requirements_total": 17,
+  "requirements_covered": 17,
+  "requirements_missing": [],
+  "test_results": {
+    "eb1_workflow_ci_ats": { "total": 17, "passed": 17, "failed": 0 },
+    "cargo_test_workspace_headless": { "failed": 0, "note": "all lib+integration+doctests green, no GPU env, includes at_709 in isolation (passed 5/5 reruns)" },
+    "cargo_test_workspace_ignored_lavapipe": {
+      "note": "ran the vendor job's exact --ignored command against local Lavapipe (Mesa 25.2.8-0ubuntu0.24.04.2, confirmed via the workflow's own vulkaninfo|grep driverInfo probe). One failure: at1707_opphi_coopmat_accumulate_bit_exact_gpu (dispatch_shared_m32.rs) — max_diff=332. This file is verified UNTOUCHED by this diff (git diff main...HEAD --stat shows zero changes to dispatch_shared_m32.rs), so causality as the pre-existing M3.23/ROADMAP.md:412 Lavapipe shared-mem defect is structurally proven, not merely asserted. Matches coder's self-report."
+    },
+    "cargo_test_bench_regression_lavapipe": {
+      "note": "ran `cargo test --release -p axc-driver --test bench_regression -- --nocapture` (byte-identical to the vendor job step) with AXC_BLESS_BASELINES=\"\". Printed `gating against machine_key='llvmpipe_llvm_20_1_2_256_bits' (device probed)` — confirms EB.2 machine-key selection works with the exact command the vendor jobs use (AT-3031 vendor-independence linkage). One CPU-timing-noise regression on cpu_vector_add_1m (95.6% over baseline) on this shared sandbox VM — same class of noisy-VM false-regression the coder self-reported (cpu_vector_add_1024, 22.7%), not a code defect; bench_regression.rs is untouched by this diff."
+    }
+  },
+  "verification_results": {
+    "clippy_check": "PASS (cargo clippy --workspace --all-targets -- -D warnings, clean)",
+    "diff_check": "PASS — every §6.1/§6.2 planned file present; git diff --stat main...HEAD matches files_created/files_modified in EB1prep-coder.json exactly (plus the milestone spec doc itself, which is expected pipeline artifact)",
+    "actionlint_check": "PASS — downloaded actionlint v1.7.12 independently, verified sha256 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8 against the upstream GitHub release checksums.txt (exact match), ran `actionlint .github/workflows/*.yml` locally: exit 0, zero findings",
+    "adversarial_injection_results": {
+      "expression_runs_on": "FAIL as required — injected `runs-on: ${{ fromJSON(...) }}` scratch job; at_3032/at_3034 panicked with the exact COND-1 fail-closed message ('non-literal ... runs-on'). Scratch file deleted, git status clean.",
+      "guardless_self_hosted_job": "FAIL as required — injected a self-hosted job on `pull_request` with no fork guard; at_3032(a) panicked ('has neither the same-repo fork guard ... nor is workflow_dispatch-only'). Scratch file deleted, git status clean.",
+      "pull_request_target_trigger": "FAIL as required — injected `pull_request_target:` into cross-vendor-ci.yml's `on:` block; at_3024 panicked. File restored from backup, byte-identical (diffed against pre-edit copy), git status clean.",
+      "missing_permissions_block": "FAIL as required — deleted the `permissions:` block from amd-gpu; at_3025 AND at_3032(b) both panicked. File restored, git status clean.",
+      "missing_timeout": "FAIL as required — deleted `timeout-minutes: 30` from amd-gpu; at_3034 AND at_3032(c) both panicked. File restored, git status clean.",
+      "cleanup_verified": "git status --short is empty after all 5 injections; git diff --stat main...HEAD unchanged from the true diff"
+    },
+    "workflow_line_by_line": {
+      "if_expression_precedence": "verified correct in all 3 new + 1 modified workflow: `vars.X_RUNNER_ONLINE == 'true' && (event_name != 'pull_request' || same-repo)` for cross-vendor-ci.yml (both push/PR paths need activation AND either non-PR or same-repo); `github.event.inputs.vendor == '<v>' && vars.X_RUNNER_ONLINE == 'true'` for the workflow_dispatch-only ab/bless jobs (no fork guard needed there per spec, since dispatch-only jobs are exempted by AT-3021/AT-3032(a) design)",
+      "permissions_pinned": "contents: read on every job in cross-vendor-ci.yml, cross-vendor-ab.yml, cross-vendor-bless.yml, and the hardened pytorch-interop + new lint-workflows job in ci.yml — confirmed by direct diff read and independently re-derived by at_3032(b)/at_3025",
+      "timeouts": "30 (amd-gpu/intel-gpu, bless-amd/bless-intel, pytorch-interop) / 90 (ab-amd/ab-intel) all present and match spec §2.3/§3.1/§4.1/§4.2 exactly",
+      "pull_request_target_absent": "confirmed absent via grep across all 3 new files (and negatively tested above)",
+      "pytorch_interop_hardening": "continue-on-error: true preserved verbatim; timeout-minutes: 30, permissions: contents: read, and the same-repo `if:` guard added exactly as spec'd in §2.3; AXC_ENABLE_GPU_TESTS/VK_DRIVER_FILES/steps unchanged",
+      "ab_job_llama_pin_assertion": "AT-3027 reads scripts/m34_llamacpp_ab.sh and cross-vendor-ab.yml's env: block and asserts LLAMACPP_TAG==\"b9542\" and LLAMACPP_COMMIT==\"6b80c74f285390368b3c99c5e750f19e9b096e98\" AND that the script contains both — genuine cross-file pin-drift guard, not a hardcoded-only check"
+    },
+    "docs_completeness": "PASS — EB1_RUNNER_SETUP.md contains all §1-§13 sections named in the spec's file list (RADV justification + AMDVLK fallback, ANV, labels, Activation §5, Mesa honesty §7, Fork-PR security §8 incl. the COND-3 'fork guard, not trust guard' + Dependabot sentence verbatim, branch-protection posture §9 incl. the paths-filter trap, first-run bless §11, A/B job §12, validation-without-hardware §13). grep confirms NO invented known-good Mesa version string follows any 'known-good' occurrence (AT-3035 passed; independently re-read §7 prose: explicitly UNKNOWN/TBD, only 25.2.8 known-bad is stated)",
+    "saphyr_scope": "PASS — saphyr = \"0.0.11\" appears ONLY under crates/axc-driver/Cargo.toml's [dev-dependencies] (confirmed via awk section-scan); no other crate's Cargo.toml references saphyr; Cargo.lock delta is the minimal transitive set (saphyr, saphyr-parser implied, hashlink, foldhash 0.2.0, encoding_rs, ordered-float, arraydeque) with no unrelated version bumps beyond hashbrown's existing dual-version resolution",
+    "src_scope_check": "PASS — `git diff --stat main...HEAD -- 'crates/*/src'` returns empty; zero touches to any crate's src/ confirmed",
+    "roadmap_upstream_pr_plan_edits": "accurate — ROADMAP.md's EB.1 row correctly states 'prep MERGED ... measurement remains hardware-gated'; UPSTREAM_PR_PLAN.md §7.5 correctly notes the A/B trigger is now a single workflow_dispatch click, still UNMEASURED",
+    "preexisting_flakes": "spot-confirmed at1707_opphi_coopmat_accumulate_bit_exact_gpu independently by re-running the vendor job's exact --ignored command against local Lavapipe (Mesa 25.2.8) — failed identically to the coder's report, AND the containing file dispatch_shared_m32.rs is provably untouched by this diff (not in git diff --stat), which is stronger evidence of pre-existence than a stash-based re-run",
+    "coder_self_report_matches_reality": true
+  },
+  "memory_footprint_ok": true,
+  "summary": "EB.1-prep cross-vendor CI PASSES QA. All 17 ATs (AT-3019..3035) green headless with no GPU env; clippy clean; full cargo test --workspace clean (0 failed). Independently replicated all 5 required adversarial security injections (expression-based runs-on, guardless self-hosted job, pull_request_target trigger, missing permissions block, missing timeout) in my own scratch workflow files — every one correctly failed the suite (fail-closed), and all scratch files were deleted with git status verified clean afterward. actionlint's pinned checksum (8aca8db9...349a3d8 for v1.7.12) was independently verified against the real upstream GitHub release checksums.txt — exact match — and a local actionlint run against all 4 workflow files was clean. Re-ran the vendor job's exact commands (GPU-ignored suite + bench_regression gate) against local Lavapipe: confirmed the EB.2 machine-key selection fires with the byte-identical entrypoint (AT-3031's claim), and confirmed the one pre-existing test failure (at1707_opphi_coopmat_accumulate_bit_exact_gpu) is structurally provable as pre-existing since its containing file is entirely untouched by this diff. Docs completeness, Mesa honesty (no fabricated known-good version), the COND-3 fork-guard-not-trust-guard/Dependabot sentence, the saphyr dev-only scope, the zero-src-touch scope, and the ROADMAP/UPSTREAM_PR_PLAN doc edits all check out against the r2 spec. No discrepancies found."
+}

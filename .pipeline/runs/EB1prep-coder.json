@@ -1,0 +1,117 @@
+{
+  "verdict": "COMPLETE",
+  "agent": "coder",
+  "milestone_id": "EB1prep-cross-vendor-ci",
+  "branch": "coder/EB1prep-20260716-0600/EB1prep-cross-vendor-ci",
+  "files_created": [
+    ".github/workflows/cross-vendor-ci.yml",
+    ".github/workflows/cross-vendor-ab.yml",
+    ".github/workflows/cross-vendor-bless.yml",
+    ".github/actionlint.yaml",
+    "docs/EB1_RUNNER_SETUP.md",
+    "crates/axc-driver/tests/eb1_workflow_ci.rs"
+  ],
+  "files_modified": [
+    ".github/workflows/ci.yml",
+    "crates/axc-driver/Cargo.toml",
+    "Cargo.lock",
+    "ROADMAP.md",
+    "UPSTREAM_PR_PLAN.md"
+  ],
+  "files_not_touched_confirming_scope": [
+    "zero touches to any crates/axc-*/src (compiler/driver/runtime source unchanged)"
+  ],
+  "yaml_crate_decision": {
+    "chosen": "saphyr 0.0.11",
+    "scope": "crates/axc-driver [dev-dependencies] only, zero src/ crate-graph edge",
+    "rejected": "serde_yaml (deprecated/archived by dtolnay per spec §6.3, not introduced)",
+    "verification": "cargo add -p axc-driver --dev saphyr resolved + `cargo build -p axc-driver --tests` compiled clean before any test code was written; saphyr::Yaml::load_from_str used unconditionally (no #[cfg] gate) in eb1_workflow_ci.rs so a missing/broken parser is a COMPILE error, never a silent skip",
+    "fallback_used": false
+  },
+  "three_binding_conditions": {
+    "COND_1_fail_closed_nonliteral_runs_on": {
+      "implementation": "runs_on_kind() in eb1_workflow_ci.rs classifies every job's `runs-on:` as Literal(labels) | NonLiteral | Absent. Any sequence item that isn't a plain string, any scalar/sequence-element containing '${{' (expression/matrix marker), or any non-string/non-sequence form is classified NonLiteral and scan_self_hosted_jobs() panics immediately with a message demanding literal labels — this applies to every job across every glob-discovered workflow file, not just self-hosted-labeled ones.",
+      "verified": "adversarially — a scratch workflow file with `runs-on: ${{ matrix.os }}` was added, at_3032 was re-run and panicked with the exact fail-closed message, then the scratch file was deleted (not committed)."
+    },
+    "COND_2_floor_and_independent_cross_check": {
+      "implementation": "KNOWN_SELF_HOSTED_JOB_FLOOR = 7 (pytorch-interop, amd-gpu, intel-gpu, ab-amd, ab-intel, bless-amd, bless-intel). at_3032 asserts the saphyr-AST-based structural count is non-empty AND >= 7, independently computes grep_self_hosted_job_count() via a raw-text line-scan (no saphyr) over the same glob, asserts that count is also >= 7, and asserts the two counts are EQUAL.",
+      "verified": "adversarially — a scratch workflow file adding an 8th self-hosted job with NO fork-guard/dispatch-only was added; at_3032 correctly failed on the missing-fork-guard property check (AT-3032(a)), then the scratch file was deleted (not committed)."
+    },
+    "COND_3_fork_guard_not_trust_guard_sentence": {
+      "implementation": "docs/EB1_RUNNER_SETUP.md §8 item 1 contains a blockquoted forward-defensive note: 'this is a fork guard, not a trust guard' explicitly stating Dependabot PRs are same-repo and would pass the guard, and instructing extra scrutiny if such bots are ever enabled.",
+      "verified": "grep confirms the exact phrase and 'Dependabot' both present; AT-3029's docs-completeness test does not directly grep this sentence (not in the AT table) but the file is otherwise fully AT-3029/3035-verified."
+    }
+  },
+  "saphyr_add_time_verification": {
+    "crate_exists_and_compiles": true,
+    "method": "cargo add -p axc-driver --dev saphyr (resolved 0.0.11 + transitive deps: saphyr-parser, hashlink, foldhash, encoding_rs, ordered-float, arraydeque), then `cargo build -p axc-driver --tests` succeeded before any test logic was written",
+    "maintenance_status": "actively maintained (yaml-rust2 successor project) per spec §6.3 recommendation — used as-is, no fallback to yaml-rust2 needed"
+  },
+  "acceptance_tests": {
+    "location": "crates/axc-driver/tests/eb1_workflow_ci.rs",
+    "count": 17,
+    "range": "AT-3019..AT-3035",
+    "all_green_no_gpu": true,
+    "run_command": "cargo test -p axc-driver --test eb1_workflow_ci",
+    "runs_in_default_cargo_test_workspace": true
+  },
+  "build_verification": {
+    "cargo_build_workspace": "pass",
+    "cargo_clippy_workspace_lib_tests_D_warnings": "pass",
+    "cargo_test_workspace": "pass (0 failed; a pre-existing axc-runtime lib-test env-var-ordering flake (icd::tests::at_709_captured_icd_path_empty_when_no_env) and a pre-existing axc-optimize doctest bug were observed and independently confirmed via `git stash` to reproduce identically on the unmodified base branch — both are outside this milestone's scope (no crates/axc-*/src touches permitted) and were NOT introduced by this diff)",
+    "actionlint": {
+      "used": true,
+      "reason_not_dropped": "checksum-pinned download verified locally (sha256 of actionlint_1.7.12_linux_amd64.tar.gz matched the upstream release checksums.txt before being hardcoded into ci.yml's lint-workflows job) so the §6.4 escape hatch to drop it was not needed",
+      "local_run_result": "`actionlint .github/workflows/*.yml` clean (exit 0) against all 4 workflow files after adding .github/actionlint.yaml to declare the intentional custom self-hosted labels (nvidia/cuda/amd-rdna3/intel-arc)"
+    }
+  },
+  "lavapipe_standin_smoke": {
+    "purpose": "prove vendor-independence of the job SCRIPTS (not the vendor hardware) by running the exact command text from cross-vendor-ci.yml against Lavapipe with VK_DRIVER_FILES swapped in as the stand-in ICD",
+    "mesa_version_observed": "25.2.8-0ubuntu0.24.04.2 (the documented KNOWN-BAD version from M3.23 / docs §7 — confirmed by running the workflow's own `vulkaninfo | grep driverInfo` probe step verbatim)",
+    "gpu_test_suite": "`cargo test --workspace -- --ignored` ran hundreds of GPU-dispatch tests successfully against Lavapipe; one test (at1707_opphi_coopmat_accumulate_bit_exact_gpu, a shared-memory/OpPhi resident-dispatch test) failed and was verified via `git stash` to fail IDENTICALLY on the unmodified base branch on this same Mesa 25.2.8 box — this is the pre-existing, already-tracked ROADMAP.md:412/M3.23 Lavapipe defect, not a regression introduced here",
+    "bench_regression_gate": "`cargo test --release -p axc-driver --test bench_regression -- --nocapture` (byte-identical command to both the Lavapipe ci.yml job and the new vendor jobs, per AT-3031) ran successfully end-to-end, printed 'gating against machine_key=llvmpipe_llvm_20_1_2_256_bits (device probed)', and exercised the real EB.2 machine-key selection with no per-vendor script branch — exactly the vendor-independence property the milestone claims. One CPU-timing-noise-driven 'regression' was reported for cpu_vector_add_1024 (22.7% over baseline on this shared sandbox VM) — unrelated to this diff (no runtime src touched) and expected variance on a noisy virtualized CPU, not a code defect."
+  },
+  "self_assessment": {
+    "spec_coverage": "All §6.1/§6.2 files created/modified per the r2 spec; all AT-3019..3035 implemented and green; all 3 binding coder conditions closed and adversarially verified; §6.4 actionlint wired with a verified checksum (not dropped); §7 validation-without-hardware surface (saphyr parse + actionlint + Lavapipe script smoke) all executed",
+    "known_limitations": [
+      "AT-3029's docs-completeness check greps for anchor substrings (RADV/AMDVLK/ANV/labels/AMD_RUNNER_ONLINE/workflow_dispatch/Fork-PR security/AXC_BLESS_BASELINES/required status check/paths:/Ephemeral/non-root/REQUIRED/Mesa/25.2.8) but does not independently re-derive every prose claim in EB1_RUNNER_SETUP.md — it is a completeness anchor test, not a full doc-correctness prover, matching the spec's own framing of AT-3029",
+      "the pre-existing axc-runtime icd::tests::at_709 flake and axc-optimize doctest failure (surfaced only under `-- --ignored`) are real, reproducible on the unmodified base branch, and out of this milestone's no-src-changes scope; flagged here rather than silently worked around"
+    ],
+    "deviations": []
+  },
+  "git_commits": "none created (orchestrator owns git per M3.0 pipeline-execution convention; branch left with working-tree changes only, no commits/adds performed by the Coder)",
+  "review_fix": {
+    "trigger": "optimistic code review NEEDS_REVISION must-fix (silent bench-regression no-op) + pessimistic code review NEEDS_REVISION must-fix PESS-1 (.yaml security-scan bypass) + PESS-2 warning (script-injection hygiene) + orchestrator-authorized spec lockstep edit",
+    "fixes": [
+      {
+        "finding": "optimistic must-fix: cross-vendor-ci.yml amd-gpu/intel-gpu jobs never set AXC_ENABLE_BENCH_REGRESSION=\"1\", so bench_regression.rs:209 short-circuits to a silent pass on real hardware (contrast ci.yml:61/:86 which do set it).",
+        "fix": "Added `AXC_ENABLE_BENCH_REGRESSION: \"1\"` to the job-level env: block of both amd-gpu and intel-gpu in .github/workflows/cross-vendor-ci.yml.",
+        "regression_proof_test": "Added AT-3036 (crates/axc-driver/tests/eb1_workflow_ci.rs): globs ALL workflow files (not hardcoded to amd-gpu/intel-gpu), finds every job with a step invoking `--test bench_regression`, and asserts AXC_ENABLE_BENCH_REGRESSION: \"1\" is present in that job's effective env (job-level or step-level). Generalizes past AT-3031 (which only diffs the `run:` command text, not the enclosing env:) so this class of bug cannot recur on any future job.",
+        "files": [".github/workflows/cross-vendor-ci.yml", "crates/axc-driver/tests/eb1_workflow_ci.rs"]
+      },
+      {
+        "finding": "PESS-1 must-fix: both the saphyr scan (all_workflow_files, eb1_workflow_ci.rs) and the actionlint invocation (ci.yml lint-workflows) filtered to `.yml` only — a `.yaml` workflow bypasses the entire security suite. Demonstrated by the pessimistic reviewer with a scratch `.yaml` injection that AT-3032 passed green.",
+        "fix": [
+          "all_workflow_files() now accepts Some(\"yml\") | Some(\"yaml\") via a new WORKFLOW_FILE_EXTENSIONS = [\"yml\", \"yaml\"] constant.",
+          "ci.yml's lint-workflows step now invokes `./actionlint` with NO path args (auto-discovers every file under .github/workflows regardless of extension) instead of a `*.yml`-only glob.",
+          "Spec .pipeline/milestones/EB1prep-cross-vendor-ci.md updated in lockstep: §2.4 ('*.yml' -> '*.{yml,yaml}'), §6.3 (new paragraph noting both extensions are accepted, AT-3037 pins the set), §7.1 (actionlint no-args auto-discovery + saphyr glob wording + AT-3036 bench-regression-env note), AT table header/rows (AT-3032 wording, new AT-3036/AT-3037 rows)."
+        ],
+        "regression_proof_test": "Added AT-3037 (unit test asserting WORKFLOW_FILE_EXTENSIONS sorts to exactly [\"yaml\",\"yml\"] plus positive/negative probes against the classifier) so a future refactor that narrows the accepted extension set fails even with no physical .yaml file on disk.",
+        "re_verification": "Created a scratch .github/workflows/zz_scratch_hole.yaml with a guardless self-hosted job (push trigger, runs-on: [self-hosted, amd-rdna3], no fork guard/permissions/timeout) — cargo test -p axc-driver --test eb1_workflow_ci now correctly FAILS both at_3032_all_self_hosted_jobs_security_scan (AT-3032(a): missing fork guard) and at_3034_self_hosted_timeout_bounds (missing timeout-minutes), i.e. the exact bypass the pessimistic reviewer demonstrated is now caught. Also downloaded + sha256-verified actionlint 1.7.12 (matches ci.yml's pinned checksum) and confirmed `./actionlint` with no args auto-discovers the scratch .yaml file (added a schema error to it and actionlint correctly flagged it at that file/line, exit 1). Scratch file, downloaded actionlint binary, and tarball all deleted afterward; `git status` clean (only the intended tracked-file diffs remain).",
+        "files": ["crates/axc-driver/tests/eb1_workflow_ci.rs", ".github/workflows/ci.yml", ".pipeline/milestones/EB1prep-cross-vendor-ci.md"]
+      },
+      {
+        "finding": "PESS-2 warning (low, cheap): `${{ inputs.variant }}` interpolated directly into `run:` bodies in cross-vendor-ab.yml (ab-amd:103, ab-intel:170) is a script-injection sink — GitHub splices the expression into the script text before bash parses it.",
+        "fix": "Both ARGS+=(${{ inputs.variant }}) sites now pass the value via a step-level `env: VARIANT: ${{ inputs.variant }}` and reference it as `$VARIANT` (deliberately unquoted, preserving the original word-splitting behavior for a multi-flag variant string). Not a live privilege-escalation path (workflow_dispatch is write-access-gated already) but cheap defense-in-depth per the reviewer's own framing.",
+        "files": [".github/workflows/cross-vendor-ab.yml"]
+      }
+    ],
+    "re_run_verification": {
+      "cargo_build_workspace": "pass",
+      "cargo_clippy_workspace_lib_tests_D_warnings": "pass, zero warnings",
+      "cargo_test_workspace": "pass, 0 failed (one pre-existing unrelated flake, axc-runtime icd::tests::at_709_captured_icd_path_returns_vk_driver_files_verbatim, observed once under full-workspace parallel execution and confirmed non-reproducing in isolation and on a clean re-run — an env-var test-parallelism race in a file this diff never touches, not a regression)",
+      "eb1_workflow_ci_test_count": "19 (17 original + AT-3036 + AT-3037), all green",
+      "yaml_injection_re_test": "PASS — scratch .yaml injection now caught by AT-3032 and AT-3034; actionlint no-args invocation confirmed to auto-discover .yaml files; scratch artifacts deleted, git status clean"
+    }
+  }
+}
