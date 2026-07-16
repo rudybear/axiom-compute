@@ -149,17 +149,23 @@ impl CoopMatLoadSource {
 
 // ── CoopMatBuiltin ────────────────────────────────────────────────────────────
 
-/// The four new cooperative-matrix builtin call names (M2.1).
+/// The five cooperative-matrix builtin call names (M2.1 + M4.2a `StoreCol`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoopMatBuiltin {
     /// `coopmat_zero() -> matrix[T, M, N, use]` — result from expected-type context.
     Zero,
     /// `coopmat_load(buf, element_offset, stride) -> matrix[T, M, N, use]`.
     Load,
-    /// `coopmat_store(m, buf, element_offset, stride)` — void; statement-only.
+    /// `coopmat_store(m, buf, element_offset, stride)` — void; statement-only. Row-major layout.
     Store,
     /// `coopmat_mul_add(a, b, c) -> matrix[T, M, N, accumulator]`.
     MulAdd,
+    /// `coopmat_store_col(m, buf, element_offset, stride)` — void; statement-only (M4.2a).
+    ///
+    /// Identical arity/typing to `Store`; differs ONLY in the emitted SPIR-V layout operand
+    /// (`CooperativeMatrixLayoutColumnMajorKHR = 1` instead of `RowMajorKHR = 0`). Added for the
+    /// ggml-ABI-matched Q4_K_M variant, whose D output is column-major (§3, M4.2a spec).
+    StoreCol,
 }
 
 impl CoopMatBuiltin {
@@ -170,6 +176,7 @@ impl CoopMatBuiltin {
             CoopMatBuiltin::Load => "coopmat_load",
             CoopMatBuiltin::Store => "coopmat_store",
             CoopMatBuiltin::MulAdd => "coopmat_mul_add",
+            CoopMatBuiltin::StoreCol => "coopmat_store_col",
         }
     }
 
@@ -180,38 +187,57 @@ impl CoopMatBuiltin {
             "coopmat_load" => Some(CoopMatBuiltin::Load),
             "coopmat_store" => Some(CoopMatBuiltin::Store),
             "coopmat_mul_add" => Some(CoopMatBuiltin::MulAdd),
+            "coopmat_store_col" => Some(CoopMatBuiltin::StoreCol),
             _ => None,
         }
     }
 
     /// Number of source-level arguments accepted by this builtin.
     ///
-    /// - `Zero`:    0 args.
-    /// - `Load`:    3 args (buf, element_offset, stride).
-    /// - `Store`:   4 args (m, buf, element_offset, stride).
-    /// - `MulAdd`:  3 args (a, b, c).
+    /// - `Zero`:      0 args.
+    /// - `Load`:      3 args (buf, element_offset, stride).
+    /// - `Store`:     4 args (m, buf, element_offset, stride).
+    /// - `MulAdd`:    3 args (a, b, c).
+    /// - `StoreCol`:  4 args (m, buf, element_offset, stride) — same arity as `Store`.
     pub fn arity(self) -> usize {
         match self {
             CoopMatBuiltin::Zero => 0,
             CoopMatBuiltin::Load => 3,
             CoopMatBuiltin::Store => 4,
             CoopMatBuiltin::MulAdd => 3,
+            CoopMatBuiltin::StoreCol => 4,
         }
     }
 
     /// True if this builtin's return type is determined by expected-type context
-    /// (Zero and Load) rather than by arguments (MulAdd) or is void (Store).
+    /// (Zero and Load) rather than by arguments (MulAdd) or is void (Store / StoreCol).
     pub fn needs_expected_type(self) -> bool {
         match self {
             CoopMatBuiltin::Zero | CoopMatBuiltin::Load => true,
-            CoopMatBuiltin::Store | CoopMatBuiltin::MulAdd => false,
+            CoopMatBuiltin::Store | CoopMatBuiltin::MulAdd | CoopMatBuiltin::StoreCol => false,
         }
     }
 }
 
+// ── CoopMatStoreLayout ────────────────────────────────────────────────────────
+
+/// Discriminates the SPIR-V layout operand emitted by a `coopmat_store*` statement (M4.2a).
+///
+/// `RowMajor` is the M2.1 default (`coopmat_store`, `RowMajorKHR = 0`); `ColMajor` is the M4.2a
+/// addition (`coopmat_store_col`, `ColumnMajorKHR = 1`) — both are legal layout operands of the
+/// core `SPV_KHR_cooperative_matrix` store instruction (no new capability).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoopMatStoreLayout {
+    /// `RowMajorKHR = 0` — `coopmat_store`.
+    RowMajor,
+    /// `ColumnMajorKHR = 1` — `coopmat_store_col` (M4.2a).
+    ColMajor,
+}
+
 // ── RESERVED_COOPMAT_BUILTIN_NAMES ───────────────────────────────────────────
 
-/// Sorted-for-binary-search list of the four cooperative-matrix builtin names.
+/// Sorted-for-binary-search list of the five cooperative-matrix builtin names
+/// (`coopmat_store_col` added M4.2a).
 ///
 /// Used by the HIR reserved-name check to reject `let coopmat_load = ...` etc.
 /// MUST remain sorted lexicographically. The lexer-layer copy in
@@ -220,6 +246,7 @@ pub const RESERVED_COOPMAT_BUILTIN_NAMES: &[&str] = &[
     "coopmat_load",
     "coopmat_mul_add",
     "coopmat_store",
+    "coopmat_store_col",
     "coopmat_zero",
 ];
 
@@ -334,12 +361,13 @@ mod tests {
 
     #[test]
     fn coopmat_builtin_from_source_name_happy() {
-        // All four names round-trip via from_source_name / source_name.
+        // All five names round-trip via from_source_name / source_name.
         for &builtin in &[
             CoopMatBuiltin::Zero,
             CoopMatBuiltin::Load,
             CoopMatBuiltin::Store,
             CoopMatBuiltin::MulAdd,
+            CoopMatBuiltin::StoreCol,
         ] {
             let name = builtin.source_name();
             let parsed = CoopMatBuiltin::from_source_name(name);
@@ -353,6 +381,7 @@ mod tests {
         assert_eq!(CoopMatBuiltin::Load.arity(), 3);
         assert_eq!(CoopMatBuiltin::Store.arity(), 4);
         assert_eq!(CoopMatBuiltin::MulAdd.arity(), 3);
+        assert_eq!(CoopMatBuiltin::StoreCol.arity(), 4);
     }
 
     #[test]
@@ -361,6 +390,18 @@ mod tests {
         assert!(CoopMatBuiltin::Load.needs_expected_type(), "Load needs expected type");
         assert!(!CoopMatBuiltin::Store.needs_expected_type(), "Store is void — no expected type");
         assert!(!CoopMatBuiltin::MulAdd.needs_expected_type(), "MulAdd result is from args");
+        assert!(!CoopMatBuiltin::StoreCol.needs_expected_type(), "StoreCol is void — no expected type");
+    }
+
+    /// M4.2a: `coopmat_store_col` mirrors `coopmat_store`'s arity/void-ness exactly — only the
+    /// emitted layout operand differs (codegen-level, not typing-level).
+    #[test]
+    fn coopmat_store_col_mirrors_store_arity_and_voidness() {
+        assert_eq!(CoopMatBuiltin::StoreCol.arity(), CoopMatBuiltin::Store.arity());
+        assert_eq!(
+            CoopMatBuiltin::StoreCol.needs_expected_type(),
+            CoopMatBuiltin::Store.needs_expected_type()
+        );
     }
 
     #[test]

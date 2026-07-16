@@ -406,7 +406,8 @@ pub fn is_reserved_subgroup_builtin(name: &str) -> bool {
     RESERVED_SUBGROUP_BUILTIN_NAMES.binary_search(&name).is_ok()
 }
 
-/// Sorted-for-binary-search list of the four cooperative-matrix builtin call names (M2.1).
+/// Sorted-for-binary-search list of the five cooperative-matrix builtin call names (M2.1;
+/// `coopmat_store_col` added M4.2a).
 ///
 /// These are plain identifiers (not keywords) recognized by the parser and HIR typechecker.
 /// The lexer does NOT create dedicated token kinds for these; they remain `TokenKind::Ident`.
@@ -417,6 +418,7 @@ pub const RESERVED_COOPMAT_BUILTIN_NAMES: &[&str] = &[
     "coopmat_load",
     "coopmat_mul_add",
     "coopmat_store",
+    "coopmat_store_col",
     "coopmat_zero",
 ];
 

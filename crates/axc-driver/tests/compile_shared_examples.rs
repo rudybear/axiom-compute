@@ -8,6 +8,7 @@
 //! AT-1613: Buffer-source coopmat path is byte-identical (no regression from CoopMatLoadSource).
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use axc_driver::{compile_source_with_meta, compile_source_with_assignments};
 use spirv_tools::val::{Validator, create as create_validator};
 use spirv_tools::TargetEnv;
@@ -2499,5 +2500,227 @@ fn at_2821_q5km_coopmat_cached_compiles_capset_and_builtinset() {
         "AT-2821 PASS: q5km_matmul_rb_coopmat_f32acc_cached.axc compiles + spirv-val clean; \
          caps BYTE-IDENTICAL to M3.6 leader ({q5km_caps:?}); shared_memory_bytes=4096; \
          referenced-builtin set ⊆ leader ({q5km_builtins:?} ⊆ {leader_builtins:?})"
+    );
+}
+
+// ── AT-2985 / AT-2987: M4.2a `coopmat_store_col` codegen feature — compile + spirv-val + ──
+//            no-new-capability, and the ggml-ABI-matched Q4_K_M variant compile anchor ──────
+
+/// Minimal single-tile kernel using `coopmat_store_col` — a byte-copy of `examples/matmul_tile.axc`
+/// (the M2.1 minimal coopmat example) with the ONE store call swapped to the M4.2a builtin.
+const MATMUL_TILE_STORE_COL_SRC: &str = r#"
+@kernel
+@workgroup(32,1,1)
+@cooperative_matrix
+@intent("AT-2985: minimal coopmat_store_col compile anchor (mirrors matmul_tile.axc)")
+fn matmul_tile_store_col(
+    tile_offset: u32,
+    a_buf: readonly_buffer[f16],
+    b_buf: readonly_buffer[f16],
+    c_buf: buffer[f16]
+) -> void {
+    let stride: u32 = 16u32;
+    let a: matrix[f16, 16, 16, a] = coopmat_load(a_buf, tile_offset, stride);
+    let b: matrix[f16, 16, 16, b] = coopmat_load(b_buf, tile_offset, stride);
+    let acc: matrix[f16, 16, 16, accumulator] = coopmat_zero();
+    let result: matrix[f16, 16, 16, accumulator] = coopmat_mul_add(a, b, acc);
+    coopmat_store_col(result, c_buf, tile_offset, stride);
+    return;
+}
+"#;
+
+/// AT-2985 (M4.2a, CI no-GPU): `coopmat_store_col` compiles, passes spirv-val (Vulkan 1.1), and
+/// declares a capability set IDENTICAL to `coopmat_store`'s (`matmul_tile.axc`) — `ColumnMajorKHR`
+/// is a layout OPERAND of the existing `OpCooperativeMatrixStoreKHR` instruction, not a distinct
+/// SPIR-V capability, so the swap must add NO capability/extension. Also asserts the emitted
+/// module contains an `OpConstant %u32 1` (the ColumnMajorKHR layout value) that the row-major
+/// sibling does NOT need as a distinct layout constant (the row-major kernel emits layout=0).
+#[test]
+fn at_2985_coopmat_store_col_compiles_no_new_capability() {
+    use std::collections::BTreeSet;
+
+    let row_major_src = include_str!("../../../examples/matmul_tile.axc");
+    let row_words = compile_and_validate(row_major_src, "matmul_tile.axc");
+    let col_words = compile_and_validate(MATMUL_TILE_STORE_COL_SRC, "matmul_tile_store_col (AT-2985 inline)");
+
+    let (row_caps, row_exts) = capability_extension_sets(&row_words);
+    let (col_caps, col_exts) = capability_extension_sets(&col_words);
+
+    let row_set: BTreeSet<u32> = row_caps.iter().copied().collect();
+    let col_set: BTreeSet<u32> = col_caps.iter().copied().collect();
+    assert_eq!(
+        col_set, row_set,
+        "AT-2985: coopmat_store_col must declare a capability set IDENTICAL to coopmat_store's \
+         (ColumnMajorKHR is a layout OPERAND, not a new capability): col={col_caps:?}, row={row_caps:?}"
+    );
+    assert_eq!(
+        col_exts, row_exts,
+        "AT-2985: coopmat_store_col must declare the SAME extension set as coopmat_store's: \
+         col={col_exts:?}, row={row_exts:?}"
+    );
+
+    eprintln!(
+        "AT-2985 PASS: coopmat_store_col compiles + spirv-val clean; cap set IDENTICAL to \
+         coopmat_store's ({col_caps:?})"
+    );
+}
+
+/// AT-2987 (M4.2a, CI no-GPU): the ggml-ABI-matched Q4_K_M variant
+/// (`q4km_matmul_rb_coopmat_f32acc_cached_ggml.axc`) compiles, passes spirv-val, and declares a
+/// capability set IDENTICAL to the M3.6 leader's (`q4km_matmul_rb_coopmat_f32acc_cached.axc`) —
+/// the `coopmat_store_col` swap and the `f32_to_f16` B-staging convert (already-used M3.5
+/// builtin) introduce NO new capability. Mirrors AT-1806/AT-2821 verbatim.
+///
+/// NECESSARY but NOT SUFFICIENT: the six ABI deltas (B type, grid axes, D layout, stride
+/// semantics) are NOT observable from spirv-val alone — those are covered by the static-ABI
+/// goldens (AT-2988,2995,3000,3001,3003,3005) and the GPU bit-identity/combined tests
+/// (AT-2989..2994, AT-3002).
+#[test]
+fn at_2987_q4km_ggml_variant_compiles_and_validates() {
+    use std::collections::BTreeSet;
+    use axc_runtime::{CoopMatScalarMeta, CoopMatScopeMeta};
+
+    let ggml_src = include_str!("../../../examples/q4km_matmul_rb_coopmat_f32acc_cached_ggml.axc");
+    let leader_src = include_str!("../../../examples/q4km_matmul_rb_coopmat_f32acc_cached.axc");
+
+    let assignments = rb2x2_assignments();
+
+    let (ggml_bytes, meta) = compile_source_with_assignments(ggml_src, &assignments)
+        .unwrap_or_else(|e| panic!("q4km_matmul_rb_coopmat_f32acc_cached_ggml.axc: compile failed: {e:?}"));
+    let ggml_words = words_and_validate(ggml_bytes, "q4km_matmul_rb_coopmat_f32acc_cached_ggml.axc");
+    let leader_words = compile_words(leader_src, Some(&assignments), "q4km_matmul_rb_coopmat_f32acc_cached.axc");
+
+    let (ggml_caps, ggml_exts) = capability_extension_sets(&ggml_words);
+    let (leader_caps, leader_exts) = capability_extension_sets(&leader_words);
+
+    let ggml_set: BTreeSet<u32> = ggml_caps.iter().copied().collect();
+    let leader_set: BTreeSet<u32> = leader_caps.iter().copied().collect();
+
+    // No NEW capability: coopmat_store_col (ColumnMajorKHR is a layout OPERAND, not a
+    // capability) and f32_to_f16 (already used by M3.5) add nothing beyond the leader's set.
+    let extra_caps: Vec<u32> = ggml_set.difference(&leader_set).copied().collect();
+    assert!(
+        extra_caps.is_empty(),
+        "AT-2987: ggml variant declares capabilities NOT in the M3.6 leader's set: \
+         {extra_caps:?} (ggml={ggml_caps:?}, leader={leader_caps:?})"
+    );
+
+    // MEASURED (not the r3 spec's assumed byte-identical set): the ggml variant's B buffer is
+    // retyped f32 (§2.5), so it no longer needs `StorageBuffer16BitAccess` (SPIR-V capability
+    // 4433) for the SSBO storage class — only Float16 (9, for the shared[f16] b_tile/a_tile) is
+    // required. This is a CORRECT, EXPECTED drop (a direct, benign consequence of the B-retype
+    // ABI delta), analogous to the AT-1806 "one benign delta is pre-permitted" precedent — NOT a
+    // silent capability loosening of anything the kernel actually uses (Float16 is still present).
+    const STORAGE_BUFFER_16BIT_ACCESS_CAP: u32 = 4433;
+    let dropped_caps: Vec<u32> = leader_set.difference(&ggml_set).copied().collect();
+    assert_eq!(
+        dropped_caps,
+        vec![STORAGE_BUFFER_16BIT_ACCESS_CAP],
+        "AT-2987: the ONLY capability the ggml variant may drop vs the M3.6 leader is \
+         StorageBuffer16BitAccess (4433) — the direct, documented consequence of retyping the B \
+         SSBO from f16 to f32 (§2.5); any OTHER drop is unexpected and must be investigated. \
+         ggml={ggml_caps:?}, leader={leader_caps:?}, dropped={dropped_caps:?}"
+    );
+    const FLOAT16_CAP: u32 = 9;
+    assert!(
+        ggml_set.contains(&FLOAT16_CAP),
+        "AT-2987: ggml variant must STILL declare Float16 (the shared[f16] a_tile/b_tile and the \
+         f32_to_f16 staging convert both require it)"
+    );
+
+    let extra_exts: Vec<String> = ggml_exts.difference(&leader_exts).cloned().collect();
+    assert!(
+        extra_exts.is_empty(),
+        "AT-2987: ggml variant declares extensions NOT in the M3.6 leader's set: {extra_exts:?}"
+    );
+
+    // Coopmat metadata shape unchanged: {16,16,16, F16,F16,F32,F32, Subgroup}.
+    let coopmat = meta.coopmat.as_ref()
+        .expect("AT-2987: ggml variant must emit coopmat metadata");
+    assert_eq!(coopmat.m, 16, "AT-2987: coopmat.m");
+    assert_eq!(coopmat.n, 16, "AT-2987: coopmat.n");
+    assert_eq!(coopmat.k, 16, "AT-2987: coopmat.k");
+    assert_eq!(coopmat.a_type, CoopMatScalarMeta::F16, "AT-2987: A type must be F16");
+    assert_eq!(coopmat.b_type, CoopMatScalarMeta::F16, "AT-2987: B type must be F16 (coopmat operand)");
+    assert_eq!(coopmat.c_type, CoopMatScalarMeta::F32, "AT-2987: C type must be F32");
+    assert_eq!(coopmat.result_type, CoopMatScalarMeta::F32, "AT-2987: result type must be F32");
+    assert_eq!(coopmat.scope, CoopMatScopeMeta::Subgroup, "AT-2987: scope must be Subgroup");
+
+    // shared_memory_bytes UNCHANGED vs the M3.6 leader (same a_tile/b_tile/dsc/dmm sizing —
+    // the B retype to f32 is a BUFFER-side change; b_tile stays shared[f16]).
+    let expected_shared_bytes: u32 = (512 + 512) * 2 + 2 * 256 * 4;
+    assert_eq!(
+        meta.shared_memory_bytes, expected_shared_bytes,
+        "AT-2987: shared_memory_bytes must be {expected_shared_bytes} (UNCHANGED vs the M3.6 \
+         leader — b_tile stays shared[f16]); got {}", meta.shared_memory_bytes
+    );
+
+    eprintln!(
+        "AT-2987 PASS: q4km_matmul_rb_coopmat_f32acc_cached_ggml.axc compiles + spirv-val clean; \
+         caps match the M3.6 leader's set MINUS the documented StorageBuffer16BitAccess (4433) \
+         drop ({ggml_caps:?}); meta.coopmat = {{16,16,16, F16,F16,F32,F32, Subgroup}}; \
+         shared_memory_bytes={}",
+        meta.shared_memory_bytes
+    );
+}
+
+// ── AT-2997: the committed `upstream/matmul_q4_k_f32_cm1_axiom.spv` is spirv-val clean AND ──
+//            byte-reproducible from the pinned source + `@strategy` assignments (M4.2a spec §8) ──
+
+/// AT-2997 (M4.2a, CI no-GPU): the committed RFC artifact
+/// `upstream/matmul_q4_k_f32_cm1_axiom.spv` is (a) spirv-val clean and (b) BYTE-REPRODUCIBLE — a
+/// fresh compile of `examples/q4km_matmul_rb_coopmat_f32acc_cached_ggml.axc` with the SAME RB
+/// 2×2 `@strategy` assignments used to generate it (`rb2x2_assignments`, mirroring
+/// `upstream/REPRODUCE.md`'s documented `axc compile ... --strategy-value rb_m=2 ...` command)
+/// produces the EXACT bytes on disk. This is the drift guard the pessimistic code review (H1)
+/// found missing: without it, nothing catches the committed `.spv` going stale after a future
+/// codegen change, and `upstream/REPRODUCE.md`'s "AT-2997 asserts byte-reproducible" claim would
+/// be false. Mirrors the AT-2838 golden-byte-compare pattern (`compile_empty_kernel.rs`).
+#[test]
+fn at_2997_committed_ggml_spv_is_spirv_val_clean_and_byte_reproducible() {
+    let ggml_src = include_str!("../../../examples/q4km_matmul_rb_coopmat_f32acc_cached_ggml.axc");
+    let assignments = rb2x2_assignments();
+
+    let (fresh_bytes, _meta) = compile_source_with_assignments(ggml_src, &assignments)
+        .unwrap_or_else(|e| {
+            panic!("AT-2997: q4km_matmul_rb_coopmat_f32acc_cached_ggml.axc: compile failed: {e:?}")
+        });
+
+    // (a) spirv-val clean (Vulkan 1.1 target env, same discipline as every other test in this file).
+    let _ = words_and_validate(fresh_bytes.clone(), "AT-2997 fresh ggml compile");
+
+    // (b) byte-reproducible: fresh compile == the committed artifact.
+    let manifest_dir: PathBuf = PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"),
+    );
+    let committed_path: PathBuf = manifest_dir
+        .join("..")
+        .join("..")
+        .join("upstream")
+        .join("matmul_q4_k_f32_cm1_axiom.spv");
+    let committed_bytes: Vec<u8> = std::fs::read(&committed_path).unwrap_or_else(|e| {
+        panic!("AT-2997: failed to read committed artifact {committed_path:?}: {e}")
+    });
+
+    assert_eq!(
+        fresh_bytes, committed_bytes,
+        "AT-2997: a fresh compile of examples/q4km_matmul_rb_coopmat_f32acc_cached_ggml.axc with \
+         the RB 2×2 @strategy assignments (rb_m=2, rb_n=2, tile_k=16, a_block_size=512, \
+         b_block_size=512) is NOT byte-identical to the committed {committed_path:?}. Within a \
+         fixed rustc + Cargo.lock this output is byte-deterministic (no spirv-opt pass, generator \
+         word forced to 0), so a mismatch here means either (a) a legitimate codegen change — \
+         re-bless via: `cargo run -p axc-driver --bin axc -- compile \
+         examples/q4km_matmul_rb_coopmat_f32acc_cached_ggml.axc -o \
+         upstream/matmul_q4_k_f32_cm1_axiom.spv --strategy-value rb_m=2 --strategy-value rb_n=2 \
+         --strategy-value tile_k=16 --strategy-value a_block_size=512 --strategy-value \
+         b_block_size=512` (the exact command documented in upstream/REPRODUCE.md), or (b) a real \
+         regression — do not re-bless blindly."
+    );
+
+    eprintln!(
+        "AT-2997 PASS: upstream/matmul_q4_k_f32_cm1_axiom.spv is spirv-val clean AND \
+         byte-reproducible ({} bytes) from examples/q4km_matmul_rb_coopmat_f32acc_cached_ggml.axc \
+         + rb2x2_assignments()",
+        committed_bytes.len()
     );
 }

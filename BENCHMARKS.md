@@ -213,6 +213,66 @@ M3.8 tested the other classic GEMM lever — **larger register tiles** to raise 
 
 ---
 
+## M4.2a — ggml-ABI-matched Q4_K_M coopmat kernel (the preparable half of the held M4.2 upstream RFC)
+
+M4.2a produces a **ggml-ABI-matched** variant of the M3.6 leader
+(`examples/q4km_matmul_rb_coopmat_f32acc_cached_ggml.axc`) — VERBATIM except six ABI deltas
+(`n_blocks_per_row` derived `stride_a/256`; ggml's 17-field push consumed; B retyped f32 +
+transposed + f32→f16 staged; D stored column-major via the NEW `coopmat_store_col` codegen
+builtin; the grid axis order swapped to ggml's convention) — so it is a drop-in coopmat-KHR
+(`_cm1`) Q4_K pipeline for llama.cpp's Vulkan backend. **This is NOT a performance milestone**
+(M3.13 already concluded the NVIDIA throughput campaign — M3.6 remains the production leader);
+M4.2a is an ABI-compatibility + integration-package milestone, with an honest perf-sanity
+side-measurement.
+
+> **Correctness: GPU-PROVEN on real NVIDIA hardware.** Cross-kernel bit-identity vs the M3.6
+> leader (de-transposed, f16-exact B fixture — the f32→f16 staging convert round-trips EXACTLY
+> to the leader's directly-read f16 bits) at K=256/512/14336: `max|Δbits| == 0` at every size.
+> Combined condition-aware ≤ FROZEN 1e-3 at K=256/512/14336 AND at the REAL rectangular A/B shape
+> (M=4096, N=512, K=14336 — non-square, so a grid-axis-swap bug cannot pass silently). The new
+> `coopmat_store_col` codegen builtin (mirrors `coopmat_store`, adds only the `ColumnMajorKHR`
+> layout operand — no new SPIR-V capability) is independently GPU-proven: a 16×16 accumulator
+> stored column-major is the bit-exact transpose of the same accumulator stored row-major.
+
+**Honest perf sanity (NO gate) — ggml variant vs the M3.6 leader, same sizes, same device:**
+
+| size (M=N=K) | M3.6 leader TFLOPS | ggml variant TFLOPS | ggml/leader |
+|---|---|---|---|
+| 256 | 1.57–1.59 | 1.36–1.37 | 0.86–0.87× |
+| 512 | 6.77–6.83 | 5.95–5.97 | 0.87–0.88× |
+| 768 | 14.20–14.21 | 11.31–11.63 | 0.80–0.82× |
+| 1024 | 23.80–23.87 | 17.67–17.68 | 0.74× |
+| 4096×512×14336 (A/B, MIN-of-10 GpuTimestamp; stable across 11 bench invocations at 0.504–0.505×) | **44.11** | **22.26** | **0.505×** |
+
+The ggml variant honestly runs at **0.50×–0.88× the leader's throughput**, WORST at the A/B
+(inference) shape — the extra per-B-element f32→f16 staging convert cost scales with `N*K`
+(7.3M converts at the A/B shape vs ≤1M at the largest cube tested), and the B buffer itself is 4×
+larger in bytes (f32 vs f16) — MEASURED (not modeled). This does not reflect ggml's real dispatch
+performance, since the host override replaces whichever of ggml's six l/m/s/aligned variants
+would have been chosen for a given shape with AXIOM's FIXED 32×32 tile (§2.9 of the milestone
+spec, an honest, NOT-gated caveat). The standing M3.6-vs-llama gap is **UNCHANGED**: 42.86 vs
+102.49 TFLOPS = 2.39× behind.
+
+**The integration package** (`upstream/`): the generated `matmul_q4_k_f32_cm1_axiom.spv`
+(git-tracked via a `.gitignore` negation), a ready-to-paste byte-array fragment, a hand-written
+`ggml-vulkan-axiom-q4k.patch` against the pinned SHA `6b80c74f285390368b3c99c5e750f19e9b096e98`
+(`git apply --check`-verified), and `REPRODUCE.md`. `UPSTREAM_PR_PLAN.md`'s status and trigger are
+UNCHANGED — still **PREPARE-AND-HOLD**, still gated on the AMD/Intel A/B trigger (EB.1) AND the
+executed real-ggml ABI smoke (a new HARD precondition, not yet run).
+
+**Anti-circularity: the static ABI-conformance golden suite** (`m42a_ggml_abi_golden.rs`, CI,
+no GPU) encodes the ggml facts as literal, cited, in-repo tables — the 17-field push offset table,
+the B-type-suffix rule, the grid axis mapping, the `/256` stride semantics, the 144-byte
+`block_q4_K`, the column-major D formula, the six-variant aligned pipeline family + the `:8239`
+interception point + the 13-condition selection guard — so a future kernel/oracle/fixture drift
+away from ggml's REAL ABI fails CI, closing the exact blind spot that let the r1 pessimistic
+REJECT's CRITICAL findings (wrong B type, wrong grid axes) slip past an AXIOM-vs-AXIOM-only
+bit-identity anchor.
+
+**Reproduce:** `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json AXC_ENABLE_GPU_BENCHES=1 scripts/m34_llamacpp_ab.sh --fused-f32acc-cached-ggml` (writes `.pipeline/benchmarks/m34/ab_results_fused_f32acc_cached_ggml.json`); full design + vendor citations: `.pipeline/milestones/M4.2a-ggml-abi.md`; upstream package: `upstream/REPRODUCE.md`.
+
+---
+
 ## Running benchmarks
 
 ```sh

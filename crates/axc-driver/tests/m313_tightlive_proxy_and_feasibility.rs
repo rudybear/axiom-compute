@@ -591,28 +591,32 @@ fn scan_for_marker(dir: &std::path::Path, marker: &str, offenders: &mut Vec<Stri
 
 #[test]
 fn at_2810_no_per_element_coopmat_fragment_write_op() {
-    // (1) The RESERVED set is EXACTLY the 4-name {Zero/Load/Store/MulAdd} — NO per-element fragment
-    //     write op (no convert/recast/cast/extract/set/write_elem). This is the EXHAUSTIVE builtin set.
+    // (1) The RESERVED set is EXACTLY the 5-name {Zero/Load/Store/MulAdd/StoreCol} — NO per-element
+    //     fragment write op (no convert/recast/cast/extract/set/write_elem). This is the EXHAUSTIVE
+    //     builtin set. M4.2a added `coopmat_store_col`: a WHOLE-MATRIX store (mirrors `coopmat_store`
+    //     exactly, differing only in the emitted SPIR-V layout OPERAND — ColumnMajorKHR vs RowMajorKHR)
+    //     — NOT a per-element fragment write, so the PRONG B BLOCKED verdict below is UNCHANGED.
     assert_eq!(
         RESERVED_COOPMAT_BUILTIN_NAMES.len(),
-        4,
-        "AT-2810: AXIOM must expose EXACTLY 4 coopmat builtins; got {}: {RESERVED_COOPMAT_BUILTIN_NAMES:?}",
+        5,
+        "AT-2810: AXIOM must expose EXACTLY 5 coopmat builtins (M4.2a added coopmat_store_col, a \
+         whole-matrix store, not a per-element write); got {}: {RESERVED_COOPMAT_BUILTIN_NAMES:?}",
         RESERVED_COOPMAT_BUILTIN_NAMES.len()
     );
     let expected: BTreeSet<&str> =
-        ["coopmat_load", "coopmat_mul_add", "coopmat_store", "coopmat_zero"]
+        ["coopmat_load", "coopmat_mul_add", "coopmat_store", "coopmat_store_col", "coopmat_zero"]
             .into_iter()
             .collect();
     let actual: BTreeSet<&str> = RESERVED_COOPMAT_BUILTIN_NAMES.iter().copied().collect();
     assert_eq!(
         actual, expected,
-        "AT-2810: the coopmat builtin set must be EXACTLY {{Zero/Load/Store/MulAdd}}; got {actual:?}"
+        "AT-2810: the coopmat builtin set must be EXACTLY {{Zero/Load/Store/MulAdd/StoreCol}}; got {actual:?}"
     );
 
-    // (2) The CoopMatBuiltin enum likewise parses ONLY those 4 names; every per-element-fragment-write
+    // (2) The CoopMatBuiltin enum likewise parses ONLY those 5 names; every per-element-fragment-write
     //     candidate name parses to None (no such builtin exists -> register-resident dequant-into-
     //     fragment is UNEXPRESSIBLE). This pins the NEGATIVE falsifiably.
-    for &name in &["coopmat_zero", "coopmat_load", "coopmat_store", "coopmat_mul_add"] {
+    for &name in &["coopmat_zero", "coopmat_load", "coopmat_store", "coopmat_mul_add", "coopmat_store_col"] {
         assert!(
             CoopMatBuiltin::from_source_name(name).is_some(),
             "AT-2810: '{name}' must parse to a CoopMatBuiltin"
@@ -666,7 +670,8 @@ fn at_2810_no_per_element_coopmat_fragment_write_op() {
 
     eprintln!(
         "AT-2810 PASS (PRONG B VERDICT — BLOCKED): coopmat builtin set is EXACTLY \
-         {{coopmat_load, coopmat_mul_add, coopmat_store, coopmat_zero}} (4); NO per-element \
+         {{coopmat_load, coopmat_mul_add, coopmat_store, coopmat_store_col, coopmat_zero}} (5, \
+         M4.2a added the whole-matrix coopmat_store_col — not a per-element write); NO per-element \
          coopmat-fragment-write op (convert/recast/cast/extract/set/write_elem all parse to None); \
          coopmat_mul_add always yields an Accumulator-use result; coopmat_load reads FROM memory \
          (forces the M3.6 shared round-trip). => register-resident dequant-into-fragment is \
