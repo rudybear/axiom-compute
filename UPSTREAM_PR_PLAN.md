@@ -104,6 +104,15 @@ by itself sufficient to open the RFC. Both of the following are HARD preconditio
 RFC-open trigger:
 
 - [ ] **The AMD/Intel A/B trigger condition** (the paragraph above) — UNMEASURED, EB.1-gated.
+      **EB.1-prep MERGED:** producing this measurement is now a single `workflow_dispatch`
+      click away — `.github/workflows/cross-vendor-ab.yml` (inputs: `vendor`, `variant`,
+      `skip_llama_build`) builds AXIOM, runs the pinned llama.cpp `b9542` /
+      `6b80c74f285390368b3c99c5e750f19e9b096e98` `test-backend-ops` A/B via
+      `scripts/m34_llamacpp_ab.sh`, and uploads `ab_results*.json` + the run log +
+      `vulkaninfo --summary` as the evidence artifact. It has no pass/fail ratio gate (measurement,
+      not a CI gate) and requires the vendor's `AMD_RUNNER_ONLINE` / `INTEL_RUNNER_ONLINE`
+      repository variable to be `true`, i.e. a registered runner — see
+      `docs/EB1_RUNNER_SETUP.md`. Still UNMEASURED; only the mechanism is now prepared.
 - [ ] **The executed real-ggml ABI smoke** — building `llama.cpp` with the
       `GGML_VULKAN_AXIOM_Q4K` patch applied and running actual inference (bit-close output vs
       stock ggml) on the pinned SHA. This is the ONLY test that exercises the REAL bound

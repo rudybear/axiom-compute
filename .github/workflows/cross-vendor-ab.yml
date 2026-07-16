@@ -1,0 +1,201 @@
+name: Cross-vendor llama.cpp A/B (evidence, manual)
+
+# workflow_dispatch-ONLY: this is the RFC-trigger evidence job for
+# UPSTREAM_PR_PLAN.md §7.5 (the AMD/Intel A/B parity-or-better precondition).
+# It NEVER triggers automatically (no `push`/`pull_request`), so it cannot
+# queue on a PR. It has NO ratio pass/fail gate — M3.13 concluded the NVIDIA
+# throughput campaign; this run is measurement/evidence, not a CI gate. It
+# records whatever the numbers are (parity, win, or loss), no cherry-picking.
+#
+# Two separate jobs (ab-amd / ab-intel), each with a LITERAL `runs-on:` label
+# set — deliberately NOT a single job with an expression-derived `runs-on:`
+# selected by the `vendor` input. A self-hosted job with a non-literal
+# `runs-on:` cannot be verified by the AT-3032 security scan (which requires
+# enumerable, literal self-hosted labels) and is disallowed by design.
+on:
+  workflow_dispatch:
+    inputs:
+      vendor:
+        description: 'Target vendor'
+        required: true
+        type: choice
+        options:
+          - amd
+          - intel
+      variant:
+        description: 'AXIOM fused Q4_K_M kernel flag (scripts/m34_llamacpp_ab.sh)'
+        required: false
+        type: string
+        default: '--fused-f32acc-cached'
+      skip_llama_build:
+        description: 'Reuse a cached llama.cpp checkout (preflight SHA-verified)'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  # The exact pin M3.4 established (scripts/m34_llamacpp_ab.sh). AT-3027 checks
+  # this equals the script's LLAMACPP_TAG / LLAMACPP_COMMIT — guards pin drift.
+  LLAMACPP_TAG: b9542
+  LLAMACPP_COMMIT: 6b80c74f285390368b3c99c5e750f19e9b096e98
+
+jobs:
+  ab-amd:
+    name: AMD RDNA3 (RADV) A/B evidence
+    runs-on: [self-hosted, amd-rdna3]
+    if: >-
+      github.event.inputs.vendor == 'amd'
+      && vars.AMD_RUNNER_ONLINE == 'true'
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      VK_DRIVER_FILES: /usr/share/vulkan/icd.d/radeon_icd.x86_64.json
+      VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/radeon_icd.x86_64.json
+      AXC_ENABLE_GPU_BENCHES: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build AXIOM (release)
+        run: cargo build --release -p axc-driver
+      - name: Preflight — verify cached llama.cpp build (skip_llama_build)
+        # Fails loudly (cache absent OR SHA drifted) instead of the obscure
+        # downstream "missing test-backend-ops" error further into the run.
+        if: ${{ inputs.skip_llama_build }}
+        run: |
+          set -euo pipefail
+          LLAMA_DIR="vendor/llama.cpp"
+          if [ ! -d "${LLAMA_DIR}/.git" ] || [ ! -x "${LLAMA_DIR}/build/bin/test-backend-ops" ]; then
+            echo "FATAL: skip_llama_build=true but no cached llama.cpp build found at ${LLAMA_DIR}" >&2
+            exit 1
+          fi
+          ACTUAL_SHA="$(git -C "${LLAMA_DIR}" rev-parse HEAD)"
+          if [ "${ACTUAL_SHA}" != "${LLAMACPP_COMMIT}" ]; then
+            echo "FATAL: cached llama.cpp SHA ${ACTUAL_SHA} != pinned ${LLAMACPP_COMMIT}" \
+                 "(cache drifted; re-run without skip_llama_build)" >&2
+            exit 1
+          fi
+          echo "cached llama.cpp build verified at pinned SHA ${ACTUAL_SHA}"
+      - name: Device provenance (vulkaninfo --summary)
+        # Evidence-provenance chain (r2 §3): ties the numbers below to a real
+        # device string. Bounded, not a cryptographic proof — deters/audits.
+        run: vulkaninfo --summary | tee vulkaninfo-summary.txt
+      - name: Record dispatch provenance (actor + run metadata)
+        run: |
+          {
+            echo "{"
+            echo "  \"actor\": \"${{ github.actor }}\","
+            echo "  \"run_id\": \"${{ github.run_id }}\","
+            echo "  \"run_attempt\": \"${{ github.run_attempt }}\","
+            echo "  \"vendor\": \"${{ inputs.vendor }}\","
+            echo "  \"variant\": \"${{ inputs.variant }}\","
+            echo "  \"llamacpp_tag\": \"${LLAMACPP_TAG}\","
+            echo "  \"llamacpp_commit\": \"${LLAMACPP_COMMIT}\""
+            echo "}"
+          } > ab-provenance.json
+      - name: Run the A/B harness
+        # PESS-2 (script-injection hygiene): `inputs.variant` is a free-form
+        # `type: string` and MUST NOT be interpolated directly into the `run:`
+        # body — GitHub splices `${{ }}` expressions into the script text
+        # BEFORE bash ever sees it, so a value like `; curl … | sh #` would
+        # execute. Passed via `env:` instead and referenced as `$VARIANT`
+        # (still deliberately unquoted below to preserve the original
+        # word-splitting behavior for a multi-flag variant string).
+        # workflow_dispatch is write-access-gated so this was never a
+        # privilege-escalation path, but the hardening is cheap.
+        env:
+          VARIANT: ${{ inputs.variant }}
+        run: |
+          set -euo pipefail
+          ARGS=()
+          if [ "${{ inputs.skip_llama_build }}" = "true" ]; then
+            ARGS+=(--skip-build)
+          fi
+          ARGS+=($VARIANT)
+          scripts/m34_llamacpp_ab.sh "${ARGS[@]}" 2>&1 | tee ab-run.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cross-vendor-ab-amd-${{ github.run_id }}
+          path: |
+            .pipeline/benchmarks/m34/ab_results*.json
+            ab-run.log
+            vulkaninfo-summary.txt
+            ab-provenance.json
+
+  ab-intel:
+    name: Intel Arc (ANV) A/B evidence
+    runs-on: [self-hosted, intel-arc]
+    if: >-
+      github.event.inputs.vendor == 'intel'
+      && vars.INTEL_RUNNER_ONLINE == 'true'
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      VK_DRIVER_FILES: /usr/share/vulkan/icd.d/intel_icd.x86_64.json
+      VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/intel_icd.x86_64.json
+      AXC_ENABLE_GPU_BENCHES: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build AXIOM (release)
+        run: cargo build --release -p axc-driver
+      - name: Preflight — verify cached llama.cpp build (skip_llama_build)
+        if: ${{ inputs.skip_llama_build }}
+        run: |
+          set -euo pipefail
+          LLAMA_DIR="vendor/llama.cpp"
+          if [ ! -d "${LLAMA_DIR}/.git" ] || [ ! -x "${LLAMA_DIR}/build/bin/test-backend-ops" ]; then
+            echo "FATAL: skip_llama_build=true but no cached llama.cpp build found at ${LLAMA_DIR}" >&2
+            exit 1
+          fi
+          ACTUAL_SHA="$(git -C "${LLAMA_DIR}" rev-parse HEAD)"
+          if [ "${ACTUAL_SHA}" != "${LLAMACPP_COMMIT}" ]; then
+            echo "FATAL: cached llama.cpp SHA ${ACTUAL_SHA} != pinned ${LLAMACPP_COMMIT}" \
+                 "(cache drifted; re-run without skip_llama_build)" >&2
+            exit 1
+          fi
+          echo "cached llama.cpp build verified at pinned SHA ${ACTUAL_SHA}"
+      - name: Device provenance (vulkaninfo --summary)
+        run: vulkaninfo --summary | tee vulkaninfo-summary.txt
+      - name: Record dispatch provenance (actor + run metadata)
+        run: |
+          {
+            echo "{"
+            echo "  \"actor\": \"${{ github.actor }}\","
+            echo "  \"run_id\": \"${{ github.run_id }}\","
+            echo "  \"run_attempt\": \"${{ github.run_attempt }}\","
+            echo "  \"vendor\": \"${{ inputs.vendor }}\","
+            echo "  \"variant\": \"${{ inputs.variant }}\","
+            echo "  \"llamacpp_tag\": \"${LLAMACPP_TAG}\","
+            echo "  \"llamacpp_commit\": \"${LLAMACPP_COMMIT}\""
+            echo "}"
+          } > ab-provenance.json
+      - name: Run the A/B harness
+        # PESS-2 (script-injection hygiene): `inputs.variant` is a free-form
+        # `type: string` and MUST NOT be interpolated directly into the `run:`
+        # body — GitHub splices `${{ }}` expressions into the script text
+        # BEFORE bash ever sees it, so a value like `; curl … | sh #` would
+        # execute. Passed via `env:` instead and referenced as `$VARIANT`
+        # (still deliberately unquoted below to preserve the original
+        # word-splitting behavior for a multi-flag variant string).
+        # workflow_dispatch is write-access-gated so this was never a
+        # privilege-escalation path, but the hardening is cheap.
+        env:
+          VARIANT: ${{ inputs.variant }}
+        run: |
+          set -euo pipefail
+          ARGS=()
+          if [ "${{ inputs.skip_llama_build }}" = "true" ]; then
+            ARGS+=(--skip-build)
+          fi
+          ARGS+=($VARIANT)
+          scripts/m34_llamacpp_ab.sh "${ARGS[@]}" 2>&1 | tee ab-run.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cross-vendor-ab-intel-${{ github.run_id }}
+          path: |
+            .pipeline/benchmarks/m34/ab_results*.json
+            ab-run.log
+            vulkaninfo-summary.txt
+            ab-provenance.json

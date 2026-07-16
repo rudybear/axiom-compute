@@ -1,0 +1,11 @@
+self-hosted-runner:
+  # Custom self-hosted runner labels used across this repo's workflows.
+  # ci.yml's pytorch-interop (pre-existing, [self-hosted, nvidia, cuda]) plus
+  # the EB.1-prep vendor labels (amd-rdna3, intel-arc). None of these runners
+  # are registered yet (EB.1 hardware-gated) — the label set is declared here
+  # purely so actionlint's schema check doesn't flag them as unknown/typo'd.
+  labels:
+    - nvidia
+    - cuda
+    - amd-rdna3
+    - intel-arc

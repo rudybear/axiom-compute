@@ -1,0 +1,113 @@
+name: Cross-vendor CI (AMD / Intel)
+
+# EB.1-prep: per-PR AMD (RDNA3/RADV) + Intel (Arc/ANV) GPU-test + bench-regression
+# gates. See docs/EB1_RUNNER_SETUP.md for the full setup + activation + security
+# writeup. Two independent controls keep this file safe to merge BEFORE any
+# AMD/Intel runner exists:
+#
+#   1. Activation gate (`if: vars.<VENDOR>_RUNNER_ONLINE == 'true'`) — while the
+#      variable is unset/false, the job's `if:` is false and GitHub SKIPS it.
+#      A job-level skip reports its required-check status as PASS and never
+#      queues (see §1.4 of the milestone spec / EB1_RUNNER_SETUP.md). This is
+#      the anti-"queue-forever" control: `runs-on:` targeting a label with no
+#      matching runner would queue indefinitely and block merges forever, which
+#      is why this workflow uses `if:`, never a conditional `runs-on:`.
+#   2. Fork-PR guard (`head.repo.full_name == github.repository`) — a fork PR's
+#      `if:` evaluates false, so fork-controlled code is NEVER checked out or
+#      executed on the self-hosted machine (arbitrary-code-execution control on
+#      a real GPU box on a public repo).
+#
+# Deliberately triggers on push/pull_request/workflow_dispatch WITHOUT a
+# `paths:` filter. Job-level `if:` does the gating, not workflow-level path
+# filters — a paths-filtered workflow that never triggers on a given PR leaves
+# any required check it declares PENDING FOREVER (a different, worse failure
+# mode than the `if:`-skip above). Never add a `paths:` filter to this file.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  amd-gpu:
+    name: AMD RDNA3 (RADV) — GPU tests + bench-regression gate
+    runs-on: [self-hosted, amd-rdna3]
+    if: >-
+      vars.AMD_RUNNER_ONLINE == 'true'
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository)
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      AXC_ENABLE_GPU_TESTS: "1"
+      AXC_REQUIRE_SPIRV_VAL: "1"
+      # AT-3036 must-fix: without this, bench_regression.rs:209 short-circuits
+      # to a silent no-op ("skipping bench regression") and the step exits 0
+      # unconditionally — the exact vacuous-pass class this milestone's own
+      # AT-3033 discipline forbids. Mirrors ci.yml:61 (Lavapipe bench-regression
+      # job) verbatim.
+      AXC_ENABLE_BENCH_REGRESSION: "1"
+      VK_DRIVER_FILES: /usr/share/vulkan/icd.d/radeon_icd.x86_64.json
+      VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/radeon_icd.x86_64.json
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Probe Mesa driver version (non-fatal)
+        # M3.23 fold-in: Mesa 25.2.8 is KNOWN-BAD for the resident shared-mem
+        # dispatch path (SIGSEGV/heap corruption, observed on Lavapipe; RADV is
+        # also Mesa). This surfaces a bad Mesa bump in the log instead of a
+        # mystery segfault — see docs/EB1_RUNNER_SETUP.md §Mesa pin.
+        run: vulkaninfo | grep driverInfo || echo 'mesa-version probe non-fatal'
+      - name: Test (default suite)
+        run: cargo test --workspace
+      - name: Test (ignored / GPU-dispatch suite)
+        run: cargo test --workspace -- --ignored
+      - name: Bench regression gate (release mode, no feature flag)
+        # AXC_BLESS_BASELINES must NOT be set (AT-714b — never auto-bless in
+        # CI). A brand-new device is an ABSENT machine key: EB.2's
+        # select_block returns SelectOutcome::LoudSkipKeyAbsent and the gate
+        # SKIPS with a loud warning ("re-bless with AXC_BLESS_BASELINES=1")
+        # rather than failing, until a maintainer runs cross-vendor-bless.yml
+        # (see docs/EB1_RUNNER_SETUP.md §First-run bless). This is the EXACT
+        # command the existing Lavapipe bench-regression job in ci.yml runs
+        # (byte-identical modulo the ICD env above) — the vendor-independence
+        # proof: no per-vendor script branch, device selection is delegated
+        # entirely to EB.2's machine_key.
+        run: >
+          cargo test --release -p axc-driver --test bench_regression
+          -- --nocapture
+        env:
+          AXC_BLESS_BASELINES: ""
+
+  intel-gpu:
+    name: Intel Arc (ANV) — GPU tests + bench-regression gate
+    runs-on: [self-hosted, intel-arc]
+    if: >-
+      vars.INTEL_RUNNER_ONLINE == 'true'
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository)
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      AXC_ENABLE_GPU_TESTS: "1"
+      AXC_REQUIRE_SPIRV_VAL: "1"
+      # AT-3036 must-fix: see the amd-gpu job's identical comment above.
+      AXC_ENABLE_BENCH_REGRESSION: "1"
+      VK_DRIVER_FILES: /usr/share/vulkan/icd.d/intel_icd.x86_64.json
+      VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/intel_icd.x86_64.json
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Probe Mesa driver version (non-fatal)
+        run: vulkaninfo | grep driverInfo || echo 'mesa-version probe non-fatal'
+      - name: Test (default suite)
+        run: cargo test --workspace
+      - name: Test (ignored / GPU-dispatch suite)
+        run: cargo test --workspace -- --ignored
+      - name: Bench regression gate (release mode, no feature flag)
+        run: >
+          cargo test --release -p axc-driver --test bench_regression
+          -- --nocapture
+        env:
+          AXC_BLESS_BASELINES: ""
