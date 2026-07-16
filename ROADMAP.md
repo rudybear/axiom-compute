@@ -302,15 +302,9 @@ Goal: real users.
 
 ## Engineering debt (cuts across phases)
 
-### EB.1 — Cross-vendor real GPU CI
+### EB.1 — Cross-vendor real GPU CI — PREP ✅ DONE (EB.1-prep, 2026-07-16); measurement HARDWARE-GATED
 
-**Scope:** self-hosted GitHub Actions runners for AMD (RDNA3 + Vulkan ICD) + Intel (Arc + ANV ICD). Currently CI is Lavapipe-only.
-
-**Why it matters:** the portability thesis is unproven without measurements on AMD and Intel. Dev machine has only NVIDIA.
-
-**Acceptance:** all 6 GPU tests + bench regression gate run on AMD and Intel in CI on every PR.
-
-**Effort:** infra work, ~1 week to set up runners + ~1000 LOC of GitHub Actions YAML.
+**EB.1-prep MERGED**: vendor workflows (`cross-vendor-ci.yml` per-PR gates, `cross-vendor-ab.yml` one-command llama.cpp A/B evidence, `cross-vendor-bless.yml` artifact→PR bless) if-gated on `vars.{AMD,INTEL}_RUNNER_ONLINE` activation variables (never runs-on-gated — absent labels pend forever); same-repo fork guards + `contents: read` + timeouts on EVERY self-hosted job (incl. hardening the pre-existing pytorch-interop fork-PR hole); fail-closed security suite AT-3019..3037 ({yml,yaml}, expression-runs-on rejected, job-count floor, bench-gate env asserted); `docs/EB1_RUNNER_SETUP.md` (ephemeral+non-root REQUIRED, RADV/ANV, Mesa 25.2.8 known-bad / known-good UNKNOWN). **To activate: register a runner per the doc, flip the repo variable — CI lights up; run cross-vendor-ab.yml → the M4.2 RFC trigger evidence.** The actual AMD/Intel measurements remain hardware-gated (EB.1-HW placeholders).
 
 **EB.1-prep MERGED** (see the Status snapshot row above + `.pipeline/milestones/EB1prep-cross-vendor-ci.md`): the workflows, the runner setup docs, and a CPU-only validation harness are authored and merged — everything preparable without the hardware. Activation is **one repository variable per vendor** (`AMD_RUNNER_ONLINE` / `INTEL_RUNNER_ONLINE`, see `docs/EB1_RUNNER_SETUP.md §5`); no code change is needed when a runner registers. What remains is genuinely hardware-gated: registering the physical AMD/Intel runners, flipping the activation variables, running the first-run bless (`cross-vendor-bless.yml`), and observing the per-PR gates + the `cross-vendor-ab.yml` A/B evidence job actually execute on real silicon.
 
