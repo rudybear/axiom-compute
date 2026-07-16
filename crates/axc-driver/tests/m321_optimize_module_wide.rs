@@ -1,13 +1,19 @@
 //! M3.21 (FG.9) — `axc optimize` module-wide hole discovery (F3) and winner
-//! cross-validation (F4 / r3 orchestrator patch). AT-2957, AT-2970.
+//! cross-validation (F4 / r3 orchestrator patch). AT-3013, AT-3014, AT-3016.
 //!
-//! `run_optimize`'s bench closure is the pre-existing M2.3 mock (fixed
-//! 1000ns for every variant, no GPU) — these tests exercise the CPU-only
-//! discovery/selection/cross-validation logic, not GPU timing.
+//! M3.23 migrates all three `run_optimize` call sites to the new 5-arg
+//! signature (`vk: Option<&VulkanContext>`) and rewrites the two callers that
+//! depended on the OLD mock bench's "ordinal 0 always ties/wins" determinism
+//! into GPU-gated (`#[ignore]` + `AXC_ENABLE_GPU_TESTS=1`, Lavapipe-runnable)
+//! real-bench legs — the mock bench is gone (M3.23 §1).
 
 use std::path::PathBuf;
 
 use axc_driver::optimize::{run_optimize, OptimizeError};
+
+fn gpu_tests_enabled() -> bool {
+    std::env::var("AXC_ENABLE_GPU_TESTS").as_deref() == Ok("1")
+}
 
 /// A 2-kernel source sharing `?WG` (module-global, F3): BOTH kernels declare
 /// `@strategy { WG: ?[32, 64] }` with a BYTE-IDENTICAL candidate list (§4
@@ -52,17 +58,39 @@ fn tempfile_dir(label: &str) -> PathBuf {
     dir
 }
 
-/// AT-2957: `axc optimize multi.axc --kernel bench_target` runs grid_search
-/// over the UNION holes (F3), and the winner is cross-compiled across ALL
-/// kernels (F4) BEFORE the winner sidecar is written.
+/// Probe a real `VulkanContext` (Lavapipe-runnable) the same way `main.rs`
+/// wires `axc optimize`. `None` if no Vulkan device is available.
+fn probe_vk() -> Option<axc_runtime::VulkanContext> {
+    if axc_runtime::probe_vulkan_available() {
+        axc_runtime::VulkanContext::new().ok()
+    } else {
+        None
+    }
+}
+
+/// AT-3014 (rewritten from AT-2957): `axc optimize multi.axc --kernel
+/// bench_target` real-benches over the UNION holes (F3), and the winner is
+/// cross-compiled across ALL kernels (F4) BEFORE the winner sidecar is
+/// written. GPU-gated (Lavapipe-runnable, non-coopmat fixture) — does NOT
+/// assert which candidate wins (real timings).
 #[test]
-fn at_2957_optimize_union_holes_and_f4_cross_validate_before_write() {
-    let dir = tempfile_dir("at_2957");
+#[ignore]
+fn at_3014_optimize_union_holes_and_f4_cross_validate_before_write() {
+    if !gpu_tests_enabled() {
+        eprintln!("AT-3014: AXC_ENABLE_GPU_TESTS not set; skipping");
+        return;
+    }
+    let Some(vk) = probe_vk() else {
+        eprintln!("AT-3014: no Vulkan device available; skipping");
+        return;
+    };
+
+    let dir = tempfile_dir("at_3014");
     let src = dir.join("multi.axc");
     std::fs::write(&src, SHARED_HOLE_SRC).unwrap();
     let out = dir.join("out.spv");
 
-    let result = run_optimize(&src, &out, "none", Some("bench_target"));
+    let result = run_optimize(&src, &out, "none", Some("bench_target"), Some(&vk));
     assert!(result.is_ok(), "optimize must succeed: {result:?}");
     assert!(out.exists(), "winning .spv must be written");
     let sidecar = axc_driver::optimize::strategy_sidecar_path(&out);
@@ -75,16 +103,19 @@ fn at_2957_optimize_union_holes_and_f4_cross_validate_before_write() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `axc optimize` with no `--kernel` on an ambiguous (2+ kernel) source
-/// fails closed (never a silent kernels[0] pick).
+/// AT-3013: `axc optimize` with no `--kernel` on an ambiguous (2+ kernel)
+/// source fails closed (never a silent kernels[0] pick) — HEADLESS
+/// (`vk=None`), proving the AmbiguousKernel diagnostic fires at
+/// `select_kernel`, BEFORE the `vk==None` GpuUnavailable check (§1.3.1
+/// ordering pin). Arity-only migration from the pre-M3.23 test.
 #[test]
-fn optimize_no_kernel_on_ambiguous_source_fails_closed() {
+fn at_3013_optimize_no_kernel_on_ambiguous_source_fails_closed() {
     let dir = tempfile_dir("optimize_ambiguous");
     let src = dir.join("multi.axc");
     std::fs::write(&src, SHARED_HOLE_SRC).unwrap();
     let out = dir.join("out.spv");
 
-    let result = run_optimize(&src, &out, "none", None);
+    let result = run_optimize(&src, &out, "none", None, None);
     match result {
         Err(OptimizeError::Compile(axc_driver::DriverError::AmbiguousKernel { available })) => {
             assert_eq!(available, vec!["bench_target".to_string(), "sibling".to_string()]);
@@ -96,29 +127,31 @@ fn optimize_no_kernel_on_ambiguous_source_fails_closed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// AT-2970 / r3: a candidate that is valid for the BENCHED kernel but makes a
-/// SIBLING kernel fail to compile -> `run_optimize` fails closed BEFORE
-/// writing EITHER the `.spv` or the strategy sidecar (r3 orchestrator patch —
-/// zero partial artifacts on an injected sibling failure).
-///
-/// `bench_target` uses `?BAD` only as its OWN workgroup x-dim with y=z=1 (a
-/// 1-D workgroup, legal for ANY of these candidates); `sibling` multiplies
-/// the SAME value by two more dimensions of 16, so `?BAD=8` overflows the
-/// portable 1024-invocation ceiling for `sibling` (8*16*16=2048 ->
-/// `HirError::BadWorkgroupDim`) while staying perfectly legal for
-/// `bench_target` alone (product=8). `?BAD`'s candidate order is `[8, 2]` —
-/// the mock bench (`run_optimize`'s fixed-1000ns-for-every-variant closure)
-/// always crowns ORDINAL 0 (ties broken by original enumeration order via a
-/// stable sort), so this deterministically drives `run_optimize`'s OWN
-/// winner selection into the sibling-breaking candidate — a genuine internal
-/// F4 firing, not just an external proof that F4 *would* catch it.
+/// AT-3016 (rewritten from AT-2970): a SINGLE-candidate `@strategy { BAD: ?[8] }`
+/// forces `BAD=8` as the winner bench-independently (only candidate; even the
+/// R3 fallback crowns ordinal 0) — `bench_target` benches fine (1-D,
+/// product=8), but F4 then rejects the winner because `sibling`
+/// (`@workgroup(?BAD,16,16)`, 8*16*16=2048 > 1024) breaks module-wide =>
+/// `WinnerInvalidModuleWide` naming `sibling`; NEITHER `.spv` NOR sidecar
+/// exists. GPU-gated (Lavapipe-runnable) — the real bench must actually run
+/// (and succeed) on `bench_target` before F4 fires.
 #[test]
-fn at_2970_winner_invalid_for_sibling_fails_closed_zero_artifacts() {
+#[ignore]
+fn at_3016_winner_invalid_for_sibling_fails_closed_zero_artifacts() {
+    if !gpu_tests_enabled() {
+        eprintln!("AT-3016: AXC_ENABLE_GPU_TESTS not set; skipping");
+        return;
+    }
+    let Some(vk) = probe_vk() else {
+        eprintln!("AT-3016: no Vulkan device available; skipping");
+        return;
+    };
+
     let src_text = concat!(
         "@kernel\n",
         "@workgroup(?BAD, 1, 1)\n",
-        "@strategy { BAD: ?[8, 2] }\n",
-        "@intent(\"bench target: legal for both candidates as a 1-D workgroup\")\n",
+        "@strategy { BAD: ?[8] }\n",
+        "@intent(\"bench target: legal for the sole candidate as a 1-D workgroup\")\n",
         "@complexity(O(n))\n",
         "fn bench_target(x: buffer[u32]) -> void {\n",
         "    let i: u32 = gid(0u32);\n",
@@ -127,7 +160,7 @@ fn at_2970_winner_invalid_for_sibling_fails_closed_zero_artifacts() {
         "}\n",
         "@kernel\n",
         "@workgroup(?BAD, 16, 16)\n",
-        "@strategy { BAD: ?[8, 2] }\n",
+        "@strategy { BAD: ?[8] }\n",
         "@intent(\"sibling: BAD=8 overflows the 1024-invocation ceiling (8*16*16=2048)\")\n",
         "@complexity(O(n))\n",
         "fn sibling(y: buffer[u32]) -> void {\n",
@@ -136,32 +169,23 @@ fn at_2970_winner_invalid_for_sibling_fails_closed_zero_artifacts() {
         "    return;\n",
         "}\n",
     );
-    let dir = tempfile_dir("at_2970");
+    let dir = tempfile_dir("at_3016");
     let src = dir.join("multi.axc");
     std::fs::write(&src, src_text).unwrap();
     let out = dir.join("out.spv");
     let sidecar = axc_driver::optimize::strategy_sidecar_path(&out);
 
-    // Sanity: confirm BAD=8 really does break `sibling` (the scenario F4
-    // exists to catch) and BAD=2 does not — otherwise this fixture would be
-    // vacuous.
-    let mut bad_first = std::collections::BTreeMap::new();
-    bad_first.insert("BAD".to_string(), 8i64);
-    let resolved_first = axc_driver::substitute_strategy_holes(src_text, &bad_first);
+    // Fixture sanity: BAD=8 really does break `sibling` module-wide.
+    let mut bad = std::collections::BTreeMap::new();
+    bad.insert("BAD".to_string(), 8i64);
+    let resolved = axc_driver::substitute_strategy_holes(src_text, &bad);
     assert!(
-        axc_driver::compile_module_all(&resolved_first, false).is_err(),
+        axc_driver::compile_module_all(&resolved, false).is_err(),
         "fixture sanity: BAD=8 must break `sibling` module-wide"
     );
-    let mut bad_second = std::collections::BTreeMap::new();
-    bad_second.insert("BAD".to_string(), 2i64);
-    let resolved_second = axc_driver::substitute_strategy_holes(src_text, &bad_second);
-    assert!(
-        axc_driver::compile_module_all(&resolved_second, false).is_ok(),
-        "fixture sanity: BAD=2 must be valid module-wide"
-    );
 
-    // The actual F4 firing, inside run_optimize's own winner-selection path.
-    let result = run_optimize(&src, &out, "none", Some("bench_target"));
+    // The actual F4 firing, inside run_optimize's own real-bench winner path.
+    let result = run_optimize(&src, &out, "none", Some("bench_target"), Some(&vk));
     match result {
         Err(OptimizeError::WinnerInvalidModuleWide { broken_kernel, detail }) => {
             assert_eq!(broken_kernel.as_deref(), Some("sibling"), "F4 must name the broken sibling; detail={detail}");
@@ -170,8 +194,8 @@ fn at_2970_winner_invalid_for_sibling_fails_closed_zero_artifacts() {
     }
 
     // r3: NEITHER the .spv NOR the sidecar may exist after an F4 failure.
-    assert!(!out.exists(), "AT-2970 (r3): NO .spv may be written on an F4 failure");
-    assert!(!sidecar.exists(), "AT-2970 (r3): NO strategy sidecar may be written on an F4 failure");
+    assert!(!out.exists(), "AT-3016 (r3): NO .spv may be written on an F4 failure");
+    assert!(!sidecar.exists(), "AT-3016 (r3): NO strategy sidecar may be written on an F4 failure");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

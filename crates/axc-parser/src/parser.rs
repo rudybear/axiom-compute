@@ -230,6 +230,20 @@ pub enum ParseError {
         #[label("here")]
         span: Span,
     },
+
+    // ── M3.23 (M3.19a): out-of-i64-range annotation/strategy/log-record literal ──
+
+    /// An integer literal (magnitude, with an optional leading `-`) in an
+    /// annotation arg / strategy candidate / `@optimization_log` record value
+    /// position does not fit in `i64`. Previously this silently clamped to
+    /// `i64::MAX`/`i64::MIN` (a fail-open); now it is a hard parse error.
+    /// Does NOT apply to the general typed *body* literal path (a separate,
+    /// untouched grammar position — e.g. `u64::MAX` in `let x: u64 = ...;`).
+    #[error("integer literal out of i64 range in this position (annotation arg / strategy candidate / optimization-log record value)")]
+    IntLiteralOutOfRange {
+        #[label("here")]
+        span: Span,
+    },
 }
 
 /// Internal enum for infix operators used by the Pratt parser.
@@ -250,6 +264,27 @@ impl<'tok> Parser<'tok> {
     /// Create a new parser over a slice of tokens (must end with `Eof`).
     pub fn new(tokens: &'tok [Token]) -> Self {
         Self { tokens, pos: 0, errors: Vec::new() }
+    }
+
+    /// M3.23 (M3.19a): checked i64 reconstruction from a lexer-supplied literal
+    /// `value: i128` MAGNITUDE (the lexer never produces a negative `value`; unary
+    /// `-` is a separate `Minus` token, so `neg` is supplied by the caller) at the
+    /// five annotation-arg / strategy-candidate / optimization-log-record sites.
+    ///
+    /// ASYMMETRIC boundary: `|i64::MIN| == 2^63 == 9223372036854775808`, one more
+    /// than `i64::MAX == 2^63 - 1`. `neg` branches accordingly so the negated
+    /// magnitude `9223372036854775808` is accepted as exactly `i64::MIN`, while
+    /// `9223372036854775809` (and anything larger) is rejected. On success, `Ok`
+    /// contains the EXACT `i64` (no clamping); on failure, pushes
+    /// `ParseError::IntLiteralOutOfRange` and returns `None` (fail-closed).
+    fn int_literal_checked(&mut self, value: i128, neg: bool, span: Span) -> Option<i64> {
+        const I64_MIN_MAGNITUDE: i128 = 9_223_372_036_854_775_808_i128;
+        let ok: bool = if neg { value <= I64_MIN_MAGNITUDE } else { value <= i64::MAX as i128 };
+        if !ok {
+            self.errors.push(ParseError::IntLiteralOutOfRange { span });
+            return None;
+        }
+        Some(if neg { (-value) as i64 } else { value as i64 })
     }
 
     /// Parse the entire token stream into a `Module`.
@@ -546,8 +581,7 @@ impl<'tok> Parser<'tok> {
             let val: i64 = match self.peek_kind().clone() {
                 TokenKind::IntLiteral { value, .. } => {
                     self.advance();
-                    let raw: i64 = i64::try_from(value).unwrap_or(i64::MAX);
-                    if neg { raw.wrapping_neg() } else { raw }
+                    self.int_literal_checked(value, neg, cand_span)?
                 }
                 other => {
                     self.errors.push(ParseError::Unexpected {
@@ -814,9 +848,9 @@ impl<'tok> Parser<'tok> {
                 self.advance();
                 match self.peek_kind().clone() {
                     TokenKind::IntLiteral { value, .. } => {
+                        let lit_span: Span = self.peek_span();
                         self.advance();
-                        let v: i64 = i64::try_from(value.wrapping_neg()).unwrap_or(i64::MIN);
-                        RecordValue::Int(v)
+                        RecordValue::Int(self.int_literal_checked(value, true, start.merge(lit_span))?)
                     }
                     other => {
                         self.errors.push(ParseError::OptimizationLogBlockSyntax {
@@ -829,8 +863,7 @@ impl<'tok> Parser<'tok> {
             }
             TokenKind::IntLiteral { value, .. } => {
                 self.advance();
-                let v: i64 = i64::try_from(value).unwrap_or(i64::MAX);
-                RecordValue::Int(v)
+                RecordValue::Int(self.int_literal_checked(value, false, start)?)
             }
             TokenKind::Question => {
                 self.errors.push(ParseError::OptimizationLogBlockSyntax {
@@ -910,8 +943,9 @@ impl<'tok> Parser<'tok> {
                 if let TokenKind::IntLiteral { value, .. } = self.peek_kind().clone() {
                     let span_end: Span = self.peek_span();
                     self.advance();
-                    let v: i64 = i64::try_from(value.wrapping_neg()).unwrap_or(i64::MIN);
-                    Some(Spanned::new(AnnotationArg::Int(v), span_start.merge(span_end)))
+                    let merged: Span = span_start.merge(span_end);
+                    let v: i64 = self.int_literal_checked(value, true, merged)?;
+                    Some(Spanned::new(AnnotationArg::Int(v), merged))
                 } else {
                     self.errors.push(ParseError::Unexpected {
                         expected: "integer literal after `-`".into(),
@@ -923,7 +957,7 @@ impl<'tok> Parser<'tok> {
             }
             TokenKind::IntLiteral { value, .. } => {
                 self.advance();
-                let v: i64 = i64::try_from(value).unwrap_or(i64::MAX);
+                let v: i64 = self.int_literal_checked(value, false, span_start)?;
                 Some(Spanned::new(AnnotationArg::Int(v), span_start))
             }
             TokenKind::BoolLiteral(b) => {
@@ -3551,6 +3585,56 @@ mod tests {
         assert!(
             errors2.iter().any(|e| matches!(e, ParseError::NonPositiveStrategyCandidate { .. })),
             "expected NonPositiveStrategyCandidate for -1: {errors2:?}"
+        );
+    }
+
+    /// AT-3010 (M3.19a): an out-of-i64-range annotation-arg literal is rejected
+    /// with `ParseError::IntLiteralOutOfRange` — both the positive `> i64::MAX`
+    /// case AND the negated boundary (`-9223372036854775808` == i64::MIN MUST be
+    /// accepted; `-9223372036854775809` MUST be rejected). Ordinary boundary
+    /// values (`i64::MAX`, `i64::MIN`) still parse to the exact value.
+    #[test]
+    fn at_3010_int_literal_out_of_range_annotation_arg() {
+        // Positive overflow (i64::MAX + 1) is rejected.
+        let (_, errs) = parse_src(
+            "@foo(9223372036854775808) @kernel @workgroup(1,1,1) fn k() -> void { return; }"
+        );
+        assert!(
+            errs.iter().any(|e| matches!(e, ParseError::IntLiteralOutOfRange { .. })),
+            "expected IntLiteralOutOfRange for i64::MAX+1: {errs:?}"
+        );
+
+        // Negated i64::MIN magnitude (2^63) MUST be accepted, exactly.
+        let (ast, errs) = parse_src(
+            "@foo(-9223372036854775808) @kernel @workgroup(1,1,1) fn k() -> void { return; }"
+        );
+        assert!(errs.is_empty(), "negated i64::MIN must parse cleanly: {errs:?}");
+        let crate::ast::Item::Kernel(kd) = &ast.items[0].node;
+        let foo = kd.annotations.iter().find(|a| a.node.name.node == "foo").unwrap();
+        assert!(
+            matches!(foo.node.args[0].node, AnnotationArg::Int(i64::MIN)),
+            "expected AnnotationArg::Int(i64::MIN); got {:?}", foo.node.args[0].node
+        );
+
+        // One past negated i64::MIN (2^63 + 1) is rejected.
+        let (_, errs) = parse_src(
+            "@foo(-9223372036854775809) @kernel @workgroup(1,1,1) fn k() -> void { return; }"
+        );
+        assert!(
+            errs.iter().any(|e| matches!(e, ParseError::IntLiteralOutOfRange { .. })),
+            "expected IntLiteralOutOfRange for i64::MIN-1: {errs:?}"
+        );
+
+        // i64::MAX itself still parses to the exact value.
+        let (ast, errs) = parse_src(
+            "@foo(9223372036854775807) @kernel @workgroup(1,1,1) fn k() -> void { return; }"
+        );
+        assert!(errs.is_empty(), "i64::MAX must parse cleanly: {errs:?}");
+        let crate::ast::Item::Kernel(kd) = &ast.items[0].node;
+        let foo = kd.annotations.iter().find(|a| a.node.name.node == "foo").unwrap();
+        assert!(
+            matches!(foo.node.args[0].node, AnnotationArg::Int(i64::MAX)),
+            "expected AnnotationArg::Int(i64::MAX); got {:?}", foo.node.args[0].node
         );
     }
 

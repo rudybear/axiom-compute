@@ -253,6 +253,22 @@ pub fn entry_from_grid_record(
     }
 }
 
+/// M3.23 (M3.19b): the line ending to use for a NEW boundary newline spliced
+/// into `source` — `"\r\n"` iff `source` contains at least one `\r\n` and no
+/// LONE `\n` (a bare `\n` not preceded by `\r`); otherwise `"\n"`. An LF-only
+/// or empty source keeps today's `"\n"` (byte-identical splice output); a
+/// CRLF source gets a CRLF-terminated new block instead of a mixed-ending one.
+fn dominant_line_ending(source: &str) -> &'static str {
+    let mut prev_was_cr: bool = false;
+    for b in source.bytes() {
+        if b == b'\n' && !prev_was_cr {
+            return "\n"; // a lone LF settles it: this source is LF-terminated.
+        }
+        prev_was_cr = b == b'\r';
+    }
+    if source.contains("\r\n") { "\r\n" } else { "\n" }
+}
+
 // ── The writer (splice, fail-closed) ───────────────────────────────────────────
 
 /// Pure splice core (unit-testable without touching the filesystem):
@@ -291,10 +307,11 @@ pub fn splice_optimization_log_entry(source: &str, new_entry: &OptimizationLogEn
                 forward_unknown: Vec::new(),
             };
             let block_text: String = format_optimization_log_block(&fresh);
-            let mut out = String::with_capacity(source.len() + block_text.len() + 2);
+            let newline: &str = dominant_line_ending(source);
+            let mut out = String::with_capacity(source.len() + block_text.len() + newline.len());
             out.push_str(&source[..anchor]);
             out.push_str(&block_text);
-            out.push('\n');
+            out.push_str(newline);
             out.push_str(&source[anchor..]);
             Ok(out)
         }
@@ -464,6 +481,29 @@ mod tests {
         let close = src.rfind('}').unwrap(); // the block's own close, since it's the first `}` here... use kernel's structure instead
         let _ = close;
         assert!(spliced.contains("fn k() -> void { return; }"));
+    }
+
+    // ── AT-3011 (M3.19b): CRLF-source create-path boundary newline ───────────
+
+    /// A CRLF source (no existing `@optimization_log` block) gets a `\r\n`
+    /// -terminated new block at the create-path boundary newline; an LF-only
+    /// source is byte-identical to today (`\n` boundary).
+    #[test]
+    fn at_3011_crlf_source_gets_crlf_boundary_newline() {
+        let crlf_src = "@kernel @workgroup(1,1,1)\r\nfn k() -> void { return; }";
+        let spliced = splice_optimization_log_entry(crlf_src, &sample_entry()).expect("must splice");
+        assert!(
+            spliced.contains("} }\r\n@kernel"),
+            "CRLF source must get a \\r\\n boundary newline before the preserved source: {spliced:?}"
+        );
+        assert!(!spliced.contains("} }\n@kernel"), "must NOT insert a bare LF into a CRLF source: {spliced:?}");
+
+        let lf_src = "@kernel @workgroup(1,1,1)\nfn k() -> void { return; }";
+        let spliced_lf = splice_optimization_log_entry(lf_src, &sample_entry()).expect("must splice");
+        assert!(
+            spliced_lf.contains("} }\n@kernel"),
+            "LF source must stay byte-identical to today (\\n boundary): {spliced_lf:?}"
+        );
     }
 
     // ── AT-2922: fail-closed at capacity, source byte-unchanged ──────────────
