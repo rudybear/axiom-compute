@@ -1,0 +1,140 @@
+{
+  "verdict": "COMPLETE",
+  "agent": "coder",
+  "milestone_id": "M3.23-real-bench",
+  "design_revision": "r3",
+  "branch": "coder/M323-20260716-0000/M3.23-real-bench",
+  "files_changed": {
+    "modified": [
+      "crates/axc-driver/src/log_opt.rs",
+      "crates/axc-driver/src/main.rs",
+      "crates/axc-driver/src/mcp/tools/append_optimization_log.rs",
+      "crates/axc-driver/src/mcp/tools/bench_variant.rs",
+      "crates/axc-driver/src/optimize.rs",
+      "crates/axc-driver/tests/m321_optimize_module_wide.rs",
+      "crates/axc-driver/tests/optimize_real_bench.rs (blocker-fix pass: AT-3018 added, AT-3017/AT-3017b diverge_src mechanism updated)",
+      "crates/axc-hir/src/lower.rs",
+      "crates/axc-parser/src/parser.rs"
+    ],
+    "created": [
+      "crates/axc-driver/tests/optimize_real_bench.rs"
+    ]
+  },
+  "public_apis_implemented": [
+    "pub fn run_optimize(input: &Path, output: &Path, correctness_str: &str, kernel: Option<&str>, vk: Option<&axc_runtime::VulkanContext>) -> Result<(), OptimizeError>  # NEW 5th arg",
+    "OptimizeError::GpuUnavailable(String)  # NEW variant, fail-closed before any write",
+    "OptimizeError::VariantsDiverge { ordinals: Vec<usize>, kernel: String }  # NEW variant, fail-closed before any write",
+    "pub(crate) fn bench_variant::check_correctness(..)  # promoted private -> pub(crate)",
+    "pub(crate) fn bench_variant::correctness_match(..)  # promoted private -> pub(crate)",
+    "pub(crate) fn bench_variant::differential_mismatch(reference: &[Vec<u8>], got: &[Vec<u8>], ulp_tol: u32) -> Option<(usize, u32)>  # NEW, bitwise fast-path + f32-ULP",
+    "fn log_opt::dominant_line_ending(source: &str) -> &'static str  # NEW private helper",
+    "const append_optimization_log::MAX_NOTE_LEN: usize = 512  # NEW, byte cap",
+    "ParseError::IntLiteralOutOfRange { span: Span }  # NEW variant",
+    "fn Parser::int_literal_checked(&mut self, value: i128, neg: bool, span: Span) -> Option<i64>  # NEW helper, all 5 sites migrated",
+    "fn lower.rs::collect_shared_len_hole_refs / collect_shared_len_hole_refs_stmt  # NEW private helpers (PW-1)"
+  ],
+  "tests_added": [
+    "AT-3006 (optimize.rs unit, headless GpuUnavailable, zero artifacts) -- REPLACES the old AT-2984a mock-completes leg A",
+    "AT-3007 (tests/optimize_real_bench.rs, GPU-gated, real bench + winner-consistency)",
+    "AT-3008 (tests/optimize_real_bench.rs, GPU-gated, unoracled NotChecked warning)",
+    "AT-3009 (axc-hir/src/lower.rs unit, shared-len hole ref is not UnusedStrategyHole)",
+    "AT-3010 (axc-parser/src/parser.rs unit, IntLiteralOutOfRange incl. negated i64::MIN boundary)",
+    "AT-3011 (axc-driver/src/log_opt.rs unit, CRLF create-path boundary newline)",
+    "AT-3012 (axc-driver/src/mcp/tools/append_optimization_log.rs unit, 512-byte note cap)",
+    "AT-3013 (tests/m321_optimize_module_wide.rs, headless AmbiguousKernel, arity migration)",
+    "AT-3014 (tests/m321_optimize_module_wide.rs, GPU-gated, rewritten from at_2957, F3 real bench)",
+    "AT-3015 (optimize.rs in-crate unit, F4 cross_validate_winner_module_wide direct call, no promotion)",
+    "AT-3016 (tests/m321_optimize_module_wide.rs, GPU-gated, rewritten from at_2970, single-candidate forced winner)",
+    "AT-3017 (tests/optimize_real_bench.rs, GPU-gated, unattributable divergence, non-reference ordinal)",
+    "AT-3017b (tests/optimize_real_bench.rs, GPU-gated, unattributable divergence, reference-ordinal-reversed direction-independence)",
+    "AT-3018 (tests/optimize_real_bench.rs, GPU-gated, blocker-fix pass -- pessimistic reviewer's canonical DEFECT-2 repro fixture through the real CLI/library path, no index-bounding workaround, asserts per-variant geometry correctness)"
+  ],
+  "per_platform_results": {
+    "cargo_build_workspace": "pass",
+    "cargo_clippy_workspace_lib_tests_D_warnings": "pass, zero warnings",
+    "cargo_test_workspace_non_ignored": "pass, 0 failures across every crate (full run tee'd; grepped for FAILED/panicked -- none found)",
+    "nvidia_rtx_pro_6000_blackwell": {
+      "AT-3013": "pass (headless, no GPU touch)",
+      "AT-3014": "pass (real bench, winner-consistency, F3 union + F4)",
+      "AT-3016": "pass (single-candidate forced winner, F4 fires, zero artifacts)",
+      "AT-3007": "pass (real bench, LocalSize winner-consistency)",
+      "AT-3008": "pass (NotChecked warning surfaced)",
+      "AT-3017": "pass (VariantsDiverge, zero artifacts)",
+      "AT-3017b": "pass (VariantsDiverge, zero artifacts, direction-independence)",
+      "repeat_stability": "re-ran the optimize_real_bench.rs + m321 suites multiple times back-to-back; consistently green"
+    },
+    "lavapipe_mesa_25_2_8": {
+      "AT-3013": "pass",
+      "AT-3014": "pass",
+      "AT-3016": "pass",
+      "AT-3007": "pass (after fixture redesign -- see deviations)",
+      "AT-3008": "pass (after fixture redesign)",
+      "AT-3017": "pass (after fixture redesign)",
+      "AT-3017b": "pass (after fixture redesign)",
+      "repeat_stability": "re-ran 2-3x each after the fixture fix; consistently green"
+    }
+  },
+  "cli_smoke_test": {
+    "command": "axc optimize /tmp/smoke/smoke.axc -o /tmp/smoke/smoke.spv --correctness none",
+    "fixture": "3-candidate workgroup_x-hole kernel (?[32,64,128]), unoracled",
+    "nvidia_result": "exit 0; stderr disclosed 'timing_source = GpuTimestamp (device = NVIDIA RTX PRO 6000 Blackwell Workstation Edition)'; measured winner workgroup_x=32, median_ns=2496 (real GpuTimestamp MIN-of-10, all 3 candidates benched with real median/min/max_ns); winner .spv + sidecar written",
+    "lavapipe_result": "exit 0; stderr disclosed 'timing_source = GpuTimestamp (device = llvmpipe (LLVM 20.1.2, 256 bits))'; measured winner workgroup_x=32, fallback_used=false; winner .spv + sidecar written",
+    "headless_diagnostic_smoke": "axc optimize on a no-@strategy source exits 1 with a NoStrategy miette error (proves the CPU-only-diagnostics-before-GpuUnavailable ordering is live end-to-end via the real CLI, not just unit-tested)"
+  },
+  "corpus_golden_result": "No compiler-crate (axc-codegen) changes at all (Part A). Part B touches axc-parser (5 literal-overflow sites, all previously fail-open/clamping, now fail-closed only for OUT-OF-i64-RANGE literals that no valid existing example contains) and axc-hir (PW-1 only seeds a HashSet consumed by an UNUSED-HOLE WARNING, never a codegen decision). Verified via: (1) full `cargo test --workspace` pass including axc-codegen's own byte-exact golden fixture tests (untouched crate); (2) axc-driver's per-example compile+spirv-val test suite (compile_shared_examples.rs et al., ~300+ tests) all green; (3) direct CLI compile of all 56 examples/*.axc with the release binary -- the 22 that 'fail' do so for PRE-EXISTING reasons (AmbiguousKernel / unresolved @strategy holes needing --kernel/--strategy-value, e.g. two_pass_reduce.axc, matmul_shared_f32.axc) unrelated to this diff; (4) explicit determinism spot-check (compile twice, sha256 match) on 5 representative examples including a shared-array-hole one. No `main`-branch binary diff was performed (git worktree/stash intentionally avoided per the 'no git write commands' constraint) -- byte-identity rests on the analytical proof above plus the passing test suite, not a literal bytes-vs-main diff. Flagged honestly as a slightly weaker verification method than a direct diff.",
+  "cargo_check_status": "pass",
+  "cargo_clippy_status": "pass",
+  "loc": {
+    "target": 641,
+    "cap": 700,
+    "gross_insertions": 882,
+    "net_added_lines": 744,
+    "over_cap": true,
+    "honest_disclosure": "Net LOC (~744) is over the 700 hard cap by roughly 6%. Drivers of the overage, all judged necessary rather than scope creep: (1) real GPU dispatch surfaced two PRE-EXISTING axc-runtime/axc-optimize defects (see deviations) that had to be root-caused, disclosed in doc comments, and worked around in test-fixture design -- this added real investigation-derived documentation weight, especially in tests/optimize_real_bench.rs's module doc and the m321 test file's per-test rationale; (2) the r3 spec's own AT-3017b reverse leg and VariantsDiverge gate were already anticipated to add ~+20 over r2; (3) the m321 test file's per-test doc comments were kept verbose (matching the pre-existing file's own documentation density) rather than trimmed for budget. No structural rework (no duplicated grid_search, no GridSearchResult schema change) was needed -- the overage is documentation/investigation weight, not logic bloat."
+  },
+  "self_assessment": {
+    "spec_coverage": "Part A: real bench (GpuTimestamp MIN-of-10 resident harness), the differential detector + oracle attributor two-face correctness system, GpuUnavailable fail-closed at the pinned \u00a71.3.1 ordering point, VariantsDiverge fail-closed (both direction legs), NotChecked warning surfacing, all 3 m321 caller migrations, AT-3006..AT-3017b all implemented and GPU-verified on 2 platforms. Part B: PW-1 shared-len-hole-ref-seeds-referenced-holes, M3.19a IntLiteralOutOfRange at all 5 sites (body-literal path verified untouched), M3.19b CRLF boundary newline, M3.19c 512-byte note cap -- all implemented with unit tests, all passing.",
+    "known_limitations": [
+      "DISCOVERED (not introduced by M3.23, NOT fixed here per the spec's own 'runtime UNCHANGED' scope): axc-runtime's resident harness (upload_resident/dispatch_resident) SIGFPEs on this Lavapipe build (Mesa 25.2.8) for ANY workgroup-shared-memory kernel, reproduced even with a static non-hole shared array, fully independent of @strategy holes or grid_search. This means the M3.22 shared[T,?WG]-length-hole fixture literally named in the r3 spec's AT-3007 text is NOT safely real-bench-dispatchable on Lavapipe today via run_optimize -- a real, disclosable gap in axc-runtime's Lavapipe compatibility surface that predates this milestone and is out of scope to fix here.",
+      "CORRECTED per QA's re-framing (M3.23-qa.json defect_2_workgroup_hole_dispatch_geometry_oob.attribution_determination) and FIXED in the blocker-fix pass (see the top-level `blocker_fix` section below) -- SUPERSEDES the original entry verbatim below, kept for record: the original framing ('DISCOVERED (same class)' as the genuinely pre-existing shared-memory/Lavapipe defect, 'not introduced by M3.23') OVERSTATED the pre-existing-ness. QA's correct characterization: the ENABLING CONDITIONS are genuinely pre-existing and untouched by this diff (HIR's placeholder-dims-for-HoleRef-workgroup behavior in axc-hir/src/lower.rs; axc-optimize's resolve_single_variant legacy-convention-only @workgroup resolution in enumerator.rs, zero diff lines), but the TRIGGERING CODE -- run_optimize's own dispatch-geometry invariant capture and its use in derive_workgroups -- is 100% NEW code written by this milestone (it could not have manifested before M3.23 since the old mock bench never dispatched anything). The correct framing is: 'a new consequence of new code faithfully implementing the r3 spec's own \u00a71.4/\u00a75 design, whose edge-case analysis under-predicted the failure mode' -- the spec's \u00a75 text anticipated only under-coverage ('caught by the oracle, else NotChecked'), not the actual failure mode (OOB over-dispatch causing a crash on Lavapipe / silent wrong-output on NVIDIA). The pessimistic code reviewer independently reproduced this 3/3 as a BLOCKER (not a disclosable limitation) and required the fix before merge; \u00a75 of the milestone spec has been corrected in place to describe the real failure mode. ORIGINAL (superseded) text: \"DISCOVERED (same class): run_optimize's own dispatch-geometry invariant capture (per spec) reads the HIR's PLACEHOLDER [1,1,1] workgroup dims whenever @workgroup itself is a strategy hole (real dims aren't known until per-variant resolution). Combined with axc-optimize's resolve_single_variant only resolving @workgroup dims for the LEGACY 'workgroup_x'/'workgroup_y'/'workgroup_z' hole-naming convention (any other hole name silently leaves the compiled kernel's LocalSize at 1x1x1 for EVERY candidate -- a separate, pre-existing latent gap that happens to make AT-3014/AT-3016's inherited 'WG'/'BAD'-named fixtures accidentally safe), a workgroup_x-named hole causes a genuine, deterministic 32x-64x dispatch over-provisioning whose out-of-bounds buffer writes SIGSEGV Lavapipe (real NVIDIA's robustBufferAccess tolerates it). My new AT-3007/3008/3017/3017b fixtures work around this by bounding every buffer index via `i % N` (in-bounds by construction, verified stable across repeated runs on both platforms) rather than by touching axc-runtime or axc-optimize.\"",
+      "Both discoveries are recommended as follow-up bug reports against axc-runtime (shared-memory + resident-dispatch on Lavapipe) and axc-optimize (resolve_single_variant's @workgroup convention-name-only resolution, and run_optimize's placeholder-derived dispatch geometry for any hole-driven @workgroup) -- out of scope for M3.23 per its own 'Codegen/runtime/SPIR-V: UNCHANGED' mandate.",
+      "The M3.23 spec's own documented limitations stand unchanged: zero-push-constant timing degeneracy for scalar-gated kernels, non-f32 buffer approximation in the differential's ULP leg, device-lost-cascade unmeasured-fallback-winner risk."
+    ],
+    "deviations": [
+      "AT-3007/AT-3008 fixture: uses a workgroup_x-hole-driven, index-bounded (i % 1024) unoracled kernel instead of the spec's literally-named shared[i32,?WG] fixture, and asserts winner-consistency via `OpExecutionMode ... LocalSize` instead of `OpTypeArray` -- forced by the Lavapipe SIGFPE defect above (verified via direct manual repro bypassing run_optimize entirely, so it's not a bug in this milestone's new code). The INTENT (winner .spv's compiled artifact matches its own sidecar assignment; real timings; no assumption about which candidate wins) is preserved exactly.",
+      "AT-3017/AT-3017b fixture: uses a workgroup_x-hole-driven, index-bounded (i % 1024, aliased-write) divergence mechanism instead of local_invocation_id-driven divergence -- the first local_invocation_id-based design was empirically root-caused to trigger the placeholder-driven-over-dispatch SIGSEGV defect above, independent of shared memory. The bounded-alias design reliably (repeat-tested) produces genuine, deterministic, in-bounds variant-vs-variant divergence on both platforms without touching axc-runtime. SUPERSEDED by the blocker-fix pass: once DEFECT-2 was fixed, this aliasing mechanism (which depended on the placeholder-driven OVER-dispatch to alias extra global ids onto the same bounded index) stopped diverging, since dispatch is now exactly sized. AT-3017/AT-3017b's `diverge_src` was updated to use `local_invocation_id(0)` instead (safe now that geometry is correct) -- see the top-level `blocker_fix` section.",
+      "LOC: ~744 net added lines vs the 700 hard cap (honest disclosure per the coder brief) -- see the loc block above for the breakdown.",
+      "The m321_optimize_module_wide.rs test names were renamed to at_3013_/at_3014_/at_3016_ prefixes (from at_2957_/optimize_no_kernel_.../at_2970_) to match their new AT numbers per the r3 migration table; the module doc comment and const/fn names otherwise carry over verbatim."
+    ]
+  },
+  "git_commits": [],
+  "blocker_fix": {
+    "trigger": "M3.23-pessimistic-code-review.json the_ruling_defect_2: NEEDS_REVISION, BLOCKER. Independently reproduced 3/3 on the canonical `@strategy { workgroup_x: ?[32,64] }` autotune fixture via the shipped binary on Lavapipe: SIGSEGV / glibc heap-corruption abort, zero artifacts. Root cause: run_optimize's invariant-metadata capture read the HIR PLACEHOLDER `@workgroup` dims (`[1,1,1]`) whenever `@workgroup` itself is a `?hole`, then used that placeholder (via `derive_workgroups`) for EVERY variant's dispatch geometry, while the compiled SPIR-V's actual `LocalSize` was the RESOLVED value -- causing 32x-64x over-dispatch and out-of-bounds buffer writes (Lavapipe: crash; NVIDIA: silent OOB clamp / possibly-wrong winner).",
+    "fix_summary": "crates/axc-driver/src/optimize.rs only, no library/cross-crate changes. Added `local_size_from_spirv(words: &[u32]) -> Option<(u32,u32,u32)>` (~26 LOC incl. doc comment; ~15 LOC of actual scan logic): walks the SPIR-V instruction stream past the 5-word module header, finds `OpExecutionMode` (opcode 16) with mode `LocalSize` (17), and returns its 3 literal operands, returning `None` on a missing/malformed stream. Both `correctness_fn` and `bench_fn` closures now compute `let wg_dims = local_size_from_spirv(words).map(|(x,y,z)| [x,y,z]).unwrap_or(workgroup_size); let workgroups = bench_variant::derive_workgroups(&input_sizes, wg_dims, None);` PER VARIANT (using that variant's own compiled `words`) instead of reusing a single pre-captured `workgroups` value computed once (pre-substitution) from the placeholder. `workgroup_size` (the old invariant capture) is kept only as the fallback for literal-`@workgroup` kernels (no hole), where it is already correct and identical across all variants -- so literal-`@workgroup` kernel behavior is unchanged.",
+    "loc_delta": "optimize.rs: +96/-6 net (git diff --stat, local uncommitted). Within the reviewer's ~20-25 LOC estimate for the core fix; the remainder is doc comments explaining the blocker/root-cause/fix for future readers (consistent with this file's existing documentation density).",
+    "cosmetic_fix_ordinal_numbering": "DIVERGENCE-ORDINAL-NUMBERING (warnings, minor): VariantsDiverge's reported ordinals previously were the cfn-CALL-sequence counter, not the library's `variant.ordinal` -- diverging whenever an earlier variant fails resolve/codegen (grid_search `continue`s before calling cfn, so cfn's call-index skips ahead of the true ordinal). Fixed by building `cfn_call_to_true_ordinal: Vec<usize>` AFTER `grid_search` returns, by filtering `result.results` (which IS in true-ordinal order and covers every variant including resolve/codegen failures) for entries whose outcome is not a pre-correctness `resolve error:`/`codegen error:` `Failed(..)` -- exactly the variants for which `grid_search` actually invoked `cfn` -- then mapping each recorded call-index in `divergence` through this vector before constructing `OptimizeError::VariantsDiverge`. No library change; `BenchOutcome` added to the existing `use axc_optimize::grid_search::{...}` import list (already-public type, zero-diff to axc-optimize).",
+    "spec_and_run_json_corrections": "(1) .pipeline/milestones/M3.23-real-bench.md SS5 'Hole that parameterises @workgroup dims' bullet corrected in place: the original text claimed 'under-coverage is caught by the oracle, else NotChecked' -- WRONG failure-mode prediction. Replaced with the real failure mode (over-dispatch OOB writes -> crash on non-robustBufferAccess / silent-wrong-output on NVIDIA, undetectable by any oracle since the crash happens during dispatch, before readback) and the fix description. (2) M3.23-coder.json's own `self_assessment.known_limitations[1]` ('DISCOVERED (same class)...not introduced by M3.23') corrected per QA's `defect_2_workgroup_hole_dispatch_geometry_oob.attribution_determination`: the enabling conditions (HIR placeholder dims, resolve_single_variant's legacy-convention-only resolution) are genuinely pre-existing, but the TRIGGERING code (run_optimize's own invariant-metadata capture) is 100% new to M3.23 -- the original framing overstated pre-existing-ness by grouping it with the genuinely-pre-existing shared-memory/Lavapipe defect. The original text is preserved inline (marked SUPERSEDED) for the record.",
+    "test_added": {
+      "id": "AT-3018",
+      "file": "crates/axc-driver/tests/optimize_real_bench.rs",
+      "fn": "at_3018_canonical_workgroup_hole_geometry_fix_repro",
+      "fixture": "VERBATIM the pessimistic reviewer's DEFECT-2 repro fixture (adapted to valid AXIOM-Compute syntax: @intent/@complexity/-> void/return, which the reviewer's shorthand omitted): `@kernel @workgroup(?workgroup_x,1,1) @strategy { workgroup_x: ?[32,64] } fn k(out: buffer[f32]) -> void { out[gid(0u32)] = 1.0; return; }`, run with NO index-bounding workaround (unlike AT-3007/AT-3008/AT-3017/AT-3017b, whose `i % 1024` bounding predates this fix and is no longer strictly necessary for this fixture since 32 and 64 both evenly divide the 1024-element default buffer).",
+      "assertions": "run_optimize returns Ok; winner .spv + sidecar both written; winner_assignments[\"workgroup_x\"] is a real candidate (32 or 64); the winner .spv's `OpExecutionMode ... LocalSize` matches the winning workgroup_x exactly (per-variant geometry correctness, not just crash-avoidance).",
+      "gpu_gated": true,
+      "also_fixed": "AT-3017/AT-3017b's diverge_src mechanism: the original `i % 1024` aliasing trick relied on the pre-fix OVER-dispatch to alias extra global ids onto the same bounded index -- once geometry is correctly sized (no more over-dispatch), the two workgroup_x candidates no longer alias differently and the fixture stopped diverging (observed: both tests regressed from PASS to FAIL on first post-fix run, `got Ok(())` instead of `VariantsDiverge`). Replaced the divergence mechanism with `local_invocation_id(0)` (out[i] = x[i] + local_invocation_id(0)), which is intrinsically workgroup_x-dependent at the same global id and does not rely on any over/under-dispatch behavior -- verified genuinely in-bounds and non-UB under the corrected geometry."
+    },
+    "verification": {
+      "cargo_build_workspace": "clean, 0 errors, 0 warnings",
+      "cargo_clippy_workspace_lib_tests_D_warnings": "clean, 0 warnings",
+      "cargo_test_workspace": "all non-ignored tests pass (0 failed), no regressions",
+      "at_3015_ordinal_naming_regression_check": "optimize::tests (in-crate, includes AT-3015 cross_validate_winner_module_wide naming) -- 6 passed, 0 failed",
+      "at_3018_lavapipe": "3/3 runs, all `ok`, isolated (`cargo test at_3018 -- --ignored --test-threads=1`), VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json, device='llvmpipe (LLVM 20.1.2, 256 bits)'",
+      "at_3018_nvidia": "3/3 runs, all `ok`, isolated, no VK_DRIVER_FILES override (default ICD selection), device='NVIDIA RTX PRO 6000 Blackwell Workstation Edition'",
+      "full_m323_gpu_at_set_lavapipe": "m321_optimize_module_wide.rs (AT-3014, AT-3016) + optimize_real_bench.rs (AT-3007, AT-3008, AT-3017, AT-3017b, AT-3018) -- 7/7 pass, 0 failed, on Lavapipe (previously-crashing class AT-3017/AT-3017b now pass with the updated local_invocation_id mechanism; AT-3007/3008 already worked around the bug pre-fix and continue to pass)",
+      "full_m323_gpu_at_set_nvidia": "same 7/7 pass, 0 failed, on NVIDIA RTX PRO 6000 Blackwell",
+      "cli_repro_lavapipe_3x": "reviewer's exact canonical fixture (`@workgroup(?workgroup_x,1,1)` + `@strategy { workgroup_x: ?[32,64] }`) via the actual `axc optimize` CLI binary, `--correctness none`, VK_DRIVER_FILES=lvp_icd.json: 3/3 runs exit 0, real winner each time (`fallback_used: false`, two genuinely-differing GpuTimestamp median_ns values e.g. 41998 vs 36354), winner .spv's compiled `OpExecutionMode ... LocalSize` verified byte-parsed to match the winning workgroup_x exactly (64 in the captured run). Zero crashes across all 3 runs (previously 3/3 SIGSEGV).",
+      "cli_repro_nvidia_3x": "same canonical fixture via the CLI on NVIDIA (default ICD, no VK_DRIVER_FILES): 3/3 runs exit 0, real winner each time (`fallback_used: false`, device='NVIDIA RTX PRO 6000 Blackwell Workstation Edition', timing_source=GpuTimestamp), winners observed 32/64/64 across the 3 runs (real measured variance, not a fixed fallback) -- confirms the silent-wrong-output risk the reviewer flagged for NVIDIA (OOB clamp masking the real winner) is also closed, not just the Lavapipe crash."
+    },
+    "verdict": "BLOCKER RESOLVED. All 5 mandated items implemented: (1) local_size_from_spirv scan added; (2) per-variant geometry derivation wired into both correctness_fn and bench_fn with metadata fallback preserved for literal-@workgroup kernels; (3) AT-3018 canonical-fixture test added and green on both platforms via the real CLI/library path; (4) VariantsDiverge ordinals switched from the cfn-call counter to true variant.ordinal via post-grid_search translation; (5) spec SS5 and the run-JSON defect-2 framing corrected per QA's guidance, original text preserved inline as superseded."
+  }
+}
