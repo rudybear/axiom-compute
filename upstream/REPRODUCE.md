@@ -56,10 +56,11 @@ cargo run -p axc-driver --bin axc -- compile \
 
 These are the SAME `@strategy` assignments as the M3.6 leader (RB 2×2, tile_k=16,
 a_block_size/b_block_size pinned at 512 — see the kernel's `@strategy` line). AT-2997
-(`compile_shared_examples.rs`) asserts the committed `.spv` is byte-reproducible from this exact
-command against the pinned source. `spirv-val` (Vulkan 1.1 target env, via the `spirv-tools`
-crate) is clean — verified in the coder pass (AT-2985/2987/2997) and mirrored by every dispatch
-test that compiles this source.
+(`compile_shared_examples.rs`, CI-run) recompiles the pinned source in-process with these exact
+`@strategy` assignments and asserts the resulting bytes are byte-identical to the committed
+`.spv` — the same input the command above produces. `spirv-val` (Vulkan 1.1 target env, via the
+`spirv-tools` crate) is clean on that fresh compile — verified in the coder pass (AT-2985/2987/2997)
+and mirrored by every dispatch test that compiles this source.
 
 ## How the byte array was produced
 
@@ -97,6 +98,15 @@ the 13-condition guard (all confirmed present in the pinned source during this c
 exhaustively compile-checked) may need small adjustments when the patch is actually built. This is
 exactly why the executed real-ggml ABI smoke (below) is a HARD precondition of the RFC-open
 trigger, not a formality.
+
+**KNOWN LIMITATION (disclosed, not yet resolved):** guard condition #8 at the `:8239` override
+site calls `ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k, pipeline)` with the
+STOCK guess pipeline still in scope, but the real dispatch at `:8252` recomputes split-K with the
+OVERRIDDEN AXIOM pipeline (fixed 32×32 tile, single-split only) — a latent mismatch that could
+activate split-K on a kernel that does not support it, at shapes where the two pipelines'
+split-K decisions diverge. The real-ggml ABI smoke (below) MUST exercise a split-K-eligible shape
+(large K relative to M/N) to close this before the RFC-open trigger fires — see
+`UPSTREAM_PR_PLAN.md`'s §7.5 checklist.
 
 ## Rebuild llama.cpp with the patch (POST-HARDWARE — not run in this milestone)
 

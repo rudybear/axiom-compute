@@ -8,6 +8,7 @@
 //! AT-1613: Buffer-source coopmat path is byte-identical (no regression from CoopMatLoadSource).
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use axc_driver::{compile_source_with_meta, compile_source_with_assignments};
 use spirv_tools::val::{Validator, create as create_validator};
 use spirv_tools::TargetEnv;
@@ -2656,8 +2657,70 @@ fn at_2987_q4km_ggml_variant_compiles_and_validates() {
 
     eprintln!(
         "AT-2987 PASS: q4km_matmul_rb_coopmat_f32acc_cached_ggml.axc compiles + spirv-val clean; \
-         caps IDENTICAL to the M3.6 leader ({ggml_caps:?}); meta.coopmat = \
-         {{16,16,16, F16,F16,F32,F32, Subgroup}}; shared_memory_bytes={}",
+         caps match the M3.6 leader's set MINUS the documented StorageBuffer16BitAccess (4433) \
+         drop ({ggml_caps:?}); meta.coopmat = {{16,16,16, F16,F16,F32,F32, Subgroup}}; \
+         shared_memory_bytes={}",
         meta.shared_memory_bytes
+    );
+}
+
+// ── AT-2997: the committed `upstream/matmul_q4_k_f32_cm1_axiom.spv` is spirv-val clean AND ──
+//            byte-reproducible from the pinned source + `@strategy` assignments (M4.2a spec §8) ──
+
+/// AT-2997 (M4.2a, CI no-GPU): the committed RFC artifact
+/// `upstream/matmul_q4_k_f32_cm1_axiom.spv` is (a) spirv-val clean and (b) BYTE-REPRODUCIBLE — a
+/// fresh compile of `examples/q4km_matmul_rb_coopmat_f32acc_cached_ggml.axc` with the SAME RB
+/// 2×2 `@strategy` assignments used to generate it (`rb2x2_assignments`, mirroring
+/// `upstream/REPRODUCE.md`'s documented `axc compile ... --strategy-value rb_m=2 ...` command)
+/// produces the EXACT bytes on disk. This is the drift guard the pessimistic code review (H1)
+/// found missing: without it, nothing catches the committed `.spv` going stale after a future
+/// codegen change, and `upstream/REPRODUCE.md`'s "AT-2997 asserts byte-reproducible" claim would
+/// be false. Mirrors the AT-2838 golden-byte-compare pattern (`compile_empty_kernel.rs`).
+#[test]
+fn at_2997_committed_ggml_spv_is_spirv_val_clean_and_byte_reproducible() {
+    let ggml_src = include_str!("../../../examples/q4km_matmul_rb_coopmat_f32acc_cached_ggml.axc");
+    let assignments = rb2x2_assignments();
+
+    let (fresh_bytes, _meta) = compile_source_with_assignments(ggml_src, &assignments)
+        .unwrap_or_else(|e| {
+            panic!("AT-2997: q4km_matmul_rb_coopmat_f32acc_cached_ggml.axc: compile failed: {e:?}")
+        });
+
+    // (a) spirv-val clean (Vulkan 1.1 target env, same discipline as every other test in this file).
+    let _ = words_and_validate(fresh_bytes.clone(), "AT-2997 fresh ggml compile");
+
+    // (b) byte-reproducible: fresh compile == the committed artifact.
+    let manifest_dir: PathBuf = PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"),
+    );
+    let committed_path: PathBuf = manifest_dir
+        .join("..")
+        .join("..")
+        .join("upstream")
+        .join("matmul_q4_k_f32_cm1_axiom.spv");
+    let committed_bytes: Vec<u8> = std::fs::read(&committed_path).unwrap_or_else(|e| {
+        panic!("AT-2997: failed to read committed artifact {committed_path:?}: {e}")
+    });
+
+    assert_eq!(
+        fresh_bytes, committed_bytes,
+        "AT-2997: a fresh compile of examples/q4km_matmul_rb_coopmat_f32acc_cached_ggml.axc with \
+         the RB 2×2 @strategy assignments (rb_m=2, rb_n=2, tile_k=16, a_block_size=512, \
+         b_block_size=512) is NOT byte-identical to the committed {committed_path:?}. Within a \
+         fixed rustc + Cargo.lock this output is byte-deterministic (no spirv-opt pass, generator \
+         word forced to 0), so a mismatch here means either (a) a legitimate codegen change — \
+         re-bless via: `cargo run -p axc-driver --bin axc -- compile \
+         examples/q4km_matmul_rb_coopmat_f32acc_cached_ggml.axc -o \
+         upstream/matmul_q4_k_f32_cm1_axiom.spv --strategy-value rb_m=2 --strategy-value rb_n=2 \
+         --strategy-value tile_k=16 --strategy-value a_block_size=512 --strategy-value \
+         b_block_size=512` (the exact command documented in upstream/REPRODUCE.md), or (b) a real \
+         regression — do not re-bless blindly."
+    );
+
+    eprintln!(
+        "AT-2997 PASS: upstream/matmul_q4_k_f32_cm1_axiom.spv is spirv-val clean AND \
+         byte-reproducible ({} bytes) from examples/q4km_matmul_rb_coopmat_f32acc_cached_ggml.axc \
+         + rb2x2_assignments()",
+        committed_bytes.len()
     );
 }

@@ -236,7 +236,8 @@ pub enum CoopMatStoreLayout {
 
 // ── RESERVED_COOPMAT_BUILTIN_NAMES ───────────────────────────────────────────
 
-/// Sorted-for-binary-search list of the four cooperative-matrix builtin names.
+/// Sorted-for-binary-search list of the five cooperative-matrix builtin names
+/// (`coopmat_store_col` added M4.2a).
 ///
 /// Used by the HIR reserved-name check to reject `let coopmat_load = ...` etc.
 /// MUST remain sorted lexicographically. The lexer-layer copy in

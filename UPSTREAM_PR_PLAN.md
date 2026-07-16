@@ -110,7 +110,9 @@ RFC-open trigger:
       buffers/dispatch/f32 `src1`/column-major D — the static ABI goldens
       (`crates/axc-driver/tests/m42a_ggml_abi_golden.rs`) are the CI-runnable substitute until
       this runs, NOT a replacement for it. NOT executed in M4.2a (explicit out-of-scope); see
-      `upstream/REPRODUCE.md` for the deferred build+run steps.
+      `upstream/REPRODUCE.md` for the deferred build+run steps. This smoke MUST include a
+      split-K-eligible shape (large K relative to M/N) to exercise guard condition #8's latent
+      stock-vs-AXIOM-pipeline split-K mismatch (`upstream/REPRODUCE.md`'s KNOWN LIMITATION).
 
 Both boxes must be checked before the RFC referenced by this document is opened.
 
