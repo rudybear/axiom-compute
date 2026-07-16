@@ -1,0 +1,83 @@
+{
+  "verdict": "APPROVE",
+  "agent": "pessimistic_code_reviewer",
+  "milestone_id": "M4.2a-ggml-abi",
+  "branch": "coder/M42a-20260715-1500/M4.2a-ggml-abi",
+  "commits_reviewed": ["59bcb54", "dd3140e"],
+  "recheck": {
+    "verdict": "APPROVE",
+    "commit_rechecked": "59f32e7",
+    "prior_verdict": "NEEDS_REVISION",
+    "summary": "Scoped re-verification of the review-fix commit 59f32e7. The single HIGH finding (H1) is fully resolved and every low nit is fixed. The milestone now APPROVES. AT-2997 is genuinely implemented (not a placeholder): it recompiles examples/q4km_matmul_rb_coopmat_f32acc_cached_ggml.axc IN-PROCESS with rb2x2_assignments() = {rb_m=2, rb_n=2, tile_k=16, a_block_size=512, b_block_size=512} — byte-for-byte the same assignment set as the REPRODUCE.md `axc compile --strategy-value ...` command — spirv-vals the fresh bytes (words_and_validate, Vulkan 1.1), reads the COMMITTED artifact via CARGO_MANIFEST_DIR/../../upstream/matmul_q4_k_f32_cm1_axiom.spv, and does a FULL Vec<u8> equality assert_eq!(fresh_bytes, committed_bytes). The panic message carries the exact re-bless command (the documented REPRODUCE.md invocation) and correctly warns 'do not re-bless blindly.' The test PASSES (1 passed) and reports the 11036-byte artifact. This is the drift guard H1 required, and it makes the REPRODUCE.md claim TRUE. REPRODUCE.md:57-62 no longer overclaims: it now states the test 'recompiles the pinned source in-process with these exact @strategy assignments and asserts the resulting bytes are byte-identical to the committed .spv' — an exact, non-fabricated description of what the code does. The D1 split-K disclosure is present in BOTH deliverables: REPRODUCE.md KNOWN LIMITATION block (the :8239/:8252 stock-vs-AXIOM pipeline split-K mismatch, with the mandate that the real-ggml smoke MUST exercise a split-K-eligible shape) AND UPSTREAM_PR_PLAN.md §7.5 (the smoke 'MUST include a split-K-eligible shape (large K relative to M/N)'). Low nits all fixed: token.rs:409 and coopmat.rs:239 both now read 'five' cooperative-matrix builtin names (with the '(coopmat_store_col added M4.2a)' note); AT-2987's success eprintln no longer overstates cap identity — it now reads 'caps match the M3.6 leader's set MINUS the documented StorageBuffer16BitAccess (4433) drop', matching the exact programmatic assertion. Full `cargo test --workspace` is CLEAN: 101 'test result: ok' lines, 0 FAILED, 0 errors. Adversarial discrimination probe on the byte-compare (performed on a scratchpad COPY, repo file untouched): flipping ONE byte (index 5518, 0x00->0x01) of the committed .spv yields full-Vec inequality (num differing bytes = 1, `data == flip` -> False; on-disk `cmp` also flags byte 5519) — confirming assert_eq! on the full Vec<u8> discriminates a single-byte drift. The comparison is a whole-binary equality with no length/prefix truncation, so it cannot miss a stale artifact. Nothing regressed; no new concerns surfaced.",
+    "H1_status": "RESOLVED — AT-2997 implemented as an in-process recompile + spirv-val + full-byte-compare against the committed artifact; passes; panic carries the regen command. REPRODUCE.md:57-62 claim now accurate.",
+    "low_nits_status": "L1 FIXED (token.rs:409 + coopmat.rs:239 now say 'five'); L2 FIXED (AT-2987 eprintln precisioned to 'MINUS the documented StorageBuffer16BitAccess (4433) drop').",
+    "D1_status": "DISCLOSED in BOTH REPRODUCE.md (KNOWN LIMITATION) and UPSTREAM_PR_PLAN.md §7.5 (split-K-eligible smoke-shape requirement added to the RFC hard preconditions). Remains a design note for the Architect / EB.1 real-ggml smoke, not an M4.2a blocker.",
+    "workspace_tests": "cargo test --workspace: 101 'test result: ok', 0 FAILED, 0 errors.",
+    "at_2997_run": "cargo test -p axc-driver --test compile_shared_examples at_2997 -> 1 passed.",
+    "adversarial_byte_flip_probe": "On a scratchpad COPY (repo .spv untouched): single-byte flip at index 5518 (0x00->0x01) -> full Vec<u8> equality False, num differing bytes=1; on-disk cmp flags byte 5519. The assert_eq! full-binary compare discriminates a one-byte drift; no truncation/prefix weakness.",
+    "residual_notes": "D1 remains an open design note carried to the RFC hard-precondition checklist (correctly, since the patch is not built/run in M4.2a). No new findings."
+  },
+  "summary": "Deep adversarial review of the ggml-ABI-matched Q4_K_M kernel + upstream package destined for an external RFC. The engineering core is CLEAN and independently verified: the .axc kernel is line-for-line exactly the six ABI deltas vs the M3.6 leader with no smuggled changes; the emitted SPIR-V confirms every ABI-critical fact (B SSBO f32, D SSBO f32, q u8; all four D stores ColumnMajorKHR layout=1; push block exactly 6 members at offsets 0..20 = 24B, legally within ggml's 68B range; StorageBuffer16BitAccess(4433) correctly dropped; workgroup (32,1,1); f32->f16 converts present); the coopmat_store_col codegen is a clean byte-copy of the row-major emitter with layout const 1, typecheck fail-closes ColMajor+Shared and expression-position use, and no corpus golden regressed (36 compile_shared_examples goldens pass; existing stores default to RowMajor -> identical output); the transpose-cancellation trap is avoided (the oracle tests compare against an UN-transposed oracle at asymmetric shapes M=4096/N=512 and M=64/N=128, which cannot cancel; the f16-exact fixture is genuinely f16-first); the patch applies cleanly against the REAL vendor tree at the pinned SHA (AT-2998 ran, not skipped) with hunks anchored in [4090,4211] + near :8239, all #ifdef-guarded, 13-condition fail-closed guard present; the .spv is git-tracked and the .gitignore negation is correctly ordered. HOWEVER: one mandated acceptance test (AT-2997) is entirely ABSENT, and the external-facing REPRODUCE.md falsely cites it as existing/verified. That is the class of defect this review exists to stop before it ships publicly. I independently confirmed the committed .spv IS currently byte-reproducible, so there is no shipped-binary defect today -- but there is no CI guard against future source/binary drift, and a document going into the upstream RFC asserts a verification that does not exist. NEEDS_REVISION, small and mechanical to fix.",
+  "spirv_val_check": "PASS",
+  "ub_check": "PASS",
+  "race_condition_check": "PASS",
+  "vendor_divergence_check": "PASS",
+  "critical_bugs": [],
+  "high_findings": [
+    {
+      "id": "H1",
+      "severity": "high",
+      "title": "AT-2997 (mandated) is not implemented, and REPRODUCE.md -- an external RFC deliverable -- falsely cites it as existing and verified",
+      "detail": "Spec section 8 mandates AT-2997: 'The committed upstream/matmul_q4_k_f32_cm1_axiom.spv is spirv-val clean AND byte-reproducible from the pinned source + assignments (regen == committed), in compile_shared_examples.rs (CI)'. No such test exists. Exhaustive grep of crates/ finds no `at_2997`/`AT-2997` test function; the only test that references the committed .spv path is AT-3004 (git-tracked check) in m42a_package_integrity.rs -- it never recompiles the kernel nor compares bytes. AT-2987 compiles the SAME source and runs spirv-val (so the 'spirv-val clean' half is effectively covered by identical bytes), but nothing asserts the ON-DISK committed artifact equals a fresh compile -- the exact guard against shipping a stale binary in the RFC package. Worse: upstream/REPRODUCE.md:58-62 states 'AT-2997 (compile_shared_examples.rs) asserts the committed .spv is byte-reproducible from this exact command' and 'verified in the coder pass (AT-2985/2987/2997)'. Both references are to a nonexistent test, in a document that will be read by a llama.cpp maintainer. For a milestone whose thesis is 'the compiler VERIFIES what is claimed', shipping a deliverable that cites a fabricated verification is a public-credibility defect. NOTE: I independently ran the documented REPRODUCE.md command (cargo run -p axc-driver --bin axc -- compile ... --strategy-value rb_m=2 rb_n=2 tile_k=16 a_block_size=512 b_block_size=512) and `cmp` reports BYTE-IDENTICAL to the committed upstream/matmul_q4_k_f32_cm1_axiom.spv (both 11036 bytes) -- so the artifact is correct TODAY; this is a missing-guard + false-doc-claim, not a wrong-binary. Collateral: QA's requirements_covered=21/21 is wrong (AT-2997 is uncovered -> 20/21); QA's baseline_comparison explicitly lists AT-2997 'landing as passed', which is inaccurate.",
+      "files": [
+        "upstream/REPRODUCE.md:58-62",
+        "crates/axc-driver/tests/compile_shared_examples.rs (AT-2997 expected here, absent)",
+        "crates/axc-driver/tests/m42a_package_integrity.rs (only AT-3004 touches the .spv)"
+      ],
+      "fix": "Implement AT-2997 in compile_shared_examples.rs: recompile the ggml kernel with the rb2x2 assignments and assert the produced bytes == std::fs::read(upstream/matmul_q4_k_f32_cm1_axiom.spv) (it will pass -- verified byte-identical), plus a spirv-val on those bytes. This closes the drift guard AND makes the REPRODUCE.md claim true. If for any reason the test is not added, the two REPRODUCE.md references to AT-2997 must be corrected to name the tests that actually run (AT-2987 for compile+spirv-val) and drop the false 'byte-reproducible' assertion -- but implementing the mandated test is the correct resolution."
+    }
+  ],
+  "low_findings": [
+    {
+      "id": "L1",
+      "severity": "low",
+      "title": "Stale doc comments say 'four' coopmat builtin names; the lists now hold five",
+      "detail": "crates/axc-lexer/src/token.rs:409 and crates/axc-hir/src/coopmat.rs:239 both read 'Sorted-for-binary-search list of the four cooperative-matrix builtin names', but both RESERVED_COOPMAT_BUILTIN_NAMES arrays now contain 5 entries (coopmat_store_col added). Cosmetic; no behavior impact.",
+      "files": ["crates/axc-lexer/src/token.rs:409", "crates/axc-hir/src/coopmat.rs:239"]
+    },
+    {
+      "id": "L2",
+      "severity": "low",
+      "title": "AT-2987 success eprintln overstates cap identity",
+      "detail": "compile_shared_examples.rs AT-2987's final eprintln says 'caps IDENTICAL to the M3.6 leader' while the (correct, precise) assertion permits exactly the documented StorageBuffer16BitAccess(4433) drop. The programmatic assertion is exact; only the log string is loose. Already noted by QA; cosmetic.",
+      "files": ["crates/axc-driver/tests/compile_shared_examples.rs"]
+    }
+  ],
+  "design_notes_for_architect": [
+    {
+      "id": "D1",
+      "severity": "informational",
+      "title": "Host-patch guard condition #8 calls ggml_vk_guess_split_k with the STOCK guess pipeline, not the AXIOM override pipeline that will actually dispatch",
+      "detail": "In upstream/ggml-vulkan-axiom-q4k.patch the override branch (at :8239) evaluates condition #8 as `ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k, pipeline) == 1` where `pipeline` is still the STOCK guess result. But the real split-K decision at :8252 will be recomputed with the OVERRIDDEN AXIOM pipeline (wg_denoms {32,32,1}, fixed 32x32 tile). If the AXIOM pipeline geometry yields a different split_k than the stock pipeline at some shape, split-K could activate on AXIOM's single-split kernel (which does not support it). This is latent and the patch is explicitly NOT built/run in M4.2a (out of scope; gated behind the HARD real-ggml smoke precondition, section 7.5) and the not-compiled caveat is disclosed in REPRODUCE.md/patch header. Not an M4.2a blocker, but the Architect should ensure the RFC-trigger real-ggml smoke exercises a split-K-eligible shape so this cannot slip into the eventual upstream build."
+    }
+  ],
+  "verified_clean": [
+    "Kernel diff is EXACTLY the six ABI deltas vs the M3.6 leader (git diff line-by-line): B->f32, n_blocks_per_row=stride_a/256u32, grid axis swap (block_row=gid(0)/32u32, block_col=gid(1)), B staged transposed+converted (b_global=col*stride_b+row; f32_to_f16(x[...])), D column-major (coopmat_store_col with (tile_col*16)*stride_d+(tile_row*16)). No smuggled changes.",
+    "D-store algebra correct: 2x2 accumulator->tile mapping preserved (acc_00->row0/col0 ... acc_11->row1/col1); each base offset is col*stride_d+row (the correct column-major transpose of the leader's row*N+col).",
+    "SPIR-V (disassembled by direct binary parse): entry point 'q4km_matmul_rb_coopmat_f32acc_cached_ggml', ExecutionMode LocalSize (32,1,1); binding0=struct{arr<i8>}, binding1(B/x)=struct{arr<f32>}, binding2(C/D)=struct{arr<f32>}; all four OpCooperativeMatrixStoreKHR reference the single layout constant %203 = value 1 (ColumnMajorKHR), no row-major D store remains; push struct %20 has exactly 6 members at offsets 0,4,8,12,16,20 (24B, subset of ggml's 68B range -> vkCmdPushConstants-legal); capability set excludes StorageBuffer16BitAccess(4433) (correct drop from B-retype) and retains Float16(9)/Int16(22)/CooperativeMatrixKHR(6022)/StorageBuffer8BitAccess(4448 for u8 q); two f32->f16 OpFConvert sites present (B staging + dequant narrow).",
+    "coopmat_store_col codegen: emit_coopmat_store_col_inline is a faithful byte-copy of emit_coopmat_store_inline with COL_MAJOR_LAYOUT=1; body.rs dispatches on the layout discriminant; the Shared path fail-closes on ColMajor; typecheck rejects coopmat_store_col at expression position and coopmat_store_col targeting a shared array.",
+    "No corpus regression: existing coopmat_store call sites default to CoopMatStoreLayout::RowMajor -> unchanged emitter -> identical SPIR-V; 36 compile_shared_examples goldens + 319 axc-hir lib tests pass.",
+    "Static ABI goldens bind to REAL artifacts, not vacuously: AT-3000 (B f32) and AT-2995 (6 scalars @0-20, bindings q/x/C=0/1/2) assert against compiled meta.binding_plan; AT-3001/AT-3003/AT-2988 assert against kernel source text; AT-3005 cross-checks block_q4_K=144 against the oracle's Q4KM_SUPERBLOCK_BYTES. The circularity that hid r1's #1/#2 cannot recur.",
+    "Transpose-cancellation trap avoided: dispatch_q4km_ggml.rs compares the de-transposed GPU output against the UN-transposed logical oracle at asymmetric AT-3002 (M=4096,N=512) and AT-2990 (M=64,N=128) -- a kernel axis-swap or column-major-store bug cannot cancel against the oracle. AT-2986 uses a deliberately NON-symmetric 16x16 tile fixture. The f16-exact fixture is genuinely f16-first (make_x_f16 -> transpose_widen_b exact widen).",
+    "Patch verified against the REAL vendor tree: vendor/llama.cpp present at pinned SHA 6b80c74f28; AT-2998 actually executed (not typed-skipped) -- git apply --check exit 0, hunks anchor in [4090,4211] (creation) and window [8200,8242] (override), all hunks #ifdef GGML_VULKAN_AXIOM_Q4K, 13-condition fail-closed guard present.",
+    ".gitignore: !upstream/*.spv present and ordered AFTER *.spv; committed .spv is git-tracked (AT-3004).",
+    "UPSTREAM_PR_PLAN.md status line 'PREPARED - HOLD' and the TRIGGER paragraph are byte-unchanged (AT-2999 pass); FROZEN_REL_TOL=1e-3 never loosened; axc-runtime untouched."
+  ],
+  "independent_actions_taken": [
+    "Parsed upstream/matmul_q4_k_f32_cm1_axiom.spv at the binary level to confirm bindings/types/layout-operand/push-offsets/capabilities/workgroup.",
+    "Diffed examples/q4km_matmul_rb_coopmat_f32acc_cached_ggml.axc against git main's M3.6 leader line-by-line.",
+    "Built and ran the CI-runnable M4.2a suite: compile_shared_examples (36 ok), m42a_ggml_abi_golden (6 ok), m42a_package_integrity (3 ok), m42a_patch_applies (2 ok -- AT-2998 executed against the real pinned vendor tree), axc-hir lib (319 ok).",
+    "Reproduced the .spv via the documented REPRODUCE.md command and cmp-confirmed BYTE-IDENTICAL to the committed artifact.",
+    "Exhaustively grepped for at_2997/AT-2997 across crates/ -> absent."
+  ]
+}

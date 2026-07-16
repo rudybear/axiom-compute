@@ -1,0 +1,155 @@
+{
+  "verdict": "COMPLETE",
+  "agent": "coder",
+  "milestone_id": "M4.2a-ggml-abi",
+  "branch": "coder/M42a-20260715-1500/M4.2a-ggml-abi",
+  "summary": "Implemented the ggml-ABI-matched Q4_K_M coopmat-KHR kernel variant (six ABI deltas, VERBATIM from the M3.6 leader otherwise), the one required codegen feature (coopmat_store_col, column-major layout operand), the static ABI-conformance golden suite (anti-circularity anchor), the GPU correctness/equiv test suites, the resident A/B bench, and the upstream/ integration package (spv + byte-array fragment + hand-written patch + REPRODUCE.md). All GPU-dependent claims were MEASURED on real NVIDIA hardware (RTX PRO 6000 Blackwell) available in this environment, not simulated.",
+  "files_created": [
+    "examples/q4km_matmul_rb_coopmat_f32acc_cached_ggml.axc",
+    "crates/axc-driver/tests/dispatch_coopmat_store_col.rs",
+    "crates/axc-driver/tests/dispatch_q4km_ggml.rs",
+    "crates/axc-driver/tests/dispatch_q4km_ggml_equiv.rs",
+    "crates/axc-driver/tests/m42a_ggml_abi_golden.rs",
+    "crates/axc-driver/tests/m42a_patch_applies.rs",
+    "crates/axc-driver/tests/m42a_package_integrity.rs",
+    "crates/axc-driver/benches/resident_q4km_matmul_rb_f32acc_cached_ggml.rs",
+    "upstream/matmul_q4_k_f32_cm1_axiom.spv",
+    "upstream/matmul_q4_k_f32_cm1_axiom_data.hpp.fragment",
+    "upstream/ggml-vulkan-axiom-q4k.patch",
+    "upstream/REPRODUCE.md"
+  ],
+  "files_modified": [
+    "crates/axc-lexer/src/token.rs",
+    "crates/axc-hir/src/coopmat.rs",
+    "crates/axc-hir/src/expr.rs",
+    "crates/axc-hir/src/typecheck.rs",
+    "crates/axc-codegen/src/coopmat.rs",
+    "crates/axc-codegen/src/body.rs",
+    "crates/axc-driver/tests/compile_shared_examples.rs",
+    "crates/axc-driver/tests/m313_tightlive_proxy_and_feasibility.rs",
+    "crates/axc-driver/Cargo.toml",
+    "scripts/m34_llamacpp_ab.sh",
+    ".gitignore",
+    "UPSTREAM_PR_PLAN.md",
+    "DESIGN.md",
+    "BENCHMARKS.md"
+  ],
+  "codegen_feature_coopmat_store_col": {
+    "description": "5th cooperative-matrix builtin. Mirrors coopmat_store exactly (arity 4, void, statement-only); the ONLY delta is the emitted SPIR-V layout operand (ColumnMajorKHR=1 instead of RowMajorKHR=0) -- a core SPV_KHR_cooperative_matrix operand, NOT a new capability/extension.",
+    "lowering": {
+      "lexer": "RESERVED_COOPMAT_BUILTIN_NAMES gains \"coopmat_store_col\" (both axc-lexer and axc-hir mirrored copies, sorted)",
+      "hir": "CoopMatBuiltin::StoreCol variant + CoopMatStoreLayout{RowMajor,ColMajor} discriminant added to HirStmt::CoopMatStore (orthogonal to typing); typecheck rejects StoreCol targeting a shared array (no shared-memory column-major store)",
+      "parser": "no change required -- coopmat_store_col dispatches through the existing generic BuiltinCallStmt path via the reserved-name list",
+      "codegen": "emit_coopmat_store_col_inline (crates/axc-codegen/src/coopmat.rs) is a byte-copy of emit_coopmat_store_inline with COL_MAJOR_LAYOUT=1; body.rs dispatches Buffer-path stores on the layout discriminant; Shared-path ColMajor is a defensive fail-closed codegen error (unreachable given the typecheck guard)"
+    },
+    "measured_deviation_from_spec": "AT-2987's spec text claimed the ggml variant's capability set is IDENTICAL to the leader's. MEASURED result: the ggml variant correctly DROPS StorageBuffer16BitAccess (cap 4433) vs the leader -- a direct, expected consequence of retyping the B SSBO from f16 to f32 (Sec.2.5). The AT-2987 test was written to assert this specific, documented drop (and reject any OTHER capability delta) rather than blind equality."
+  },
+  "six_abi_deltas_gpu_proven": [
+    "n_blocks_per_row derived as stride_a/256u32 (ggml stride_a is ELEMENTS)",
+    "17-field ggml push struct consumed, reading only the leading six (M,N,K,stride_a,stride_b,stride_d @ offsets 0,4,8,12,16,20)",
+    "B retyped readonly_buffer[f32], read transposed (ggml [N,K] row-major), staged f32->f16 via the existing M3.5 f32_to_f16 builtin",
+    "D stored column-major with stride_d via the new coopmat_store_col builtin",
+    "grid axis order swapped to ggml's convention (gid(0)->M-row, gid(1)->N-col); host wg_denoms={32,32,1}",
+    "(codegen) coopmat_store_col itself"
+  ],
+  "acceptance_tests": {
+    "AT-2985": { "result": "PASS", "platform": "CI (no GPU)", "note": "coopmat_store_col compiles + spirv-val clean + cap set IDENTICAL to coopmat_store's" },
+    "AT-2986": { "result": "PASS", "platform": "NVIDIA RTX PRO 6000 (measured)", "note": "coopmat_store_col output is the bit-exact transpose of coopmat_store's, 256/256 elements, 0 diffs" },
+    "AT-2987": { "result": "PASS", "platform": "CI (no GPU)", "note": "ggml variant compiles + spirv-val clean; cap set drops ONLY StorageBuffer16BitAccess vs the leader (documented, expected); coopmat metadata shape unchanged; shared_memory_bytes=4096 unchanged" },
+    "AT-2988": { "result": "PASS", "platform": "CI (no GPU)", "note": "static golden: n_blocks_per_row = stride_a/256, source-text + literal-table anchored" },
+    "AT-2989": { "result": "PASS", "platform": "NVIDIA RTX PRO 6000 (measured)", "note": "K=256, combined=4.127e-7 <= 1e-3" },
+    "AT-2990": { "result": "PASS", "platform": "NVIDIA RTX PRO 6000 (measured)", "note": "K=512, combined=4.668e-7 <= 1e-3" },
+    "AT-2991": { "result": "PASS", "platform": "NVIDIA RTX PRO 6000 (measured)", "note": "K=14336, combined=1.544e-6 <= 1e-3" },
+    "AT-2992": { "result": "PASS", "platform": "NVIDIA RTX PRO 6000 (measured)", "note": "K=256 cross-kernel bit-identity (de-transposed) vs the M3.6 leader, max|Delta bits|==0, 4096 elements" },
+    "AT-2993": { "result": "PASS", "platform": "NVIDIA RTX PRO 6000 (measured)", "note": "K=512 bit-identity, 8192 elements, 0 diffs" },
+    "AT-2994": { "result": "PASS", "platform": "NVIDIA RTX PRO 6000 (measured)", "note": "K=14336 bit-identity, 4096 elements, 0 diffs" },
+    "AT-2995": { "result": "PASS", "platform": "CI (no GPU)", "note": "17-field push offset table (ne02@48) + q/x/C=0/1/2 bindings, literal-table + compiled-plan cross-check" },
+    "AT-2996": { "result": "PASS (bench runs, no ratio gate by design)", "platform": "NVIDIA RTX PRO 6000 (measured)", "note": "both kernels dispatch and produce finite positive TFLOPS at cube sizes + the A/B shape (cube-size numbers reproduced consistently across 4 independent runs). The bench memoizes the per-(kernel,shape) CPU-oracle correctness pre-flight (computed exactly ONCE per shape per process -- the fixture seeds are identical every criterion invocation, so the value cannot differ; subsequent criterion samples re-time only the GPU dispatch), because recomputing the multi-minute A/B-shape oracle inside every criterion sample made the sweep take hours. The A/B numbers were additionally cross-validated via a one-shot MIN-of-10 measurement (see perf_ab); scripts/m34_llamacpp_ab.sh --fused-f32acc-cached-ggml writes .pipeline/benchmarks/m34/ab_results_fused_f32acc_cached_ggml.json" },
+    "AT-2997": { "result": "PASS", "platform": "CI (no GPU)", "note": "committed upstream/matmul_q4_k_f32_cm1_axiom.spv is spirv-val clean and was generated by the documented axc compile command from the pinned source + assignments (regeneration verified manually in the coder pass; a dedicated byte-identity CI test was folded into the AT-2985/2987/2997 compile-anchor coverage rather than a separate file, since compile_source_with_assignments IS the regeneration path exercised by AT-2987)" },
+    "AT-2998": { "result": "PASS", "platform": "CI (no GPU, vendor tree present in this env)", "note": "git apply --check succeeds against the pinned SHA; hunks anchor at lines 734/4157/8238 -- inside [4090,4211] (creation) and at the :8239 override window; typed-skip wired for CI without vendor/" },
+    "AT-2999": { "result": "PASS", "platform": "CI (no GPU)", "note": "all referenced artifacts exist; UPSTREAM_PR_PLAN.md status line + trigger paragraph BYTE-IDENTICAL to pre-M4.2a text (hardcoded golden string byte-compared)" },
+    "AT-3000": { "result": "PASS", "platform": "CI (no GPU)", "note": "ggml variant's B buffer elem_byte_size==4 (F32); leader's B stays F16 (regression guard)" },
+    "AT-3001": { "result": "PASS", "platform": "CI (no GPU)", "note": "source-text anchor: ggml variant maps gid(0)->block_row(M)/gid(1)->block_col(N); leader keeps the opposite mapping" },
+    "AT-3002": { "result": "PASS", "platform": "NVIDIA RTX PRO 6000 (measured, release build)", "note": "M=4096,N=512,K=14336 (the real rectangular A/B shape), combined=2.053e-6 <= 1e-3, no OOB" },
+    "AT-3003": { "result": "PASS", "platform": "CI (no GPU)", "note": "4/4 D stores use coopmat_store_col (0 bare coopmat_store); base-offset formula col*stride_d+row matched for all 4 tiles" },
+    "AT-3004": { "result": "PASS", "platform": "CI (no GPU)", "note": ".gitignore negation present+ordered AND the .spv is git-tracked (git ls-files --error-unmatch exit 0) -- verified PASSING after the orchestrator committed the branch (59bcb54). NOTE for the orchestrator: the working tree contains a post-commit improvement to the bench file (the oracle-memoization fix, 61 insertions) + the appended bench log; these need a follow-up commit." },
+    "AT-3005": { "result": "PASS", "platform": "CI (no GPU)", "note": "144-byte block_q4_K + six-variant aligned family + coopmat block [4090,4211] (fp16 tier 4429 correctly excluded) + interception at :8239 + 13-condition guard, all re-verified against vendor/llama.cpp in this coder pass" }
+  },
+  "perf_ab": {
+    "gate": "NONE (perf sanity only, per spec -- M3.13 already concluded the NVIDIA throughput campaign)",
+    "device": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+    "cube_sizes_ggml_over_leader": {
+      "256": "0.86-0.92x",
+      "512": "0.87-0.88x",
+      "768": "0.80-0.82x",
+      "1024": "0.74x"
+    },
+    "ab_shape_4096x512x14336": {
+      "leader_tflops": 44.11,
+      "ggml_tflops": 22.26,
+      "ratio": 0.5047,
+      "combined_both_kernels": "2.053e-6 (VALID, <= frozen 1e-3; identical for both -- accumulator bits identical, only the store destination transposed)",
+      "method": "the CANONICAL record: the deliverable resident bench's AXC_Q4KM_AB_F32ACC_CACHED_GGML machine line (MIN-of-10 GpuTimestamp), stable across 11 criterion invocations at 0.504-0.505x (ggml 22.25-22.28, leader 44.07-44.17 TFLOPS); cross-validated by an independent one-shot measurement (44.06/22.26/0.505). Written to .pipeline/benchmarks/m34/ab_results_fused_f32acc_cached_ggml.json by scripts/m34_llamacpp_ab.sh --fused-f32acc-cached-ggml"
+    },
+    "standing_m36_vs_llama_gap_unchanged": { "axiom_m36_tflops": 42.86, "llama_tflops": 102.49, "ratio": "2.39x behind" },
+    "honest_explanation": "the ggml variant's B buffer is f32 (4B/elem) vs the leader's f16 (2B/elem), and every B element is converted f32->f16 during staging (N*K converts -- 7.3M at the A/B shape); this cost + the transposed/column-major addressing scale with problem size, dominating at the large A/B shape"
+  },
+  "loc_breakdown": {
+    "target": 1650,
+    "cap": 2300,
+    "actual_approx": 3220,
+    "overage_disclosure": "SIGNIFICANTLY exceeds the cap (~38% over). Breakdown: kernel 282; codegen feature (lexer+hir+codegen) 209; three GPU correctness/equiv test files 825 (each carries its own duplicated fixture-builder functions, following this codebase's established per-test-file-independence convention -- not shared via a common module); static ABI golden suite 440 (six comprehensive cited golden tests, larger than the spec's ~230 estimate); package-integrity/patch tests 303; bench + Cargo.toml 529 (incl. the oracle-memoization fix); upstream/ package (REPRODUCE.md + patch, excluding the .spv binary and the generated byte-array fragment text) 278; compile_shared_examples.rs additions 160; doc/script updates (DESIGN.md/BENCHMARKS.md/UPSTREAM_PR_PLAN.md/gitignore/m34_llamacpp_ab.sh) 223; m313 regression-test fix (net) 23. The dominant driver of the overage vs the spec's ~1650 estimate is the GPU test suite (825 + 303 LOC) and the golden suite (440 LOC vs the estimated 230) -- both were written to the same rigor as the existing M3.x precedent test files (which are themselves 200-400+ LOC each with duplicated fixtures), not padded. No correctness coverage was cut to fit the budget.",
+    "excluded_from_count": ["upstream/matmul_q4_k_f32_cm1_axiom.spv (binary)", "upstream/matmul_q4_k_f32_cm1_axiom_data.hpp.fragment (934 lines of generated hex data, analogous to the binary)"]
+  },
+  "per_platform_results": {
+    "ci_no_gpu": "AT-2985, 2987, 2988, 2995, 2997, 2998, 2999, 3000, 3001, 3003, 3004(disclosed-fail), 3005 -- all pass except the disclosed AT-3004 git-tracking dependency",
+    "nvidia_rtx_pro_6000": "AT-2986, 2989, 2990, 2991, 2992, 2993, 2994, 2996, 3002 -- ALL PASS, measured on real hardware (not Lavapipe, not simulated)",
+    "lavapipe": "not exercised in this pass (coopmat ATs are typed-skip there per the M3.16 convention; the CI-runnable static goldens do not need it)",
+    "workspace_test_suite": "cargo test --workspace: full suite green except the disclosed AT-3004 (single test, single assertion, environment-dependent on git staging)",
+    "clippy": "cargo clippy --workspace --lib --tests -- -D warnings: CLEAN",
+    "build": "cargo build --workspace: CLEAN"
+  },
+  "self_assessment": {
+    "spec_coverage": "All six ABI deltas implemented and GPU-proven; the coopmat_store_col codegen feature implemented per spec surface (4 args, mirrors coopmat_store) and GPU-proven bit-exact; all deliverable files created; static ABI golden suite covers AT-2988/2995/3000/3001/3003/3005 with vendor citations re-verified against the pinned vendor/llama.cpp tree present in this environment; upstream/ package complete and git-apply-check-verified.",
+    "known_limitations": [
+      "The branch was committed externally (59bcb54) during the coder pass, so AT-3004 now fully PASSES; the working tree carries a small post-commit bench improvement (oracle memoization) + the appended bench log awaiting a follow-up commit by the orchestrator (the coder pass runs NO git write commands).",
+      "The patch's guard condition #8 (split_k==1 check) calls ggml_vk_guess_split_k inline since the split_k local is not yet declared at the :8239 interception point -- architecturally sound (the function signature was confirmed against the pinned source) but NOT compile-checked against the real headers (the patch is explicitly not built/applied in this milestone). Disclosed in REPRODUCE.md as a KNOWN LIMITATION.",
+      "The patch's CMake wiring for -DGGML_VULKAN_AXIOM_Q4K is not included (a small, mechanical addition left for the actual build pass) -- disclosed in REPRODUCE.md.",
+      "LOC significantly exceeds the cap (see loc_breakdown) -- disclosed per the spec's explicit 'honest overage disclosure' instruction, not hidden or papered over.",
+      "The resident bench diverges from the M3.x sibling pattern in ONE respect: the per-shape correctness pre-flight (CPU oracle + abs_scale) is MEMOIZED in a process-global map so it runs exactly once per (kernel, shape) instead of inside every criterion sample. Without this, the A/B-shape sweep (two multi-minute oracle computations per criterion invocation) took hours. The oracle is still genuinely computed and still gates the printed VALID/INVALID label; the memo cannot mask a regression because the fixture seeds are byte-identical across invocations. Disclosed as a deliberate, bounded pattern deviation.",
+      "AT-2997's 'byte-reproducible from the pinned source + assignments' claim is anchored by AT-2985/2987 (which both compile via the exact same compile_source_with_assignments path used to generate the committed .spv) rather than a dedicated byte-for-byte diff test against the committed file on disk -- the regeneration command was manually verified to reproduce the same compile path in this coder pass."
+    ],
+    "deviations": [
+      "AT-2987's capability-set assertion was written to require the ggml variant's caps to be a subset of the leader's PLUS exactly the documented StorageBuffer16BitAccess drop, rather than literal set equality as the spec's Sec.4 capabilities paragraph states -- this is a MEASURED correction (the B-retype to f32 genuinely and correctly drops that capability requirement), not an implementation bug. Recorded as a measured_deviation_from_spec above.",
+      "The host patch's three hunks span TWO logical sites per the spec's Sec.7.2 framing (creation + override) but THREE physical hunks in the diff (a small vk_device_struct member declaration is a necessary companion to the creation hunk, since the standalone pipeline needs a struct slot). Disclosed in the patch's own header comment and REPRODUCE.md.",
+      "No separate byte-array-fragment or .spv regeneration CI test file was created as a distinct AT-2997 test; the coverage is folded into the existing AT-2985/2987 compile-anchor pattern in compile_shared_examples.rs, which exercises the identical compile path."
+    ]
+  },
+  "git_commits": [],
+  "review_fix": {
+    "source_review": ".pipeline/runs/M4.2a-pessimistic-code-review.json (verdict NEEDS_REVISION)",
+    "H1_AT_2997": {
+      "finding": "AT-2997 (spec §8-mandated) did not exist as a dedicated test; upstream/REPRODUCE.md:58-62 cited it as existing/verified. Reviewer independently confirmed the committed .spv WAS byte-identical to a fresh compile, but no CI guard existed against future source/binary drift.",
+      "fix": "Added crates/axc-driver/tests/compile_shared_examples.rs::at_2997_committed_ggml_spv_is_spirv_val_clean_and_byte_reproducible. It (a) recompiles examples/q4km_matmul_rb_coopmat_f32acc_cached_ggml.axc with rb2x2_assignments() (the same @strategy values documented in REPRODUCE.md's regen command), (b) spirv-val's the fresh bytes (Vulkan 1.1 target env, same discipline as every other test in the file), and (c) asserts the fresh bytes are byte-identical to std::fs::read(upstream/matmul_q4_k_f32_cm1_axiom.spv), with the exact regen command embedded in the panic message (mirrors the AT-2838 golden pattern in compile_empty_kernel.rs). Result: PASS, 11036 bytes, byte-identical -- confirms the reviewer's manual finding is now CI-enforced.",
+      "doc_fix": "upstream/REPRODUCE.md:57-62 reworded: no longer implies the test shells out the documented command; now states AT-2997 recompiles in-process with the same @strategy assignments and byte-compares against the committed artifact -- this is now a TRUE claim."
+    },
+    "low_nits": {
+      "L1_stale_four_builtins": "crates/axc-lexer/src/token.rs:409 and crates/axc-hir/src/coopmat.rs:239 both said 'four cooperative-matrix builtin names' / 'four cooperative-matrix builtin call names'; both RESERVED_COOPMAT_BUILTIN_NAMES arrays hold 5 entries since coopmat_store_col was added. Fixed both to 'five', with a parenthetical noting coopmat_store_col was added in M4.2a.",
+      "L2_AT_2987_eprintln": "AT-2987's success eprintln said caps 'IDENTICAL to the M3.6 leader' while the assertion correctly pins the documented StorageBuffer16BitAccess(4433) drop. Fixed the message to say caps 'match the M3.6 leader's set MINUS the documented StorageBuffer16BitAccess (4433) drop'."
+    },
+    "D1_split_k_design_note": {
+      "finding": "Host-patch guard condition #8 (:8239 override site) calls ggml_vk_guess_split_k with the STOCK guess pipeline still in scope, but the real dispatch at :8252 recomputes split-K with the OVERRIDDEN AXIOM pipeline (fixed 32x32 tile, single-split only) -- a latent mismatch. Informational, not an M4.2a blocker (patch not built/run this milestone).",
+      "fix": "Added one paragraph each to upstream/REPRODUCE.md (new KNOWN LIMITATION, appended after the existing guard-condition-#8 disclosure) and UPSTREAM_PR_PLAN.md's §7.5 hard-precondition checklist (appended to the 'executed real-ggml ABI smoke' bullet), both stating the real-ggml smoke MUST exercise a split-K-eligible shape (large K relative to M/N) before the RFC-open trigger fires."
+    },
+    "qa_cosmetic_44_06_vs_44_11": {
+      "finding": "DESIGN.md cited the A/B-shape leader TFLOPS as 44.06 in two places (§3.1.46 body + the dated changelog entry) while BENCHMARKS.md and the canonical .pipeline/benchmarks/m34/ab_results_fused_f32acc_cached_ggml.json both record 44.11 (leader_tflops=44.110148 in the machine ab_line).",
+      "fix": "Both DESIGN.md occurrences corrected to 44.11 (the canonical JSON number); the §3.1.46 body now also cites the run-to-run range (44.07-44.17 across 11 bench invocations, all at 0.504-0.505x, normal GPU-clock/thermal variance) once, and the changelog entry cross-references §3.1.46 for that variance instead of repeating it."
+    },
+    "verification": {
+      "cargo_build_workspace": "PASS (clean)",
+      "cargo_clippy_workspace_lib_tests_D_warnings": "PASS (clean, 0 warnings)",
+      "cargo_test_workspace": "PASS (all suites green, 0 failed; AT-2997 present and passing; compile_shared_examples.rs: 37/37 passed, up from 36/36)",
+      "at_2997_byte_compare_path": "crates/axc-driver/tests/compile_shared_examples.rs reads upstream/matmul_q4_k_f32_cm1_axiom.spv via CARGO_MANIFEST_DIR-relative PathBuf (../../upstream/matmul_q4_k_f32_cm1_axiom.spv from crates/axc-driver), i.e. the actual committed file at the repo root -- not a copy or fixture."
+    }
+  }
+}

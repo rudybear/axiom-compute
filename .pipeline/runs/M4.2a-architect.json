@@ -1,0 +1,104 @@
+{
+  "verdict": "REVISED",
+  "agent": "architect",
+  "milestone_id": "M4.2a-ggml-abi",
+  "revision": "r3",
+  "supersedes": "r2 (pessimistic NEEDS_REVISION: 1 HIGH + 2 LOW; optimistic APPROVE + 3 findings)",
+  "pinned_sha": "6b80c74f285390368b3c99c5e750f19e9b096e98 (tag b9542)",
+  "vendor_tree_reverified": true,
+  "summary": "r3 is a bounded spec-text + guard-citation + interception-mechanism revision. It (HIGH) states the SIX-variant aligned family explicitly and switches the integration mechanism from register-into-slot to OVERRIDE-THE-RESULT of ggml_vk_guess_matmul_pipeline (one interception point at :8239, covers all six variants, alignment-independent) with an honest fixed-32x32-tile perf caveat; (optimistic #1) corrects the patch range to the real coopmat block :4090-:4211 and adds a patch injection-site anchoring assertion; (both) corrects guard condition #11 to coopmat_acc_f32_support at :4111 (NOT :3299, which is FA_COOPMAT1 tuning) and adds the 13th condition (the 64b-indexing swap at :8241-8242, excluded and unreachable at target shapes); (LOW) states the f16-exact fixture excludes inf/nan. No new code paths; AT range AT-2985..3005 and LOC ~1650 unchanged. Everything else in r2 stands byte-exact-verified.",
+  "r2_review_issues_resolved": {
+    "HIGH_pessimistic_six_variant_family_and_mechanism": {
+      "finding": "CREATE_MM (:4092-4104) builds SIX pipelines ({s,m,l}x{unaligned,aligned}) from TWO byte arrays (matmul_q4_k_f32_cm1_data l/m/s + matmul_q4_k_f32_aligned_cm1_data a_l/a_m/a_s, tile via spec constants); on the dominant shape aligned (:8237) is TRUE so ggml_vk_guess_matmul_pipeline (:7822-7839) returns the aligned variant. r2's register-into-slot understated this.",
+      "fix": "Override the RESULT of ggml_vk_guess_matmul_pipeline: reassign the pipeline local right after the call site (:8239), under the build flag + guard, to a single standalone AXIOM _cm1 pipeline. ONE interception point covers all six variants and is alignment-independent (l/m/s or a_l/a_m/a_s). Simpler/safer than injecting two byte arrays into six slots.",
+      "perf_caveat_recorded_not_gated": "AXIOM's kernel has a FIXED 32x32 tile; the override ignores ggml's l/m/s spec-constant tile selection. On shapes where ggml would pick the l or s tile, AXIOM's fixed 32x32 may be worse than stock ggml. Recorded in the A/B (section 6) + REPRODUCE.md; NOT gated (M3.13 concluded the NVIDIA throughput campaign).",
+      "vendor_proof": "ggml-vulkan.cpp:4092-4104 (CREATE_MM, _cm1_data + _aligned_cm1_data); :8237 (aligned = !quantize_y && ne10==kpad && ne01>8 && ne11>8); :7796 ggml_vk_guess_matmul_pipeline, tail :7822-7839 (return aligned ? mmp->a_l : mmp->l); call site :8239.",
+      "sections": ["2.9", "7.1", "7.2"],
+      "static_at": "AT-3005 golden corrected to name the aligned/l-m-s family + the interception point + the 13-condition guard"
+    },
+    "optimistic_1_patch_range_and_injection_assertion": {
+      "finding": "The coopmat_support block is :4090-:4211, NOT :4090-:4474 (r2). :4090-:4474 spans three device tiers; :4429 is the if(device->fp16) fallback tier (:4212+), a separate device class.",
+      "fix": "Corrected section 7.2 patch range to :4090-:4211 (creation site) + :8239 (override site). Added a patch injection-site anchoring assertion (folded into AT-2998): the patch's hunk context must anchor INSIDE [:4090,:4211] (creation) and at the ggml_vk_guess_matmul_pipeline call :8239 (override) - a cheap static check on the patch file's hunk headers so a patch drifting to the fp16 tier (:4429) fails CI.",
+      "vendor_proof": "if(device->coopmat_support) at :4090, block closes at :4210 (} else) / :4211 (#endif); if(device->fp16) tier begins :4212; the second q4_k f32acc CREATE_MM at :4429 is inside that fp16 tier."
+    },
+    "both_guard_citation_corrections_and_13th_condition": {
+      "finding_11": "Condition #11's real matmul f32acc gate is device->coopmat_acc_f32_support at :4111 (the CREATE_MM2 gate), NOT coopmat_support_16x16x16_f32acc at :3299 - :3299 is FA_COOPMAT1 flash-attention tuning (get_fa_tuning_params_coopmat1 / shmem_support), unrelated to the matmul path.",
+      "finding_13": "Added the 13th condition: the 64b-indexing swap at :8241-8242 (ggml_nbytes(src0) > maxStorageBufferRange => ggml_vk_get_64b_indexing_pipeline). Excluded via the guard (AXIOM's single variant is not a 64b build). RESOLUTION: documented UNREACHABLE at the target shapes - the Q4_K A weight at M=4096,K=14336 is ~33 MB, far below the >=2 GB maxStorageBufferRange - but included so the guard stays fail-closed if a larger weight ever hits this path.",
+      "conditions_10_12_recited": "10: coopmat_support && !coopmat2 (coopmat block :4090; _cm2 block :4010; runtime :8201/:8203 coopmat2 => x/y_non_contig). 11: coopmat_acc_f32_support (:4111). 12: (ggml_prec)dst->op_params[0]==GGML_PREC_F32 (f32acc member select, :8215/:8219/:8228). (Also corrected condition #8 split-K source to ggml_vk_guess_split_k :8252.)",
+      "vendor_proof": "coopmat_acc_f32_support member :689, gate :4111; :3299 is inside if(path==FA_COOPMAT1) shape_ok; ggml_vk_get_64b_indexing_pipeline :8142 invoked at :8242."
+    },
+    "LOW_pessimistic_fixture_inf_nan": {
+      "fix": "Section 5.2 now states explicitly: the f16-exact fixture is the finite [-1,1] grid (all magnitudes <= 1, inside f16's normal range, no subnormal-flush corner) - it excludes inf/nan/overflow, so both the f16->f32 widen and the f32->f16 staging convert are total and exact with no special-value rounding."
+    }
+  },
+  "guard_conditions_13": [
+    "1: src0->type == GGML_TYPE_Q4_K",
+    "2: src1->type == GGML_TYPE_F32 (y_f32_kernel, :8210)",
+    "3: !quantize_y (excludes Q8_1 integer-dot rebind, :8212)",
+    "4: !x_non_contig (:8201)",
+    "5: !y_non_contig (:8203)",
+    "6: !qx_needs_dequant (excludes A->f16 predequant, :8223)",
+    "7: !qy_needs_dequant (:8224)",
+    "8: split_k == 1 && (ne12*ne13) == 1 && broadcast2==1 && broadcast3==1 (ggml_vk_guess_split_k :8252)",
+    "9: ne01%32==0 && ne11%32==0 && ne10%256==0",
+    "10: device->coopmat_support && !device->coopmat2 (block :4090; _cm2 block :4010; runtime :8201/:8203)",
+    "11: device->coopmat_acc_f32_support (:4111) -- CORRECTED from :3299 (FA_COOPMAT1 tuning)",
+    "12: (ggml_prec)dst->op_params[0] == GGML_PREC_F32 (f32acc member select, :8215/:8219/:8228)",
+    "13: ggml_nbytes(src0) <= device->properties.limits.maxStorageBufferRange (:8241-8242 64b-indexing swap; unreachable at target shapes ~33 MB << >=2 GB; fail-closed safety)"
+  ],
+  "interception_mechanism": {
+    "chosen": "Override the RESULT of ggml_vk_guess_matmul_pipeline (reassign the pipeline local right after the call site :8239) to a single standalone AXIOM _cm1 pipeline, under #ifdef GGML_VULKAN_AXIOM_Q4K + the 13-condition guard.",
+    "why": "One interception point covers all six {s,m,l}x{unaligned,aligned} variants, alignment-independent; simpler and lower-risk than register-into-slot (which would need to shadow both byte arrays across six slots).",
+    "standalone_pipeline_wg_denoms": "{32,32,1} so ggml's {M,N,z} dispatch (:7863) maps to (M/32,N/32,1)",
+    "perf_caveat": "AXIOM fixed 32x32 tile ignores ggml's l/m/s spec-constant tile selection; may be worse on shapes where ggml would pick l or s. Recorded (A/B section 6 + REPRODUCE.md), NOT gated."
+  },
+  "patch_range_corrected": {
+    "r2_wrong": ":4090-:4474 (spans three device tiers)",
+    "r3_correct_creation": ":4090-:4211 (the if(device->coopmat_support) block)",
+    "r3_correct_override": ":8239 (ggml_vk_guess_matmul_pipeline call site in ggml_vk_mul_mat_q_f16, :8200-:8242)",
+    "fp16_tier_is_not_coopmat": ":4429 is inside if(device->fp16), :4212+",
+    "injection_site_assertion": "AT-2998: patch hunk context must anchor inside [:4090,:4211] (creation) and at :8239 (override); static hunk-header check, fails if it drifts to :4429 or elsewhere"
+  },
+  "carried_forward_unchanged_from_r2": [
+    "the SIX ABI deltas (a n_blocks_per_row=stride_a/256; b 17-field push read leading 6; c-B B f32 read transposed staged f32->f16; c-D D column-major with stride_d; e grid axis swap x->M/y->N)",
+    "kernel VERBATIM discipline vs the M3.6 leader",
+    "coopmat_store_col codegen feature (ColumnMajorKHR=1 core operand, no new capability)",
+    "the transposing+widening oracle wrapper",
+    "bit-identity primary anchor on the f16-exact fixture; combined <= FROZEN 1e-3 standing gate",
+    "the target symbol matmul_q4_k_f32_cm1_data[]/_len (KHR coopmat)",
+    ".gitignore !upstream/*.spv negation + git-tracked AT-3004",
+    "AT range AT-2985..3005 (21 ATs); AT numbering AT-3000+ plainly",
+    "all r1-confirmed-correct facts (/256, push order, bindings, D col-major, split-K, rejected operand-swap)"
+  ],
+  "at_range": "AT-2985 .. AT-3005 (21 ATs, unchanged). r3 edits: AT-2998 (+ injection-site hunk-anchor assertion), AT-3005 (golden corrected: aligned/l-m-s family + interception point + 13-condition guard). No AT added or removed.",
+  "loc": {
+    "target_net_new": 1650,
+    "hard_cap": 2300,
+    "r3_delta": "LOC-neutral: the patch shrinks slightly (one pipeline creation + one post-guess override branch, <= r2's register-into-slot); AT-2998/3005 gain a static hunk-anchor + a golden-table field; section 2.9/5.2/7.2 are text. No new code path."
+  },
+  "coopmat_target_symbol": "matmul_q4_k_f32_cm1_data[] / matmul_q4_k_f32_cm1_len (KHR coopmat, device->coopmat_support block :4090-:4211); the aligned sibling matmul_q4_k_f32_aligned_cm1_data[] is NOT shadowed (result-override covers it); committed artifact upstream/matmul_q4_k_f32_cm1_axiom.spv (standalone byte array)",
+  "honest_scope_boundaries": [
+    "fixed 32x32 tile ignores ggml's l/m/s tile selection -- may be worse on l/s-preferring shapes; recorded, not gated",
+    "coopmat2 (_cm2) NVIDIA devices: substitution inactive (ggml dispatches _cm2), fail-closed via guard #10",
+    "NVIDIA-throughput only; AMD/Intel cross-vendor value prop remains EB.1-hardware-gated",
+    "no RFC submission; the executed real-ggml smoke is a HARD trigger precondition (section 7.5)"
+  ],
+  "reverified_lines_at_pinned_sha": {
+    "ggml-vulkan.cpp:4090-4211": "if(device->coopmat_support) block bounds (:4210 } else / :4211 #endif)",
+    "ggml-vulkan.cpp:4092-4104": "CREATE_MM builds 6 variants from _cm1_data + _aligned_cm1_data",
+    "ggml-vulkan.cpp:4111": "if(device->coopmat_acc_f32_support) -- the f32acc matmul gate",
+    "ggml-vulkan.cpp:4135/4159": "Q4_K f32acc registration (CREATE_MM2 / its else), both in the coopmat block",
+    "ggml-vulkan.cpp:4429": "Q4_K f32acc CREATE_MM inside the if(device->fp16) fallback tier -- NOT coopmat",
+    "ggml-vulkan.cpp:7796,7822-7839": "ggml_vk_guess_matmul_pipeline returns aligned?a_l/a_m/a_s:l/m/s",
+    "ggml-vulkan.cpp:8237": "aligned = !quantize_y && ne10==kpad && ne01>8 && ne11>8",
+    "ggml-vulkan.cpp:8239": "pipeline = ggml_vk_guess_matmul_pipeline(...) -- THE interception point",
+    "ggml-vulkan.cpp:8241-8242": "64b-indexing swap (ggml_nbytes(src0) > maxStorageBufferRange) -- guard #13",
+    "ggml-vulkan.cpp:3299": "coopmat_support_16x16x16_f32acc inside FA_COOPMAT1 -- flash-attention tuning, NOT the matmul gate",
+    "ggml-vulkan.cpp:8252": "ggml_vk_guess_split_k call -- guard #8 source"
+  },
+  "outputs_written": [
+    ".pipeline/milestones/M4.2a-ggml-abi.md (updated in place, marked r3, r3-changelog appended, section 2.9/5.2/7.1/7.2/9/11 + AT-2998/3005 corrected)",
+    ".pipeline/runs/M4.2a-architect.json (this file, r3)"
+  ],
+  "ready_for": "the two design reviewers (r3, FINAL cycle) -- optimistic + pessimistic"
+}
