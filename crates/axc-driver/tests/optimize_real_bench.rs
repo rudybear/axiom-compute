@@ -1,6 +1,28 @@
 //! M3.23 — real-bench `run_optimize` integration tests: AT-3007, AT-3008,
-//! AT-3017, AT-3017b. All GPU-gated (`#[ignore]` + `AXC_ENABLE_GPU_TESTS=1`),
-//! Lavapipe-runnable.
+//! AT-3017, AT-3017b, AT-3018. All GPU-gated (`#[ignore]` +
+//! `AXC_ENABLE_GPU_TESTS=1`), Lavapipe-runnable.
+//!
+//! ## AT-3018 (blocker-fix pass, added post-merge)
+//!
+//! AT-3007/3008/3017/3017b below all bound every buffer index (`i % N`) as a
+//! WORKAROUND for a since-fixed bug (see defect #2 below): before the
+//! blocker-fix, `run_optimize` derived dispatch geometry from the HIR
+//! PLACEHOLDER `@workgroup` dims (captured once, pre-substitution) instead of
+//! each variant's actually-resolved `LocalSize`, causing 32x-64x over-dispatch
+//! and out-of-bounds writes on ANY `@workgroup(?hole,...)` fixture — the
+//! pessimistic code reviewer reproduced this 3/3 (SIGSEGV / heap-corruption on
+//! Lavapipe) on exactly the canonical `@strategy { workgroup_x: ?[32,64] }`
+//! autotuning pattern and ruled it a BLOCKER
+//! (`M3.23-pessimistic-code-review.json` `the_ruling_defect_2`). The fix (in
+//! `crates/axc-driver/src/optimize.rs`): a new `local_size_from_spirv` scan
+//! parses the RESOLVED `OpExecutionMode ... LocalSize` out of each variant's
+//! own compiled SPIR-V words and derives that variant's dispatch geometry
+//! from it (falling back to the invariant-captured dims only when no hole is
+//! present). AT-3018 below is the reviewer's own canonical repro fixture, run
+//! UNMODIFIED (no `i % N` index-bounding — the fix makes that unnecessary,
+//! since real per-variant geometry now covers the buffer exactly) through the
+//! real CLI/library path, proving workgroup-size autotuning now WORKS instead
+//! of merely not-crashing.
 //!
 //! ## Fixture-design note (deviation from the spec's literal fixture text —
 //! see M3.23-coder.json `deviations`)
@@ -170,24 +192,30 @@ fn at_3008_real_bench_unoracled_kernel_not_checked_warning() {
 }
 
 /// A `workgroup_x`-hole-dependent kernel with NO registered CPU oracle:
-/// `out[i % 1024] = x[i % 1024] + i`. Since `i = gid(0)` ranges over the
-/// FULL (over-provisioned) dispatch — which differs per candidate because
-/// `resolve_single_variant` genuinely resolves `workgroup_x` while
-/// `run_optimize`'s OWN dispatch-count stays placeholder-derived (module doc
-/// defect #2) — many DIFFERENT global ids alias onto the SAME bounded index
-/// via `% 1024`, so the LAST writer to each index differs deterministically
-/// between the two `workgroup_x` candidates (different total invocation
-/// counts). A legitimate (in-bounds, non-UB) variant-vs-variant divergence
-/// for the differential to detect. `candidates` controls ordinal order
-/// (direction-independence).
+/// `out[i] = x[i] + local_invocation_id(0)`.
+///
+/// UPDATED in the blocker-fix pass: the ORIGINAL mechanism here (`out[i %
+/// 1024] = x[i % 1024] + i`, relying on the placeholder-derived
+/// OVER-dispatch to alias many extra global ids onto the same bounded index)
+/// stopped diverging once the geometry blocker-fix landed — `run_optimize`
+/// now dispatches EXACTLY `ceil(1024 / workgroup_x) * workgroup_x` threads
+/// (== 1024 for both 32 and 64, which evenly divide it), so there is no more
+/// over-provisioned aliasing to exploit. The NEW mechanism instead uses
+/// `local_invocation_id(0)`, which is intrinsically `workgroup_x`-dependent
+/// at the SAME global id `i` (e.g. at `i=32`: `local_invocation_id` is `0`
+/// under `workgroup_x=32`'s second workgroup, but `32` under
+/// `workgroup_x=64`'s first workgroup) — a genuine, in-bounds,
+/// non-UB divergence between candidates that does NOT depend on any
+/// over/under-dispatch behavior, so it stays valid regardless of geometry
+/// correctness. `candidates` controls ordinal order (direction-independence).
 fn diverge_src(candidates: &str) -> String {
     format!(
         "@kernel @workgroup(?workgroup_x, 1, 1) @strategy {{ workgroup_x: ?[{candidates}] }} \
          @intent(\"M3.23 divergence fixture: workgroup_x-dependent output, no oracle\") @complexity(O(n)) \
          fn diverge_kernel(x: buffer[u32], out: buffer[u32]) -> void {{ \
          let i: u32 = gid(0u32); \
-         let idx: u32 = i % 1024u32; \
-         out[idx] = x[idx] + i; \
+         let lid: u32 = local_invocation_id(0u32); \
+         out[i] = x[i] + lid; \
          return; }}"
     )
 }
@@ -246,4 +274,92 @@ fn at_3017_unattributable_divergence_non_reference_ordinal() {
 #[ignore]
 fn at_3017b_unattributable_divergence_reference_ordinal_reversed() {
     assert_variants_diverge_zero_artifacts("AT-3017b", "64, 32");
+}
+
+// ── AT-3018: blocker-fix canonical repro, run UNMODIFIED ──────────────────
+
+/// VERBATIM the pessimistic code review's DEFECT-2 repro fixture
+/// (`M3.23-pessimistic-code-review.json` `the_ruling_defect_2.repro`) — a
+/// bare `@workgroup(?workgroup_x,1,1)` + `@strategy { workgroup_x: ?[32,64] }`
+/// sweep with NO index-bounding workaround. `out` is `DEFAULT_BENCH_BYTES`
+/// (4096) / `sizeof(f32)` = 1024 elements; both candidates (32, 64) divide
+/// 1024 evenly, so once dispatch geometry is derived from each variant's
+/// REAL resolved `LocalSize` (post blocker-fix), every dispatched thread
+/// writes exactly one in-bounds element — no padding, no OOB, by
+/// construction.
+const CANONICAL_WORKGROUP_HOLE_SRC: &str = "@kernel @workgroup(?workgroup_x, 1, 1) \
+    @strategy { workgroup_x: ?[32, 64] } \
+    @intent(\"AT-3018 canonical workgroup-size autotune (blocker-fix repro fixture)\") \
+    @complexity(O(n)) \
+    fn k(out: buffer[f32]) -> void { \
+    let i: u32 = gid(0u32); \
+    out[i] = 1.0; \
+    return; }";
+
+/// AT-3018 (blocker-fix): the CANONICAL autotune fixture from the
+/// pessimistic code review's DEFECT-2 repro, swept through REAL `axc
+/// optimize` (`run_optimize`, no test-only shortcuts, no index-bounding
+/// workaround). Before the blocker-fix this EXACT pattern SIGSEGV'd Lavapipe
+/// 3/3 (heap-corruption abort, zero artifacts) via a 32x over-dispatch
+/// computed from the HIR placeholder workgroup dims. After the fix
+/// (`local_size_from_spirv` deriving geometry from each variant's RESOLVED
+/// `LocalSize`), it must complete cleanly: a real winner is crowned, a
+/// `.spv` + sidecar are written, and the winning `.spv`'s
+/// `OpExecutionMode ... LocalSize` matches its own sidecar `workgroup_x`
+/// assignment — proving geometry is per-variant-correct, not merely
+/// "didn't crash".
+#[test]
+#[ignore]
+fn at_3018_canonical_workgroup_hole_geometry_fix_repro() {
+    if !gpu_tests_enabled() {
+        eprintln!("AT-3018: AXC_ENABLE_GPU_TESTS not set; skipping");
+        return;
+    }
+    let Some(vk) = probe_vk() else {
+        eprintln!("AT-3018: no Vulkan device available; skipping");
+        return;
+    };
+
+    let dir = tempfile_dir("at_3018");
+    let input_path = dir.join("fixture.axc");
+    std::fs::write(&input_path, CANONICAL_WORKGROUP_HOLE_SRC).expect("write fixture");
+    let output_path = dir.join("fixture.spv");
+
+    let result = run_optimize(&input_path, &output_path, "none", None, Some(&vk));
+    assert!(
+        result.is_ok(),
+        "AT-3018: canonical workgroup-hole autotune must complete post-fix \
+         (previously SIGSEGV'd 3/3 on Lavapipe via placeholder-derived over-dispatch): {result:?}"
+    );
+    assert!(output_path.exists(), "AT-3018: winner .spv must be written");
+    let sidecar_path = strategy_sidecar_path(&output_path);
+    assert!(sidecar_path.exists(), "AT-3018: strategy sidecar must be written");
+
+    let sidecar_json: String = std::fs::read_to_string(&sidecar_path).expect("read sidecar");
+    let sidecar: axc_optimize::grid_search::GridSearchResult = serde_json::from_str(&sidecar_json)
+        .expect("sidecar must deserialize as GridSearchResult");
+    let winning_wg: i64 = *sidecar.winner_assignments.values.get("workgroup_x")
+        .expect("winner_assignments must contain workgroup_x");
+    assert!(
+        winning_wg == 32 || winning_wg == 64,
+        "AT-3018: winner must be a real candidate from the sweep, not a fallback artifact: {winning_wg}"
+    );
+
+    let spv_bytes: Vec<u8> = std::fs::read(&output_path).expect("read winner spv");
+    let words: Vec<u32> = spv_bytes.chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let mut loader = rspirv::dr::Loader::new();
+    rspirv::binary::parse_words(&words, &mut loader).expect("rspirv parse");
+    let asm: String = {
+        use rspirv::binary::Disassemble;
+        loader.module().disassemble()
+    };
+    assert!(
+        asm_has_local_size(&asm, winning_wg),
+        "AT-3018: winner .spv geometry must match the winning workgroup_x ({winning_wg}) — \
+         per-variant geometry correctness, not just crash-avoidance; asm:\n{asm}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

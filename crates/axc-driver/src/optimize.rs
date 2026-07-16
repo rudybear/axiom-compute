@@ -27,8 +27,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use axc_optimize::grid_search::{
-    grid_search, BenchFn, CorrectnessFailure, CorrectnessFn, CorrectnessPolicy, GridSearchResult,
-    SampleStats,
+    grid_search, BenchFn, BenchOutcome, CorrectnessFailure, CorrectnessFn, CorrectnessPolicy,
+    GridSearchResult, SampleStats,
 };
 use axc_codegen::emit::CodegenOptions;
 use axc_hir::hir::{Kernel, Module as HirModule};
@@ -95,6 +95,47 @@ pub enum OptimizeError {
              ordinals {ordinals:?} produced different output on identical seeded input; \
              refusing to crown a winner (register a CPU reference for kernel `{kernel}` to disambiguate)")]
     VariantsDiverge { ordinals: Vec<usize>, kernel: String },
+}
+
+/// M3.23 blocker-fix (pessimistic code review DEFECT-2): parse the RESOLVED
+/// `OpExecutionMode %entry LocalSize x y z` out of a variant's emitted SPIR-V
+/// words.
+///
+/// When a `@workgroup` dim is itself a `?hole` (e.g. the legacy
+/// `workgroup_x`/`y`/`z` convention), the invariant metadata captured ONCE in
+/// `run_optimize` (`selected.annotations.workgroup`) still carries the HIR
+/// PLACEHOLDER value (`1`) — only the per-variant compiled SPIR-V carries the
+/// RESOLVED dispatch size (`resolve_single_variant` substitutes the real
+/// value before codegen). Deriving dispatch geometry from the placeholder
+/// causes gross over-dispatch (e.g. 32x-64x) and out-of-bounds buffer writes
+/// (Lavapipe: crash; NVIDIA: silent OOB clamp / wrong winner). Scanning the
+/// compiled words per variant instead makes the geometry always match what
+/// that variant's shader actually declares.
+///
+/// Scans the instruction stream (skipping the 5-word module header) for
+/// `OpExecutionMode` (opcode 16) with mode `LocalSize` (17, the 3rd operand
+/// word) and returns its 3 literal operands. Returns `None` on a missing or
+/// malformed (truncated) stream so the caller falls back to the metadata
+/// dims — this is exactly correct for literal-`@workgroup` kernels (no hole),
+/// where every variant's LocalSize is identical to the metadata anyway.
+fn local_size_from_spirv(words: &[u32]) -> Option<(u32, u32, u32)> {
+    const HEADER_LEN: usize = 5;
+    const OP_EXECUTION_MODE: u32 = 16;
+    const MODE_LOCAL_SIZE: u32 = 17;
+    let mut i: usize = HEADER_LEN;
+    while i < words.len() {
+        let word0: u32 = words[i];
+        let word_count: usize = (word0 >> 16) as usize;
+        let opcode: u32 = word0 & 0xffff;
+        if word_count == 0 || i + word_count > words.len() {
+            return None; // malformed stream — fail closed to the metadata fallback
+        }
+        if opcode == OP_EXECUTION_MODE && word_count >= 6 && words[i + 2] == MODE_LOCAL_SIZE {
+            return Some((words[i + 3], words[i + 4], words[i + 5]));
+        }
+        i += word_count;
+    }
+    None
 }
 
 /// Run grid search on the source file, write winning SPIR-V to `output`,
@@ -196,7 +237,14 @@ pub fn run_optimize(
     let input_data: Vec<Vec<u8>> = bench_variant::seeded_inputs(&input_sizes, SEED);
     let input_refs: Vec<&[u8]> = input_data.iter().map(Vec::as_slice).collect();
     let output_sizes_u64: Vec<u64> = input_sizes.iter().map(|&s| s as u64).collect();
-    let workgroups: [u32; 3] = bench_variant::derive_workgroups(&input_sizes, workgroup_size, None);
+    // NOTE (blocker-fix, pessimistic code review DEFECT-2): dispatch geometry
+    // is NOT derived here from `workgroup_size` anymore. When `@workgroup`
+    // itself carries a hole (the legacy `workgroup_x`/`y`/`z` convention),
+    // `workgroup_size` above is the HIR PLACEHOLDER (`1`) — only the
+    // per-variant compiled SPIR-V (inside each closure below) carries the
+    // RESOLVED LocalSize. `workgroup_size` is kept as the fallback for
+    // literal-@workgroup kernels (no hole) where every variant's LocalSize
+    // is identical and equals the metadata dims anyway.
     let push_constants: Vec<u8> = vec![0_u8; pc_bytes as usize];
     let device_name: String = vk.physical_device_name().to_string();
     let ulp_tol: u32 = bench_variant::ulp_tolerance_for_device(&device_name);
@@ -204,6 +252,18 @@ pub fn run_optimize(
     // ── The differential's bookkeeping cells (§1.5, §1.5.1) — read AFTER
     // `grid_search` returns (the closures' borrows end at their last use,
     // inside `grid_search`).
+    //
+    // `ordinal` is a cfn-CALL-SEQUENCE counter (0, 1, 2, ... in call order),
+    // NOT the library's `variant.ordinal` — `CorrectnessFn`'s signature
+    // (`&dyn Fn(&[u32]) -> ...`) carries no ordinal, and `grid_search` skips
+    // calling `cfn` for any variant whose resolve/codegen fails (it
+    // `continue`s before the correctness check), so call-index and
+    // `variant.ordinal` diverge whenever an earlier variant fails to compile
+    // (blocker-fix pass, cosmetic DIVERGENCE-ORDINAL-NUMBERING finding). The
+    // `divergence` vector below is therefore translated from call-index to
+    // true `variant.ordinal` AFTER `grid_search` returns, via
+    // `cfn_call_to_true_ordinal` (built from `result.results`, which is
+    // available only once `grid_search` has finished).
     let ordinal: Cell<usize> = Cell::new(0);
     let reference_ord: Cell<usize> = Cell::new(0);
     let reference_outputs: RefCell<Option<Vec<Vec<u8>>>> = RefCell::new(None);
@@ -221,6 +281,13 @@ pub fn run_optimize(
             .map_err(|e| CorrectnessFailure::OracleError(e.to_string()))?;
         let resident = vk.upload_resident(&handle, &input_refs, &output_sizes_u64)
             .map_err(|e| CorrectnessFailure::OracleError(e.to_string()))?;
+        // Blocker-fix (DEFECT-2): derive geometry from THIS variant's
+        // resolved LocalSize, not the pre-captured (possibly-placeholder)
+        // metadata — see the NOTE at the `workgroup_size` invariant above.
+        let wg_dims: [u32; 3] = local_size_from_spirv(words)
+            .map(|(x, y, z)| [x, y, z])
+            .unwrap_or(workgroup_size);
+        let workgroups: [u32; 3] = bench_variant::derive_workgroups(&input_sizes, wg_dims, None);
         let cfg = ResidentBenchConfig {
             workgroups: (workgroups[0], workgroups[1], workgroups[2]),
             push_constants: push_constants.clone(),
@@ -265,6 +332,11 @@ pub fn run_optimize(
     let bench_fn: BenchFn<'_> = &|words: &[u32]| -> Result<SampleStats, String> {
         let handle = vk.prepare_kernel(words, plan, pc_bytes, &entry).map_err(|e| e.to_string())?;
         let resident = vk.upload_resident(&handle, &input_refs, &output_sizes_u64).map_err(|e| e.to_string())?;
+        // Blocker-fix (DEFECT-2): same per-variant derivation as correctness_fn.
+        let wg_dims: [u32; 3] = local_size_from_spirv(words)
+            .map(|(x, y, z)| [x, y, z])
+            .unwrap_or(workgroup_size);
+        let workgroups: [u32; 3] = bench_variant::derive_workgroups(&input_sizes, wg_dims, None);
         let cfg = ResidentBenchConfig {
             workgroups: (workgroups[0], workgroups[1], workgroups[2]),
             push_constants: push_constants.clone(),
@@ -293,8 +365,24 @@ pub fn run_optimize(
     // Post-grid_search decision (§1.5.1, §4): unattributable divergence fails
     // closed with ZERO artifacts — attributed divergence proceeds (the oracle
     // already rejected the wrong variant(s)); no divergence proceeds normally.
-    if let Some(ordinals) = divergence.into_inner() {
+    if let Some(call_ordinals) = divergence.into_inner() {
         if !oracle_attributed.get() {
+            // Blocker-fix cosmetic (DIVERGENCE-ORDINAL-NUMBERING): translate
+            // cfn call-sequence indices to true `variant.ordinal`s. `cfn` is
+            // invoked (per `grid_search`'s body) for exactly the variants
+            // that are NOT rejected before the correctness check — i.e.
+            // every `VariantResult` whose outcome isn't a pre-correctness
+            // `resolve error:` / `codegen error:` `Failed(..)` — and those
+            // appear in `result.results` in ascending ordinal order, so the
+            // Nth cfn call corresponds to the Nth such entry.
+            let cfn_call_to_true_ordinal: Vec<usize> = result.results.iter()
+                .filter(|r| !matches!(&r.outcome, BenchOutcome::Failed(msg)
+                    if msg.starts_with("resolve error:") || msg.starts_with("codegen error:")))
+                .map(|r| r.ordinal as usize)
+                .collect();
+            let ordinals: Vec<usize> = call_ordinals.iter()
+                .map(|&call_idx| cfn_call_to_true_ordinal.get(call_idx).copied().unwrap_or(call_idx))
+                .collect();
             return Err(OptimizeError::VariantsDiverge { ordinals, kernel: selected.name.clone() });
         }
     }
