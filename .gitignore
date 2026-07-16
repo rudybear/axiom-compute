@@ -3,6 +3,9 @@
 Cargo.lock.bak
 .pipeline/runs/
 *.spv
+# M4.2a: the committed upstream-package .spv IS tracked (HIGH #4; AT-3004 asserts git-tracked,
+# NOT merely on-disk) — negate the blanket *.spv ignore for this one directory.
+!upstream/*.spv
 *.dis
 *.prof
 .vscode/

@@ -857,16 +857,18 @@ fn emit_stmt(em: &mut BodyEmitter<'_>, stmt: &HirStmt) -> Result<(), BodyCodegen
             )
         }
 
-        HirStmt::CoopMatStore { matrix_binding, store_source, element_offset, stride, .. } => {
+        HirStmt::CoopMatStore { matrix_binding, store_source, element_offset, stride, layout, .. } => {
             // M2.1 / M3.2: Emit OpCooperativeMatrixStoreKHR via coopmat module.
             // Branch on store_source: Buffer -> SSBO two-index path; Shared -> Workgroup single-index path.
+            // M4.2a: `layout` additionally selects RowMajorKHR vs ColumnMajorKHR on the Buffer path
+            // (typecheck rejects ColMajor + Shared — see check_coopmat_store_stmt).
             let mat_val_id = *em.var_ids.get(matrix_binding)
                 .ok_or(BodyCodegenError::UnexpectedHir(
                     "CoopMatStore: matrix binding not in var_ids"
                 ))?;
             let offset_id = emit_expr(em, element_offset)?;
             let stride_id = emit_expr(em, stride)?;
-            use axc_hir::coopmat::CoopMatLoadSource;
+            use axc_hir::coopmat::{CoopMatLoadSource, CoopMatStoreLayout};
             match store_source {
                 CoopMatLoadSource::Buffer(buf_param) => {
                     // M2.1 default: SSBO two-index access chain (byte-identical to pre-M3.2).
@@ -882,13 +884,28 @@ fn emit_stmt(em: &mut BodyEmitter<'_>, stmt: &HirStmt) -> Result<(), BodyCodegen
                         .ok_or(BodyCodegenError::UnexpectedHir(
                             "CoopMatStore(Buffer): buffer slot not in elem_ptr_ids"
                         ))?;
-                    crate::coopmat::emit_coopmat_store_inline(
-                        em.b, em.type_cache, em.caps,
-                        buf_var_id, elem_ptr_ty, mat_val_id, offset_id, stride_id,
-                    )
+                    match layout {
+                        CoopMatStoreLayout::RowMajor => crate::coopmat::emit_coopmat_store_inline(
+                            em.b, em.type_cache, em.caps,
+                            buf_var_id, elem_ptr_ty, mat_val_id, offset_id, stride_id,
+                        ),
+                        CoopMatStoreLayout::ColMajor => crate::coopmat::emit_coopmat_store_col_inline(
+                            em.b, em.type_cache, em.caps,
+                            buf_var_id, elem_ptr_ty, mat_val_id, offset_id, stride_id,
+                        ),
+                    }
                 }
                 CoopMatLoadSource::Shared(shared_id) => {
                     // M3.2 PART B: Workgroup shared array — SINGLE-index access chain.
+                    // M4.2a §3.1: no shared-memory column-major store exists; typecheck already
+                    // rejects `coopmat_store_col` targeting a shared array, so `layout` is always
+                    // RowMajor here — defensive fail-closed error if that invariant is ever broken.
+                    if *layout == CoopMatStoreLayout::ColMajor {
+                        return Err(BodyCodegenError::UnexpectedHir(
+                            "CoopMatStore(Shared): ColumnMajorKHR layout is unsupported for \
+                             shared-memory stores (should have been rejected at typecheck)"
+                        ));
+                    }
                     let shared_bindings = em.res.shared_bindings
                         .ok_or(BodyCodegenError::UnexpectedHir(
                             "CoopMatStore(Shared): no SharedBindings in resources"
@@ -1728,6 +1745,11 @@ fn emit_expr(em: &mut BodyEmitter<'_>, expr: &HirExpr) -> Result<Word, BodyCodeg
                 CoopMatBuiltin::Store => {
                     Err(BodyCodegenError::UnexpectedHir(
                         "coopmat_store used in expression position (must be a statement)"
+                    ))
+                }
+                CoopMatBuiltin::StoreCol => {
+                    Err(BodyCodegenError::UnexpectedHir(
+                        "coopmat_store_col used in expression position (must be a statement)"
                     ))
                 }
             }

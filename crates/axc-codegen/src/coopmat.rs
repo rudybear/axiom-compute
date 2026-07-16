@@ -75,8 +75,14 @@ const MATRIX_USE_B: u32 = 1;
 const MATRIX_USE_ACCUMULATOR: u32 = 2;
 
 /// CooperativeMatrixLayout::RowMajorKHR = 0.
-/// Used for all loads and stores (AT-613: all loads/stores use row major).
+/// Used for all loads and (by default) stores (AT-613: all loads/stores use row major).
 const ROW_MAJOR_LAYOUT: u32 = 0;
+
+/// CooperativeMatrixLayout::ColumnMajorKHR = 1 (M4.2a).
+///
+/// A core `SPV_KHR_cooperative_matrix` layout OPERAND — no new capability or extension. Used
+/// only by `coopmat_store_col` (the ggml-ABI-matched D-output store), never by loads.
+const COL_MAJOR_LAYOUT: u32 = 1;
 
 // ── CoopMatTypeCache ──────────────────────────────────────────────────────────
 
@@ -237,6 +243,57 @@ pub fn emit_coopmat_store_inline(
 
     // RowMajorKHR layout constant.
     let layout_id = type_cache.get_or_emit_u32_const(b, ROW_MAJOR_LAYOUT);
+
+    b.cooperative_matrix_store_khr(
+        ptr_id,
+        mat_val_id,
+        layout_id,
+        Some(stride_id),
+        None,              // no MemoryAccess flags
+        std::iter::empty(),
+    )
+    .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+
+    Ok(())
+}
+
+/// Emit `coopmat_store_col(m, buf, element_offset, stride)` using pre-extracted buffer ids (M4.2a).
+///
+/// Byte-copy of [`emit_coopmat_store_inline`] with the layout `OpConstant` set to
+/// `ColumnMajorKHR = 1` instead of `RowMajorKHR = 0` — the ONE difference. Used by the
+/// ggml-ABI-matched Q4_K_M variant, whose D (output) buffer is stored column-major
+/// (`mul_mm.comp:404`, `ggml-vulkan.cpp:8175`; see M4.2a spec §2.6, §3).
+///
+/// Lowers to:
+/// ```text
+/// %zero   = OpConstant u32 0
+/// %ptr    = OpAccessChain %elem_ptr_ty %buf_var %zero %element_offset
+/// %layout = OpConstant u32 1   ; ColumnMajorKHR
+/// OpCooperativeMatrixStoreKHR %ptr %mat_val %layout %stride None []
+/// ```
+///
+/// Sets `caps.coopmat = true`. No new capability: `ColumnMajorKHR` is a layout OPERAND of the
+/// existing `SPV_KHR_cooperative_matrix` store instruction, not a distinct SPIR-V capability.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_coopmat_store_col_inline(
+    b: &mut Builder,
+    type_cache: &mut ScalarTypeCache,
+    caps: &mut CapabilitiesRequired,
+    buf_var_id: Word,
+    elem_ptr_ty: Word,
+    mat_val_id: Word,
+    element_offset_id: Word,
+    stride_id: Word,
+) -> Result<(), BodyCodegenError> {
+    caps.coopmat = true;
+
+    // OpAccessChain into the buffer at element_offset (member 0 of the SSBO struct).
+    let zero_id = type_cache.get_or_emit_u32_const(b, 0);
+    let ptr_id = b.access_chain(elem_ptr_ty, None, buf_var_id, [zero_id, element_offset_id])
+        .map_err(|e| BodyCodegenError::Rspirv(e.to_string()))?;
+
+    // ColumnMajorKHR layout constant (the ONLY delta vs emit_coopmat_store_inline).
+    let layout_id = type_cache.get_or_emit_u32_const(b, COL_MAJOR_LAYOUT);
 
     b.cooperative_matrix_store_khr(
         ptr_id,

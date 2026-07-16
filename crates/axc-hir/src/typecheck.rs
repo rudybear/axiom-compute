@@ -2749,9 +2749,14 @@ fn check_builtin_call_stmt(
     if let axc_parser::ast::Expr::Call { name, args } = &call.node {
         let op_name: &str = &name.node;
 
-        // M2.1: coopmat_store is the ONLY coopmat builtin that appears as a statement.
+        // M2.1: coopmat_store is a coopmat builtin that appears as a statement.
+        // M4.2a: coopmat_store_col mirrors it exactly (only the layout operand differs).
+        use crate::coopmat::CoopMatStoreLayout;
         if op_name == "coopmat_store" {
-            return check_coopmat_store_stmt(tc, args, call.span, stmt_span);
+            return check_coopmat_store_stmt(tc, args, call.span, stmt_span, CoopMatStoreLayout::RowMajor);
+        }
+        if op_name == "coopmat_store_col" {
+            return check_coopmat_store_stmt(tc, args, call.span, stmt_span, CoopMatStoreLayout::ColMajor);
         }
         // Reject other coopmat builtins used at statement position (they return non-void values).
         use crate::coopmat::CoopMatBuiltin;
@@ -3129,6 +3134,13 @@ fn check_coopmat_init_expr(
                     });
                     None
                 }
+                Some(CoopMatBuiltin::StoreCol) => {
+                    tc.errors.push(TypecheckError::UnsupportedStmtInM1_4 {
+                        detail: "coopmat_store_col must appear at statement position (it returns void)",
+                        span,
+                    });
+                    None
+                }
                 None => {
                     // Non-coopmat call in coopmat context — fall through to normal check_expr.
                     // This will likely produce a type error, which is correct.
@@ -3189,11 +3201,19 @@ fn check_coopmat_expr_call(
 ) -> Option<HirExpr> {
     use crate::coopmat::{CoopMatBuiltin, is_allowed_coopmat_element};
 
-    // Arity check (except Store which is handled as a stmt).
+    // Arity check (except Store / StoreCol, which are handled as statements).
     if op == CoopMatBuiltin::Store {
         // coopmat_store used in expression position is an error.
         tc.errors.push(TypecheckError::UnsupportedStmtInM1_4 {
             detail: "coopmat_store must appear at statement position (it returns void)",
+            span: call_span,
+        });
+        return None;
+    }
+    if op == CoopMatBuiltin::StoreCol {
+        // coopmat_store_col used in expression position is an error (M4.2a, mirrors Store).
+        tc.errors.push(TypecheckError::UnsupportedStmtInM1_4 {
+            detail: "coopmat_store_col must appear at statement position (it returns void)",
             span: call_span,
         });
         return None;
@@ -3349,21 +3369,29 @@ fn check_coopmat_expr_call(
             })
         }
         CoopMatBuiltin::Store => unreachable!("Store handled above"),
+        CoopMatBuiltin::StoreCol => unreachable!("StoreCol handled above"),
     }
 }
 
-/// Typecheck `coopmat_store(m, buf, element_offset, stride);` as a statement.
+/// Typecheck `coopmat_store(m, buf, element_offset, stride);` (or `coopmat_store_col(...)`,
+/// M4.2a — same shape, `layout` selects the emitted SPIR-V layout operand) as a statement.
 fn check_coopmat_store_stmt(
     tc: &mut TypeChecker<'_>,
     args: &[axc_lexer::Spanned<past::Expr>],
     call_span: Span,
     stmt_span: Span,
+    layout: crate::coopmat::CoopMatStoreLayout,
 ) -> Option<HirStmt> {
-    use crate::coopmat::CoopMatBuiltin;
+    use crate::coopmat::{CoopMatBuiltin, CoopMatStoreLayout};
+
+    let builtin_name: &'static str = match layout {
+        CoopMatStoreLayout::RowMajor => "coopmat_store",
+        CoopMatStoreLayout::ColMajor => "coopmat_store_col",
+    };
 
     if args.len() != CoopMatBuiltin::Store.arity() {
         tc.errors.push(TypecheckError::CoopMatArity {
-            name: "coopmat_store",
+            name: builtin_name,
             expected: CoopMatBuiltin::Store.arity(),
             found: args.len(),
             span: call_span,
@@ -3419,6 +3447,16 @@ fn check_coopmat_store_stmt(
 
     // PART B (M3.2): check if dst_ident is a shared array first.
     let store_source = if let Some((shared_id, shared_elem, _shared_len)) = tc.find_shared(&dst_ident) {
+        // M4.2a (§3.1): no shared-memory column-major store is needed or supported —
+        // `coopmat_store_col` targets global buffers only (the ggml D/C output).
+        if layout == CoopMatStoreLayout::ColMajor {
+            tc.errors.push(TypecheckError::TypeMismatch {
+                expected: "buffer parameter (coopmat_store_col targets buffers only)",
+                got: "shared array name",
+                span: args[1].span,
+            });
+            return None;
+        }
         // Shared destination path.
         if shared_elem != matrix_key.elem {
             tc.errors.push(TypecheckError::CoopMatStoreElementTypeMismatch {
@@ -3500,6 +3538,7 @@ fn check_coopmat_store_stmt(
         store_source,
         element_offset: offset_hir,
         stride: stride_hir,
+        layout,
         span: stmt_span,
     })
 }

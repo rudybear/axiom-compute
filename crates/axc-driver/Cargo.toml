@@ -117,6 +117,16 @@ name = "resident_q4km_matmul_rb_f32acc_cached"
 path = "benches/resident_q4km_matmul_rb_f32acc_cached.rs"
 harness = false
 
+# M4.2a: resident TFLOPS for the ggml-ABI-MATCHED variant vs the M3.6 leader (AT-2996), emitting
+# AXC_Q4KM_AB_F32ACC_CACHED_GGML (scripts/m34_llamacpp_ab.sh --fused-f32acc-cached-ggml). NO
+# ratio gate (perf sanity only, M3.13 concluded the NVIDIA throughput campaign) — records the
+# f32->f16 B-staging convert cost + the transposed/column-major addressing cost honestly. Bench
+# ID: dispatch_resident_q4km_matmul_rb_f32acc_cached_ggml. GPU-gated.
+[[bench]]
+name = "resident_q4km_matmul_rb_f32acc_cached_ggml"
+path = "benches/resident_q4km_matmul_rb_f32acc_cached_ggml.rs"
+harness = false
+
 # M3.13 PRONG A: resident TFLOPS for the LIVE-RANGE-TIGHTENED kernel vs the M3.6 leader (AT-2802/2804),
 # emitting AXC_Q4KM_TIGHTLIVE (scripts/m34_llamacpp_ab.sh --tightlive). Prints the tightlive/leader
 # ratio at 768^3 + A/B, the >=1.15x gate verdict (NEVER loosened), and the per-variant A-staging

@@ -417,6 +417,7 @@ pub const RESERVED_COOPMAT_BUILTIN_NAMES: &[&str] = &[
     "coopmat_load",
     "coopmat_mul_add",
     "coopmat_store",
+    "coopmat_store_col",
     "coopmat_zero",
 ];
 

@@ -11,7 +11,16 @@
 #
 # Usage:
 #   VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json AXC_ENABLE_GPU_BENCHES=1 \
-#     scripts/m34_llamacpp_ab.sh [--skip-build] [--skip-llama] [--fused | --fused-f32acc | --fused-f32acc-cached | --fused-f32acc-db | --fused-f32acc-rb44 | --fused-f32acc-rb42 | --warptile | --pad | --sr | --ablate | --tightlive]
+#     scripts/m34_llamacpp_ab.sh [--skip-build] [--skip-llama] [--fused | --fused-f32acc | --fused-f32acc-cached | --fused-f32acc-cached-ggml | --fused-f32acc-db | --fused-f32acc-rb44 | --fused-f32acc-rb42 | --warptile | --pad | --sr | --ablate | --tightlive]
+#
+#   --fused-f32acc-cached-ggml (M4.2a): runs the ggml-ABI-MATCHED variant's resident bench
+#                    (resident_q4km_matmul_rb_f32acc_cached_ggml) ALONGSIDE the M3.6 leader at
+#                    the SAME sizes (cube + the A/B shape), on NVIDIA. Perf SANITY ONLY — NO
+#                    ratio gate (M3.13 concluded the NVIDIA throughput campaign); records the
+#                    extra per-B-element f32->f16 staging convert + transposed-B/column-major-D
+#                    addressing cost HONESTLY. Emits AXC_Q4KM_AB_F32ACC_CACHED_GGML. Short-
+#                    circuits the llama Q4_K_M path (the llama A/B is the M3.6 leader's,
+#                    unchanged) and writes ab_results_fused_f32acc_cached_ggml.json.
 #
 #   --pad (M3.10a): runs the BANK-PADDED resident benches — the plain-f32 padded RB
 #                    (resident_matmul_rb_pad, gate >=1.15x the unpadded base at 768^3) AND the
@@ -119,6 +128,7 @@ PAD=0         # M3.10a: --pad -> the BANK-PADDED resident benches (plain-f32 + Q
 SR=0          # M3.11a: --sr -> the dequant-index STRENGTH-REDUCED resident bench vs M3.6 (no llama path).
 ABLATE=0      # M3.12: --ablate -> the dequant front-end ABLATION DIAGNOSTIC profiling instruments (no llama path).
 TIGHTLIVE=0   # M3.13 PRONG A: --tightlive -> the LIVE-RANGE-TIGHTENED resident bench vs M3.6 (no llama path).
+GGML=0        # M4.2a: --fused-f32acc-cached-ggml -> the ggml-ABI-MATCHED variant vs M3.6 leader (no llama path).
 for arg in "$@"; do
     case "$arg" in
         --skip-build) SKIP_BUILD=1 ;;
@@ -142,6 +152,8 @@ for arg in "$@"; do
         --ablate) ABLATE=1 ;;
         # M3.13 PRONG A: LIVE-RANGE-TIGHTENED resident bench vs M3.6 (short-circuits the llama path).
         --tightlive) TIGHTLIVE=1 ;;
+        # M4.2a: ggml-ABI-matched variant vs the M3.6 leader (short-circuits the llama Q4_K_M path).
+        --fused-f32acc-cached-ggml) GGML=1 ;;
         *) echo "unknown arg: $arg" >&2; exit 2 ;;
     esac
 done
@@ -264,6 +276,45 @@ if [ "${TIGHTLIVE}" -eq 1 ]; then
     } > "${TIGHTLIVE_RESULTS}"
     echo "-- wrote ${TIGHTLIVE_RESULTS}"
     echo "-- full bench log: ${TIGHTLIVE_LOG}"
+    exit 0
+fi
+
+# ── M4.2a --fused-f32acc-cached-ggml: ggml-ABI-MATCHED variant vs the M3.6 leader (no llama path). ──
+# Runs resident_q4km_matmul_rb_f32acc_cached_ggml: BOTH the ggml variant AND the M3.6 leader at
+# the SAME sizes (cube + A/B), MIN-of-10/GpuTimestamp, emitting AXC_Q4KM_AB_F32ACC_CACHED_GGML.
+# Perf SANITY ONLY -- NO ratio gate (M3.13 concluded the NVIDIA throughput campaign); records the
+# f32->f16 B-staging convert + transposed-B/column-major-D addressing cost HONESTLY. The llama
+# A/B is unchanged (the M3.6 leader's, 42.86 vs 102.49 = 2.39x behind) -- this flag does NOT
+# touch the llama Q4_K_M path.
+if [ "${GGML}" -eq 1 ]; then
+    GGML_RESULTS="${OUTDIR}/ab_results_fused_f32acc_cached_ggml.json"
+    GGML_LOG="${OUTDIR}/ggml_bench_q4km.txt"
+    echo "== M4.2a ggml-ABI-MATCHED resident bench (ggml variant vs M3.6 leader; no llama path) =="
+    echo "  repo_root : ${REPO_ROOT}"
+    echo "  ICD       : ${ICD}"
+    echo "  outdir    : ${OUTDIR}"
+    echo "  gate      : NONE (perf sanity only) -- records the f32->f16 convert + transposed/column-major addressing cost honestly"
+    VK_DRIVER_FILES="${ICD}" AXC_ENABLE_GPU_BENCHES=1 \
+        cargo bench --manifest-path "${REPO_ROOT}/Cargo.toml" -p axc-driver \
+        --bench resident_q4km_matmul_rb_f32acc_cached_ggml 2>&1 | tee "${GGML_LOG}"
+    GGML_AB_LINES="$(grep 'resident_q4km_ggml_ab:' "${GGML_LOG}" || true)"
+    GGML_LINE="$(grep 'AXC_Q4KM_AB_F32ACC_CACHED_GGML' "${GGML_LOG}" | tail -1 || true)"
+    {
+        echo "{"
+        echo "  \"milestone\": \"M4.2a-ggml-abi\","
+        echo "  \"mode\": \"ggml-ABI-matched-variant-vs-leader (same shapes, same device, no llama path)\","
+        echo "  \"gate\": \"NONE (perf sanity only -- M3.13 concluded the NVIDIA throughput campaign)\","
+        echo "  \"icd\": \"${ICD}\","
+        echo "  \"vulkaninfo_device\": \"$(VK_DRIVER_FILES="${ICD}" vulkaninfo 2>/dev/null | grep -m1 'deviceName' | sed 's/.*= //' | tr -d '\r' || true)\","
+        echo "  \"note\": \"The six ABI deltas (B f32 + transposed staging, grid-axis swap, column-major D via coopmat_store_col, stride_a/256 derivation) applied to the M3.6 leader, VERBATIM otherwise. HONEST EXPECTATION: the extra per-B-element f32->f16 convert + the transposed/column-major addressing cost a nonzero throughput tax vs the leader -- recorded, not gated. See ggml_bench_q4km.txt.\","
+        echo "  \"ab_line\": \"$(printf '%s' "${GGML_LINE}" | sed 's/\"/\\\"/g')\","
+        echo "  \"ab_lines\": ["
+        printf '%s\n' "${GGML_AB_LINES}" | sed '/^$/d' | sed 's/\"/\\\"/g' | awk 'BEGIN{first=1} {if(!first)printf ",\n"; printf "    \"%s\"", $0; first=0} END{if(!first)printf "\n"}'
+        echo "  ]"
+        echo "}"
+    } > "${GGML_RESULTS}"
+    echo "-- wrote ${GGML_RESULTS}"
+    echo "-- full bench log: ${GGML_LOG}"
     exit 0
 fi
 

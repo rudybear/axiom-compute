@@ -1,0 +1,282 @@
+// examples/q4km_matmul_rb_coopmat_f32acc_cached_ggml.axc
+//
+// M4.2a — ggml-ABI-MATCHED variant of the M3.6 production leader
+// (q4km_matmul_rb_coopmat_f32acc_cached.axc). VERBATIM except the SIX ABI deltas required to be
+// a drop-in coopmat-KHR (`_cm1`) Q4_K pipeline for llama.cpp's Vulkan backend (see
+// .pipeline/milestones/M4.2a-ggml-abi.md for the full spec + vendor citations at pinned SHA
+// 6b80c74f285390368b3c99c5e750f19e9b096e98, tag b9542):
+//
+//   (a) `n_blocks_per_row` is DERIVED (`stride_a / 256u32`) instead of a push field — ggml's
+//       `stride_a` is the A row stride in ELEMENTS (`ggml_vk_matmul(ne01,ne11,ne10,ne10,ne10,
+//       stride_d,…)` -> stride_a==ne10==K), so `/256` (not `/144`) — §2.4.
+//   (b) the kernel consumes ggml's 17-field push constant struct (`vk_mat_mat_push_constants`,
+//       `ggml-vulkan.cpp:1036-1044`), reading only the LEADING SIX scalars
+//       (M,N,K,stride_a,stride_b,stride_d) at std430 offsets 0,4,8,12,16,20 — byte-identical to
+//       ggml's layout by construction (AXIOM lays out scalar push members in declaration order).
+//       Fields 6..17 are ignored; the host adapter guards the split_k==1/num_batches==1
+//       precondition (§2.7, §7.2) — §2.3.
+//   (c-B) B (activations) are f32 (ggml's `matmul_q4_k_f32` B_TYPE), read TRANSPOSED (ggml's
+//       `[N,K]` row-major: `x[n*stride_b+k]`), and converted f32->f16 during staging via the
+//       existing M3.5 `f32_to_f16` builtin — the coopmat B operand stays `matrix[f16,16,16,b]`
+//       (canonical f16xf16->f32 HMMA), only the SOURCE buffer type + read index change — §2.5.
+//   (c-D) D (output) is stored COLUMN-MAJOR with `stride_d` (ggml `coopMatStore(...,
+//       gl_CooperativeMatrixLayoutColumnMajor)`, `mul_mm.comp:404`) via the new M4.2a
+//       `coopmat_store_col` builtin (mirrors `coopmat_store` except the ColumnMajorKHR layout
+//       operand — a core SPV_KHR_cooperative_matrix operand, no new capability) — §2.6, §3.
+//   (e) the grid axis order is SWAPPED to ggml's convention: `gl_WorkGroupID.x` selects the
+//       M-row block (`ir = WorkGroupID.x % blocks_m`, `mul_mm.comp:166`), `gl_WorkGroupID.y`
+//       selects the N-col block (`ic = WorkGroupID.y`, `mul_mm.comp:141`) — the OPPOSITE of the
+//       M3.6 leader. `@workgroup(32,1,1)` is UNCHANGED; the host adapter registers the pipeline
+//       with `wg_denoms={32,32,1}` so ggml's `{M,N,z}` dispatch (`ggml-vulkan.cpp:7863`) maps to
+//       workgroups `(M/32, N/32, 1)` — §2.8.
+//
+// Buffer bindings 0/1/2 (q/x/C) MATCH ggml's A=0/B=1/D=2 with ZERO codegen work (declaration-
+// order binding assignment, `param.rs:55-78`) — §2.1. Weight layout (144-byte block_q4_K) is
+// UNCHANGED and bit-exact to ggml (§2.2) — NO dequant arithmetic changes in this milestone.
+//
+// Everything below this header is the M3.6 mechanism/barriers/numerics discipline, PRESERVED
+// VERBATIM (the ABI deltas touch ONLY addressing/types/grid-axis, never accumulation order):
+//
+// MECHANISM (PURE SOURCE REWRITE — flat loop + conditional fill; NO new builtin/codegen/cap
+//   beyond the ONE `coopmat_store_col` addition, which itself is a byte-copy of `coopmat_store`
+//   with the layout operand flipped — see crates/axc-codegen/src/coopmat.rs):
+//   Two `shared[f32, 256]` arrays cache the 8 (dsc=d*sc, dmm=dmin*m) PRODUCTS for each of the 32
+//   weight-rows the 2x2 block covers, for the superblock currently in flight. The K-loop STAYS
+//   the FLAT single loop (`for k_block in range(0, num_k_blocks)`): the 4 f32 accumulators are
+//   reassigned UNCONDITIONALLY at its top level, preserving the single-level OpPhi N-accumulator
+//   carry (M3.3c, AT-1731/1733) — NO nested coopmat carry (the r1 M3.6 silent-miscompile class is
+//   NOT reintroduced). The cooperative scale-cache fill fires once per superblock
+//   (`k_block % 16 == 0`, WORKGROUP-UNIFORM), writing ONLY dsc_cache/dmm_cache (never the coopmat
+//   accumulators) — no BarrierInDivergentContext trip. The RAW barrier is HOISTED unconditional
+//   (r3 OPT-B): 3 barriers per k_block total (RAW, post-staging, end-of-body WAR).
+//
+// SHARED BOUNDS — a_block_size PINNED at 512 (UNCHANGED: the 256-entry cache invariant).
+//
+// NUMERICS — pure reassociation of M3.5b/M3.6, FROZEN 1e-3 unchanged. The B f32->f16 staging
+//   convert is EXACT (bit-identical to the leader's direct f16 read) iff the B fixture is
+//   f16-exact (§5.2 of the M4.2a spec) — the cross-kernel bit-identity anchor (AT-2992/93/94)
+//   asserts this; a non-zero diff on an f16-exact fixture is a BUG, not a permissible reorder.
+//
+// CAPABILITIES: IDENTICAL to q4km_matmul_rb_coopmat_f32acc_cached.axc — `coopmat_store_col` adds
+//   only the ColumnMajorKHR layout OPERAND (within the already-required CooperativeMatrixKHR
+//   capability); the f32->f16 convert uses the existing M3.5 `f32_to_f16` builtin (no new cap).
+//   AT-2987 asserts the cap set == the M3.6 leader's set.
+//
+// GPU DISPATCH NOTE: the host adapter must register this pipeline with `wg_denoms={32,32,1}` and
+//   dispatch workgroups `(M/32, N/32, 1)` (NOT `(N/32, M/32, 1)` as the M3.6 leader) — see §2.8
+//   and the dispatch test harnesses (dispatch_q4km_ggml.rs / dispatch_q4km_ggml_equiv.rs).
+//
+// BENCHMARKED BY: crates/axc-driver/benches/resident_q4km_matmul_rb_f32acc_cached_ggml.rs (AT-2996).
+// CORRECTNESS: crates/axc-driver/tests/dispatch_q4km_ggml.rs (AT-2989/90/91, AT-3002 rectangular).
+// CROSS-KERNEL BIT-IDENTITY: crates/axc-driver/tests/dispatch_q4km_ggml_equiv.rs (AT-2992/93/94).
+// STATIC ABI GOLDENS: crates/axc-driver/tests/m42a_ggml_abi_golden.rs (AT-2988,2995,3000,3001,3003,3005).
+// COMPILE ANCHOR: AT-2987 in compile_shared_examples.rs (CI, no GPU).
+//
+// Anti-pattern #2: explicit `return;`.
+// Anti-pattern #8: no `>>` (use shr/lshr for shifts); k_block % 16 expressed as k_block - (k_block/16)*16.
+
+@kernel
+@workgroup(32, 1, 1)
+@cooperative_matrix
+@strategy { rb_m: ?[2], rb_n: ?[2], tile_k: ?[16], a_block_size: ?[512], b_block_size: ?[512] }
+@intent("ggml-ABI-matched Q4_K_M dequant scale-caching coopmat matmul (M4.2a, AT-2985..3005)")
+@complexity(O(n))
+fn q4km_matmul_rb_coopmat_f32acc_cached_ggml(
+    q: readonly_buffer[u8],
+    x: readonly_buffer[f32],
+    C: buffer[f32],
+    M: u32,
+    N: u32,
+    K: u32,
+    stride_a: u32,
+    stride_b: u32,
+    stride_d: u32
+) -> void {
+    // M4.2a delta (a): n_blocks_per_row DERIVED from ggml's stride_a (ELEMENTS, §2.4).
+    // Every downstream use reads this local — byte-identical addressing to M3.6 for the
+    // contiguous case (stride_a == K).
+    let n_blocks_per_row: u32 = stride_a / 256u32;
+
+    // Shared staging tiles for the 2x2 block (identical sizing to M3.6; A/B stay f16 in shared).
+    shared a_tile: shared[f16, ?a_block_size];
+    shared b_tile: shared[f16, ?b_block_size];
+
+    // M3.6: per-superblock dequant-scale caches (8 sub-blocks x 32 weight-rows = 256 each).
+    // Indexed row_local*8 + is (row_local 0..31, is 0..7). a_block_size PINNED at 512 bounds it.
+    shared dsc_cache: shared[f32, 256];
+    shared dmm_cache: shared[f32, 256];
+
+    // M4.2a delta (e): grid axis order SWAPPED to ggml's convention — x-axis -> M-row (the
+    // /32 subgroup factor moves here), y-axis -> N-column (§2.8).
+    let block_row: u32 = gid(0u32) / 32u32;
+    let block_col: u32 = gid(1u32);
+
+    // Lane index within the subgroup for cooperative staging.
+    let lane: u32 = subgroup_invocation_id();
+
+    // Output tile coordinates within the 2x2 block.
+    let tile_row_0: u32 = block_row * 2u32;
+    let tile_row_1: u32 = block_row * 2u32 + 1u32;
+    let tile_col_0: u32 = block_col * 2u32;
+    let tile_col_1: u32 = block_col * 2u32 + 1u32;
+
+    // 4 loop-carried f32 coopmat accumulators (single-level OpPhi K-carry, VERBATIM M3.6).
+    let mut acc_00: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_01: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_10: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+    let mut acc_11: matrix[f32, 16, 16, accumulator] = coopmat_zero();
+
+    // Staging iterations per thread.
+    let a_iters: u32 = ?a_block_size / 32u32;
+    let b_iters: u32 = ?b_block_size / 32u32;
+
+    // Number of K-blocks.
+    let num_k_blocks: u32 = K / ?tile_k;
+
+    // K-loop: FLAT single level. The 4 coopmat accumulators are loop-carried (N-phi path),
+    // reassigned UNCONDITIONALLY at the top level -> single-level OpPhi (M3.3c), no nested carry.
+    for k_block in range(0u32, num_k_blocks) {
+        // Superblock currently in flight (UNIFORM across the workgroup: k_block is the loop
+        // induction variable, identical across all lanes).
+        let sb_idx: u32 = k_block / 16u32;
+
+        // ── COOPERATIVE SCALE-CACHE FILL — fires ONCE per superblock ──────────────────────
+        //   Predicate k_block % 16 == 0 (anti-pattern #8: expressed as k_block - sb_idx*16 == 0).
+        //   WORKGROUP-UNIFORM -> all 32 lanes take the branch together -> the barrier inside is
+        //   reached by every invocation -> NOT divergent control flow -> safe.
+        if k_block - sb_idx * 16u32 == 0u32 {
+            // 256 (row,is) entries over 32 lanes -> 8 fills/lane.
+            // cache_i = fi*32 + lane (fi 0..7, lane 0..31) covers 0..255 EXACTLY ONCE (AT-1620 class).
+            for fi in range(0u32, 8u32) {
+                let cache_i: u32 = fi * 32u32 + lane;          // 0..255
+                let row_local: u32 = cache_i / 8u32;           // 0..31
+                let is: u32 = cache_i - row_local * 8u32;      // 0..7
+                let g_row: u32 = block_row * 32u32 + row_local;
+
+                // Byte offset of superblock sb_idx in weight-row g_row.
+                let base: u32 = g_row * n_blocks_per_row * 144u32 + sb_idx * 144u32;
+                // Super-scale d and super-min dmin (f16, bytes [base..base+4]) — byte-identical M3.6.
+                let d_bits: u32 = ptr_read_u16_zext(q, base);
+                let dmin_bits: u32 = ptr_read_u16_zext(q, base + 2u32);
+                let d: f32 = f16_bits_to_f32(d_bits);
+                let dmin: f32 = f16_bits_to_f32(dmin_bits);
+                let scales_base: u32 = base + 4u32;
+
+                // Inline get_scale_min_k4 for sub-block `is` (byte-identical to M3.6 lines 170-183).
+                let mut sc: u32 = 0u32;
+                let mut mm: u32 = 0u32;
+                if is < 4u32 {
+                    sc = band(ptr_read_u8_zext(q, scales_base + is), 63u32);
+                    mm = band(ptr_read_u8_zext(q, scales_base + is + 4u32), 63u32);
+                } else {
+                    let lo4_sc: u32 = band(ptr_read_u8_zext(q, scales_base + is + 4u32), 0x0Fu32);
+                    let hi2_sc: u32 = band(lshr(ptr_read_u8_zext(q, scales_base + is - 4u32), 6u32), 0x03u32);
+                    sc = bor(lo4_sc, shl(hi2_sc, 4u32));
+                    let lo4_m: u32 = band(lshr(ptr_read_u8_zext(q, scales_base + is + 4u32), 4u32), 0x0Fu32);
+                    let hi2_m: u32 = band(lshr(ptr_read_u8_zext(q, scales_base + is), 6u32), 0x03u32);
+                    mm = bor(lo4_m, shl(hi2_m, 4u32));
+                }
+
+                // Cache the per-sub-block PRODUCTS (SAME d*sc / dmin*m as M3.6, computed ONCE
+                // here instead of per-nibble — pure hoist, identical bits).
+                dsc_cache[cache_i] = d * f32_from_u32(sc);
+                dmm_cache[cache_i] = dmin * f32_from_u32(mm);
+            }
+            // r3 (OPT-B, VERBATIM M3.6): NO barrier inside this if-body — HOISTED below.
+        }
+
+        // RAW barrier (r3 OPT-B HOISTED, VERBATIM M3.6): UNCONDITIONAL, once per k_block, at the
+        // TOP LEVEL of the loop body (conditional_depth==0), AFTER the conditional fill block and
+        // BEFORE A staging.
+        workgroup_barrier();
+
+        // ── Dequant A[block_row*32..+32, k_block*16..+16] into a_tile (shared[f16]) ─
+        // Each lane stages a_iters = 16 A elements. ei_a covers 0..511 exactly once.
+        // UNCHANGED vs M3.6: A is still Q4_K_M weight bytes, addressed by n_blocks_per_row
+        // (now a derived local instead of a push param, §2.4) — byte-identical decode.
+        for a_iter in range(0u32, a_iters) {
+            let ei_a: u32 = a_iter * 32u32 + lane;
+            let a_row: u32 = ei_a / 16u32;
+            let a_col: u32 = ei_a - a_row * 16u32;
+            let g_k: u32 = k_block * ?tile_k + a_col;
+
+            // Superblock-to-tile decode for this element's nibble (byte-identical M3.6).
+            let sb: u32 = g_k / 256u32;
+            let wk: u32 = g_k - sb * 256u32;
+            let chunk: u32 = wk / 64u32;
+            let wc: u32 = wk - chunk * 64u32;
+            let l: u32 = wc - (wc / 32u32) * 32u32;
+            let is_hi: u32 = wc / 32u32;            // 0 = lo nibble, 1 = hi nibble
+            let is: u32 = chunk * 2u32 + is_hi;     // sub-block index 0..7
+
+            // Read the cached (dsc, dmm) for (a_row, is) instead of recomputing.
+            let cache_idx: u32 = a_row * 8u32 + is;
+            let dsc: f32 = dsc_cache[cache_idx];
+            let dmm: f32 = dmm_cache[cache_idx];
+
+            // Byte holding this element's nibble: qs_base + chunk*32 + l (qs_base = base+16).
+            let base: u32 = (block_row * 32u32 + a_row) * n_blocks_per_row * 144u32 + sb * 144u32;
+            let qs_base: u32 = base + 16u32;
+            let byte: u32 = ptr_read_u8_zext(q, qs_base + chunk * 32u32 + l);
+            let mut nib: u32 = band(byte, 0x0Fu32);
+            if is_hi >= 1u32 {
+                nib = band(lshr(byte, 4u32), 0x0Fu32);
+            }
+
+            // Dequant in f32, narrow to f16 — SAME multiply-then-subtract ORDER as M3.6.
+            let w: f16 = f32_to_f16(dsc * f32_from_u32(nib) - dmm);
+            a_tile[ei_a] = w;
+        }
+
+        // ── M4.2a delta (c-B): stage B (x) TRANSPOSED + CONVERTED f32->f16 ────────────────
+        // ggml's B is f32, row-major [N,K]: element (k,n) lives at x[n*stride_b + k]
+        // (`vulkan-shaders-gen.cpp:582` B_TYPE=float; §2.5). The coopmat B operand stays
+        // matrix[f16,16,16,b] — only the SOURCE buffer type + read index change vs M3.6.
+        for b_iter in range(0u32, b_iters) {
+            let ei_b: u32 = b_iter * 32u32 + lane;
+            let b_row: u32 = ei_b / 32u32;
+            let b_col: u32 = ei_b - b_row * 32u32;
+            let b_global_row: u32 = k_block * ?tile_k + b_row;
+            let b_global_col: u32 = block_col * 32u32 + b_col;
+            let b_global: u32 = b_global_col * stride_b + b_global_row;  // ggml [N,K] row-major
+            b_tile[ei_b] = f32_to_f16(x[b_global]);                     // f32 source, staged f16
+        }
+
+        // Barrier: staging complete before coopmat loads.
+        workgroup_barrier();
+
+        // ── Coopmat loads (f16 A/B) + 4 mul_adds into f32 accumulators (HMMA) ─────
+        let a_mat_0: matrix[f16, 16, 16, a] = coopmat_load(a_tile, 0u32, 16u32);
+        let a_mat_1: matrix[f16, 16, 16, a] = coopmat_load(a_tile, 256u32, 16u32);
+
+        let b_mat_0: matrix[f16, 16, 16, b] = coopmat_load(b_tile, 0u32, 32u32);
+        let b_mat_1: matrix[f16, 16, 16, b] = coopmat_load(b_tile, 16u32, 32u32);
+
+        // f16 A × f16 B → f32 accumulator (mixed-precision HMMA).
+        acc_00 = coopmat_mul_add(a_mat_0, b_mat_0, acc_00);
+        acc_01 = coopmat_mul_add(a_mat_0, b_mat_1, acc_01);
+        acc_10 = coopmat_mul_add(a_mat_1, b_mat_0, acc_10);
+        acc_11 = coopmat_mul_add(a_mat_1, b_mat_1, acc_11);
+
+        // WAR barrier: before the next k_block overwrites a_tile / b_tile AND (next superblock)
+        // the scale caches. VERBATIM M3.6 — doubles as the cache WAR.
+        workgroup_barrier();
+    }
+
+    // ── M4.2a delta (c-D): store the 4 accumulated f32 tiles to C (buffer[f32]) ──────
+    // COLUMN-MAJOR with stride_d (ggml `coopMatStore(..., ColumnMajor)`, `mul_mm.comp:404`;
+    // §2.6). Base offset formula: (tile_col*16)*stride_d + (tile_row*16) — the tile origin in
+    // the column-major buffer. Accumulator VALUES are bit-identical to M3.6; only their memory
+    // destination is transposed.
+    let c_base_00: u32 = (tile_col_0 * 16u32) * stride_d + (tile_row_0 * 16u32);
+    let c_base_01: u32 = (tile_col_1 * 16u32) * stride_d + (tile_row_0 * 16u32);
+    let c_base_10: u32 = (tile_col_0 * 16u32) * stride_d + (tile_row_1 * 16u32);
+    let c_base_11: u32 = (tile_col_1 * 16u32) * stride_d + (tile_row_1 * 16u32);
+
+    coopmat_store_col(acc_00, C, c_base_00, stride_d);
+    coopmat_store_col(acc_01, C, c_base_01, stride_d);
+    coopmat_store_col(acc_10, C, c_base_10, stride_d);
+    coopmat_store_col(acc_11, C, c_base_11, stride_d);
+
+    return;
+}

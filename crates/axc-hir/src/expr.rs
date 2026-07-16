@@ -324,7 +324,8 @@ pub enum HirStmt {
         kind: crate::subgroup::BarrierKind,
         span: Span,
     },
-    /// `coopmat_store(m, buf_or_shared, element_offset, stride);` (M2.1 / M3.2).
+    /// `coopmat_store(m, buf_or_shared, element_offset, stride);` (M2.1 / M3.2) or
+    /// `coopmat_store_col(...)` (M4.2a, same shape, column-major layout).
     ///
     /// Lowers to `OpAccessChain` + `OpCooperativeMatrixStoreKHR`.
     /// Only valid as a statement (void return type).
@@ -339,6 +340,9 @@ pub enum HirStmt {
         element_offset: HirExpr,
         /// Stride argument (must be U32).
         stride: HirExpr,
+        /// SPIR-V layout operand (M4.2a): `RowMajor` for `coopmat_store` (the M2.1 default),
+        /// `ColMajor` for `coopmat_store_col`. Orthogonal to typing — codegen-only discriminant.
+        layout: crate::coopmat::CoopMatStoreLayout,
         span: Span,
     },
     /// Write one element to a workgroup-shared array: `tile[index] = value;` (M3.2).
